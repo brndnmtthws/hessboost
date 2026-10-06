@@ -52,7 +52,7 @@ pub(super) struct TreeSample<'a> {
 pub(super) enum Prepared {
     Exact(SortedColumns),
     /// Histogram method: the binned dataset plus the backend its histograms
-    /// are built on (the CPU's, or the Metal GPU's when `device = metal`).
+    /// are built on (the CPU's, or a GPU's when `device` names one).
     Hist {
         index: GHistIndex,
         backend: Box<dyn HistogramBackend>,
@@ -305,9 +305,9 @@ pub(super) fn prepare_builder(
     })
 }
 
-/// The histogram backend a training run builds on: the Metal GPU's when
-/// `device = metal` (the parameter validation has already checked the
-/// platform and feature), else the CPU's.
+/// The histogram backend a training run builds on: a GPU's when `device`
+/// names one (the parameter validation has already checked the platform
+/// and feature), else the CPU's.
 fn hist_backend(params: &TrainingParams, index: &GHistIndex) -> Result<Box<dyn HistogramBackend>> {
     match params.device {
         Device::Cpu => {
@@ -330,6 +330,23 @@ fn hist_backend(params: &TrainingParams, index: &GHistIndex) -> Result<Box<dyn H
                 Err(HessboostError::invalid_param(
                     "device",
                     "`metal` requires building with the `metal` feature on macOS",
+                ))
+            }
+        }
+        Device::Wgpu => {
+            #[cfg(feature = "wgpu")]
+            {
+                let backend: Box<dyn HistogramBackend> =
+                    Box::new(crate::backend::wgpu::WgpuHistBackend::new(index)?);
+                Ok(backend)
+            }
+            #[cfg(not(feature = "wgpu"))]
+            {
+                // Unreachable in practice, as for `metal`.
+                let _ = index;
+                Err(HessboostError::invalid_param(
+                    "device",
+                    "`wgpu` requires building with the `wgpu` feature",
                 ))
             }
         }

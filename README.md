@@ -128,6 +128,7 @@ runnable programs live in [`examples/`](examples)
 | `online_update` | adding and deleting training rows in place, and exact unlearning |
 | `pfn_boost` | boosting from a pretrained model's logits |
 | `metal` | CPU vs GPU prediction (macOS, `--features metal`) |
+| `wgpu` | GPU training and prediction through wgpu, bit-identical to the CPU (`--features wgpu`; runs on Mesa's lavapipe without a GPU) |
 
 ## Python
 
@@ -172,6 +173,7 @@ See [`python/README.md`](python/README.md).
   - [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/): Bit-packed model format with identical margins.
   - [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/): Training controlled by one budget value, based on PerpetualBooster.
   - [Metal GPU](https://docs.rs/hessboost/latest/hessboost/backend/metal/): Apple Silicon GPU prediction and training (`--features metal`).
+  - [wgpu GPU](https://docs.rs/hessboost/latest/hessboost/backend/wgpu/): Vulkan, Metal, and DirectX 12 GPU prediction and training through wgpu (`--features wgpu`), bit-identical to the CPU and testable on a software adapter; unmeasured on real GPUs so far.
 
 ## Caveats
 
@@ -182,7 +184,7 @@ See [`python/README.md`](python/README.md).
 
 - Distributed and external-memory training.
 - CLI and C bindings.
-- GPU training outside macOS (a `wgpu` backend is planned).
+- CUDA. GPU training runs through Metal (macOS) or wgpu (Vulkan, Metal, DirectX 12).
 - A few XGBoost options exist at one setting only, and a few metrics are
   missing; the [API docs](https://docs.rs/hessboost/latest/hessboost/#not-implemented)
   list them.

@@ -22,6 +22,12 @@ include = [
     "/LICENSE",
 ]
 
+# docs.rs builds on Linux, where the `wgpu` backend compiles (its drivers
+# load at run time) and `metal` cannot (no Apple SDK), so the wgpu module's
+# real docs render there and Metal's stand-in does.
+[package.metadata.docs.rs]
+features = ["wgpu"]
+
 [dependencies]
 rayon = "1.12"
 serde = { version = "1.0", features = ["derive"] }
@@ -31,11 +37,31 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 zstd = { version = "0.14", default-features = false }
 
+# `wgpu`'s own backends: Vulkan (Linux, Windows, Android), Metal (macOS),
+# DirectX 12 (Windows); GL is left out (no 64-bit integers). `bytemuck`
+# casts plain-data slices to the bytes the GPU buffers take, so the backend
+# has no `unsafe`; `parking_lot` is the lock the backend's pools use. Both
+# are already in wgpu's dependency tree.
+wgpu = { version = "30", default-features = false, features = [
+    "std",
+    "parking_lot",
+    "vulkan",
+    "metal",
+    "dx12",
+    "wgsl",
+], optional = true }
+bytemuck = { version = "1.22", features = ["derive"], optional = true }
+parking_lot = { version = "0.12", optional = true }
+
 [features]
 # Native Metal acceleration for histogram training and prediction on
 # macOS (Apple Silicon and Intel Macs with a Metal GPU). Opt-in and
 # off by default; see `src/backend/`.
 metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+# Portable GPU acceleration through wgpu (Vulkan, Metal, DirectX 12) for
+# histogram training (`device = wgpu`) and prediction
+# (`BoostedModel::to_wgpu`). Opt-in and off by default; see `src/backend/`.
+wgpu = ["dep:wgpu", "dep:bytemuck", "dep:parking_lot"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }

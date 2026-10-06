@@ -8,27 +8,63 @@
 mod common;
 
 use hessboost::backend::metal;
-use hessboost::config::{
-    BoosterKind, Dart, Device, LinearTree, ProcessType, QuantizedGrad, Refresh,
-};
-use hessboost::objective::{GradPair, Multiclass, RegLoss};
+use hessboost::config::Device;
+use hessboost::internals::{GHistIndex, HistogramBackend};
+use hessboost::model::Predictions;
 use hessboost::prelude::*;
 
-/// Whether a Metal device is present, with the skip reason printed so a
-/// vacuous pass is visible.
-fn device() -> bool {
-    if let Some(reason) = metal::unavailable_reason() {
-        eprintln!("skipping metal test: {reason}");
-        return false;
+use common::gpu::{self, GpuBackend, GpuPredictor};
+
+/// The Metal backend under the shared GPU suite.
+struct Metal;
+
+impl GpuBackend for Metal {
+    const NAME: &'static str = "metal";
+    const DEVICE: Device = Device::Metal;
+    /// Enough blocks to reuse a row slot (four, at 262,144 rows each) with a
+    /// last block that is short, and a handful of features so the batch stays
+    /// manageable. The regression model covers the single-output arena (the
+    /// 8-byte one) and the multiclass model the multi-output one (16 bytes).
+    const MULTI_BLOCK_ROWS: usize = 1_200_000;
+    type Model = metal::GpuModel;
+
+    fn unavailable_reason() -> Option<String> {
+        metal::unavailable_reason()
     }
-    true
+
+    fn hist_backend(index: &GHistIndex) -> Box<dyn HistogramBackend> {
+        Box::new(metal::MetalHistBackend::new(index).unwrap())
+    }
+
+    fn to_gpu(model: &BoostedModel) -> Result<metal::GpuModel> {
+        model.to_gpu()
+    }
+}
+
+// The across-blocks test needs four prediction blocks of 262,144 rows.
+const _: () = assert!(
+    Metal::MULTI_BLOCK_ROWS > 3 * 262_144,
+    "the test needs four prediction blocks"
+);
+
+impl GpuPredictor for metal::GpuModel {
+    fn predict(&self, data: &DMatrix, iterations: Iterations) -> Result<Predictions> {
+        self.predict(data, iterations)
+    }
+
+    fn predict_margin(&self, data: &DMatrix, iterations: Iterations) -> Result<Predictions> {
+        self.predict_margin(data, iterations)
+    }
+
+    fn predict_class(&self, data: &DMatrix, iterations: Iterations) -> Result<Predictions<u32>> {
+        self.predict_class(data, iterations)
+    }
 }
 
 /// The backend must either be fully available or absent because the machine
 /// has no Metal device (hosted CI runners). A kernel-compile or pipeline
 /// failure is never an acceptable "skip" reason: without this guard, every
-/// device-dependent test above would pass vacuously while the backend is
-/// broken.
+/// device-dependent test would pass vacuously while the backend is broken.
 #[test]
 fn backend_available_or_no_device() {
     match metal::unavailable_reason() {
@@ -40,448 +76,62 @@ fn backend_available_or_no_device() {
     }
 }
 
-/// A deterministic regression dataset with missing values and a categorical
-/// first column.
-fn dataset(n: usize, cols: usize) -> DMatrix {
-    let mut x = vec![0.0f32; n * cols];
-    let mut y = vec![0.0f32; n];
-    for r in 0..n {
-        let mut target = 0.0;
-        for f in 0..cols {
-            let v = if f == 0 {
-                ((r * 31 + f) % 5) as f32 // categorical codes
-            } else if (r + f) % 13 == 0 {
-                f32::NAN
-            } else {
-                (((r * 97 + f * 13) % 1000) as f32) * 0.001
-            };
-            x[r * cols + f] = v;
-            if f > 0 && v.is_finite() {
-                target += v * (f as f32);
-            }
-        }
-        y[r] = target % 3.0;
-    }
-    let types: Vec<hessboost::data::FeatureType> = (0..cols)
-        .map(|f| {
-            if f == 0 {
-                hessboost::data::FeatureType::Categorical
-            } else {
-                hessboost::data::FeatureType::Numerical
-            }
-        })
-        .collect();
-    DMatrix::from_dense_with_missing(&x, n, cols, f32::NAN)
-        .unwrap()
-        .with_feature_types(&types)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
-}
-
-/// `device = metal` training reproduces single-threaded CPU training bit for
-/// bit, tree for tree (the whole serialized model compares equal), SGLB
-/// posterior sampling included (its noise is drawn on the CPU and its
-/// leaves re-estimated there).
+/// [`gpu::training_matches_single_threaded_cpu`] on Metal.
 #[test]
 fn device_metal_training_matches_single_threaded_cpu() {
-    if !device() {
-        return;
-    }
-    let data = dataset(40_000, 12);
-    for posterior_sampling in [false, true] {
-        let build = |device| {
-            TrainingParams::builder()
-                .objective(Objective::SquaredError(RegLoss::default()))
-                .tree_method(TreeMethod::Hist)
-                .max_depth(6)
-                .eta(0.3)
-                .posterior_sampling(posterior_sampling)
-                .device(device)
-                .build()
-                .unwrap()
-        };
-        let train_one = |params| common::with_threads(1, || train(&params, &data, 10).unwrap());
-        let cpu = train_one(build(Device::Cpu));
-        let gpu = train_one(build(Device::Metal));
-        assert_eq!(
-            cpu.encode(ModelFormat::Binary).unwrap(),
-            gpu.encode(ModelFormat::Binary).unwrap(),
-            "the metal-trained model must be bit-identical to the CPU's \
-             (posterior sampling {posterior_sampling})"
-        );
-    }
+    gpu::training_matches_single_threaded_cpu::<Metal>();
 }
 
-/// A `device = metal` run repeats itself exactly, independent of the worker
-/// count.
+/// [`gpu::training_is_deterministic`] on Metal.
 #[test]
 fn device_metal_training_is_deterministic() {
-    if !device() {
-        return;
-    }
-    let data = dataset(20_000, 9);
-    let params = TrainingParams::builder()
-        .objective(Objective::SquaredError(RegLoss::default()))
-        .tree_method(TreeMethod::Hist)
-        .max_depth(6)
-        .eta(0.3)
-        .subsample(0.8)
-        .device(Device::Metal)
-        .build()
-        .unwrap();
-    let run = |threads| {
-        common::with_threads(threads, || {
-            train(&params, &data, 8)
-                .unwrap()
-                .encode(ModelFormat::Binary)
-                .unwrap()
-        })
-    };
-    assert_eq!(run(1), run(1));
-    assert_eq!(run(1), run(4));
+    gpu::training_is_deterministic::<Metal>();
 }
 
-/// The unsupported `device = metal` combinations are refused with an error,
-/// never silently ignored.
+/// [`gpu::refuses_unsupported_combinations`] on Metal.
 #[test]
 fn device_metal_refuses_unsupported_combinations() {
-    let base = TrainingParams::builder()
-        .device(Device::Metal)
-        .build()
-        .unwrap();
-    let with = |change: fn(&mut TrainingParams)| {
-        let mut params = base.clone();
-        change(&mut params);
-        params
-    };
-    let variants: Vec<(TrainingParams, &str)> = vec![
-        (
-            with(|p| p.tree_method = TreeMethod::Approx),
-            "tree_method=approx",
-        ),
-        (
-            with(|p| p.tree_method = TreeMethod::Exact),
-            "tree_method=exact",
-        ),
-        (
-            with(|p| p.quantized = Some(QuantizedGrad::default())),
-            "use_quantized_grad",
-        ),
-        (
-            with(|p| p.booster = BoosterKind::GbLinear),
-            "booster=gblinear",
-        ),
-        (
-            with(|p| p.process_type = ProcessType::Update(Refresh::default())),
-            "process_type=update",
-        ),
-    ];
-    for (params, name) in variants {
-        assert_eq!(common::invalid_param(params.validate()), "device", "{name}");
-    }
+    gpu::refuses_unsupported_combinations::<Metal>();
 }
 
-/// `to_gpu` predictions are bit-identical to the model's across objectives,
-/// missing values, categorical splits, DART weights, and iteration ranges.
+/// [`gpu::round_trips_through_xgboost_params`] on Metal.
+#[test]
+fn device_metal_round_trips_through_xgboost_params() {
+    gpu::round_trips_through_xgboost_params::<Metal>();
+}
+
+/// [`gpu::predicts_bit_identically`] on Metal.
 #[test]
 fn to_gpu_predicts_bit_identically() {
-    if !device() {
-        return;
-    }
-    let cases = [
-        Objective::SquaredError(RegLoss::default()),
-        Objective::BinaryLogistic(RegLoss::default()),
-        Objective::Softmax(Multiclass::new(4).unwrap()),
-    ];
-    for spec in cases {
-        let objective = spec.name();
-        let num_class = spec.num_class().unwrap_or(0);
-        let data = dataset(6_000, 7);
-        let labels: Vec<f32> = data
-            .labels()
-            .unwrap()
-            .iter()
-            .map(|&y| {
-                if num_class > 0 {
-                    y.trunc() % num_class as f32
-                } else if objective == "binary:logistic" {
-                    f32::from(y >= 1.5)
-                } else {
-                    y
-                }
-            })
-            .collect();
-        let data = data.with_labels(&labels).unwrap();
-        let params = TrainingParams::builder()
-            .objective(spec.clone())
-            .tree_method(TreeMethod::Hist)
-            .max_depth(5)
-            .eta(0.4)
-            .booster(BoosterKind::Dart(Dart::default()))
-            .build()
-            .unwrap();
-        let model = train(&params, &data, 15).unwrap();
-        let gpu = model.to_gpu().unwrap();
-        assert_eq!(
-            model.predict(&data, Iterations::Best).unwrap(),
-            gpu.predict(&data, Iterations::Best).unwrap(),
-            "{objective}: predict"
-        );
-        assert_eq!(
-            model.predict_margin(&data, Iterations::Best).unwrap(),
-            gpu.predict_margin(&data, Iterations::Best).unwrap(),
-            "{objective}: predict_margin"
-        );
-        assert_eq!(
-            model.predict_class(&data, Iterations::Best).unwrap(),
-            gpu.predict_class(&data, Iterations::Best).unwrap(),
-            "{objective}: predict_class"
-        );
-        // Range predictions: the first half of the iterations.
-        let half = model.num_boost_rounds() / 2;
-        assert_eq!(
-            model.predict_margin(&data, ..half).unwrap(),
-            gpu.predict_margin(&data, ..half).unwrap(),
-            "{objective}: predict_margin(..half)"
-        );
-    }
+    gpu::predicts_bit_identically::<Metal>();
 }
 
-/// A batch larger than one prediction block: the GPU pipelines the call in
-/// row blocks (uploading one block's rows while the GPU walks another), and
-/// every block still lands bit-identical to the CPU's single walk. Covers
-/// both arenas: the regression model is single-output (the 8-byte one) and
-/// the multiclass model several outputs (the 16-byte one).
+/// [`gpu::predicts_bit_identically_across_blocks`] on Metal.
 #[test]
 fn to_gpu_predicts_bit_identically_across_blocks() {
-    if !device() {
-        return;
-    }
-    // Enough blocks to reuse a row slot (four, at 262,144 rows each) with a
-    // last block that is short, and a handful of features so the batch stays
-    // manageable.
-    let rows = 1_200_000;
-    let cols = 5;
-    let train_data = dataset(4_000, cols);
-    let batch = dataset(rows, cols);
-    let mut specs: Vec<(Objective, DMatrix)> = Vec::new();
-    for spec in [
-        Objective::SquaredError(RegLoss::default()),
-        Objective::Softmax(Multiclass::new(3).unwrap()),
-    ] {
-        // A multiclass objective needs labels inside its class range.
-        let data = match spec.num_class() {
-            Some(classes) => {
-                let labels: Vec<f32> = train_data
-                    .labels()
-                    .unwrap()
-                    .iter()
-                    .map(|&y| y.trunc().abs() % classes as f32)
-                    .collect();
-                train_data.clone().with_labels(&labels).unwrap()
-            }
-            None => train_data.clone(),
-        };
-        specs.push((spec, data));
-    }
-    assert!(
-        batch.n_rows() > 3 * 262_144,
-        "the test needs four prediction blocks"
-    );
-    for (spec, train_data) in specs {
-        let objective = spec.name().to_owned();
-        let params = TrainingParams::builder()
-            .objective(spec)
-            .tree_method(TreeMethod::Hist)
-            .max_depth(4)
-            .eta(0.4)
-            .build()
-            .unwrap();
-        let model = train(&params, &train_data, 8).unwrap();
-        let gpu = model.to_gpu().unwrap();
-        assert_eq!(
-            model.predict_margin(&batch, Iterations::Best).unwrap(),
-            gpu.predict_margin(&batch, Iterations::Best).unwrap(),
-            "{objective}: predict_margin across blocks"
-        );
-        assert_eq!(
-            model.predict(&batch, Iterations::Best).unwrap(),
-            gpu.predict(&batch, Iterations::Best).unwrap(),
-            "{objective}: predict across blocks"
-        );
-    }
+    gpu::predicts_bit_identically_across_blocks::<Metal>();
 }
 
-/// `to_gpu` refuses models that do not predict through the compact forest.
+/// [`gpu::refuses_unsupported_models`] on Metal.
 #[test]
 fn to_gpu_refuses_unsupported_models() {
-    if !device() {
-        return;
-    }
-    let data = dataset(2_000, 5);
-    let gblinear = train(
-        &TrainingParams::builder()
-            .booster(BoosterKind::GbLinear)
-            .build()
-            .unwrap(),
-        &data,
-        4,
-    )
-    .unwrap();
-    assert_eq!(common::incompatible_model(gblinear.to_gpu()), "model");
-
-    let linear = train(
-        &TrainingParams::builder()
-            .tree_method(TreeMethod::Hist)
-            .linear_tree(LinearTree::default())
-            .build()
-            .unwrap(),
-        &data,
-        4,
-    )
-    .unwrap();
-    assert_eq!(common::incompatible_model(linear.to_gpu()), "model");
+    gpu::refuses_unsupported_models::<Metal>();
 }
 
-/// The review's dynamic-range case: in every 128-row slice the first 64
-/// rows (bin 0) carry `2^50, 2^26, 2^23 + 1, -2^50, -2^26, -2^23` then zeros
-/// and the next 64 (bin 1) the negated sequence. The CPU's `f64` chain sums
-/// the bins to +64 and -64 (the first double-float kernels returned 0 and
-/// 0). Values up to `2^50` with a grain of 1 are exact on the GPU for at
-/// most 8 rows per node, so the backend must take its CPU path.
-fn dynamic_range_case() -> (Vec<f32>, Vec<f32>) {
-    let six = [
-        2f32.powi(50),
-        2f32.powi(26),
-        2f32.powi(23) + 1.0,
-        -(2f32.powi(50)),
-        -(2f32.powi(26)),
-        -(2f32.powi(23)),
-    ];
-    let n = 8192;
-    let x: Vec<f32> = (0..n).map(|i| f32::from(i % 128 >= 64)).collect();
-    let grad: Vec<f32> = (0..n)
-        .map(|i| match i % 128 {
-            p @ 0..6 => six[p],
-            p @ 64..70 => -six[p - 64],
-            _ => 0.0,
-        })
-        .collect();
-    (x, grad)
-}
-
-/// The histogram of `rows` on `backend` after `prepare(gpair)`, run on one
-/// thread so the CPU backend takes its sequential path.
-fn histogram(
-    backend: &dyn hessboost::internals::HistogramBackend,
-    index: &hessboost::internals::GHistIndex,
-    rows: &[u32],
-    gpair: &[GradPair],
-) -> Vec<(f64, f64)> {
-    let mut out = hessboost::internals::zeroed(index.total_bins());
-    common::with_threads(1, || {
-        backend.prepare(index, gpair);
-        backend.build(index, rows, gpair, &mut out);
-    });
-    out.iter().map(|s| (s.grad, s.hess)).collect()
-}
-
-/// A binned one-feature index of `x`.
-fn index_of(x: &[f32]) -> hessboost::internals::GHistIndex {
-    let data = DMatrix::from_dense(x, x.len(), 1).unwrap();
-    let cuts = hessboost::internals::HistCuts::from_dmatrix(&data, 256);
-    hessboost::internals::GHistIndex::from_dmatrix(&data, cuts)
-}
-
-/// Gradients outside the GPU's exactness bound give the CPU's histogram
-/// bit for bit.
+/// [`gpu::wide_dynamic_range_histogram_matches_cpu`] on Metal.
 #[test]
 fn wide_dynamic_range_histogram_matches_cpu() {
-    if !device() {
-        return;
-    }
-    let (x, grad) = dynamic_range_case();
-    let index = index_of(&x);
-    let gpair: Vec<_> = grad.iter().map(|&g| GradPair::new(g, 1.0)).collect();
-    let rows: Vec<u32> = (0..x.len() as u32).collect();
-    let cpu = histogram(&hessboost::internals::CpuBackend, &index, &rows, &gpair);
-    assert_eq!(cpu, [(64.0, 4096.0), (-64.0, 4096.0)]);
-    let backend = metal::MetalHistBackend::new(&index).unwrap();
-    assert_eq!(histogram(&backend, &index, &rows, &gpair), cpu);
+    gpu::wide_dynamic_range_histogram_matches_cpu::<Metal>();
 }
 
-/// The same case through training: with `base_score = 0`, squared error's
-/// gradients are the negated labels, and the `device = metal` model is the
-/// single-threaded CPU model bit for bit.
+/// [`gpu::wide_dynamic_range_training_matches_single_threaded_cpu`] on Metal.
 #[test]
 fn wide_dynamic_range_training_matches_single_threaded_cpu() {
-    if !device() {
-        return;
-    }
-    let (x, grad) = dynamic_range_case();
-    let labels: Vec<f32> = grad.iter().map(|&g| -g).collect();
-    let data = DMatrix::from_dense(&x, x.len(), 1)
-        .unwrap()
-        .with_labels(&labels)
-        .unwrap();
-    let build = |device| {
-        TrainingParams::builder()
-            .objective(Objective::SquaredError(RegLoss::default()))
-            .tree_method(TreeMethod::Hist)
-            .base_score(0.0)
-            .max_depth(2)
-            .device(device)
-            .build()
-            .unwrap()
-    };
-    let train_one = |params| common::with_threads(1, || train(&params, &data, 2).unwrap());
-    assert_eq!(
-        train_one(build(Device::Cpu))
-            .encode(ModelFormat::Binary)
-            .unwrap(),
-        train_one(build(Device::Metal))
-            .encode(ModelFormat::Binary)
-            .unwrap()
-    );
+    gpu::wide_dynamic_range_training_matches_single_threaded_cpu::<Metal>();
 }
 
-/// Inputs that do not fit the backend's GPU buffers never reach the GPU: a
-/// gradient slice longer than the index and a row list longer than the
-/// index (repeated rows) give the CPU's histogram, and a row past the index
-/// is refused by the CPU path's bounds check exactly as the CPU backend
-/// refuses it, instead of being read past the GPU buffers.
+/// [`gpu::mismatched_inputs_match_the_cpu_backend`] on Metal.
 #[test]
 fn mismatched_inputs_match_the_cpu_backend() {
-    if !device() {
-        return;
-    }
-    let n = 10_000;
-    let x: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
-    let index = index_of(&x);
-    let cpu = hessboost::internals::CpuBackend;
-    let backend = metal::MetalHistBackend::new(&index).unwrap();
-    let long: Vec<_> = (0..n + 1000)
-        .map(|i| GradPair::new((i % 7) as f32 - 3.0, 1.0))
-        .collect();
-    let rows: Vec<u32> = (0..n as u32).collect();
-    assert_eq!(
-        histogram(&backend, &index, &rows, &long),
-        histogram(&cpu, &index, &rows, &long)
-    );
-    let gpair = &long[..n];
-    let twice: Vec<u32> = rows.iter().chain(&rows).copied().collect();
-    assert_eq!(
-        histogram(&backend, &index, &twice, gpair),
-        histogram(&cpu, &index, &twice, gpair)
-    );
-    let past_end: Vec<u32> = (1..=n as u32).collect();
-    let refused = |backend: &dyn hessboost::internals::HistogramBackend| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            histogram(backend, &index, &past_end, gpair)
-        }))
-        .is_err()
-    };
-    assert!(refused(&cpu));
-    assert!(refused(&backend));
+    gpu::mismatched_inputs_match_the_cpu_backend::<Metal>();
 }

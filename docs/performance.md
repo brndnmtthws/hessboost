@@ -777,6 +777,35 @@ cargo run --release --features metal --example metal
 
 Hosted macOS CI has no Metal device: those tests skip there.
 
+## wgpu GPU (Vulkan, Metal, DirectX 12)
+
+The `wgpu` feature adds a portable GPU backend (`src/backend/wgpu.rs` has
+the design, the same exactness bound as Metal, and how prediction's
+additions stay exact on adapters that flush subnormals). It is a correctness and
+portability path so far: **nothing has been measured on a real GPU**. The
+only numbers to date come from Mesa's lavapipe software adapter on a
+192-core aarch64 Linux host (Rust 1.98.1, 2026-10-06), where the "GPU" is
+the CPU emulating one: predicting 200k rows × 24 features through 50
+depth-8 trees took 1.3 ms on the CPU path and 20.7 ms through wgpu, and
+`device = wgpu` training reproduced the CPU model bit for bit. Those
+numbers say nothing about a GPU; they show the path is correct and testable
+without one.
+
+The histogram kernel is the scatter design (one workgroup per feature
+window and row slice, 32-bit shared atomics on exact integer pieces, a
+64-bit merge), without Metal's register-bin fallback and 8-byte prediction
+arena: a node whose grain counts overflow the pieces runs on the CPU, and
+prediction walks the 16-byte arena. Tune neither on a software adapter.
+
+Run the wgpu benches on a machine with an adapter (set `WGPU_ADAPTER_NAME`
+to pick one; the group prints which adapter ran and whether it is a software
+renderer):
+
+```sh
+cargo bench --features wgpu --bench training -- wgpu
+cargo run --release --features wgpu --example wgpu
+```
+
 ## Reproduce the measurements
 
 Benchmarks live in [`benches/training.rs`](../benches/training.rs). Run the

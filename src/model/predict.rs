@@ -214,13 +214,7 @@ impl BoostedModel {
         data: &DMatrix,
         iterations: impl Into<Iterations>,
     ) -> Result<Predictions> {
-        let margin = self.predict_margin(data, iterations)?;
-        Ok(transform_model_margins(
-            &self.objective,
-            self.max_delta_step,
-            self.n_targets,
-            margin,
-        ))
+        Ok(self.transform_margins(self.predict_margin(data, iterations)?))
     }
 
     /// For multiclass, the predicted class index per row (argmax over classes).
@@ -239,6 +233,12 @@ impl BoostedModel {
         iterations: impl Into<Iterations>,
     ) -> Result<Predictions<u32>> {
         Ok(self.classes(&self.predict(data, iterations)?))
+    }
+
+    /// The predictions of [`Self::predict`] from the margins of
+    /// [`Self::predict_margin`] (shared with the GPU predictors).
+    pub(crate) fn transform_margins(&self, margin: Predictions) -> Predictions {
+        transform_model_margins(&self.objective, self.max_delta_step, self.n_targets, margin)
     }
 
     /// The class decisions of [`Self::predict_class`] from the

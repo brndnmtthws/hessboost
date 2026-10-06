@@ -83,15 +83,13 @@ jobs:
         with:
           persist-credentials: false
       # Mesa's lavapipe is a software Vulkan adapter: the wgpu backend's
-      # tests run their GPU paths on it, and `HESSBOOST_REQUIRE_WGPU` makes
-      # `tests/wgpu.rs` fail instead of skipping when the backend is not
-      # available. The hosted macOS runners have no GPU (Metal and wgpu
-      # tests skip there; their guard tests still check the kernels).
+      # tests run their GPU paths on it, and the script's
+      # `HESSBOOST_REQUIRE_WGPU` makes `tests/wgpu.rs` fail instead of
+      # skipping when the backend is not available. The hosted macOS runners
+      # have no GPU (Metal and wgpu tests skip there; their guard tests still
+      # check the kernels).
       - if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
-          echo "HESSBOOST_REQUIRE_WGPU=1" >> "$GITHUB_ENV"
+        run: sh .github/scripts/install-lavapipe.sh
       - uses: jdx/mise-action@v4
       - uses: jdx/mr-boxington-action@v1
         with:

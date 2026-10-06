@@ -58,11 +58,11 @@ loads `mise.ci.toml`, which moves rustup's toolchains into that cache. Rust
 tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal tests
 needing a device skip without one; a guard test still fails if the kernels
 do not compile; the Linux runners install Mesa's lavapipe and set
-`HESSBOOST_REQUIRE_WGPU=1`, so `tests/wgpu.rs` and the `backend::wgpu`
-unit tests run the GPU paths there) under the `ci` Cargo profile
-(`Cargo.toml`: `dev` at opt-level 1, debug assertions and overflow checks
-on; about ten times faster than opt-level 0). The parity job caches uv's
-XGBoost source build.
+`HESSBOOST_REQUIRE_WGPU=1` (`.github/scripts/install-lavapipe.sh`), so
+`tests/wgpu.rs` and the `backend::wgpu` unit tests run the GPU paths there)
+under the `ci` Cargo profile (`Cargo.toml`: `dev` at opt-level 1, debug
+assertions and overflow checks on; about ten times faster than opt-level
+0). The parity job caches uv's XGBoost source build.
 Its Python jobs build one abi3 wheel each on x86_64/aarch64 Linux, aarch64
 macOS, and x86_64 Windows (without the release profile's LTO and single
 codegen unit) and test it on CPython 3.11 and the latest 3.x with

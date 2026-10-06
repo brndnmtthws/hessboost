@@ -105,11 +105,13 @@
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {}
 
-use crate::backend::exact_sum::SumDomain;
-use crate::backend::{materialize_rows, scatter_row_bound};
+use crate::backend::shared::{
+    IndexShape, MAX_BUFFER_ENTRIES, MarginPlan, StagedSlice, ensure_forest_model, materialize_rows,
+    plan_margins,
+};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::error::{HessboostError, Result};
-use crate::model::{BoostedModel, Iterations, initial_margins, transform_model_margins};
+use crate::model::{BoostedModel, Iterations};
 use crate::objective::GradPair;
 use crate::tree::gain::GradStats;
 use crate::tree::hist::{CpuBackend, HistogramBackend};
@@ -175,8 +177,6 @@ const PREDICT_BLOCK_ROWS: usize = 262_144;
 /// Largest number of prediction blocks. The pipeline needs two row buffers
 /// (one per block in flight), not one per block.
 const PREDICT_BLOCKS_MAX: usize = 4;
-/// Upper bound on GPU buffer sizes (entries), keeping index math in `u32`.
-const MAX_BUFFER_ENTRIES: usize = 1 << 30;
 
 /// Whether a Metal device and working compute pipelines are available.
 /// `false` on hardware without Metal support (for example a macOS VM).
@@ -1002,25 +1002,8 @@ struct HistRun {
 /// has completed, so the buffer never changes while the GPU reads it.
 struct StagedGradients {
     buffer: GpuBuffer,
-    /// (address, length) identity of the staged slice; length 0 when
-    /// nothing is staged (a staged slice always has `n_rows > 0` entries).
-    addr: usize,
-    len: usize,
-    grad: SumDomain,
-    hess: SumDomain,
-}
-
-impl StagedGradients {
-    /// Whether `gpair` is the staged slice.
-    fn holds(&self, gpair: &[GradPair]) -> bool {
-        self.len != 0 && self.len == gpair.len() && self.addr == gpair.as_ptr().addr()
-    }
-
-    /// Whether every sum of at most `n` staged gradient pairs is exact on
-    /// both paths (see `backend::exact_sum`).
-    fn sums_exact(&self, n: usize) -> bool {
-        self.grad.sums_exact(n) && self.hess.sums_exact(n)
-    }
+    /// The staged slice ([`StagedSlice::NONE`] when nothing is staged).
+    slice: StagedSlice,
 }
 
 /// Which scan kernels a node's histogram is built with.
@@ -1102,9 +1085,7 @@ pub struct MetalHistBackend {
     groups_bytes: GpuBuffer,
     /// Threads per scan threadgroup (`features_per_group` × 64).
     threads_per_group: usize,
-    total_bins: usize,
-    n_rows: usize,
-    n_cols: usize,
+    shape: IndexShape,
     run: HistRun,
     gradients: RwLock<StagedGradients>,
     pool: Mutex<Vec<CallBuffers>>,
@@ -1232,16 +1213,11 @@ impl MetalHistBackend {
             groups,
             groups_bytes,
             threads_per_group,
-            total_bins,
-            n_rows,
-            n_cols,
+            shape: IndexShape::of(index),
             run,
             gradients: RwLock::new(StagedGradients {
                 buffer: gpair,
-                addr: 0,
-                len: 0,
-                grad: SumDomain::EMPTY,
-                hess: SumDomain::EMPTY,
+                slice: StagedSlice::NONE,
             }),
             pool: Mutex::new(vec![call]),
         })
@@ -1259,17 +1235,16 @@ impl MetalHistBackend {
     /// while a tree grows.
     fn stage(&self, gpair: &[GradPair], force: bool) {
         let mut staged = self.gradients.write().expect("gradient lock poisoned");
-        if !force && staged.holds(gpair) {
+        if !force && staged.slice.holds(gpair) {
             return;
         }
         // Unstage first, so a slice that is not uploaded below is never
         // mistaken for the previous one.
-        staged.len = 0;
-        if gpair.len() != self.n_rows {
+        staged.slice = StagedSlice::NONE;
+        if gpair.len() != self.shape.n_rows {
             return;
         }
-        let grad = SumDomain::of_slice(gpair, |p| p.grad);
-        let hess = SumDomain::of_slice(gpair, |p| p.hess);
+        let slice = StagedSlice::of(gpair);
         // SAFETY: the write lock excludes every GPU build (each holds a
         // read guard until its command buffer has completed), so no GPU work
         // reads the buffer and nothing else aliases it; `[i64; 2]` is plain
@@ -1277,16 +1252,11 @@ impl MetalHistBackend {
         let Ok(units) = (unsafe { staged.buffer.as_slice_mut::<[i64; 2]>(gpair.len()) }) else {
             return;
         };
-        // Integer multiples of each component's grain, the values the
-        // kernels sum: exact whenever a node's sums can be (`exact_sum`).
         units
             .par_iter_mut()
             .zip(gpair)
-            .for_each(|(u, p)| *u = [grad.units(p.grad), hess.units(p.hess)]);
-        staged.grad = grad;
-        staged.hess = hess;
-        staged.addr = gpair.as_ptr().addr();
-        staged.len = gpair.len();
+            .for_each(|(u, p)| *u = slice.units(*p));
+        staged.slice = slice;
     }
 
     /// A read guard on the staged gradients when they hold `gpair`, staging
@@ -1294,18 +1264,18 @@ impl MetalHistBackend {
     /// thread staged a different slice in between. While the guard lives,
     /// the gradient buffer does not change.
     fn staged_for(&self, gpair: &[GradPair]) -> Option<RwLockReadGuard<'_, StagedGradients>> {
-        if gpair.len() != self.n_rows {
+        if gpair.len() != self.shape.n_rows {
             return None;
         }
         {
             let staged = self.gradients.read().expect("gradient lock poisoned");
-            if staged.holds(gpair) {
+            if staged.slice.holds(gpair) {
                 return Some(staged);
             }
         }
         self.stage(gpair, false);
         let staged = self.gradients.read().expect("gradient lock poisoned");
-        staged.holds(gpair).then_some(staged)
+        staged.slice.holds(gpair).then_some(staged)
     }
 
     /// Check out a per-call buffer set from the pool.
@@ -1313,7 +1283,7 @@ impl MetalHistBackend {
         if let Some(call) = self.pool.lock().expect("buffer pool lock poisoned").pop() {
             return Ok(call);
         }
-        CallBuffers::new(&self.ctx.device, self.n_rows, self.total_bins)
+        CallBuffers::new(&self.ctx.device, self.shape.n_rows, self.shape.total_bins)
     }
 
     fn checkin(&self, call: CallBuffers) {
@@ -1340,16 +1310,7 @@ impl MetalHistBackend {
         gpair: &[GradPair],
         out: &mut [GradStats],
     ) -> bool {
-        // The kernels do not bounds-check: inputs the GPU buffers were not
-        // sized for (another index shape, more rows than the index holds, a
-        // row past its end) must never reach a dispatch.
-        let fits = out.len() == self.total_bins
-            && ghist.n_rows() == self.n_rows
-            && ghist.n_cols() == self.n_cols
-            && ghist.total_bins() == self.total_bins
-            && rows.len() <= self.n_rows
-            && rows.iter().all(|&r| (r as usize) < self.n_rows);
-        if !fits {
+        if !self.shape.fits(ghist, rows, out) {
             return false;
         }
         // The guard lives until this function returns, after the dispatch's
@@ -1358,7 +1319,7 @@ impl MetalHistBackend {
         let Some(staged) = self.staged_for(gpair) else {
             return false;
         };
-        if !staged.sums_exact(rows.len()) {
+        if !staged.slice.sums_exact(rows.len()) {
             return false;
         }
         // The scatter kernel needs the index's feature-major `u16` store, and
@@ -1366,9 +1327,7 @@ impl MetalHistBackend {
         // threadgroup's rows fit `scatter_row_bound`; anything else takes the
         // register kernels.
         let scan = match &self.feature_bins {
-            Some(_) if scatter_row_bound(&staged.grad, &staged.hess) >= ROWS_PER_SLICE => {
-                Scan::Scatter
-            }
+            Some(_) if staged.slice.scatter_row_bound() >= ROWS_PER_SLICE => Scan::Scatter,
             _ if self.columns_u16 => Scan::Packed,
             _ => Scan::Wide,
         };
@@ -1443,8 +1402,8 @@ impl MetalHistBackend {
                 chunk_rows: chunk_rows as u32,
                 chunk_index: c as u32,
                 slices: ROW_SLICES as u32,
-                total_bins: self.total_bins as u32,
-                n_rows: self.n_rows as u32,
+                total_bins: self.shape.total_bins as u32,
+                n_rows: self.shape.n_rows as u32,
             };
             // SAFETY: see above; the row offset lies within the rows buffer,
             // and the gather wrote one pair per listing position.
@@ -1490,7 +1449,7 @@ impl MetalHistBackend {
             enc.setBuffer_offset_atIndex(Some(&call.hist.0), 0, 1);
             let merge = PiecesArgs {
                 n_partials: (chunks * ROW_SLICES) as u32,
-                total_bins: self.total_bins as u32,
+                total_bins: self.shape.total_bins as u32,
             };
             enc.setBytes_length_atIndex(
                 NonNull::from(&merge).cast(),
@@ -1499,7 +1458,7 @@ impl MetalHistBackend {
             );
             enc.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
-                    width: self.total_bins,
+                    width: self.shape.total_bins,
                     height: 1,
                     depth: 1,
                 },
@@ -1514,11 +1473,9 @@ impl MetalHistBackend {
         submit(cb)?;
         // SAFETY: the command buffer has completed, so the GPU is done with
         // the buffer; this call owns it.
-        let hist = unsafe { call.hist.as_slice_mut::<[i64; 2]>(self.total_bins)? };
-        for (o, &[g, h]) in out.iter_mut().zip(hist.iter()) {
-            // Exact piece sums in grains (below 2^53), scaled back exactly.
-            o.grad = gradients.grad.value(g);
-            o.hess = gradients.hess.value(h);
+        let hist = unsafe { call.hist.as_slice_mut::<[i64; 2]>(self.shape.total_bins)? };
+        for (o, &sums) in out.iter_mut().zip(hist.iter()) {
+            *o = gradients.slice.bin(sums);
         }
         Ok(())
     }
@@ -1625,7 +1582,7 @@ impl MetalHistBackend {
                 3,
             );
             let grid = MTLSize {
-                width: self.total_bins,
+                width: self.shape.total_bins,
                 height: 1,
                 depth: 1,
             };
@@ -1640,11 +1597,9 @@ impl MetalHistBackend {
         submit(&cb)?;
         // SAFETY: the command buffer has completed, so the GPU is done with
         // the buffer; this call owns it.
-        let hist = unsafe { call.hist.as_slice_mut::<[i64; 2]>(self.total_bins)? };
-        for (o, &[g, h]) in out.iter_mut().zip(hist.iter()) {
-            // Exact bin sums in grains (below 2^53), scaled back exactly.
-            o.grad = gradients.grad.value(g);
-            o.hess = gradients.hess.value(h);
+        let hist = unsafe { call.hist.as_slice_mut::<[i64; 2]>(self.shape.total_bins)? };
+        for (o, &sums) in out.iter_mut().zip(hist.iter()) {
+            *o = gradients.slice.bin(sums);
         }
         Ok(())
     }
@@ -1903,30 +1858,12 @@ impl GpuModel {
         data: &crate::data::DMatrix,
         iterations: impl Into<Iterations>,
     ) -> Result<crate::model::Predictions> {
-        let model = &self.model;
-        let iterations = iterations.into();
-        if model.shrinkage().is_some() {
-            return model.predict_margin(data, iterations);
-        }
-        model.validate_prediction_data(data)?;
-        let trees = model.iteration_trees(model.resolve_iterations(iterations, "iterations")?);
-        let k = model.n_outputs();
+        let (trees, mut margins) = match plan_margins(&self.model, data, iterations.into())? {
+            MarginPlan::Done(margins) => return Ok(margins),
+            MarginPlan::Walk { trees, margins } => (trees, margins),
+        };
+        let k = self.model.n_outputs();
         let n = data.n_rows();
-        let mut margins = initial_margins(model.base_scores(), data);
-        if trees.is_empty() || n == 0 {
-            return Ok(crate::model::Predictions::new(margins, n, k));
-        }
-        if n > MAX_BUFFER_ENTRIES || n * data.n_cols() > MAX_BUFFER_ENTRIES {
-            return Err(HessboostError::invalid_data(
-                "data",
-                format!(
-                    "GPU prediction needs a dense row copy ({} rows x {} features) \
-                     that exceeds 4 GiB",
-                    n,
-                    data.n_cols()
-                ),
-            ));
-        }
         // Split the batch into row blocks and pipeline them: each block's
         // rows upload into one of two slots while the GPU walks the other
         // block's. The margins are block-local inside the kernel (the row and
@@ -2048,13 +1985,9 @@ impl GpuModel {
         data: &crate::data::DMatrix,
         iterations: impl Into<Iterations>,
     ) -> Result<crate::model::Predictions> {
-        let margin = self.predict_margin(data, iterations)?;
-        Ok(transform_model_margins(
-            self.model.objective(),
-            self.model.max_delta_step(),
-            self.model.n_targets(),
-            margin,
-        ))
+        Ok(self
+            .model
+            .transform_margins(self.predict_margin(data, iterations)?))
     }
 
     /// The predicted class per row, matching
@@ -2109,19 +2042,7 @@ impl BoostedModel {
                     .unwrap_or_else(|| "no Metal device is available on this machine".into()),
             )
         })?;
-        if self.is_gblinear() {
-            return Err(HessboostError::incompatible_model(
-                "model",
-                "gblinear models predict from their linear weights, not the tree forest",
-            ));
-        }
-        if self.has_linear_leaves() {
-            return Err(HessboostError::incompatible_model(
-                "model",
-                "`linear_tree` models predict through per-leaf linear models, \
-                 which the GPU forest does not hold",
-            ));
-        }
+        ensure_forest_model(self)?;
         let forest = self.compact_forest();
         // The 8-byte arena covers single-output, categorical-free,
         // scalar-leaf trees; everything else predicts through the 16-byte
@@ -2199,6 +2120,7 @@ impl BoostedModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::shared::test_support::{cpu_hist, one_feature};
     use crate::data::quantile::HistCuts;
 
     fn context() -> bool {
@@ -2206,17 +2128,6 @@ mod tests {
             eprintln!("skipping metal tests: {reason}");
         }
         MetalContext::shared().is_some()
-    }
-
-    /// The single-threaded CPU histogram of `rows`.
-    fn cpu_hist(index: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Vec<GradStats> {
-        let mut out = vec![GradStats::default(); index.total_bins()];
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap()
-            .install(|| CpuBackend.build(index, rows, gpair, &mut out));
-        out
     }
 
     /// The histogram of `rows` built on the GPU, asserting that the GPU
@@ -2234,14 +2145,6 @@ mod tests {
             "the GPU path must take this node"
         );
         out
-    }
-
-    /// A one-feature dataset whose rows cycle through `values` distinct
-    /// feature values (one bin each).
-    fn one_feature(n: usize, values: usize) -> GHistIndex {
-        let x: Vec<f32> = (0..n).map(|i| (i % values) as f32).collect();
-        let data = crate::data::DMatrix::from_dense(&x, n, 1).unwrap();
-        GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256))
     }
 
     /// Gradients one `f32` ulp away from coarse values keep that last bit:
@@ -2447,11 +2350,11 @@ mod tests {
         backend.prepare(&index, &gpair);
         let staged = backend.gradients.read().unwrap();
         assert!(
-            staged.sums_exact(rows.len()),
+            staged.slice.sums_exact(rows.len()),
             "the node must be inside the exactness domain"
         );
         assert!(
-            scatter_row_bound(&staged.grad, &staged.hess) < ROWS_PER_SLICE,
+            staged.slice.scatter_row_bound() < ROWS_PER_SLICE,
             "the scatter kernel must not take this node"
         );
         drop(staged);

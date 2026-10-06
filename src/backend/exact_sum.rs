@@ -1,4 +1,4 @@
-//! The exactness domain of the Metal backend's histogram sums.
+//! The exactness domain of the GPU backends' histogram sums.
 //!
 //! The CPU accumulates each histogram bin in `f64`: a chain of additions in
 //! row order within each fixed block of rows, then the block partials in

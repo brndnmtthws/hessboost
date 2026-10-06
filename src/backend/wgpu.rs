@@ -63,8 +63,8 @@
 //! 64-bit integers. Integer addition is order-free, so the result does not
 //! depend on the thread schedule. A workgroup's piece sums must stay inside
 //! their 32-bit counters, which bounds the rows one workgroup may scan
-//! (`scatter_row_bound` in `backend/mod.rs`); a node whose grain
-//! counts are too coarse for that runs on the CPU.
+//! (`StagedSlice::scatter_row_bound` in `backend/shared.rs`); a node whose
+//! grain counts are too coarse for that runs on the CPU.
 //!
 //! Prediction works on bit patterns: the walk compares integer keys of the
 //! values' bits (as the CPU does), and every addition goes through the
@@ -99,14 +99,14 @@
 //! - The gradient slice is converted and re-uploaded once per tree (16
 //!   bytes per row) and each prediction call uploads its rows.
 
-use crate::backend::exact_sum::SumDomain;
-use crate::backend::{materialize_rows, scatter_row_bound};
+use crate::backend::shared::{
+    IndexShape, MAX_BUFFER_ENTRIES, MarginPlan, StagedSlice, ensure_forest_model, materialize_rows,
+    plan_margins,
+};
 use crate::data::DMatrix;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::error::{HessboostError, Result};
-use crate::model::{
-    BoostedModel, Iterations, Predictions, initial_margins, transform_model_margins,
-};
+use crate::model::{BoostedModel, Iterations, Predictions};
 use crate::objective::GradPair;
 use crate::tree::gain::GradStats;
 use crate::tree::hist::{CpuBackend, HistogramBackend};
@@ -125,8 +125,7 @@ const CPU_ROWS: usize = 8_192;
 const ROW_SLICES: usize = 64;
 /// Bins of one feature covered by a scatter workgroup (its 256 threads).
 const WINDOW_BINS: usize = 256;
-/// Threads per one-item-per-thread workgroup (gather, merge, prediction),
-/// the kernels' `@workgroup_size(64)`.
+/// Threads per one-item-per-thread workgroup (gather, merge, prediction).
 const LINEAR_THREADS: u32 = 64;
 /// Workgroups per grid dimension wgpu guarantees on every adapter.
 const MAX_GROUPS_PER_DIM: u32 = 65_535;
@@ -135,8 +134,6 @@ const MAX_GROUPS_PER_DIM: u32 = 65_535;
 const PREDICT_BLOCK_ROWS: usize = 262_144;
 /// Largest number of pooled prediction buffer sets kept per model.
 const PREDICT_POOL: usize = 8;
-/// Upper bound on GPU buffer sizes (entries), keeping index math in `u32`.
-const MAX_BUFFER_ENTRIES: usize = 1 << 30;
 /// Bytes the per-slice histogram partials of one build may take; fewer
 /// slices are used when the dataset's bins would exceed it.
 const PARTIALS_BUDGET: u64 = 64 << 20;
@@ -176,10 +173,21 @@ pub fn is_software_adapter() -> Option<bool> {
 // ---------------------------------------------------------------------------
 // WGSL kernels
 // ---------------------------------------------------------------------------
-// The kernels that run one item per thread (gather, merge, prediction)
-// index `gid.y * GRID_X + gid.x` with `GRID_X = 65535 * 64`, the items one
-// row of `grid_2d`'s grid covers (`MAX_GROUPS_PER_DIM` workgroups of
-// `LINEAR_THREADS`).
+
+/// The constants the kernels share with the host, prepended to every
+/// kernel's source: the one-item-per-thread kernels (gather, merge,
+/// prediction) run `LINEAR_THREADS`-wide workgroups and index
+/// `gid.y * GRID_X + gid.x`, `GRID_X` being the items one row of
+/// [`grid_2d`]'s grid covers; a scatter workgroup covers `WINDOW_BINS` bins
+/// of one feature.
+fn wgsl_prelude() -> String {
+    format!(
+        "const LINEAR_THREADS: u32 = {LINEAR_THREADS}u;\n\
+         const GRID_X: u32 = {}u;\n\
+         const WINDOW_BINS: u32 = {WINDOW_BINS}u;\n",
+        MAX_GROUPS_PER_DIM * LINEAR_THREADS,
+    )
+}
 
 /// `hist_gather`: one thread per entry of the node's row listing,
 /// `gathered[i] = gpair[rows[i]]`, so the scatter reads the pairs
@@ -190,9 +198,8 @@ struct GatherArgs { n: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(1) var<storage, read> rows: array<u32>;
 @group(0) @binding(2) var<storage, read> gpair: array<vec2<i64>>;
 @group(0) @binding(3) var<storage, read_write> gathered: array<vec2<i64>>;
-const GRID_X: u32 = 65535u * 64u;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(LINEAR_THREADS)
 fn hist_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * GRID_X + gid.x;
     if i >= ga.n { return; }
@@ -235,15 +242,14 @@ struct Window { feature: u32, fs: u32, nbins: u32, base: u32 }
 @group(0) @binding(5) var<storage, read_write> partials: array<vec4<i32>>;
 
 const THREADS: u32 = 256u;
-const WINDOW_BINS: u32 = 256u;
-var<workgroup> hist: array<atomic<u32>, 1024>;
+var<workgroup> hist: array<atomic<u32>, WINDOW_BINS * 4u>;
 
 fn load_bin(idx: u32) -> u32 {
     if sa.wide != 0u { return bins[idx]; }
     return (bins[idx >> 1u] >> ((idx & 1u) * 16u)) & 0xFFFFu;
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(THREADS)
 fn hist_scatter(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_index) tid: u32,
@@ -291,9 +297,8 @@ struct MergeArgs { slices: u32, total_bins: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(0) var<uniform> ma: MergeArgs;
 @group(0) @binding(1) var<storage, read> partials: array<vec4<i32>>;
 @group(0) @binding(2) var<storage, read_write> hist: array<vec2<i64>>;
-const GRID_X: u32 = 65535u * 64u;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(LINEAR_THREADS)
 fn hist_merge(@builtin(global_invocation_id) gid: vec3<u32>) {
     let b = gid.y * GRID_X + gid.x;
     if b >= ma.total_bins { return; }
@@ -344,7 +349,7 @@ struct PTree { root: u32, output: u32, vector: u32, pad: u32 }
 // NaN maps to 0, -0.0 is treated as +0.0, negatives are complemented.
 fn key_of(bits: u32) -> u32 {
     var vb = bits;
-    if (vb & 0x7F800000u) == 0x7F800000u && (vb & 0x007FFFFFu) != 0u { return 0u; }
+    if is_nan(vb) { return 0u; }
     if vb == 0x80000000u { vb = 0u; }
     return vb ^ (u32(i32(vb) >> 31u) | 0x80000000u);
 }
@@ -457,9 +462,9 @@ fn add_f32(a: u32, b: u32) -> u32 {
     return soft_add(a, b);
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(LINEAR_THREADS)
 fn forest_predict(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let r = gid.x;
+    let r = gid.y * GRID_X + gid.x;
     if r >= pa.n_rows { return; }
     let row = r * pa.n_cols;
     let scalar_run = pa.k == 1u;
@@ -625,12 +630,20 @@ fn select_adapter(instance: &wgpu::Instance) -> std::result::Result<wgpu::Adapte
     if adapters.is_empty() {
         return Err("no wgpu adapter found (no Vulkan, Metal, or DirectX 12 driver)".to_string());
     }
+    let int64 = |adapter: &wgpu::Adapter| adapter.features().contains(wgpu::Features::SHADER_INT64);
     if let Ok(wanted) = std::env::var("WGPU_ADAPTER_NAME") {
         let wanted = wanted.to_lowercase();
-        return adapters
+        let adapter = adapters
             .into_iter()
             .find(|a| a.get_info().name.to_lowercase().contains(&wanted))
-            .ok_or_else(|| format!("no wgpu adapter matches WGPU_ADAPTER_NAME={wanted:?}"));
+            .ok_or_else(|| format!("no wgpu adapter matches WGPU_ADAPTER_NAME={wanted:?}"))?;
+        if !int64(&adapter) {
+            return Err(format!(
+                "wgpu adapter {} has no 64-bit shader integers (SHADER_INT64)",
+                adapter.get_info().name
+            ));
+        }
+        return Ok(adapter);
     }
     let prefer_low_power = matches!(
         wgpu::PowerPreference::from_env(),
@@ -644,7 +657,7 @@ fn select_adapter(instance: &wgpu::Instance) -> std::result::Result<wgpu::Adapte
             "{} ({:?}, {:?})",
             info.name, info.device_type, info.backend
         ));
-        if !adapter.features().contains(wgpu::Features::SHADER_INT64) {
+        if !int64(&adapter) {
             continue;
         }
         let rank = adapter_rank(&info, prefer_low_power);
@@ -667,6 +680,13 @@ impl Context {
         CONTEXT.as_ref().ok()
     }
 
+    /// The shared context, or the reason it is unavailable as an error.
+    fn get() -> Result<&'static Self> {
+        CONTEXT
+            .as_ref()
+            .map_err(|reason| HessboostError::gpu(reason.clone()))
+    }
+
     fn new() -> std::result::Result<Self, String> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::PRIMARY;
@@ -675,11 +695,6 @@ impl Context {
         let info = adapter.get_info();
         let device_name = info.name.clone();
         let software = info.device_type == wgpu::DeviceType::Cpu;
-        if !adapter.features().contains(wgpu::Features::SHADER_INT64) {
-            return Err(format!(
-                "wgpu adapter {device_name} has no 64-bit shader integers (SHADER_INT64)"
-            ));
-        }
         let limits = adapter.limits();
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("hessboost"),
@@ -694,10 +709,11 @@ impl Context {
         device.on_uncaptured_error(Arc::new(|error: wgpu::Error| {
             UNCAPTURED.lock().get_or_insert_with(|| error.to_string());
         }));
+        let prelude = wgsl_prelude();
         let pipeline = |name: &str, source: &str| -> wgpu::ComputePipeline {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(name),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
+                source: wgpu::ShaderSource::Wgsl(format!("{prelude}{source}").into()),
             });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(name),
@@ -824,13 +840,8 @@ impl Context {
         Ok(())
     }
 
-    /// A storage buffer of `bytes` (at least [`MIN_BUFFER_BYTES`]) the CPU
-    /// writes through the queue, or an error when it exceeds the adapter's
-    /// binding limit.
-    fn storage(&self, label: &str, bytes: u64, extra: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
-        let bytes = bytes
-            .max(MIN_BUFFER_BYTES)
-            .next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+    /// Refuse a storage buffer of `bytes` past the adapter's binding limit.
+    fn check_storage(&self, label: &str, bytes: u64) -> Result<()> {
         if bytes > self.limits.max_storage_buffer_binding_size
             || bytes > self.limits.max_buffer_size
         {
@@ -843,6 +854,15 @@ impl Context {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    /// A storage buffer of `bytes` (at least [`MIN_BUFFER_BYTES`]) the CPU
+    /// writes through the queue, or an error when it exceeds the adapter's
+    /// binding limit.
+    fn storage(&self, label: &str, bytes: u64, extra: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
+        let bytes = buffer_size(bytes);
+        self.check_storage(label, bytes)?;
         Ok(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: bytes,
@@ -859,19 +879,7 @@ impl Context {
             self.queue.write_buffer(&buffer, 0, contents);
             return Ok(buffer);
         }
-        let bytes = contents.len() as u64;
-        if bytes > self.limits.max_storage_buffer_binding_size
-            || bytes > self.limits.max_buffer_size
-        {
-            return Err(HessboostError::invalid_data(
-                "data",
-                format!(
-                    "the {label} buffer ({bytes} bytes) exceeds the wgpu adapter's \
-                     storage binding limit ({} bytes)",
-                    self.limits.max_storage_buffer_binding_size
-                ),
-            ));
-        }
+        self.check_storage(label, contents.len() as u64)?;
         Ok(self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -893,9 +901,7 @@ impl Context {
 
     /// A CPU-readable staging buffer of `bytes`.
     fn staging(&self, label: &str, bytes: u64) -> Result<wgpu::Buffer> {
-        let bytes = bytes
-            .max(MIN_BUFFER_BYTES)
-            .next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+        let bytes = buffer_size(bytes);
         if bytes > self.limits.max_buffer_size {
             return Err(HessboostError::invalid_data(
                 "data",
@@ -995,7 +1001,8 @@ impl Context {
                 pad: 0,
             })
             .collect();
-        let (forest, call) = self.scoped("allocating the addition chain", || {
+        // The bind group keeps the forest's buffers alive past their handles.
+        let call = self.scoped("allocating the addition chain", || {
             let forest = ForestBuffers {
                 nodes: self.storage_init("chain nodes", bytemuck::cast_slice(&nodes))?,
                 categories: self.storage_init("chain categories", &[0; 16])?,
@@ -1003,10 +1010,14 @@ impl Context {
                     .storage_init("chain leaf vectors", bytemuck::cast_slice(&chain.leaves))?,
                 trees: self.storage_init("chain trees", bytemuck::cast_slice(&trees))?,
             };
-            let call = PredictBuffers::new(self, &forest, rows, 1, k, rows)?;
-            Ok((forest, call))
+            let shape = PredictShape {
+                block_rows: rows,
+                n_cols: 1,
+                k,
+                total_rows: rows,
+            };
+            PredictBuffers::new(self, &forest, shape)
         })?;
-        drop(forest);
         let features = vec![0.0f32; rows];
         let mut margins = chain.margins.clone();
         call.run_block(
@@ -1085,6 +1096,14 @@ fn grid_2d(items: usize) -> (u32, u32) {
     (x as u32, y as u32)
 }
 
+/// `bytes` as a buffer's size: at least [`MIN_BUFFER_BYTES`], in whole copy
+/// units.
+fn buffer_size(bytes: u64) -> u64 {
+    bytes
+        .max(MIN_BUFFER_BYTES)
+        .next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+}
+
 // ---------------------------------------------------------------------------
 // Histogram backend
 // ---------------------------------------------------------------------------
@@ -1102,25 +1121,8 @@ struct StagedGradients {
     buffer: wgpu::Buffer,
     /// Conversion scratch: the slice in grains, uploaded through the queue.
     units: Vec<[i64; 2]>,
-    /// (address, length) identity of the staged slice; length 0 when
-    /// nothing is staged (a staged slice always has `n_rows > 0` entries).
-    addr: usize,
-    len: usize,
-    grad: SumDomain,
-    hess: SumDomain,
-}
-
-impl StagedGradients {
-    /// Whether `gpair` is the staged slice.
-    fn holds(&self, gpair: &[GradPair]) -> bool {
-        self.len != 0 && self.len == gpair.len() && self.addr == gpair.as_ptr().addr()
-    }
-
-    /// Whether every sum of at most `n` staged gradient pairs is exact on
-    /// both paths (see `backend::exact_sum`).
-    fn sums_exact(&self, n: usize) -> bool {
-        self.grad.sums_exact(n) && self.hess.sums_exact(n)
-    }
+    /// The staged slice ([`StagedSlice::NONE`] when nothing is staged).
+    slice: StagedSlice,
 }
 
 /// Per-call GPU buffers of the histogram backend, pooled across the parallel
@@ -1145,8 +1147,8 @@ impl CallBuffers {
     /// with its readback copy.
     fn new(backend: &WgpuHistBackend, gradients: &wgpu::Buffer) -> Result<Self> {
         let ctx = backend.ctx;
-        let n_rows = backend.n_rows as u64;
-        let total_bins = backend.total_bins as u64;
+        let n_rows = backend.shape.n_rows as u64;
+        let total_bins = backend.shape.total_bins as u64;
         let rows = ctx.storage("row listing", n_rows * 4, wgpu::BufferUsages::empty())?;
         let gathered = ctx.storage(
             "gathered gradients",
@@ -1220,9 +1222,7 @@ pub struct WgpuHistBackend {
     /// [`ROW_SLICES`], or fewer when the dataset's bins would overrun
     /// [`PARTIALS_BUDGET`].
     slices: usize,
-    total_bins: usize,
-    n_rows: usize,
-    n_cols: usize,
+    shape: IndexShape,
     gradients: RwLock<StagedGradients>,
     pool: Mutex<Vec<CallBuffers>>,
 }
@@ -1231,9 +1231,7 @@ impl std::fmt::Debug for WgpuHistBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WgpuHistBackend")
             .field("device", &self.ctx.device_name)
-            .field("n_rows", &self.n_rows)
-            .field("n_cols", &self.n_cols)
-            .field("total_bins", &self.total_bins)
+            .field("shape", &self.shape)
             .finish_non_exhaustive()
     }
 }
@@ -1244,76 +1242,73 @@ impl std::fmt::Debug for WgpuHistBackend {
 /// such a store (with the width's maximum marking a missing entry); the
 /// rest is built from the CSR rows here.
 fn feature_major_bins(index: &GHistIndex) -> (Vec<u32>, bool) {
-    let n = index.n_rows();
-    let cols = index.n_cols();
-    let pack_u16 = |bins: &[u16]| -> Vec<u32> {
-        let mut words = vec![0u32; bins.len().div_ceil(2)];
-        words
-            .par_iter_mut()
-            .zip(bins.par_chunks(2))
-            .for_each(|(word, pair)| {
-                *word = u32::from(pair[0]) | (pair.get(1).map_or(0, |&b| u32::from(b)) << 16);
-            });
-        words
-    };
     match index.column_bins().or_else(|| index.missing_columns()) {
         Some(Bins::U16(bins)) => (pack_u16(bins), false),
         Some(Bins::U32(bins)) => (bins.to_vec(), true),
-        None => {
-            // Sparse and under half full: scatter each row's entries into a
-            // sentinel-filled store. The sentinel must never be a bin, so
-            // `u16` stores need `total_bins < u16::MAX`.
-            let narrow = index.total_bins() < usize::from(u16::MAX);
-            let cuts = index.cuts();
-            let starts: Vec<u32> = (0..cols).map(|f| cuts.feature_bins(f).0 as u32).collect();
-            let feature_of = |bin: u32| starts.partition_point(|&start| start <= bin) - 1;
-            let row_ptr = index.row_ptr();
-            let place = |r: usize, bin: u32, store: &mut dyn FnMut(usize, u32)| {
-                store(feature_of(bin) * n + r, bin);
-            };
-            if narrow {
-                let mut store = vec![u16::MAX; n * cols];
-                let mut put = |i: usize, bin: u32| store[i] = bin as u16;
-                for r in 0..n {
-                    let (s, e) = (row_ptr[r], row_ptr[r + 1]);
-                    match index.bins() {
-                        Bins::U16(b) => b[s..e]
-                            .iter()
-                            .for_each(|&bin| place(r, u32::from(bin), &mut put)),
-                        Bins::U32(b) => b[s..e].iter().for_each(|&bin| place(r, bin, &mut put)),
-                    }
-                }
-                (pack_u16(&store), false)
-            } else {
-                let mut store = vec![u32::MAX; n * cols];
-                let mut put = |i: usize, bin: u32| store[i] = bin;
-                for r in 0..n {
-                    let (s, e) = (row_ptr[r], row_ptr[r + 1]);
-                    match index.bins() {
-                        Bins::U16(b) => b[s..e]
-                            .iter()
-                            .for_each(|&bin| place(r, u32::from(bin), &mut put)),
-                        Bins::U32(b) => b[s..e].iter().for_each(|&bin| place(r, bin, &mut put)),
-                    }
-                }
-                (store, true)
-            }
+        // The sentinel must never be a bin, so `u16` stores need
+        // `total_bins < u16::MAX`.
+        None if index.total_bins() < usize::from(u16::MAX) => {
+            let store = sparse_feature_major(index, u16::MAX, |bin| bin as u16);
+            (pack_u16(&store), false)
+        }
+        None => (sparse_feature_major(index, u32::MAX, |bin| bin), true),
+    }
+}
+
+/// `u16` bins packed in pairs into `u32` words, low half first: the layout
+/// the scatter kernel's `load_bin` reads.
+fn pack_u16(bins: &[u16]) -> Vec<u32> {
+    let mut words = vec![0u32; bins.len().div_ceil(2)];
+    words
+        .par_iter_mut()
+        .zip(bins.par_chunks(2))
+        .for_each(|(word, pair)| {
+            *word = u32::from(pair[0]) | (pair.get(1).map_or(0, |&b| u32::from(b)) << 16);
+        });
+    words
+}
+
+/// A sparse index's entries scattered into a feature-major store (feature
+/// `f` of row `r` at `f * n_rows + r`) filled with `missing`, each bin
+/// stored as `stored(bin)`.
+fn sparse_feature_major<T: Copy>(
+    index: &GHistIndex,
+    missing: T,
+    stored: impl Fn(u32) -> T,
+) -> Vec<T> {
+    let n = index.n_rows();
+    let cuts = index.cuts();
+    let starts: Vec<u32> = (0..index.n_cols())
+        .map(|f| cuts.feature_bins(f).0 as u32)
+        .collect();
+    let row_ptr = index.row_ptr();
+    let bins = index.bins();
+    let mut store = vec![missing; n * index.n_cols()];
+    for r in 0..n {
+        let entries = row_ptr[r]..row_ptr[r + 1];
+        let mut put = |bin: u32| {
+            let feature = starts.partition_point(|&start| start <= bin) - 1;
+            store[feature * n + r] = stored(bin);
+        };
+        match &bins {
+            Bins::U16(bins) => bins[entries].iter().for_each(|&bin| put(u32::from(bin))),
+            Bins::U32(bins) => bins[entries].iter().for_each(|&bin| put(bin)),
         }
     }
+    store
 }
 
 impl WgpuHistBackend {
     /// Build the backend for `index`: upload its feature-major bin store and
     /// the (feature, bin window) work items.
     pub fn new(index: &GHistIndex) -> Result<Self> {
-        let ctx = Context::shared().ok_or_else(|| {
-            HessboostError::gpu(
-                unavailable_reason().unwrap_or_else(|| "no wgpu adapter is available".into()),
-            )
-        })?;
-        let n_rows = index.n_rows();
-        let n_cols = index.n_cols();
-        let total_bins = index.total_bins();
+        let ctx = Context::get()?;
+        let shape = IndexShape::of(index);
+        let IndexShape {
+            n_rows,
+            n_cols,
+            total_bins,
+        } = shape;
         if total_bins == 0 || n_rows == 0 {
             return Err(HessboostError::invalid_data(
                 "data",
@@ -1334,11 +1329,14 @@ impl WgpuHistBackend {
                 ),
             ));
         }
-        let (words, wide) = feature_major_bins(index);
-        let bins = ctx.scoped("uploading the bin store", || {
-            ctx.storage_init("feature-major bins", bytemuck::cast_slice(&words))
-        })?;
-        drop(words);
+        let partial_bytes = total_bins as u64 * 16;
+        if partial_bytes > PARTIALS_BUDGET {
+            return Err(HessboostError::invalid_data(
+                "data",
+                format!("the dataset's {total_bins} bins exceed the wgpu backend's limit"),
+            ));
+        }
+        let slices = (PARTIALS_BUDGET / partial_bytes).min(ROW_SLICES as u64) as usize;
         let cuts = index.cuts();
         let mut windows = Vec::new();
         for feature in 0..n_cols {
@@ -1362,18 +1360,15 @@ impl WgpuHistBackend {
                 ),
             ));
         }
+        let (words, wide) = feature_major_bins(index);
+        let bins = ctx.scoped("uploading the bin store", || {
+            ctx.storage_init("feature-major bins", bytemuck::cast_slice(&words))
+        })?;
+        drop(words);
         let n_windows = windows.len();
         let windows = ctx.scoped("uploading the bin windows", || {
             ctx.storage_init("bin windows", bytemuck::cast_slice(&windows))
         })?;
-        let partial_bytes = total_bins as u64 * 16;
-        if partial_bytes > PARTIALS_BUDGET {
-            return Err(HessboostError::invalid_data(
-                "data",
-                format!("the dataset's {total_bins} bins exceed the wgpu backend's limit"),
-            ));
-        }
-        let slices = (PARTIALS_BUDGET / partial_bytes).min(ROW_SLICES as u64) as usize;
         // One `[i64; 2]` gradient pair in grains per row.
         let gpair = ctx.scoped("allocating the gradient buffer", || {
             ctx.storage(
@@ -1382,29 +1377,23 @@ impl WgpuHistBackend {
                 wgpu::BufferUsages::empty(),
             )
         })?;
-        let mut backend = WgpuHistBackend {
+        let backend = WgpuHistBackend {
             ctx,
             bins,
             wide,
             windows,
             n_windows,
             slices,
-            total_bins,
-            n_rows,
-            n_cols,
+            shape,
             gradients: RwLock::new(StagedGradients {
                 buffer: gpair,
-                units: Vec::new(),
-                addr: 0,
-                len: 0,
-                grad: SumDomain::EMPTY,
-                hess: SumDomain::EMPTY,
+                units: Vec::with_capacity(n_rows),
+                slice: StagedSlice::NONE,
             }),
             pool: Mutex::new(Vec::new()),
         };
         let first = backend.checkout()?;
         backend.checkin(first);
-        backend.gradients.get_mut().units = Vec::with_capacity(n_rows);
         Ok(backend)
     }
 
@@ -1420,52 +1409,44 @@ impl WgpuHistBackend {
     /// while a tree grows.
     fn stage(&self, gpair: &[GradPair], force: bool) {
         let mut staged = self.gradients.write();
-        if !force && staged.holds(gpair) {
+        if !force && staged.slice.holds(gpair) {
             return;
         }
         // Unstage first, so a slice that is not uploaded below is never
         // mistaken for the previous one.
-        staged.len = 0;
-        if gpair.len() != self.n_rows {
+        staged.slice = StagedSlice::NONE;
+        if gpair.len() != self.shape.n_rows {
             return;
         }
-        let grad = SumDomain::of_slice(gpair, |p| p.grad);
-        let hess = SumDomain::of_slice(gpair, |p| p.hess);
-        // Integer multiples of each component's grain, the values the
-        // kernels sum: exact whenever a node's sums can be (`exact_sum`).
+        let slice = StagedSlice::of(gpair);
         staged.units.clear();
-        staged.units.par_extend(
-            gpair
-                .par_iter()
-                .map(|p| [grad.units(p.grad), hess.units(p.hess)]),
-        );
+        staged
+            .units
+            .par_extend(gpair.par_iter().map(|&p| slice.units(p)));
         // The write is queue-ordered after every submitted build, and the
         // write lock excludes new ones until it is staged.
         self.ctx
             .queue
             .write_buffer(&staged.buffer, 0, bytemuck::cast_slice(&staged.units));
-        staged.grad = grad;
-        staged.hess = hess;
-        staged.addr = gpair.as_ptr().addr();
-        staged.len = gpair.len();
+        staged.slice = slice;
     }
 
     /// A read guard on the staged gradients when they hold `gpair`, staging
     /// it first if needed; `None` when `gpair` cannot be staged or another
     /// thread staged a different slice in between.
     fn staged_for(&self, gpair: &[GradPair]) -> Option<RwLockReadGuard<'_, StagedGradients>> {
-        if gpair.len() != self.n_rows {
+        if gpair.len() != self.shape.n_rows {
             return None;
         }
         {
             let staged = self.gradients.read();
-            if staged.holds(gpair) {
+            if staged.slice.holds(gpair) {
                 return Some(staged);
             }
         }
         self.stage(gpair, false);
         let staged = self.gradients.read();
-        staged.holds(gpair).then_some(staged)
+        staged.slice.holds(gpair).then_some(staged)
     }
 
     /// Check out a per-call buffer set from the pool.
@@ -1500,16 +1481,7 @@ impl WgpuHistBackend {
         gpair: &[GradPair],
         out: &mut [GradStats],
     ) -> bool {
-        // The kernels do not bounds-check: inputs the GPU buffers were not
-        // sized for (another index shape, more rows than the index holds, a
-        // row past its end) must never reach a dispatch.
-        let fits = out.len() == self.total_bins
-            && ghist.n_rows() == self.n_rows
-            && ghist.n_cols() == self.n_cols
-            && ghist.total_bins() == self.total_bins
-            && rows.len() <= self.n_rows
-            && rows.iter().all(|&r| (r as usize) < self.n_rows);
-        if !fits {
+        if !self.shape.fits(ghist, rows, out) {
             return false;
         }
         // The guard lives until this function returns, after the dispatch
@@ -1518,13 +1490,13 @@ impl WgpuHistBackend {
         let Some(staged) = self.staged_for(gpair) else {
             return false;
         };
-        if !staged.sums_exact(rows.len()) {
+        if !staged.slice.sums_exact(rows.len()) {
             return false;
         }
         // The scatter kernel's 32-bit shared accumulators only stay exact
         // while a workgroup's rows fit `scatter_row_bound`.
         let rows_per_slice = rows.len().div_ceil(self.slices);
-        if scatter_row_bound(&staged.grad, &staged.hess) < rows_per_slice {
+        if staged.slice.scatter_row_bound() < rows_per_slice {
             return false;
         }
         let Ok(call) = self.checkout() else {
@@ -1551,6 +1523,7 @@ impl WgpuHistBackend {
     ) -> Result<()> {
         let ctx = self.ctx;
         let n = rows.len();
+        let total_bins = self.shape.total_bins;
         ctx.queue
             .write_buffer(&call.rows, 0, bytemuck::cast_slice(rows));
         ctx.queue.write_buffer(
@@ -1567,8 +1540,8 @@ impl WgpuHistBackend {
             bytemuck::bytes_of(&ScatterArgs {
                 n_node_rows: n as u32,
                 rows_per_slice: rows_per_slice as u32,
-                n_rows: self.n_rows as u32,
-                total_bins: self.total_bins as u32,
+                n_rows: self.shape.n_rows as u32,
+                total_bins: total_bins as u32,
                 wide: u32::from(self.wide),
                 pad: [0; 3],
             }),
@@ -1578,11 +1551,10 @@ impl WgpuHistBackend {
             0,
             bytemuck::bytes_of(&MergeArgs {
                 slices: self.slices as u32,
-                total_bins: self.total_bins as u32,
+                total_bins: total_bins as u32,
                 pad: [0; 2],
             }),
         );
-        let hist_bytes = self.total_bins as u64 * 16;
         ctx.run(|encoder| {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&ctx.gather);
@@ -1594,17 +1566,15 @@ impl WgpuHistBackend {
             pass.dispatch_workgroups(self.n_windows as u32, self.slices as u32, 1);
             pass.set_pipeline(&ctx.merge);
             pass.set_bind_group(0, &call.merge_bind, &[]);
-            let (x, y) = grid_2d(self.total_bins);
+            let (x, y) = grid_2d(total_bins);
             pass.dispatch_workgroups(x, y, 1);
             drop(pass);
-            encoder.copy_buffer_to_buffer(&call.hist, 0, &call.readback, 0, hist_bytes);
+            encoder.copy_buffer_to_buffer(&call.hist, 0, &call.readback, 0, total_bins as u64 * 16);
         })?;
-        let mut hist = vec![[0i64; 2]; self.total_bins];
+        let mut hist = vec![[0i64; 2]; total_bins];
         ctx.read_back(&call.readback, &mut hist)?;
-        for (o, &[g, h]) in out.iter_mut().zip(&hist) {
-            // Exact piece sums in grains (below 2^53), scaled back exactly.
-            o.grad = gradients.grad.value(g);
-            o.hess = gradients.hess.value(h);
+        for (o, &sums) in out.iter_mut().zip(&hist) {
+            *o = gradients.slice.bin(sums);
         }
         Ok(())
     }
@@ -1651,23 +1621,39 @@ struct PredictBuffers {
     bind: wgpu::BindGroup,
     /// Dense row materialization scratch, one block.
     scratch: Vec<f32>,
+    /// The call shape the buffers were sized for.
+    shape: PredictShape,
+}
+
+/// The shape of a prediction call's buffers: blocks of `block_rows` rows of
+/// `n_cols` features and `k` outputs, reading back `total_rows` rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PredictShape {
     block_rows: usize,
     n_cols: usize,
     k: usize,
-    readback_rows: usize,
+    total_rows: usize,
+}
+
+impl PredictShape {
+    /// Whether buffers of this shape serve a call of shape `call`.
+    fn serves(&self, call: PredictShape) -> bool {
+        self.block_rows >= call.block_rows
+            && self.n_cols == call.n_cols
+            && self.k == call.k
+            && self.total_rows >= call.total_rows
+    }
 }
 
 impl PredictBuffers {
-    /// Buffers for blocks of `block_rows` rows of `n_cols` features and
-    /// `k` outputs, reading back `total_rows` rows.
-    fn new(
-        ctx: &Context,
-        forest: &ForestBuffers,
-        block_rows: usize,
-        n_cols: usize,
-        k: usize,
-        total_rows: usize,
-    ) -> Result<Self> {
+    /// Buffers for calls of `shape`.
+    fn new(ctx: &Context, forest: &ForestBuffers, shape: PredictShape) -> Result<Self> {
+        let PredictShape {
+            block_rows,
+            n_cols,
+            k,
+            total_rows,
+        } = shape;
         let rows = ctx.storage(
             "prediction rows",
             (block_rows * n_cols) as u64 * 4,
@@ -1699,19 +1685,8 @@ impl PredictBuffers {
             args,
             bind,
             scratch: vec![0.0; block_rows * n_cols],
-            block_rows,
-            n_cols,
-            k,
-            readback_rows: total_rows,
+            shape,
         })
-    }
-
-    /// Whether this set serves a call of this shape.
-    fn fits(&self, block_rows: usize, n_cols: usize, k: usize, total_rows: usize) -> bool {
-        self.block_rows >= block_rows
-            && self.n_cols == n_cols
-            && self.k == k
-            && self.readback_rows >= total_rows
     }
 
     /// Upload one block's dense `rows` and initial `margins`, walk the
@@ -1743,7 +1718,7 @@ impl PredictBuffers {
                 &self.out,
                 0,
                 &self.readback,
-                (begin * self.k) as u64 * 4,
+                (begin * self.shape.k) as u64 * 4,
                 bytes,
             );
         })
@@ -1800,29 +1775,13 @@ impl GpuModel {
         data: &DMatrix,
         iterations: impl Into<Iterations>,
     ) -> Result<Predictions> {
-        let model = &self.model;
-        let iterations = iterations.into();
-        if model.shrinkage().is_some() {
-            return model.predict_margin(data, iterations);
-        }
-        model.validate_prediction_data(data)?;
-        let trees = model.iteration_trees(model.resolve_iterations(iterations, "iterations")?);
-        let k = model.n_outputs();
+        let (trees, mut margins) = match plan_margins(&self.model, data, iterations.into())? {
+            MarginPlan::Done(margins) => return Ok(margins),
+            MarginPlan::Walk { trees, margins } => (trees, margins),
+        };
+        let k = self.model.n_outputs();
         let n = data.n_rows();
         let n_cols = data.n_cols();
-        let mut margins = initial_margins(model.base_scores(), data);
-        if trees.is_empty() || n == 0 {
-            return Ok(Predictions::new(margins, n, k));
-        }
-        if n > MAX_BUFFER_ENTRIES || n.checked_mul(n_cols).is_none_or(|e| e > MAX_BUFFER_ENTRIES) {
-            return Err(HessboostError::invalid_data(
-                "data",
-                format!(
-                    "GPU prediction needs a dense row copy ({n} rows x {n_cols} features) \
-                     that exceeds 4 GiB"
-                ),
-            ));
-        }
         // Blocks of rows the per-block buffers hold within the adapter's
         // binding limit; the margins are block-local inside the kernel, so
         // the walk's arithmetic and order are those of a single-block call.
@@ -1840,7 +1799,12 @@ impl GpuModel {
                 ),
             ));
         }
-        let mut call = self.checkout(block_rows, n_cols, k, n)?;
+        let mut call = self.checkout(PredictShape {
+            block_rows,
+            n_cols,
+            k,
+            total_rows: n,
+        })?;
         let result: Result<()> = (|| {
             let mut begin = 0;
             while begin < n {
@@ -1880,13 +1844,9 @@ impl GpuModel {
         data: &DMatrix,
         iterations: impl Into<Iterations>,
     ) -> Result<Predictions> {
-        let margin = self.predict_margin(data, iterations)?;
-        Ok(transform_model_margins(
-            self.model.objective(),
-            self.model.max_delta_step(),
-            self.model.n_targets(),
-            margin,
-        ))
+        Ok(self
+            .model
+            .transform_margins(self.predict_margin(data, iterations)?))
     }
 
     /// The predicted class per row, matching
@@ -1902,23 +1862,14 @@ impl GpuModel {
 
     /// Check out buffers that fit the call, allocating when the pool has
     /// none that do.
-    fn checkout(
-        &self,
-        block_rows: usize,
-        n_cols: usize,
-        k: usize,
-        total_rows: usize,
-    ) -> Result<PredictBuffers> {
+    fn checkout(&self, shape: PredictShape) -> Result<PredictBuffers> {
         let mut pool = self.pool.lock();
-        if let Some(idx) = pool
-            .iter()
-            .position(|b| b.fits(block_rows, n_cols, k, total_rows))
-        {
+        if let Some(idx) = pool.iter().position(|b| b.shape.serves(shape)) {
             return Ok(pool.swap_remove(idx));
         }
         drop(pool);
         self.ctx.scoped("allocating prediction buffers", || {
-            PredictBuffers::new(self.ctx, &self.forest, block_rows, n_cols, k, total_rows)
+            PredictBuffers::new(self.ctx, &self.forest, shape)
         })
     }
 
@@ -1940,27 +1891,11 @@ impl BoostedModel {
     /// The returned [`GpuModel`] shares this model's objective, transforms,
     /// and layout; its predictions are bit-identical to the CPU's.
     pub fn to_wgpu(&self) -> Result<GpuModel> {
-        let ctx = Context::shared().ok_or_else(|| {
-            HessboostError::gpu(
-                unavailable_reason().unwrap_or_else(|| "no wgpu adapter is available".into()),
-            )
-        })?;
+        let ctx = Context::get()?;
         if let Err(reason) = &ctx.predict_check {
             return Err(HessboostError::gpu(reason.clone()));
         }
-        if self.is_gblinear() {
-            return Err(HessboostError::incompatible_model(
-                "model",
-                "gblinear models predict from their linear weights, not the tree forest",
-            ));
-        }
-        if self.has_linear_leaves() {
-            return Err(HessboostError::incompatible_model(
-                "model",
-                "`linear_tree` models predict through per-leaf linear models, \
-                 which the GPU forest does not hold",
-            ));
-        }
+        ensure_forest_model(self)?;
         let forest = self.compact_forest();
         let parts = forest.gpu_parts();
         let mut nodes: Vec<[u32; 4]> = bytemuck::pod_collect_to_vec(parts.nodes);
@@ -2029,6 +1964,7 @@ impl BoostedModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::shared::test_support::{cpu_hist, one_feature};
     use crate::data::quantile::HistCuts;
 
     fn context() -> bool {
@@ -2036,17 +1972,6 @@ mod tests {
             eprintln!("skipping wgpu tests: {reason}");
         }
         Context::shared().is_some()
-    }
-
-    /// The single-threaded CPU histogram of `rows`.
-    fn cpu_hist(index: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Vec<GradStats> {
-        let mut out = vec![GradStats::default(); index.total_bins()];
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap()
-            .install(|| CpuBackend.build(index, rows, gpair, &mut out));
-        out
     }
 
     /// The histogram of `rows` built on the GPU, asserting that the GPU
@@ -2064,14 +1989,6 @@ mod tests {
             "the GPU path must take this node"
         );
         out
-    }
-
-    /// A one-feature dataset whose rows cycle through `values` distinct
-    /// feature values (one bin each).
-    fn one_feature(n: usize, values: usize) -> GHistIndex {
-        let x: Vec<f32> = (0..n).map(|i| (i % values) as f32).collect();
-        let data = DMatrix::from_dense(&x, n, 1).unwrap();
-        GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256))
     }
 
     /// Gradients one `f32` ulp away from coarse values keep that last bit:
@@ -2271,8 +2188,8 @@ mod tests {
         let rows: Vec<u32> = (0..n as u32).collect();
         backend.prepare(&index, &gpair);
         let staged = backend.gradients.read();
-        assert!(staged.sums_exact(rows.len()));
-        assert!(scatter_row_bound(&staged.grad, &staged.hess) < n.div_ceil(backend.slices));
+        assert!(staged.slice.sums_exact(rows.len()));
+        assert!(staged.slice.scatter_row_bound() < n.div_ceil(backend.slices));
         drop(staged);
         let mut out = vec![GradStats::default(); index.total_bins()];
         assert!(!backend.try_gpu(&index, &rows, &gpair, &mut out));
@@ -2428,41 +2345,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A model trained with `device = wgpu` (DART weights, categorical
-    /// splits, missing values) predicts identically through `to_wgpu`.
-    #[test]
-    fn gpu_predicts_like_cpu() {
-        use crate::config::{BoosterKind, Dart, Device, TreeMethod};
-        use crate::prelude::*;
-        if !context() {
-            return;
-        }
-        let data = dataset(3_000, 6);
-        let params = TrainingParams::builder()
-            .objective(Objective::SquaredError(RegLoss::default()))
-            .tree_method(TreeMethod::Hist)
-            .max_depth(5)
-            .eta(0.3)
-            .booster(BoosterKind::Dart(Dart::default()))
-            .device(Device::Wgpu)
-            .build()
-            .unwrap();
-        let model = train(&params, &data, 12).unwrap();
-        let gpu = model.to_wgpu().unwrap();
-        assert_eq!(
-            model.predict(&data, Iterations::Best).unwrap(),
-            gpu.predict(&data, Iterations::Best).unwrap()
-        );
-        assert_eq!(
-            model.predict_margin(&data, Iterations::Best).unwrap(),
-            gpu.predict_margin(&data, Iterations::Best).unwrap()
-        );
-        assert_eq!(
-            model.predict_class(&data, Iterations::Best).unwrap(),
-            gpu.predict_class(&data, Iterations::Best).unwrap()
-        );
-    }
-
     /// Multi-output models through both leaf layouts: one scalar tree per
     /// output (`multi:softprob`) and vector leaves (`multi_output_tree`),
     /// with DART weights so the host-side leaf weighting is exercised.
@@ -2509,31 +2391,6 @@ mod tests {
                 "{strategy:?}: iteration range"
             );
         }
-    }
-
-    /// A batch larger than one prediction block lands bit-identical block
-    /// by block.
-    #[test]
-    fn gpu_predicts_across_blocks() {
-        use crate::config::TreeMethod;
-        use crate::prelude::*;
-        if !context() {
-            return;
-        }
-        let train_data = dataset(3_000, 4);
-        let params = TrainingParams::builder()
-            .objective(Objective::SquaredError(RegLoss::default()))
-            .tree_method(TreeMethod::Hist)
-            .max_depth(4)
-            .build()
-            .unwrap();
-        let model = train(&params, &train_data, 5).unwrap();
-        let gpu = model.to_wgpu().unwrap();
-        let batch = dataset(PREDICT_BLOCK_ROWS + 1_001, 4);
-        assert_eq!(
-            model.predict(&batch, Iterations::Best).unwrap(),
-            gpu.predict(&batch, Iterations::Best).unwrap()
-        );
     }
 
     /// The 2-D grid covers every item count below the dimension limit and
@@ -2698,71 +2555,6 @@ mod tests {
                     &format!("random chain (k {k}, vector {vector}, soft {soft})"),
                 );
             }
-        }
-    }
-
-    /// A model whose leaves and base margins are subnormal predicts
-    /// bit-identically through the real tree walk: every addition routes
-    /// through the integer path.
-    #[test]
-    fn gpu_predicts_subnormal_margins_like_cpu() {
-        use crate::config::TreeMethod;
-        use crate::prelude::*;
-        if !context() {
-            return;
-        }
-        let n = 3_000;
-        let cols = 4;
-        let x: Vec<f32> = (0..n * cols)
-            .map(|i: usize| ((i.wrapping_mul(2_654_435_761)) % 1000) as f32 * 0.001)
-            .collect();
-        // Labels around the smallest normal, so the leaves (label means)
-        // and most running margins are subnormal or straddle the boundary.
-        let min_normal = f32::from_bits(0x0080_0000);
-        let y: Vec<f32> = (0..n)
-            .map(|i| {
-                let scale = ((i * 7919) % 1000) as f32 * 0.003 - 1.0;
-                min_normal * scale
-            })
-            .collect();
-        let data = DMatrix::from_dense(&x, n, cols)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
-        let params = TrainingParams::builder()
-            .objective(Objective::SquaredError(RegLoss::default()))
-            .tree_method(TreeMethod::Hist)
-            .base_score(0.0)
-            .max_depth(4)
-            .eta(1.0)
-            .build()
-            .unwrap();
-        let model = train(&params, &data, 6).unwrap();
-        let subnormal_leaves = model
-            .trees()
-            .iter()
-            .flat_map(|t| {
-                t.nodes()
-                    .iter()
-                    .filter(|n| n.is_leaf())
-                    .map(|n| n.leaf_value)
-            })
-            .filter(|v| *v != 0.0 && v.abs() < min_normal)
-            .count();
-        assert!(subnormal_leaves > 0, "the test needs subnormal leaves");
-        let gpu = model.to_wgpu().unwrap();
-        let base_margin: Vec<f32> = (0..n)
-            .map(|i| {
-                f32::from_bits(((i * 48_271) % 0x00FF_FFFF) as u32)
-                    * if i % 2 == 0 { 1.0 } else { -1.0 }
-            })
-            .collect();
-        let with_margin = data.clone().with_base_margin(&base_margin).unwrap();
-        for d in [&data, &with_margin] {
-            assert_eq!(
-                model.predict_margin(d, Iterations::Best).unwrap(),
-                gpu.predict_margin(d, Iterations::Best).unwrap()
-            );
         }
     }
 }

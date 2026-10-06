@@ -695,19 +695,6 @@ impl BoostedModel {
         self.tree_weights.get(i)
     }
 
-    /// Whether this is a `gblinear` model, whose predictions come from the
-    /// linear weights instead of the tree ensemble.
-    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
-    pub(crate) fn is_gblinear(&self) -> bool {
-        self.linear.is_some()
-    }
-
-    /// Whether any tree carries per-leaf linear models (`linear_tree`).
-    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
-    pub(crate) fn has_linear_leaves(&self) -> bool {
-        self.trees.iter().any(|tree| tree.linear_leaves().is_some())
-    }
-
     /// Whether tree `t` stores a weight vector per leaf (vector-leaf trees).
     #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
     pub(crate) fn tree_is_vector_leaf(&self, t: usize) -> bool {

@@ -79,19 +79,23 @@ impl Booster {
             model: Arc::new(model),
         }
     }
+}
 
-    /// XGBoost's `iteration_range` as iterations: `(begin, 0)` runs through
-    /// the last iteration, and `None` is the method's `default`.
-    fn iterations(&self, range: Option<(usize, usize)>, default: Iterations) -> Iterations {
-        range.map_or(default, |(begin, end)| {
-            let end = if end == 0 {
-                self.model.num_boost_rounds()
-            } else {
-                end
-            };
-            (begin..end).into()
-        })
-    }
+/// XGBoost's `iteration_range` as iterations of `model`: `(begin, 0)` runs
+/// through the last iteration, and `None` is the method's `default`.
+pub(crate) fn iterations(
+    model: &BoostedModel,
+    range: Option<(usize, usize)>,
+    default: Iterations,
+) -> Iterations {
+    range.map_or(default, |(begin, end)| {
+        let end = if end == 0 {
+            model.num_boost_rounds()
+        } else {
+            end
+        };
+        (begin..end).into()
+    })
 }
 
 #[pymethods]
@@ -131,7 +135,7 @@ impl Booster {
         let model = &*self.model;
         let matrix = &data.inner;
         // `None`: through `best_iteration` after early stopping.
-        let iterations = self.iterations(iteration_range, Iterations::Best);
+        let iterations = iterations(model, iteration_range, Iterations::Best);
         let (values, shape) = py.detached(|| -> hessboost::error::Result<_> {
             Ok(match kind {
                 Kind::Value => dense(model.predict(matrix, iterations)?),
@@ -153,7 +157,7 @@ impl Booster {
         iteration_range: Option<(usize, usize)>,
     ) -> PyResult<Bound<'py, PyArrayDyn<i32>>> {
         // `None`: every iteration, regardless of early stopping.
-        let iterations = self.iterations(iteration_range, (..).into());
+        let iterations = iterations(&self.model, iteration_range, (..).into());
         let leaves = py.detached(|| self.model.predict_leaf(&data.inner, iterations))?;
         let (rows, trees) = (leaves.n_rows(), leaves.width());
         // The array stays `int32`, as it always was; a leaf id past it (a
@@ -176,7 +180,7 @@ impl Booster {
         iteration_range: Option<(usize, usize)>,
     ) -> PyResult<Distributions> {
         // `None`: through `best_iteration` after early stopping.
-        let iterations = self.iterations(iteration_range, Iterations::Best);
+        let iterations = iterations(&self.model, iteration_range, Iterations::Best);
         let dists = py.detached(|| self.model.predict_distribution(&data.inner, iterations))?;
         Distributions::new(dists)
     }
@@ -271,22 +275,12 @@ impl Booster {
         Ok(Self::new(model))
     }
 
-    /// Lays this model out for GPU batch prediction on Metal (macOS with
-    /// the `metal` feature and a Metal device; `gblinear` and `linear_tree`
-    /// models are refused, as they do not predict through the forest).
-    fn to_gpu(&self, py: Python<'_>) -> PyResult<GpuModel> {
-        #[cfg(target_os = "macos")]
-        {
-            let gpu = py.detached(|| self.model.to_gpu())?;
-            Ok(GpuModel::new(gpu))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (self, py);
-            Err(refuse(
-                "GPU prediction requires the `metal` feature on macOS",
-            ))
-        }
+    /// Lays this model out for GPU batch prediction on `device` (`"metal"`
+    /// on macOS, `"wgpu"` anywhere; `None`: Metal on macOS, wgpu
+    /// elsewhere). `gblinear` and `linear_tree` models are refused, as they
+    /// do not predict through the forest.
+    fn to_gpu(&self, py: Python<'_>, device: Option<&str>) -> PyResult<GpuModel> {
+        GpuModel::build(py, &self.model, device)
     }
 
     /// This model in the bit-packed compact layout (the trees prediction

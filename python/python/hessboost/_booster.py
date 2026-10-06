@@ -50,6 +50,8 @@ ImportanceType: TypeAlias = Literal["weight", "gain", "total_gain", "cover", "to
 """XGBoost's ``importance_type``: split counts, average or total gain,
 average or total cover (Hessian)."""
 
+_GpuDevice: TypeAlias = Literal["metal", "wgpu"]
+
 
 def _format_for(path: PathLike, format: ModelFormat | None) -> ModelFormat:
     """``format``, or the one ``path``'s extension names: ``.json`` native
@@ -315,19 +317,28 @@ class Booster(_SchemaState):
         )
         return model.predict(matrix, kind, iterations)
 
-    def to_gpu(self) -> GpuModel:
-        """Lays this model out for GPU batch prediction on Metal (macOS
-        only): the forest, category pools, and per-tree weights are uploaded
-        once, and each prediction call uploads its rows. Predictions are
-        bit-identical to the CPU's, and faster from roughly a few thousand
-        row-trees upward.
+    def to_gpu(self, device: _GpuDevice | None = None) -> GpuModel:
+        """Lays this model out for GPU batch prediction: the forest, category
+        pools, and per-tree weights are uploaded once, and each prediction
+        call uploads its rows. Predictions are bit-identical to the CPU's.
+
+        Args:
+            device: ``"metal"`` (macOS; faster than the CPU from roughly a
+                few thousand row-trees upward) or ``"wgpu"`` (Vulkan, Metal,
+                or DirectX 12; unmeasured on real GPUs so far, and slower
+                than the CPU on a software adapter such as Mesa's lavapipe,
+                which it picks only when there is no other). ``None``: Metal
+                on macOS, wgpu elsewhere.
 
         Raises:
-            HessboostError: No Metal device is available, or the model is a
-                ``gblinear`` or ``linear_tree`` model (which do not predict
-                through the forest).
+            HessboostError: ``device`` is unknown or cannot predict here
+                (:meth:`GpuModel.available` is ``False``; the message says
+                why: no usable GPU, or a wgpu adapter that reassociates float
+                additions, which would change the predictions), or the model
+                is a ``gblinear`` or ``linear_tree`` model (which do not
+                predict through the forest).
         """
-        return GpuModel._wrap(self._model.to_gpu(), self)
+        return GpuModel._wrap(self._model.to_gpu(device), self)
 
     def to_compact(self) -> CompactModel:
         """This model in the bit-packed compact layout (*Boosted Trees on a
@@ -546,11 +557,11 @@ class Booster(_SchemaState):
 
 
 class GpuModel:
-    """A model laid out for GPU batch prediction on Metal, from
-    :meth:`Booster.to_gpu` (macOS only). Wraps
-    ``hessboost._hessboost.GpuModel`` with the same feature-name checks as
-    :meth:`Booster.predict`; unlike a booster it holds no file state and
-    cannot be pickled.
+    """A model laid out for GPU batch prediction, from
+    :meth:`Booster.to_gpu`: on Metal (macOS) or through wgpu (Vulkan, Metal,
+    DirectX 12). Wraps ``hessboost._hessboost.GpuModel`` with the same
+    feature-name checks as :meth:`Booster.predict`; unlike a booster it
+    holds no file state and cannot be pickled.
     """
 
     __module__ = "hessboost"
@@ -573,17 +584,38 @@ class GpuModel:
         """The model this GPU predictor was built from."""
         return self._model
 
-    @staticmethod
-    def available() -> bool:
-        """Whether a Metal device with working compute pipelines is
-        available (``False`` off macOS, or on a machine with no GPU)."""
-        return _hessboost.GpuModel.available()
+    @property
+    def device(self) -> _GpuDevice:
+        """The backend this model predicts on: ``"metal"`` or ``"wgpu"``."""
+        return self._core.device
 
     @staticmethod
-    def device_name() -> str | None:
-        """The name of the Metal device predictions run on, if any (for
-        diagnostics and benchmarks)."""
-        return _hessboost.GpuModel.device_name()
+    def available(device: _GpuDevice | None = None) -> bool:
+        """Whether ``device`` (``None``: Metal on macOS, wgpu elsewhere) can
+        predict here, so that :meth:`Booster.to_gpu` lays forest models out
+        on it: for Metal, a device with working compute pipelines (``False``
+        off macOS); for wgpu, an adapter with 64-bit shader integers whose
+        float additions passed the backend's addition-order check. Training
+        with ``device`` needs the same GPU, except that wgpu also trains on
+        an adapter that fails the check. The first call per device sets its
+        backend up (picks the adapter, compiles the kernels, runs the check).
+
+        Raises:
+            HessboostError: ``device`` is not ``"metal"`` or ``"wgpu"``.
+        """
+        return _hessboost.GpuModel.available(device)
+
+    @staticmethod
+    def device_name(device: _GpuDevice | None = None) -> str | None:
+        """The name of the GPU ``device`` (``None``: Metal on macOS, wgpu
+        elsewhere) picked, if it found one (for diagnostics and benchmarks),
+        including a wgpu adapter that trains but fails the addition-order
+        check.
+
+        Raises:
+            HessboostError: ``device`` is not ``"metal"`` or ``"wgpu"``.
+        """
+        return _hessboost.GpuModel.device_name(device)
 
     def predict(
         self,

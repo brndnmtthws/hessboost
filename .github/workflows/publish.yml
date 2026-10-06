@@ -7,6 +7,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/publish.yml
+      - .github/scripts/install-lavapipe.sh
       - .github/scripts/test-wheel.sh
       - python/**
   workflow_dispatch:
@@ -112,6 +113,10 @@ jobs:
           container: ${{ matrix.container }}
           args: --release --locked --out dist
           working-directory: python
+      # Lavapipe runs the wgpu tests without a GPU (see ci.yml); the
+      # musllinux wheels' Alpine test container installs Alpine's own below.
+      - if: runner.os == 'Linux' && !matrix.musl
+        run: sh .github/scripts/install-lavapipe.sh
       # The latest-Python test runs first: "3" matches any installed 3.x, so
       # only on a runner without managed Pythons does it fetch the newest one.
       - name: Test abi3 wheel on latest Python
@@ -144,15 +149,17 @@ jobs:
       # checkout is mounted read-only, so the container cannot alter the
       # wheels uploaded below; the environment lives in /venv instead.
       # scikit-learn has no musllinux wheels, so test-wheel.sh leaves it and
-      # its tests out there.
+      # its tests out there. Alpine's lavapipe (mesa-vulkan-swrast) runs the
+      # wgpu tests, as install-lavapipe.sh does on the glibc runners.
       - name: Test musllinux wheels on Alpine
         if: ${{ matrix.musl }}
         run: |
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/io:ro" --workdir /io/python \
             --env UV_MANAGED_PYTHON --env UV_PROJECT_ENVIRONMENT=/venv --env VIRTUAL_ENV=/venv \
-            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env PYTHONDONTWRITEBYTECODE=1 --env HESSBOOST_REQUIRE_WGPU=1 \
             ghcr.io/astral-sh/uv:0.12-alpine sh -euc '
+              apk add --no-cache --quiet mesa-vulkan-swrast vulkan-loader
               sh ../.github/scripts/test-wheel.sh 3 "dist/*cp311-abi3*.whl"
               sh ../.github/scripts/test-wheel.sh 3.11 "dist/*cp311-abi3*.whl"
               sh ../.github/scripts/test-wheel.sh 3.14t "dist/*cp314-cp314t*.whl"

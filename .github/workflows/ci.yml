@@ -241,6 +241,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # Lavapipe runs tests/test_gpu.py's wgpu tests without a GPU (see the
+      # test job); with the script's HESSBOOST_REQUIRE_WGPU they fail instead
+      # of skipping when the backend is unavailable.
+      - if: runner.os == 'Linux'
+        run: sh .github/scripts/install-lavapipe.sh
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           working-directory: python

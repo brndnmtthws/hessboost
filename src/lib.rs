@@ -202,11 +202,12 @@
 //!     ([`device`](config::TrainingParams::device) = `wgpu`), runnable
 //!     without a GPU on a software adapter such as Mesa's lavapipe;
 //!     unmeasured on real GPUs so far ([`backend::wgpu`]);
-//!   - NVIDIA CUDA on Linux (`cuda` feature): bit-identical GPU histograms
+//!   - NVIDIA CUDA on Linux (`cuda` feature): bit-identical GPU training
 //!     ([`device`](config::TrainingParams::device) = `cuda`/`cuda:<n>`;
 //!     exact integer sums, `f64` chains in the CPU's order outside them),
-//!     loading the driver and NVRTC at run time. A correctness path so far
-//!     (one node at a time), not a speedup ([`backend::cuda`]).
+//!     with the tree's rows, and for the common objectives the margins and
+//!     gradients, kept on the GPU; the driver and NVRTC load at run time.
+//!     Not yet run on a real GPU ([`backend::cuda`]).
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,

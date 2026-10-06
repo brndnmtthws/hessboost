@@ -13,7 +13,7 @@ mod walk;
 
 use crate::data::ghist::GHistIndex;
 use crate::objective::GradPair;
-use crate::tree::gain::GradStats;
+use crate::tree::gain::{GradStats, RegParams};
 use rayon::prelude::*;
 use walk::{Bucket, RowValue, SweepRows, accumulate, by_features, contiguous_range};
 
@@ -78,6 +78,190 @@ pub trait HistogramBackend: Send + Sync {
     /// Backends that stage the gradients (a GPU) upload them here; the
     /// default does nothing.
     fn prepare(&self, _ghist: &GHistIndex, _gpair: &[GradPair]) {}
+
+    /// The device-resident row engine of a backend that keeps a tree's
+    /// rows on its device (a GPU), letting the hist builder partition and
+    /// build whole levels there. `None` (the default): the builder keeps
+    /// rows on the host and calls [`build`](Self::build) per node.
+    fn row_engine(&self) -> Option<&dyn RowEngine> {
+        None
+    }
+}
+
+/// A node's rows as a [`RowEngine`] keeps them: `len` ascending row ids at
+/// `offset` of the engine's row buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Segment {
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+}
+
+/// Where a split sends a row's present bin of the split feature; a missing
+/// value follows the split's `default_left`.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "cuda")),
+    allow(dead_code, reason = "only the CUDA row engine reads the rule")
+)]
+pub enum RowRule<'a> {
+    /// Feature-local bins below the limit go left.
+    Below(u32),
+    /// `left[local bin]`: a categorical split's per-bin direction.
+    Table(&'a [bool]),
+}
+
+/// One node to partition: its rows and how its split routes them.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "cuda")),
+    allow(dead_code, reason = "only the CUDA row engine reads the split")
+)]
+pub struct RowSplit<'a> {
+    pub(crate) seg: Segment,
+    pub(crate) feature: u32,
+    pub(crate) rule: RowRule<'a>,
+    pub(crate) default_left: bool,
+}
+
+/// A partitioned node: the left child holds the segment's first rows, the
+/// right child the rest, both in ascending order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Partitioned {
+    pub(crate) left: Segment,
+    pub(crate) right: Segment,
+}
+
+/// Device-resident tree growth ([`HistogramBackend::row_engine`]): a tree's
+/// rows live in one device buffer, each node a [`Segment`] of it, and the
+/// builder partitions and builds histograms a whole level at a time. Every
+/// histogram equals [`CpuBackend::build`]'s of the same rows bit for bit,
+/// and partitions are stable, so the tree is the host builder's.
+///
+/// Every method returns `None` after a device failure; the builder then
+/// regrows the tree on the host (or, when the device also holds the
+/// gradients, the trainer redoes the round on the host).
+pub trait RowEngine: Sync {
+    /// Start a tree over `rows` (ascending, distinct), with the gradients
+    /// staged ([`HistogramBackend::prepare`], or [`Self::gradients`]):
+    /// the root's segment.
+    fn begin_tree(&self, ghist: &GHistIndex, rows: &[u32]) -> Option<Segment>;
+
+    /// The statistics of `seg`'s rows, the host `sum_rows`'s blocks summed
+    /// on the device (exactly in integers where their sums are exact, else
+    /// as `f64` chains) and added in block order: the host's sum bit for
+    /// bit. `None` for non-finite gradients.
+    fn root_total(&self, seg: Segment) -> Option<GradStats>;
+
+    /// Partition each split's segment in place (stable), in one batch.
+    fn partition(&self, ghist: &GHistIndex, splits: &[RowSplit<'_>]) -> Option<Vec<Partitioned>>;
+
+    /// The histograms of the nodes, in one batch. `gpair` is the host copy
+    /// of the staged gradients, `None` when only the device has them.
+    fn histograms(
+        &self,
+        ghist: &GHistIndex,
+        gpair: Option<&[GradPair]>,
+        nodes: &[Segment],
+    ) -> Option<Vec<Histogram>>;
+
+    /// The row ids of each segment.
+    fn rows(&self, segs: &[Segment]) -> Option<Vec<Vec<u32>>>;
+
+    /// Keep `margins` (one per row) on the device for device-side rounds.
+    fn load_margins(&self, margins: &[f32]) -> Option<()>;
+
+    /// Stage `loss`'s gradients of the device margins for the next tree,
+    /// exactly as the host computes them: whether they are all finite (a
+    /// tree with non-finite gradients, or rows the device cannot reproduce,
+    /// must grow on the host).
+    fn gradients(&self, loss: DeviceLoss, labels: &[f32], weights: Option<&[f32]>) -> Option<bool>;
+
+    /// Add each leaf's value to the device margins of its rows.
+    fn add_leaf_values(&self, leaves: &[(Segment, f32)]) -> Option<()>;
+
+    /// Copy the device margins into `out`.
+    fn read_margins(&self, out: &mut [f32]) -> Option<()>;
+
+    /// Reserve `slots` device histograms for resident growth (histograms
+    /// built, subtracted, and searched where they are): `Some(false)`, with
+    /// nothing reserved, when they do not fit.
+    fn reserve_hists(&self, ghist: &GHistIndex, slots: usize) -> Option<bool>;
+
+    /// Build each `(segment, slot)` node's histogram into its slot, then
+    /// turn each `(parent, built)` pair's parent slot into the sibling
+    /// `parent - built` ([`subtract_in_place`]). `gpair` as for
+    /// [`Self::histograms`].
+    fn build_resident(
+        &self,
+        ghist: &GHistIndex,
+        gpair: Option<&[GradPair]>,
+        nodes: &[(Segment, HistSlot)],
+        siblings: &[(HistSlot, HistSlot)],
+    ) -> Option<()>;
+
+    /// The numeric split scan (`scan_numeric_splits` in
+    /// `tree::builder::split`) of every request's features on its slot's
+    /// histogram, request by request, feature by feature.
+    fn scan_resident(
+        &self,
+        ghist: &GHistIndex,
+        reg: &RegParams,
+        requests: &[ScanRequest<'_>],
+    ) -> Option<Vec<FeatureScan>>;
+
+    /// A slot's histogram, read back.
+    fn read_hist(&self, slot: HistSlot) -> Option<Histogram>;
+}
+
+/// A [`RowEngine`] histogram slot.
+pub type HistSlot = u32;
+
+/// One node's split scan on the device: its histogram's slot, statistics,
+/// `root_gain` and monotone bounds (as the scorer uses them, in `f32`), and
+/// the numeric features to scan, each with its monotone direction.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanRequest<'a> {
+    pub slot: HistSlot,
+    pub total: GradStats,
+    pub root_gain: f32,
+    pub lower: f32,
+    pub upper: f32,
+    pub features: &'a [(u32, i8)],
+}
+
+/// One feature's numeric split scan, as `scan_numeric_splits` reports it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FeatureScan {
+    /// No candidate has a finite loss change.
+    Empty,
+    /// Some candidate scored NaN: the host replays the feature.
+    Nan,
+    /// The first candidate with the largest finite loss change: in the
+    /// forward pass (bins `..= offset` left, missing right) or the backward
+    /// one (bins `>= offset` right, missing left), with that pass's
+    /// accumulated statistics (the left child's forward, the right's
+    /// backward).
+    Best {
+        loss_chg: f32,
+        backward: bool,
+        offset: u32,
+        acc: GradStats,
+    },
+}
+
+/// A loss whose gradients a [`RowEngine`] computes from its margins with
+/// the host's bits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeviceLoss {
+    /// `reg:squarederror`.
+    SquaredError { scale_pos_weight: f32 },
+    /// `reg:logistic`, `binary:logistic`, `binary:logitraw`: the host's
+    /// vector kernel over `split.rows`, its scalar path (on the host) after.
+    Logistic {
+        scale_pos_weight: f32,
+        min_hess: f32,
+        split: crate::simd::VectorSplit,
+    },
 }
 
 /// Multi-core CPU histogram backend.

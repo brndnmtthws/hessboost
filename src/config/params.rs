@@ -189,10 +189,10 @@ pub enum Device {
     /// goes through [`BoostedModel::to_wgpu`](crate::model::BoostedModel::to_wgpu).
     Wgpu,
     /// An NVIDIA GPU through CUDA, on Linux with the `cuda` feature (see
-    /// [`backend::cuda`](crate::backend::cuda)): histogram construction
-    /// runs on the GPU. A correctness path so far, not a speedup: every
-    /// node's rows are uploaded and its histogram read back, one node at a
-    /// time.
+    /// [`backend::cuda`](crate::backend::cuda)): the tree's rows stay on
+    /// the GPU, which partitions them and builds the histograms, and for
+    /// `reg:squarederror` and the logistic objectives keeps the margins and
+    /// computes the gradients too. Not yet run on a real GPU.
     Cuda {
         /// The CUDA device ordinal (XGBoost `cuda:<ordinal>`; `0` for
         /// plain `cuda`).

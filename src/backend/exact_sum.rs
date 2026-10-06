@@ -62,6 +62,26 @@ impl SumDomain {
         finite: true,
     };
 
+    /// The statistics a device folded (the CUDA `grad_domain` kernel): the
+    /// largest magnitude's bits, the smallest grain plus 150 (`u32::MAX`
+    /// when every value is zero), and whether every value is finite. The
+    /// fold is order-free, so this equals [`of`](Self::of) of the values.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "cuda")),
+        allow(dead_code, reason = "only the CUDA backend folds on the device")
+    )]
+    pub(crate) fn from_device(max_bits: u32, grain_code: u32, finite: bool) -> Self {
+        Self {
+            max: f32::from_bits(max_bits),
+            grain: if grain_code == u32::MAX {
+                i32::MAX
+            } else {
+                grain_code as i32 - 150
+            },
+            finite,
+        }
+    }
+
     /// The statistics of `values`, folded over the row chunks in parallel.
     ///
     /// The fold's result does not depend on the order — `max` of

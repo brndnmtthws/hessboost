@@ -79,6 +79,17 @@ pub(super) enum Prepared {
 }
 
 impl Prepared {
+    /// The binned index and backend of a histogram run whose backend keeps
+    /// the rows on a device (the CUDA backend), for device-resident rounds.
+    pub(super) fn device_backend(&self) -> Option<(&GHistIndex, &dyn HistogramBackend)> {
+        match self {
+            Prepared::Hist { index, backend, .. } if backend.row_engine().is_some() => {
+                Some((index, backend.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
     /// Grow one tree on `sample`, with the rows that reached each leaf when
     /// `capture_rows` (histogram and exact methods; empty otherwise). With reuse
     /// penalties (`reuse` is `Some`) the split search is penalized by the

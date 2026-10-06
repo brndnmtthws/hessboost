@@ -107,6 +107,11 @@ fn device_cuda_refuses_unsupported_combinations() {
 /// A dataset with missing values (every 13th cell) and a categorical first
 /// column, as the Metal tests use.
 fn dataset(n: usize, cols: usize, missing: bool) -> DMatrix {
+    dataset_with(n, cols, missing, true)
+}
+
+/// [`dataset`] with the first column categorical or numeric.
+fn dataset_with(n: usize, cols: usize, missing: bool, categorical: bool) -> DMatrix {
     let mut x = vec![0.0f32; n * cols];
     let mut y = vec![0.0f32; n];
     for r in 0..n {
@@ -128,7 +133,7 @@ fn dataset(n: usize, cols: usize, missing: bool) -> DMatrix {
     }
     let types: Vec<hessboost::data::FeatureType> = (0..cols)
         .map(|f| {
-            if f == 0 {
+            if f == 0 && categorical {
                 hessboost::data::FeatureType::Categorical
             } else {
                 hessboost::data::FeatureType::Numerical
@@ -370,6 +375,45 @@ fn device_cuda_training_matches_single_threaded_cpu() {
     }
     let dense = dataset(40_000, 10, false);
     let missing = dataset(40_000, 10, true);
+    let labelled = |f: fn(f32) -> f32| {
+        let y: Vec<f32> = missing.labels().unwrap().iter().map(|&v| f(v)).collect();
+        missing.clone().with_labels(&y).unwrap()
+    };
+    let binary = labelled(|v| f32::from(v >= 1.5));
+    let classes = labelled(f32::floor);
+    let numeric = dataset_with(40_000, 10, true, false);
+    // Weights, and labels of exactly 1 for `scale_pos_weight` to reweight.
+    let weights: Vec<f32> = (0..40_000).map(|i| 0.5 + (i % 7) as f32 * 0.25).collect();
+    let ones: Vec<f32> = missing
+        .labels()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| if i % 3 == 0 { 1.0 } else { v })
+        .collect();
+    let weighted = missing
+        .clone()
+        .with_labels(&ones)
+        .unwrap()
+        .with_weights(&weights)
+        .unwrap();
+    // Logistic rows: the weighted set's, binarized; an odd row count, whose
+    // last rows run the host's scalar path; and margins beyond the host
+    // vector kernel's range on some rows (those rounds grow on the host).
+    let binary_labels: Vec<f32> = ones.iter().map(|&v| f32::from(v >= 1.0)).collect();
+    let weighted_binary = weighted.clone().with_labels(&binary_labels).unwrap();
+    let odd = dataset(40_003, 10, true);
+    let odd_labels: Vec<f32> = odd
+        .labels()
+        .unwrap()
+        .iter()
+        .map(|&v| f32::from(v >= 1.5))
+        .collect();
+    let odd = odd.with_labels(&odd_labels).unwrap();
+    let far: Vec<f32> = (0..40_000)
+        .map(|i| if i % 997 == 0 { 85.0 } else { 0.0 })
+        .collect();
+    let far_margins = binary.clone().with_base_margin(&far).unwrap();
     let base = || {
         TrainingParams::builder()
             .objective(Objective::SquaredError(RegLoss::default()))
@@ -380,16 +424,36 @@ fn device_cuda_training_matches_single_threaded_cpu() {
     let monotone = vec![Monotone::None, Monotone::Increasing, Monotone::Decreasing];
     let configs: Vec<(&str, TrainingParamsBuilder, &DMatrix)> = vec![
         ("squared error", base(), &dense),
+        (
+            "weighted, scale_pos_weight",
+            base().objective(Objective::SquaredError(RegLoss::new(2.5).unwrap())),
+            &weighted,
+        ),
         ("missing values", base(), &missing),
         (
             "logistic",
             base().objective(Objective::BinaryLogistic(RegLoss::default())),
-            &missing,
+            &binary,
+        ),
+        (
+            "logistic, weighted, scale_pos_weight",
+            base().objective(Objective::BinaryLogistic(RegLoss::new(2.5).unwrap())),
+            &weighted_binary,
+        ),
+        (
+            "logistic, scalar tail",
+            base().objective(Objective::RegLogistic(RegLoss::default())),
+            &odd,
+        ),
+        (
+            "logitraw, margins past the vector range",
+            base().objective(Objective::BinaryLogitRaw(RegLoss::default())),
+            &far_margins,
         ),
         (
             "multiclass",
             base().objective(Objective::Softprob(Multiclass::new(3).unwrap())),
-            &missing,
+            &classes,
         ),
         ("subsample", base().subsample(0.7), &missing),
         (
@@ -429,7 +493,7 @@ fn device_cuda_training_matches_single_threaded_cpu() {
         (
             "symmetric",
             base().grow_policy(GrowPolicy::Symmetric),
-            &missing,
+            &numeric,
         ),
         (
             "dart",
@@ -456,6 +520,137 @@ fn device_cuda_training_matches_single_threaded_cpu() {
                 .unwrap()
         };
         assert_eq!(train_one(&cpu), train_one(&gpu), "{name}");
+    }
+}
+
+/// On numeric data, depthwise trees grow resident: histograms stay on the
+/// device, which subtracts siblings and scans every feature's splits. The
+/// models still equal single-threaded CPU training bit for bit, across the
+/// scorer's options (monotone bounds, `alpha`, `max_delta_step`,
+/// `min_child_weight`), feature restrictions (interaction constraints,
+/// column sampling), missing values, device-side rounds, and gradients so
+/// large that scans score NaN (those nodes are searched on the host).
+#[test]
+fn device_cuda_resident_search_matches_single_threaded_cpu() {
+    if !device() {
+        return;
+    }
+    let dense = dataset_with(40_000, 10, false, false);
+    let missing = dataset_with(40_000, 10, true, false);
+    let binary_labels: Vec<f32> = missing
+        .labels()
+        .unwrap()
+        .iter()
+        .map(|&v| f32::from(v >= 1.5))
+        .collect();
+    let binary = missing.clone().with_labels(&binary_labels).unwrap();
+    let weights: Vec<f32> = (0..40_000).map(|i| 0.5 + (i % 7) as f32 * 0.25).collect();
+    let weighted = missing.clone().with_weights(&weights).unwrap();
+    let huge_labels: Vec<f32> = dense.labels().unwrap().iter().map(|&v| v * 1e30).collect();
+    let huge = dense.clone().with_labels(&huge_labels).unwrap();
+    let base = || {
+        TrainingParams::builder()
+            .objective(Objective::SquaredError(RegLoss::default()))
+            .tree_method(TreeMethod::Hist)
+            .max_depth(6)
+            .eta(0.3)
+    };
+    let monotone = vec![Monotone::Increasing, Monotone::None, Monotone::Decreasing];
+    let configs: Vec<(&str, TrainingParamsBuilder, &DMatrix)> = vec![
+        ("dense", base(), &dense),
+        ("missing values", base(), &missing),
+        (
+            "logistic",
+            base().objective(Objective::BinaryLogistic(RegLoss::default())),
+            &binary,
+        ),
+        ("weighted", base(), &weighted),
+        ("monotone", base().monotone_constraints(monotone), &missing),
+        (
+            "alpha, lambda, max_delta_step, min_child_weight",
+            base()
+                .alpha(0.5)
+                .lambda(2.0)
+                .max_delta_step(MaxDeltaStep::Bounded(0.5))
+                .min_child_weight(3.0),
+            &missing,
+        ),
+        (
+            "interaction",
+            base().interaction_constraints(vec![vec![0, 1, 2], vec![3, 4]]),
+            &missing,
+        ),
+        (
+            "column sampling",
+            base()
+                .colsample_bytree(0.8)
+                .colsample_bylevel(0.8)
+                .colsample_bynode(0.8),
+            &missing,
+        ),
+        ("depth 1", base().max_depth(1), &missing),
+        ("NaN scans", base(), &huge),
+    ];
+    for (name, builder, data) in configs {
+        let cpu = builder.clone().build().unwrap();
+        let gpu = builder.device(CUDA).build().unwrap();
+        let train_one = |params: &TrainingParams| {
+            common::with_threads(1, || train(params, data, 8).unwrap())
+                .encode(ModelFormat::Binary)
+                .unwrap()
+        };
+        assert_eq!(train_one(&cpu), train_one(&gpu), "{name}");
+    }
+}
+
+/// At 300,000 rows every large node is summed in many chunks and the
+/// partition spans many tiles per node: training there (dense and with
+/// missing values, exact and inexact gradients, subsampled, depthwise and
+/// loss-guided) still reproduces the CPU model bit for bit.
+#[test]
+fn device_cuda_training_matches_cpu_at_scale() {
+    if !device() {
+        return;
+    }
+    let dense = dataset_with(300_000, 8, false, false);
+    let missing = dataset(300_000, 8, true);
+    let y: Vec<f32> = missing
+        .labels()
+        .unwrap()
+        .iter()
+        .map(|&v| f32::from(v >= 1.5))
+        .collect();
+    let binary = missing.clone().with_labels(&y).unwrap();
+    let base = || {
+        TrainingParams::builder()
+            .objective(Objective::SquaredError(RegLoss::default()))
+            .tree_method(TreeMethod::Hist)
+            .max_depth(7)
+            .eta(0.3)
+    };
+    let logistic = || base().objective(Objective::BinaryLogistic(RegLoss::default()));
+    let configs: Vec<(&str, TrainingParamsBuilder, &DMatrix)> = vec![
+        ("dense", base(), &dense),
+        ("dense subsample", base().subsample(0.6), &dense),
+        ("missing", base(), &missing),
+        ("logistic", logistic(), &binary),
+        ("logistic subsample", logistic().subsample(0.5), &binary),
+        (
+            "lossguide",
+            logistic().grow_policy(GrowPolicy::LossGuide).max_leaves(48),
+            &binary,
+        ),
+    ];
+    for (name, builder, data) in configs {
+        let cpu = builder.clone().build().unwrap();
+        let gpu = builder.device(CUDA).build().unwrap();
+        let bytes = |params: &TrainingParams| {
+            train(params, data, 4)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
+        };
+        assert_eq!(bytes(&cpu), bytes(&gpu), "{name}");
     }
 }
 

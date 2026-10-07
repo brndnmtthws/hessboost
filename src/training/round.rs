@@ -384,6 +384,10 @@ pub(super) fn grow_round(
 }
 
 /// What the boosting rounds do to the ensemble.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one plan per training run, on the stack: boxing the builder state saves nothing"
+)]
 pub(super) enum RoundPlan {
     /// Grow new trees with the prepared builder state.
     Grow(Prepared),

@@ -278,7 +278,13 @@ impl Booster {
     /// Upload the forest to Metal, wgpu or CUDA (Linux). CUDA uses `ordinal`.
     /// Default selection remains Metal on macOS, wgpu elsewhere.
     #[pyo3(signature = (device=None, *, backend=None, ordinal=0))]
-    fn to_gpu(&self, py: Python<'_>, device: Option<&str>, backend: Option<&str>, ordinal: usize) -> PyResult<GpuModel> {
+    fn to_gpu(
+        &self,
+        py: Python<'_>,
+        device: Option<&str>,
+        backend: Option<&str>,
+        ordinal: usize,
+    ) -> PyResult<GpuModel> {
         GpuModel::build(py, &self.model, device, backend, ordinal)
     }
 

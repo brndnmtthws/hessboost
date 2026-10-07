@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use std::ops::Range;
 
 #[cfg(all(target_os = "linux", feature = "cuda"))]
-static NEXT_IDENTITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Backing storage for bin indices, in the narrowest width that fits.
 #[derive(Debug, Clone)]
@@ -101,7 +101,7 @@ pub enum Bins<'a> {
 pub struct GHistIndex {
     /// Immutable content identity, retained by clones and across moves.
     #[cfg(all(target_os = "linux", feature = "cuda"))]
-    identity: u32,
+    identity: u64,
     n_rows: usize,
     n_cols: usize,
     row_ptr: Vec<usize>,
@@ -223,14 +223,9 @@ impl GHistIndex {
         };
 
         GHistIndex {
+            // 2^64 indexes: never exhausted.
             #[cfg(all(target_os = "linux", feature = "cuda"))]
-            identity: NEXT_IDENTITY
-                .fetch_update(
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                    |id| id.checked_add(1),
-                )
-                .expect("binned index identity exhausted"),
+            identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             n_rows,
             n_cols,
             row_ptr,
@@ -295,7 +290,7 @@ impl GHistIndex {
     }
 
     #[cfg(all(target_os = "linux", feature = "cuda"))]
-    pub(crate) fn identity(&self) -> u32 {
+    pub(crate) fn identity(&self) -> u64 {
         self.identity
     }
 

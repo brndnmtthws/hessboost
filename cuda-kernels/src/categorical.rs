@@ -199,8 +199,9 @@ pub unsafe fn scan_categorical(
 ) {
     static mut CHAIN: SharedArray<F64x2, { SCAN_WARPS * 2 * CAT_SET_BINS as usize }> =
         SharedArray::UNINIT;
-    // SAFETY: the caller's; each warp owns its chain row, written by lane 0
-    // and read by the lanes between warp barriers every lane reaches.
+    // SAFETY: the caller's; each warp owns its chain row, staged by its
+    // lanes, chained by lane 0 and read by the lanes, each step between
+    // warp barriers every lane reaches.
     unsafe {
         let lane = thread::threadIdx_x() & 31;
         let warp_index = thread::threadIdx_x() >> 5;
@@ -232,6 +233,20 @@ pub unsafe fn scan_categorical(
                 let depth = len.min(64);
                 let steps = if onehot { 0 } else { depth - 1 };
                 let (mut mg, mut mh) = (0.0f64, 0.0f64);
+                if !onehot {
+                    // The chains' bins in key order (prefix, then suffix),
+                    // staged by every lane, each loading its `order` entry
+                    // and bin in parallel; lane 0 then chains them in place,
+                    // its serial adds waiting on no global load.
+                    let mut i = lane;
+                    while i < 2 * steps {
+                        let k = if i < steps { i } else { len - 1 - (i - steps) };
+                        let index = ld(order, workspace + u64::from(k));
+                        st(chain, u64::from(i), ld(bins, u64::from(index)));
+                        i += 32;
+                    }
+                    warp::sync_mask(FULL);
+                }
                 if lane == 0 {
                     if onehot {
                         let (mut g, mut h) = (0.0f64, 0.0f64);
@@ -250,12 +265,11 @@ pub unsafe fn scan_categorical(
                             let (mut g, mut h) = (0.0f64, 0.0f64);
                             let mut step = 0;
                             while step < steps {
-                                let k = if pass == 1 { len - 1 - step } else { step };
-                                let index = ld(order, workspace + u64::from(k));
-                                let bin = ld(bins, u64::from(index));
+                                let at = u64::from(pass * steps + step);
+                                let bin = ld(chain, at);
                                 g = g + bin.x;
                                 h = h + bin.y;
-                                st(chain, u64::from(pass * steps + step), F64x2 { x: g, y: h });
+                                st(chain, at, F64x2 { x: g, y: h });
                                 step += 1;
                             }
                             pass += 1;

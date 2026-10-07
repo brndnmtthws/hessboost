@@ -884,18 +884,20 @@ NaN sorting/scoring semantics explicitly replay the affected node on CPU.
 `BoostedModel::to_cuda(ordinal)` provides independent CUDA prediction;
 transforms and the existing model-shrinkage convention remain on the CPU.
 
-**Required CUDA tests passed on an NVIDIA L40S**, compute capability 8.9,
-driver 595.91.07, on 2026-10-06: 3 lifecycle/fallback regressions and all
-10 CUDA integration tests, with `HESSBOOST_REQUIRE_CUDA=1`. Source and
-kernel checksums matched revision `3c6e5b8`. This verifies the exercised
-CPU bit-parity and determinism cases, not throughput or optimal occupancy.
-The three regressions and resident numeric split/gradient parity scenario
-also passed Compute Sanitizer `memcheck`, `racecheck`, `synccheck`, and
-`initcheck`: zero reported errors, hazards, or warnings in these scenarios.
-Full CUDA integration-suite `memcheck` also passed (10/10, zero errors),
-and histogram construction across all strategies passed `racecheck`
-with zero hazards or warnings.
-Compiling with NVRTC alone does not establish those runtime properties.
+**Required CUDA tests passed on an NVIDIA L40S** with the earlier CUDA C++
+kernels (the Rust kernels' qualification is under "Rust kernels"),
+compute capability 8.9, driver 595.91.07, on 2026-10-06: 3
+lifecycle/fallback regressions and all 10 CUDA integration tests, with
+`HESSBOOST_REQUIRE_CUDA=1`. Source and kernel checksums matched revision
+`3c6e5b8`. This verifies the exercised CPU bit-parity and determinism
+cases, not throughput or optimal occupancy. The three regressions and
+resident numeric split/gradient parity scenario also passed Compute
+Sanitizer `memcheck`, `racecheck`, `synccheck`, and `initcheck`: zero
+reported errors, hazards, or warnings in these scenarios. Full CUDA
+integration-suite `memcheck` also passed (10/10, zero errors), and
+histogram construction across all strategies passed `racecheck` with zero
+hazards or warnings. Compilation alone does not establish those runtime
+properties.
 The 512-thread histogram blocks and shared-memory budget remain starting
 configurations, not measured optima. Pinned uploads retain completion
 events before reuse or destruction; row readbacks use separate cacheable staging.
@@ -934,10 +936,86 @@ whole batch. Categorical splits, multiclass/vector leaves, DART weights,
 base margins, iteration ranges, and tree-order `f32` accumulation retain
 CPU bits. Linear models are refused as with other GPU predictors.
 
-Python Linux wheels load CUDA/NVRTC dynamically; neither is bundled.
+Python Linux wheels load the CUDA driver dynamically and embed the kernels'
+PTX; no CUDA toolkit is bundled or needed.
 Use `booster.to_gpu(backend="cuda", ordinal=0)` and
 `GpuModel.available(backend="cuda", ordinal=0)`; the previous Metal/wgpu
 defaults and positional `device` argument remain unchanged.
+
+### Rust kernels (cuda-oxide)
+
+The kernels are Rust: the `cuda-kernels/` crate, compiled to PTX for
+`sm_75` by [cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/)
+(revision `6921d3e`, `nightly-2026-08-28`, `--no-fmad`) and embedded as two
+modules, `training.ptx` (51 kernels) and `prediction.ptx` (2). They
+replaced the CUDA C++ kernels that NVRTC compiled at run time with the
+same entry points, parameters, launch geometry and arithmetic order, so the
+host code, the exactness argument and the measurements in the later
+subsections carry over. Three differ in memory access only: the numeric
+and categorical split scans stage each window of bins in shared memory
+with every lane before lane 0 chains them in order (the C++ lane 0 loaded
+each bin itself, one global load per serial step), and the row scatter
+scans its per-warp counts with warp shuffles rather than every thread
+summing them. The driver JIT-compiles a module the first time a process
+on the machine loads it and caches the machine code; NVRTC and the CUDA
+toolkit are no longer needed at run time, and `build.sh` refuses PTX
+holding an approximate, flush-to-zero or contractible floating-point
+instruction.
+
+**Required CUDA tests passed on the L40S** (compute capability 8.9,
+driver 595.91.07, CUDA 13.2, g6e.8xlarge, Rust 1.99.0) on 2026-10-07, with
+`HESSBOOST_REQUIRE_CUDA=1`: `cargo nextest run --features cuda --release`
+ran 821 tests, all passing, among them every `backend::cuda` unit test and
+all of `tests/cuda.rs` and `tests/cuda_prediction.rs` (CPU bit parity for
+every histogram strategy and bin width, CSR storage, resident numeric and
+categorical search, at-scale and single-threaded training, determinism,
+concurrent training and prediction, and prediction with categorical
+splits, DART, multiclass and subnormal leaves). Python passed 436 tests;
+`tests/test_gpu.py` passed 15 (every CUDA case; Metal and wgpu skip on that
+host). Compute Sanitizer's `memcheck`, `racecheck`, `synccheck` and
+`initcheck` each ran those 33 CUDA test cases (13 integration, 6
+prediction, 14 unit) with zero errors and zero hazards.
+
+Criterion's CUDA groups (`cargo bench --features cuda --bench training --
+'^cuda_'`), the CUDA C++ kernels (`05c0bb6`) against the Rust ones, through
+`scripts/compare_benchmarks.py` on 8 Rayon threads: baseline, candidate,
+candidate, baseline, each a 1 s warmup and 10 samples over 3 s; the mean of
+each version's two medians. The CPU rows run identical code in both and
+bound the noise (up to 2.8% in one half of a pair):
+
+| Benchmark | CUDA C++ | Rust (cuda-oxide) | Change |
+|---|---:|---:|---:|
+| Histogram build, 1M × 30 | 1.112 ms | 0.830 ms | −25.4% |
+| Histogram build, 10M × 30 | 10.20 ms | 7.467 ms | −26.8% |
+| Train 1M × 30, 20 depth-8 rounds | 325.5 ms | 330.5 ms | +1.5% |
+| Categorical training, 200k × 30 | 89.72 ms | 91.65 ms | +2.2% |
+| Lossguide training, 200k × 30 | 328.9 ms | 320.4 ms | −2.6% |
+| CSR training, 200k × 30 | 96.06 ms | 97.62 ms | +1.6% |
+| Predict 500k × 30, 100 depth-6 trees | 8.241 ms | 8.169 ms | −0.9% |
+
+Both halves of each paired run agree in sign for every CUDA row. Per
+launch (Nsight Systems, the lossguide case), `scan_splits` takes 42.1 µs
+against the C++ kernel's 44.9 µs (52.4 µs before its bins were staged) and
+`route_scatter` 5.63 µs against 7.23 µs; with 200 categories on the second
+feature, staging cuts `scan_categorical` from 17.9 to 16.0 µs.
+
+First use in a fresh process (context creation and module load; the
+prediction column includes uploading a five-tree forest; median of three
+processes):
+
+| First use | NVRTC C++ | cuda-oxide, JIT cache empty | cuda-oxide, cached |
+|---|---:|---:|---:|
+| Training backend | 138 ms | 604 ms | 81 ms |
+| `to_cuda` (prediction) | 192 ms | 182 ms | 156 ms |
+
+NVRTC compiled the training kernels in every process (its very first run
+took 1.41 s); the driver JIT-compiles each PTX module once per machine and
+driver (`~/.nv/ComputeCache`). Splitting out the prediction module keeps a
+prediction-only process from compiling the training kernels: as one
+module, a cold `to_cuda` took about 0.71 s.
+
+The subsections below predate the Rust kernels: their qualification runs
+and measurements used the CUDA C++ kernels.
 
 ### Resident search, compact sparse storage, and prediction
 
@@ -1012,10 +1090,12 @@ choose CPU when this workload is latency-sensitive. Sparse memory
 improvements similarly do not guarantee a speedup for every shape. Keep
 transfer/setup costs inside end-to-end training and prediction timings.
 The comparison harness rejects sticky CUDA fallback and checks XGBoost's
-effective device; its reports hash every `.cu` runtime compilation input.
+effective device; its reports hash the executable, which embeds the
+kernels' PTX.
 
-Linux CI requires NVRTC compilation while remaining GPU-independent.
-Python's local extension cache includes CUDA source inputs. Release
+Linux CI rebuilds the kernels' PTX with cuda-oxide and assembles it for
+every supported architecture while remaining GPU-independent. Python's
+local extension cache includes the embedded PTX. Release
 artifacts were built as wheel and sdist; installed consumers without a
 CUDA driver could import, train on CPU, and obtain the documented CUDA
 availability/refusal results. An actual manylinux 2.28 aarch64 wheel was

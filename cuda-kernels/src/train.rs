@@ -1256,8 +1256,11 @@ pub unsafe fn route_scatter(
         while base < end {
             let i = base + u64::from(tid);
             let valid = i < end;
-            let r = if valid { ld(rows, off + i) } else { 0 };
-            let left = valid && ld(flags, off + i) != 0;
+            let (r, left) = if valid {
+                (ld(rows, off + i), ld(flags, off + i) != 0)
+            } else {
+                (0, false)
+            };
             let lmask = warp::ballot_sync(FULL, left);
             let vmask = warp::ballot_sync(FULL, valid);
             if lane == 0 {
@@ -1265,18 +1268,32 @@ pub unsafe fn route_scatter(
                 st(warp_valid, u64::from(warp), vmask.count_ones());
             }
             thread::sync_threads();
-            let (mut lbefore, mut rbefore, mut ltotal, mut rtotal) = (0u32, 0u32, 0u32, 0u32);
-            let mut w = 0;
-            while w < warps {
-                let (l, v) = (ld(warp_left, u64::from(w)), ld(warp_valid, u64::from(w)));
-                if w < warp {
-                    lbefore += l;
-                    rbefore += v - l;
+            // Every warp scans the per-warp counts itself (lane `w` holds
+            // warp `w`'s) with shuffles: the earlier warps' left and right
+            // counts and the round's totals, without another barrier.
+            let (l, v) = if lane < warps {
+                (
+                    ld(warp_left, u64::from(lane)),
+                    ld(warp_valid, u64::from(lane)),
+                )
+            } else {
+                (0, 0)
+            };
+            let (mut lsum, mut rsum) = (l, v - l);
+            let mut delta = 1;
+            while delta < 32 {
+                let up_l = warp::shuffle_up_sync(FULL, lsum, delta);
+                let up_r = warp::shuffle_up_sync(FULL, rsum, delta);
+                if lane >= delta {
+                    lsum += up_l;
+                    rsum += up_r;
                 }
-                ltotal += l;
-                rtotal += v - l;
-                w += 1;
+                delta <<= 1;
             }
+            let lbefore = warp::shuffle_sync(FULL, lsum - l, warp);
+            let rbefore = warp::shuffle_sync(FULL, rsum - (v - l), warp);
+            let ltotal = warp::shuffle_sync(FULL, lsum, 31);
+            let rtotal = warp::shuffle_sync(FULL, rsum, 31);
             if left {
                 let rank = lbefore + (lmask & below).count_ones();
                 st(scratch, left_at + u64::from(rank), r);
@@ -1575,8 +1592,9 @@ pub unsafe fn scan_splits(
     acc: *mut F64x2,
 ) {
     static mut CHAIN: SharedArray<F64x2, { SCAN_WARPS * 32 }> = SharedArray::UNINIT;
-    // SAFETY: the caller's; each warp owns its chain row, written by lane 0
-    // and read by the lanes between warp barriers every lane reaches.
+    // SAFETY: the caller's; each warp owns its chain row, staged by its
+    // lanes, chained by lane 0 and read by the lanes, each step between
+    // warp barriers every lane reaches.
     unsafe {
         let lane = thread::threadIdx_x() & 31;
         let w = thread::threadIdx_x() >> 5;
@@ -1620,11 +1638,20 @@ pub unsafe fn scan_splits(
                 let mut base = 0;
                 while base < len {
                     let n = (len - base).min(32) as u32;
+                    // The window's bins, staged in shared memory by every
+                    // lane (one coalesced load each), then chained in order
+                    // in place by lane 0: its serial adds wait on no global
+                    // load.
+                    if lane < n {
+                        let at = base + u64::from(lane);
+                        let b = ld(bins, if backward { len - 1 - at } else { at });
+                        st(chain, u64::from(lane), b);
+                    }
+                    warp::sync_mask(FULL);
                     if lane == 0 {
                         let mut i = 0;
                         while i < n {
-                            let at = base + u64::from(i);
-                            let b = ld(bins, if backward { len - 1 - at } else { at });
+                            let b = ld(chain, u64::from(i));
                             g = g + b.x;
                             h = h + b.y;
                             st(chain, u64::from(i), F64x2 { x: g, y: h });

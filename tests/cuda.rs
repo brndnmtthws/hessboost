@@ -708,6 +708,54 @@ fn device_cuda_training_is_deterministic() {
     assert!(cuda::available(), "{:?}", cuda::unavailable_reason());
 }
 
+/// The warp scan must preserve the first tied candidate, missing-value
+/// direction, and partial windows for features wider than one warp.
+#[test]
+fn resident_scan_ragged_bins_and_duplicate_feature_ties_match_cpu() {
+    if !device() {
+        return;
+    }
+    let n = 20_003;
+    for (max_bin, cardinality, missing) in [(17, 13, false), (33, 67, true), (257, 521, true)] {
+        let mut values = Vec::with_capacity(n * 3);
+        let mut labels = Vec::with_capacity(n);
+        for row in 0..n {
+            let x = ((row * 31) % cardinality) as f32;
+            let x = if missing && row % 11 == 0 {
+                f32::NAN
+            } else {
+                x
+            };
+            // Identical features make cross-feature ties exact, while the
+            // first feature's bins have unequal row counts and short tails.
+            values.extend([x, x, (row % 7) as f32]);
+            labels.push(if x.is_nan() { -3.0 } else { (x / 8.0).floor() });
+        }
+        let data = DMatrix::from_dense(&values, n, 3)
+            .unwrap()
+            .with_labels(&labels)
+            .unwrap();
+        let base = TrainingParams::builder()
+            .tree_method(TreeMethod::Hist)
+            .max_bin(max_bin)
+            .max_depth(5)
+            .eta(0.2);
+        let cpu = base.clone().build().unwrap();
+        let gpu = base.device(CUDA).build().unwrap();
+        let fit = |params: &TrainingParams| {
+            common::with_threads(1, || train(params, &data, 5).unwrap())
+                .encode(ModelFormat::Binary)
+                .unwrap()
+        };
+        assert_eq!(
+            fit(&cpu),
+            fit(&gpu),
+            "bins={max_bin}, cardinality={cardinality}, missing={missing}"
+        );
+        assert!(cuda::available(), "{:?}", cuda::unavailable_reason());
+    }
+}
+
 /// Training on a device ordinal that does not exist fails with a GPU error
 /// instead of falling back silently.
 #[test]

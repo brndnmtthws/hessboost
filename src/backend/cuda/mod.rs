@@ -119,6 +119,8 @@ const HIST_THREADS: u32 = 512;
 const PART_TILE: usize = 4096;
 /// Threads per partition block.
 const PART_THREADS: u32 = 512;
+/// Warps per split-scan block (`SCAN_WARPS` in `kernels.cu`).
+const SCAN_WARPS: usize = 4;
 /// Rows per histogram tile of an exact node.
 const HIST_TILE: usize = 4096;
 /// Largest shared histogram per block; XGBoost's single-target limit.
@@ -2348,10 +2350,15 @@ impl RowEngine for CudaHistBackend {
                 .arg(&dense)
                 .arg(&mut state.scan_meta)
                 .arg(&mut state.scan_acc);
-            // SAFETY: one thread per task; each names a request, a feature
-            // below `n_cols` (whose bins `feature_first` bounds) and a pool
-            // slot, and writes its own result words.
-            unsafe { launch.launch(Device::one_per(n_tasks)) }?;
+            let config = LaunchConfig {
+                grid_dim: (n_tasks.div_ceil(SCAN_WARPS).max(1) as u32, 1, 1),
+                block_dim: ((32 * SCAN_WARPS) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: a whole warp per feature task, with warp-local shared
+            // scratch; all lanes follow the same task bounds and pass order.
+            // Lane 0 writes that task's result words.
+            unsafe { launch.launch(config) }?;
             let mut meta = vec![0u32; n_tasks * 4];
             let mut acc = vec![0f64; n_tasks * 2];
             stream.memcpy_dtoh(&state.scan_meta.slice(..meta.len()), &mut meta)?;

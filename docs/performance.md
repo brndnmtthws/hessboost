@@ -844,6 +844,80 @@ be scheduled. Profile these transfers and host synchronization in Nsight
 Systems before assuming one synchronization per level. Host evaluation
 sets and logistic scalar tails can add more synchronization.
 
+### Warp-parallel split scoring
+
+The 2026-10-06 L40S audit compared baseline `18022de` with warp-parallel
+candidate scoring. One warp owns a feature: lane 0 retains the CPU's
+sequential `f64` prefix/suffix chains, lanes score independent candidates,
+and the reduction chooses the largest finite score then earliest candidate
+position. Any NaN still triggers host replay. This restores the tuned scan
+from the original worktree without reverting the later runtime-safety fixes.
+
+Nsight Systems on dense regression, 1M × 30, 30 depth-8 rounds (two fits,
+one warmup), found `scan_splits` used 89.2% of baseline kernel time.
+Across the same 480 launches its time fell from 514.6 ms to 44.6 ms
+(11.5×). Histogram time stayed at 37.1 ms. A selected 480-feature launch
+changed from two 256-thread blocks to 120 128-thread blocks; Nsight
+Compute measured 1.14 ms versus 44.64 µs, with SM compute throughput
+1.13% versus 49.05%. Profiler replay timings are not end-to-end timings.
+
+Unprofiled end-to-end results below include cut generation, binning,
+device setup/uploads and training; input generation and model encoding
+are outside the timer. L40S, driver 595.91.07, g6e.4xlarge, Rust 1.98.1,
+8 Rayon threads, 30 rounds, depth 8, max 64 leaves, 256 bins, seed 1234.
+Order: baseline/candidate/candidate/baseline, each process discarding
+one warmup and retaining three fits; median of six fits per version.
+Encoded-model hashes matched on every fit of each workload.
+
+| Workload | Baseline | Warp scorer | Speedup |
+|---|---:|---:|---:|
+| Squared error, dense, 1M × 30 | 640.4 ms | 405.0 ms | 1.58× |
+| Logistic, ~7.7% missing, 1M × 30 | 940.4 ms | 504.1 ms | 1.87× |
+| Squared error, dense, 10M × 30 | 3.858 s | 3.604 s | 1.07× |
+| Squared error, lossguide, 1M × 30 | 712.0 ms | 712.9 ms | 1.00× |
+
+The updated implementation passed all 11 required CUDA integration tests
+and the 3 runtime regressions on the L40S. Resident split parity and the
+new ragged-bin/duplicate-feature-tie cases passed `memcheck`, `racecheck`,
+`synccheck`, and `initcheck`, with zero errors, hazards, or warnings.
+
+These synthetic results are not a universal optimum or an XGBoost
+comparison. Lossguide still searches on the host. On a selected histogram
+launch, Nsight Compute reported 40 registers/thread, zero spills, 32 KiB
+dynamic shared memory, 100% theoretical and 89% achieved occupancy.
+Increasing occupancy is not the first tuning target for that launch;
+measure memory traffic, atomics, and tail effects instead. Preprocessing,
+host descriptor submission, partition-count readback and per-feature
+winner transfers remain opportunities, especially once scanning is faster.
+
+At 10M rows, Nsight Systems recorded 690.5 ms of GPU kernel time across
+two 30-round fits (345.2 ms per fit) against about 3.60 s total fit time.
+Histograms were 59.2% of kernel time; split scans only 6.5%. This shows
+host/setup/submission work dominates total time at that shape; reducing
+device kernel time alone cannot remove the remaining roughly 3.25 s.
+The trace does not isolate all of that remainder as quantile sketching.
+
+### NVIDIA and open-source design references
+
+- Follow NVIDIA's [profile-first APOD workflow](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#assess-parallelize-optimize-deploy)
+  and [Ada resource limits](https://docs.nvidia.com/cuda/ada-tuning-guide/index.html#occupancy):
+  occupancy, registers, shared memory and throughput must be measured together.
+- [XGBoost's CUDA evaluator](https://github.com/dmlc/xgboost/blob/v3.4.2/src/tree/gpu_hist/evaluate_splits.cu)
+  parallelizes feature candidates; [feature grouping](https://github.com/dmlc/xgboost/blob/v3.4.2/src/tree/gpu_hist/feature_groups.cuh)
+  privatizes histograms in shared memory. Borrow that parallel structure,
+  not its different gradient-quantization contract.
+- [LightGBM's CUDA split finder](https://github.com/lightgbm-org/LightGBM/blob/master/src/treelearner/cuda/cuda_best_split_finder.cu)
+  distributes bins and best-gain reductions across threads. Its floating
+  scans and atomics are not substitutes for our CPU-order chains.
+- [CCCL/CUB scans](https://github.com/NVIDIA/cccl/blob/main/cub/cub/device/device_scan.cuh)
+  suit associative integer partition counts. Reproducibility is not
+  equivalence to sequential CPU rounding; generic floating scans/reductions
+  would violate the histogram and split-prefix contract.
+- [RAPIDS FIL](https://github.com/NVIDIA/cuml/blob/branch-25.04/cpp/src/fil/infer.cu)
+  and [nvForest](https://github.com/rapidsai/nvforest/blob/7d7c1a70ac89b797ecaf46aea6772b13a5ba047c/cpp/include/nvforest/detail/infer_kernel/gpu.cuh)
+  provide batching and cached-input ideas for future CUDA prediction,
+  not histogram-training implementations or ordered ensemble-sum oracles.
+
 On the target instance, require the device tests so missing CUDA cannot
 pass vacuously:
 

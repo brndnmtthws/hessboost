@@ -668,21 +668,23 @@ __device__ __forceinline__ float scan_score(double lg, double lh, double rg, dou
     return valid && monotone ? chg : -__int_as_float(0x7f800000);
 }
 
-// One thread per task `(request, feature, slot, dir)`: the feature's
-// numeric scan in `scan_batched`'s order (the forward pass, then the
-// backward one when the feature has missing values in the node), keeping
-// the first candidate with the largest finite loss change. `meta` gets
-// `(status: 0 empty, 1 best, 2 NaN; bin offset; loss bits; backward)`,
-// `acc` the winning pass's accumulated statistics.
-extern "C" __global__ void scan_splits(const double2* __restrict__ pool,
-                                       const u32* __restrict__ feature_first, u64 total_bins,
-                                       const u32* __restrict__ tasks, u64 n_tasks,
-                                       const double2* __restrict__ totals,
-                                       const float* __restrict__ params, double lambda,
-                                       double alpha, double max_delta_step,
-                                       double min_child_weight, int dense,
-                                       u32* __restrict__ meta, double2* __restrict__ acc) {
-    GRID_STRIDE(t, n_tasks) {
+// Warps per split-scan block (`SCAN_WARPS` in `mod.rs`).
+#define SCAN_WARPS 4
+
+// One warp per feature. Lane 0 forms the CPU's sequential prefix/suffix
+// chain, then all lanes score independent candidates. Reduction keeps the
+// largest finite loss, then the earliest position (forward before backward).
+// An arbitrary parallel floating-point scan would change the CPU's bits.
+extern "C" __global__ void __launch_bounds__(32 * SCAN_WARPS)
+    scan_splits(const double2* __restrict__ pool, const u32* __restrict__ feature_first,
+                u64 total_bins, const u32* __restrict__ tasks, u64 n_tasks,
+                const double2* __restrict__ totals, const float* __restrict__ params,
+                double lambda, double alpha, double max_delta_step, double min_child_weight,
+                int dense, u32* __restrict__ meta, double2* __restrict__ acc) {
+    __shared__ double2 chain[SCAN_WARPS][32];
+    const u32 lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const u64 warps = (u64)gridDim.x * SCAN_WARPS;
+    for (u64 t = (u64)blockIdx.x * SCAN_WARPS + w; t < n_tasks; t += warps) {
         u32 request = tasks[4 * t], f = tasks[4 * t + 1], slot = tasks[4 * t + 2];
         ScanReg r;
         r.lambda = lambda;
@@ -693,52 +695,72 @@ extern "C" __global__ void scan_splits(const double2* __restrict__ pool,
         r.lower = params[3 * request + 1];
         r.upper = params[3 * request + 2];
         r.dir = (int)tasks[4 * t + 3];
-        double2 total = totals[request];
-        u32 first = feature_first[f], len = feature_first[f + 1] - first;
+        const double2 total = totals[request];
+        const u32 first = feature_first[f], len = feature_first[f + 1] - first;
         const double2* bins = pool + (u64)slot * total_bins + first;
         float best = -__int_as_float(0x7f800000);
-        u32 status = 0, at = 0, backward = 0;
+        u64 pos = ~0ull;
         double best_g = 0.0, best_h = 0.0;
+        bool nan = false;
         double g = 0.0, h = 0.0;
-        for (u32 k = 0; k < len && status != 2; ++k) {
-            double2 b = bins[k];
-            g = g + b.x;
-            h = h + b.y;
-            float l = scan_score(g, h, total.x - g, total.y - h, r);
-            if (isnan(l)) {
-                status = 2;
-            } else if (l > best && isfinite(l)) {
-                best = l;
-                at = k;
-                best_g = g;
-                best_h = h;
-                status = 1;
+        for (int backward = 0; backward < 2; ++backward) {
+            if (backward) {
+                const double fg = __shfl_sync(FULL_MASK, g, 0);
+                const double fh = __shfl_sync(FULL_MASK, h, 0);
+                if (dense || (fg == total.x && fh == total.y)) break;
+                g = 0.0;
+                h = 0.0;
             }
-        }
-        if (status != 2 && !(dense || (g == total.x && h == total.y))) {
-            double sg = 0.0, sh = 0.0;
-            for (u32 k = 0; k < len && status != 2; ++k) {
-                double2 b = bins[len - 1 - k];
-                sg = sg + b.x;
-                sh = sh + b.y;
-                float l = scan_score(total.x - sg, total.y - sh, sg, sh, r);
-                if (isnan(l)) {
-                    status = 2;
-                } else if (l > best && isfinite(l)) {
-                    best = l;
-                    at = len - 1 - k;
-                    best_g = sg;
-                    best_h = sh;
-                    status = 1;
-                    backward = 1;
+            for (u64 base = 0; base < len; base += 32) {
+                const u32 n = len - base < 32 ? (u32)(len - base) : 32;
+                if (lane == 0) {
+                    for (u32 i = 0; i < n; ++i) {
+                        double2 b = bins[backward ? len - 1 - (base + i) : base + i];
+                        g = g + b.x;
+                        h = h + b.y;
+                        chain[w][i] = make_double2(g, h);
+                    }
                 }
+                __syncwarp();
+                if (lane < n) {
+                    const double2 a = chain[w][lane];
+                    const float l = backward
+                                        ? scan_score(total.x - a.x, total.y - a.y, a.x, a.y, r)
+                                        : scan_score(a.x, a.y, total.x - a.x, total.y - a.y, r);
+                    if (isnan(l)) {
+                        nan = true;
+                    } else if (l > best && isfinite(l)) {
+                        best = l;
+                        pos = (backward ? (u64)len : 0) + base + lane;
+                        best_g = a.x;
+                        best_h = a.y;
+                    }
+                }
+                __syncwarp();
             }
         }
-        meta[4 * t] = status;
-        meta[4 * t + 1] = at;
-        meta[4 * t + 2] = __float_as_uint(best);
-        meta[4 * t + 3] = backward;
-        acc[t] = make_double2(best_g, best_h);
+        for (int o = 16; o > 0; o >>= 1) {
+            const float other_best = __shfl_down_sync(FULL_MASK, best, o);
+            const u64 other_pos = __shfl_down_sync(FULL_MASK, pos, o);
+            const double other_g = __shfl_down_sync(FULL_MASK, best_g, o);
+            const double other_h = __shfl_down_sync(FULL_MASK, best_h, o);
+            if (other_best > best || (other_best == best && other_pos < pos)) {
+                best = other_best;
+                pos = other_pos;
+                best_g = other_g;
+                best_h = other_h;
+            }
+        }
+        nan = __any_sync(FULL_MASK, nan);
+        if (lane == 0) {
+            const bool found = pos != ~0ull;
+            const bool backward = found && pos >= len;
+            meta[4 * t] = nan ? 2u : (found ? 1u : 0u);
+            meta[4 * t + 1] = found ? (u32)(backward ? 2ull * len - 1 - pos : pos) : 0u;
+            meta[4 * t + 2] = __float_as_uint(best);
+            meta[4 * t + 3] = backward ? 1u : 0u;
+            acc[t] = make_double2(best_g, best_h);
+        }
     }
 }
 

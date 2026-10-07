@@ -275,6 +275,11 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   binned index is matched by immutable identity (moves and clones retain
   it), not aggregate shape. A fresh margin run invalidates cached labels
   and weights. GPU parity tests reject sticky runtime fallback.
+  Numeric split search assigns one warp per feature: lane 0 forms exact
+  CPU-order prefix/suffix chains, lanes score candidates independently,
+  and argmax keeps score then earliest forward/backward position. All
+  lanes participate in warp synchronization, including ragged bin tails;
+  any NaN still triggers host replay.
 - **CPU summation order:** `tree::hist::sum_order` depends on a node's row
   count alone (a chain below 8,192 rows, else `len / 4096` blocks reduced
   in block order), for every index layout, the feature sweeps, and the

@@ -18,8 +18,12 @@
 //! rayon's global pool: `RAYON_NUM_THREADS`, else the CPU count.
 //!
 //! Installing from a thread outside the pool hands the closure to a pool
-//! thread; work that never touches rayon detaches with plain
-//! `Python::detach` instead.
+//! thread and waits for it; work that never touches rayon detaches with
+//! plain `Python::detach` instead. A thread of the pool itself (installed
+//! work, or a Python callback that work runs) must not hand work to the
+//! pool from another thread and wait: every pool thread may be waiting on
+//! the caller, so the work would never start. [`on_pool_thread`] identifies
+//! pool threads so callers can run such work inline.
 
 use crate::errors::refuse;
 use pyo3::exceptions::PyOSError;
@@ -97,4 +101,16 @@ fn current() -> PyResult<&'static ThreadPool> {
 /// Runs `f` inside this process's pool, so its rayon work runs there.
 pub(crate) fn install<T: Send>(f: impl FnOnce() -> T + Send) -> PyResult<T> {
     Ok(current()?.install(f))
+}
+
+/// Whether the current thread is one of this process's pool threads,
+/// running installed work or a Python callback of it. Such a thread runs
+/// nested work inline: it is already in the pool, and work it queued there
+/// could wait for this very thread.
+pub(crate) fn on_pool_thread() -> bool {
+    SLOTS
+        .get(GENERATION.load(Ordering::Acquire))
+        .filter(|slot| slot.owner.load(Ordering::Acquire) == std::process::id())
+        .and_then(|slot| slot.threads.get())
+        .is_some_and(|threads| threads.current_thread_index().is_some())
 }

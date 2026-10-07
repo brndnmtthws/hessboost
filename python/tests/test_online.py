@@ -182,7 +182,7 @@ rng = np.random.default_rng(0)
 x = rng.normal(size=(300, 4))
 y = x[:, 0] - x[:, 1]
 online = OnlineModel.train(
-    {"tree_method": "hist", "max_depth": 3}, DMatrix(x, y), 6, mode=MODE
+    {"tree_method": "hist", "max_depth": 3, "nthread": NTHREAD}, DMatrix(x, y), 6, mode=MODE
 )
 seen = []
 
@@ -207,17 +207,27 @@ print("ok")
 """
 
 
+@pytest.mark.parametrize("nthread", [0, 2])
 @pytest.mark.parametrize("mode", MODES)
-def test_access_from_the_update_callback_fails_fast(mode: OnlineMode) -> None:
+def test_access_from_the_update_callback_fails_fast(mode: OnlineMode, nthread: int) -> None:
     """Reading the model or data, or updating again, from an update's own
     callback raises instead of deadlocking; the row count and mode stay
-    readable. Run in a subprocess, so a deadlock fails the test by timeout."""
+    readable. Runs in a subprocess on a one-thread pool, so a deadlock fails
+    the test by timeout. The callback holds that pool's only thread, or,
+    with ``nthread``, a thread of the update's own pool, for which the only
+    pool thread waits."""
+    import os
     import subprocess
     import sys
 
-    code = _REENTRANT.replace("MODE", repr(mode))
+    code = _REENTRANT.replace("MODE", repr(mode)).replace("NTHREAD", str(nthread))
     done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=False
+        [sys.executable, "-c", code],
+        env={**os.environ, "RAYON_NUM_THREADS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "ok"

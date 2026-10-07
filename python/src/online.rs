@@ -8,7 +8,7 @@ use crate::train::{Failure, run_hooked};
 use hessboost::training::online;
 use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
 /// `(nodes_kept, subtrees_regrown, rows_refreshed)`.
@@ -16,15 +16,43 @@ type Report = (usize, usize, usize);
 
 /// A model with its training data and update state. The one class with
 /// mutable state: an update changes it in place (copying the per-node
-/// histograms would cost more than the update) under a mutex that is never
-/// waited for: while an update holds it (its callback included), reading
-/// the model or data and starting another update fail fast instead of
-/// deadlocking on it. The row count is readable throughout.
+/// histograms would cost more than the update) under a mutex. An update is
+/// admitted on its caller's thread, before any of its work is scheduled
+/// (`updating`); while one is admitted, reading the model or data and
+/// starting another update fail fast, from any thread or the update's own
+/// callback, instead of waiting behind it. The admitted update waits only
+/// for a read in progress, which holds the mutex briefly. The row count is
+/// readable throughout.
 #[pyclass(frozen, module = "hessboost._hessboost")]
 pub struct OnlineModel {
     state: Mutex<online::OnlineModel>,
+    /// Whether an update is admitted: set before its work is scheduled,
+    /// cleared once it returns.
+    updating: AtomicBool,
     /// The committed data's row count.
     rows: AtomicUsize,
+}
+
+/// An admitted update; dropping it ends the admission.
+struct Admission<'a>(&'a AtomicBool);
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The refusal of an access while an update is admitted.
+fn being_updated() -> PyErr {
+    refuse(
+        "the online model is being updated (from another thread or this update's callback); \
+         its model, data and updates are available once the update returns",
+    )
+}
+
+/// The refusal of every access after an update panicked.
+fn poisoned() -> PyErr {
+    refuse("an earlier update of this online model panicked; its state is unknown")
 }
 
 /// An update mode (`online::OnlineParams`): `exact()` or `approximate(tolerance)`.
@@ -53,22 +81,37 @@ impl OnlineModel {
     fn new(online: online::OnlineModel) -> Self {
         Self {
             rows: AtomicUsize::new(online.data().n_rows()),
+            updating: AtomicBool::new(false),
             state: Mutex::new(online),
         }
     }
 
-    /// The state, unless an update holds it. A poisoned lock (a panic
-    /// mid-update) leaves the state unknown, so it is refused from then on.
+    /// Admits an update unless one is admitted already, deciding on the
+    /// caller's thread before any of the update's work is scheduled: a
+    /// second update is refused at once instead of queued behind the first.
+    fn admit(&self) -> PyResult<Admission<'_>> {
+        self.updating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| being_updated())?;
+        Ok(Admission(&self.updating))
+    }
+
+    /// The state for a read, unless an update is admitted or holds it. A
+    /// poisoned lock (a panic mid-update) leaves the state unknown, so it is
+    /// refused from then on.
     fn try_state(&self) -> PyResult<MutexGuard<'_, online::OnlineModel>> {
+        if self.updating.load(Ordering::Acquire) {
+            return Err(being_updated());
+        }
         self.state.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => refuse(
-                "the online model is being updated (from another thread or this update's \
-                 callback); its model, data and updates are available once the update returns",
-            ),
-            TryLockError::Poisoned(_) => {
-                refuse("an earlier update of this online model panicked; its state is unknown")
-            }
+            TryLockError::WouldBlock => being_updated(),
+            TryLockError::Poisoned(_) => poisoned(),
         })
+    }
+
+    /// The state for the admitted update, after any read in progress.
+    fn admitted_state(&self) -> PyResult<MutexGuard<'_, online::OnlineModel>> {
+        self.state.lock().map_err(|_| poisoned())
     }
 
     /// `read` of the state, detached.
@@ -152,8 +195,9 @@ impl OnlineModel {
             .collect::<PyResult<Vec<_>>>()?;
         let additions = additions.map(|matrix| &matrix.inner);
         let failure = Failure::default();
+        let _admitted = self.admit()?;
         let (result, stopped) = run_hooked(py, on_round, &failure, |mut hook, gate| {
-            let mut state = match self.try_state() {
+            let mut state = match self.admitted_state() {
                 Ok(state) => state,
                 Err(error) => return (Err(error), false),
             };

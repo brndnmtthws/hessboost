@@ -100,20 +100,31 @@ fn check_dense(data: &[f32], n_rows: usize, n_cols: usize, missing: f32) -> Resu
         .checked_mul(n_cols)
         .ok_or_else(|| HessboostError::invalid_data("data", "n_rows * n_cols overflows usize"))?;
     check_len("dense data length", data.len(), expected)?;
-    let parallel = data.len() >= PARALLEL_COPY_VALUES && rayon::current_num_threads() > 1;
-    let invalid = if parallel {
-        data.par_chunks(PARALLEL_BLOCK)
-            .any(|chunk| rejects_dense(chunk, missing))
-    } else {
-        rejects_dense(data, missing)
-    };
-    if invalid {
+    if rejects_dense_values(data, missing) {
         return Err(HessboostError::invalid_data(
             "data",
             "non-missing feature values must be finite",
         ));
     }
-    Ok(parallel)
+    Ok(parallel_values(data.len()))
+}
+
+/// Whether `len` dense values are scanned and copied in parallel.
+fn parallel_values(len: usize) -> bool {
+    len >= PARALLEL_COPY_VALUES && rayon::current_num_threads() > 1
+}
+
+/// Whether dense `values` hold what a dense matrix with the `missing`
+/// sentinel refuses (a non-missing value that is not finite), in parallel
+/// blocks for large inputs. Shared with the predictions of borrowed rows.
+pub(crate) fn rejects_dense_values(values: &[f32], missing: f32) -> bool {
+    if parallel_values(values.len()) {
+        values
+            .par_chunks(PARALLEL_BLOCK)
+            .any(|chunk| rejects_dense(chunk, missing))
+    } else {
+        rejects_dense(values, missing)
+    }
 }
 
 /// Whether `values` holds a non-missing value that is not finite. With the

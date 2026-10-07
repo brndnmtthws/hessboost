@@ -7,11 +7,13 @@ pub(crate) mod ghist;
 mod loaders;
 mod meta;
 pub(crate) mod quantile;
+mod rows;
 mod sketch;
 mod sort;
 pub mod target_stats;
 
 pub use dmatrix::DMatrix;
-pub(crate) use dmatrix::{check_len, is_missing};
+pub(crate) use dmatrix::{check_len, is_missing, rejects_dense_values};
 pub use loaders::{CsvOptions, load_csv, load_libsvm, read_csv, read_libsvm};
 pub use meta::{FeatureType, GroupInfo, LabelBounds, Labels, MetaInfo};
+pub(crate) use rows::Rows;

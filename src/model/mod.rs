@@ -380,7 +380,7 @@ pub(crate) use transform::Transform;
 pub(crate) use validate::{check_objective_width, validate_prediction_data};
 
 use self::serde::UncheckedBoostedModel;
-use crate::data::DMatrix;
+use crate::data::{DMatrix, Rows};
 use crate::ebm::EbmInfo;
 use crate::error::{HessboostError, Result};
 use crate::inference::BoulevardInfo;
@@ -612,9 +612,9 @@ impl LinearModel {
 /// Invoke `f(feature, value)` for each present feature of `row` in feature
 /// order. Shared by the gblinear training and prediction paths; arithmetic
 /// stays at each call site to preserve exact conversion points.
-pub(crate) fn for_each_present_value(data: &DMatrix, row: usize, mut f: impl FnMut(usize, f32)) {
-    for feat in 0..data.n_cols() {
-        if let Some(x) = data.get(row, feat) {
+pub(crate) fn for_each_present_value(rows: Rows<'_>, row: usize, mut f: impl FnMut(usize, f32)) {
+    for feat in 0..rows.n_cols() {
+        if let Some(x) = rows.get(row, feat) {
             f(feat, x);
         }
     }
@@ -740,7 +740,7 @@ impl BoostedModel {
     /// ensembles.
     pub(crate) fn for_each_linear_contribution(
         &self,
-        data: &DMatrix,
+        rows: Rows<'_>,
         row: usize,
         mut f: impl FnMut(usize, usize, f64),
     ) {
@@ -748,7 +748,7 @@ impl BoostedModel {
             return;
         };
         let k = self.n_outputs();
-        for_each_present_value(data, row, |feat, x| {
+        for_each_present_value(rows, row, |feat, x| {
             for c in 0..k {
                 f(feat, c, f64::from(lm.weights[feat * k + c]) * f64::from(x));
             }
@@ -765,7 +765,7 @@ impl BoostedModel {
     /// gradients from the ensemble minus its dropout set. Output is laid out
     /// `[instance][output]`.
     pub(crate) fn predict_margin_dropout(&self, data: &DMatrix, dropped: &[bool]) -> Vec<f32> {
-        let mut out = self.initial_margins(data);
+        let mut out = self.initial_margins(data.into());
         // Dropped trees contribute a zero weight, leaving per-cell accumulation
         // in ascending tree order (a `0.0` addend is a no-op).
         let weight = |ti: usize| {
@@ -775,7 +775,7 @@ impl BoostedModel {
                 self.tree_weight(ti)
             }
         };
-        self.accumulate_forest(data, &mut out, 0..self.trees.len(), weight);
+        self.accumulate_forest(data.into(), &mut out, 0..self.trees.len(), weight);
         out
     }
 
@@ -971,12 +971,12 @@ impl BoostedModel {
         (0..self.trees.len()).any(|i| self.tree_weight(i) != 1.0)
     }
 
-    /// Margin buffer for `data`: the per-output intercepts broadcast to every
+    /// Margin buffer for `rows`: the per-output intercepts broadcast to every
     /// row, overridden by the dataset's per-instance `base_margin` when
     /// present (one value per row, or one per row and output). Shared by
     /// prediction, TreeSHAP, and the training margin caches.
-    pub(crate) fn initial_margins(&self, data: &DMatrix) -> Vec<f32> {
-        initial_margins(&self.base_score, data)
+    pub(crate) fn initial_margins(&self, rows: Rows<'_>) -> Vec<f32> {
+        initial_margins(&self.base_score, rows)
     }
 
     /// Validated prologue for the TreeSHAP paths over the iterations in
@@ -1009,7 +1009,7 @@ impl BoostedModel {
             nf,
             width: nf + 1,
             trees,
-            initial: self.initial_margins(data),
+            initial: self.initial_margins(data.into()),
         })
     }
 

@@ -259,7 +259,7 @@ fn train_trees<'a>(
     {
         prepared.resume_approx_cache(
             &run.ctx,
-            &state.model.margin_from_trees(dtrain, 0..0),
+            &state.model.margin_from_trees(dtrain.into(), 0..0),
             &mut state.gpair,
             &mut state.gpair_k,
             n_out,
@@ -346,7 +346,7 @@ fn train_linear(
         params,
         dtrain,
         num_boost_round,
-        model.margin_from_trees(dtrain, 0..0),
+        model.margin_from_trees(dtrain.into(), 0..0),
         objective,
         model.linear(),
         &mut |iteration| report.finish_round(iteration, None),

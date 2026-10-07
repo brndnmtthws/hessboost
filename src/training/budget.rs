@@ -361,7 +361,7 @@ fn train_budget_inner(
     let weights = dtrain.weights();
     let weight_of = |r: usize| weights.map_or(1.0, |w| f64::from(w[r]));
     let row_loss = |r: usize, margin: f32| weight_of(r) * loss_fn(margin, labels[r]);
-    let mut margins = model.initial_margins(dtrain);
+    let mut margins = model.initial_margins(dtrain.into());
     let mut loss: Vec<f64> = (0..n).map(|r| row_loss(r, margins[r])).collect();
     let average = |loss: &[f64]| loss.iter().sum::<f64>() / n.max(1) as f64;
 

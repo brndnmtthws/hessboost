@@ -266,6 +266,18 @@ fn rows_predict_what_every_batch_predicts() {
                 bits(batch.as_slice()),
                 "{name}: transform"
             );
+            let borrowed = model.predict_rows(&x, iterations).unwrap();
+            assert_eq!(
+                bits(borrowed.as_slice()),
+                bits(batch.as_slice()),
+                "{name}: rows"
+            );
+            let borrowed = model.predict_margin_rows(&x, iterations).unwrap();
+            assert_eq!(
+                bits(borrowed.as_slice()),
+                bits(margins.as_slice()),
+                "{name}: rows"
+            );
 
             let (mut row_margins, mut row_values) = (vec![0.0; k], vec![0.0; width]);
             for (r, row) in x.chunks(n_cols).enumerate() {
@@ -342,11 +354,25 @@ fn malformed_rows_and_outputs_are_refused() {
     wrong(model.predict_margin_row_into(row, Iterations::Best, &mut out[..1]));
     wrong(model.transform_margins_into(&[0.0; 4], &mut [0.0; 3]));
     wrong(model.transform_margins_into(&[0.0; 6], &mut [0.0; 3]));
+    match model.predict_rows(&x[..9], Iterations::Best) {
+        Err(HessboostError::DimensionMismatch { .. }) => {}
+        other => panic!("expected a dimension mismatch, got {other:?}"),
+    }
+    assert_eq!(
+        model.predict_rows(&[], Iterations::Best).unwrap().n_rows(),
+        0
+    );
     let mut infinite = row.to_vec();
     infinite[2] = f32::NEG_INFINITY;
     assert_eq!(
         invalid_data(model.predict_row_into(&infinite, Iterations::Best, &mut out)),
         ("row", None)
+    );
+    let mut rows = x[..12].to_vec();
+    rows[10] = f32::INFINITY;
+    assert_eq!(
+        invalid_data(model.predict_margin_rows(&rows, Iterations::Best)),
+        ("rows", None)
     );
     // Three probabilities per row: the scalar methods name the `_into` ones.
     assert_eq!(

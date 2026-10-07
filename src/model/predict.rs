@@ -1,6 +1,5 @@
 use super::{BoostedModel, Predictions, Shrinkage, Transform, shrink_margins};
-use crate::data::DMatrix;
-use crate::data::check_len;
+use crate::data::{DMatrix, Rows, check_len, rejects_dense_values};
 use crate::error::{HessboostError, Result};
 use crate::objective::Objective;
 use crate::objective::distributional::Dist;
@@ -55,18 +54,18 @@ impl<R: RangeBounds<usize>> From<R> for Iterations {
 }
 
 impl BoostedModel {
-    /// Margins from the trees `trees` (tree ids) without validating `data`.
+    /// Margins from the trees `trees` (tree ids) without validating `rows`.
     pub(crate) fn margin_from_trees(
         &self,
-        data: &DMatrix,
+        rows: Rows<'_>,
         trees: std::ops::Range<usize>,
     ) -> Vec<f32> {
-        let n = data.n_rows();
+        let n = rows.n_rows();
         let k = self.n_outputs();
         // Initialize from the dataset's per-instance base margin when present
         // (it overrides the per-output intercepts, matching XGBoost); otherwise
         // use the trained global bias.
-        let mut out = self.initial_margins(data);
+        let mut out = self.initial_margins(rows);
         // A gblinear model predicts from its linear parameters and ignores the
         // (empty) tree ensemble: margin(row, k) = base_score[k] + bias[k] +
         // Σ_f weights[f][k] * x[row, f], with missing features contributing 0.
@@ -76,7 +75,7 @@ impl BoostedModel {
                 for (m, &b) in margin.iter_mut().zip(&lm.bias) {
                     *m += b;
                 }
-                self.for_each_linear_contribution(data, row, |_f, c, v| {
+                self.for_each_linear_contribution(rows, row, |_f, c, v| {
                     margin[c] += v as f32;
                 });
             };
@@ -91,7 +90,7 @@ impl BoostedModel {
             }
             return out;
         }
-        self.accumulate_forest(data, &mut out, trees, |ti| self.tree_weight(ti));
+        self.accumulate_forest(rows, &mut out, trees, |ti| self.tree_weight(ti));
         out
     }
 
@@ -104,7 +103,7 @@ impl BoostedModel {
     /// constant leaf values only.
     pub(super) fn accumulate_forest(
         &self,
-        data: &DMatrix,
+        rows: Rows<'_>,
         out: &mut [f32],
         trees: std::ops::Range<usize>,
         weight: impl Fn(usize) -> f32 + Sync,
@@ -112,7 +111,7 @@ impl BoostedModel {
         let k = self.n_outputs();
         if self.has_vector_leaves() {
             self.traverse_blocks(
-                data,
+                rows,
                 out,
                 k,
                 trees.clone(),
@@ -133,7 +132,7 @@ impl BoostedModel {
                 &self.trees,
                 trees,
                 |t| self.tree_output(t),
-                data,
+                rows,
                 out,
                 k,
                 weight,
@@ -142,7 +141,7 @@ impl BoostedModel {
         }
         let parallel = self.num_parallel_tree;
         self.traverse_blocks(
-            data,
+            rows,
             out,
             k,
             trees.clone(),
@@ -162,7 +161,7 @@ impl BoostedModel {
         );
     }
 
-    /// Block-parallel traversal of the trees in `trees` over `data`, writing
+    /// Block-parallel traversal of the trees in `trees` over `rows`, writing
     /// into `out` laid out `[row][stride]`: `row_op` handles one loaded row of
     /// the small-batch path, `tree_op` one tree over a loaded block of rows.
     /// Tiny batches (online serving) skip the thread pool and overlap the
@@ -171,17 +170,17 @@ impl BoostedModel {
     /// tree walks them, with blocks running in parallel.
     fn traverse_blocks<T: Send>(
         &self,
-        data: &DMatrix,
+        rows: Rows<'_>,
         out: &mut [T],
         stride: usize,
         trees: std::ops::Range<usize>,
         row_op: impl Fn(&RowBlock, &CompactForest, usize, &mut [T]),
         tree_op: impl Fn(&RowBlock, &CompactForest, usize, usize, &mut [T], usize) + Sync,
     ) {
-        let n = data.n_rows();
+        let n = rows.n_rows();
         let forest = self.compact_forest();
         if n < LANES {
-            let mut block = RowBlock::new(data);
+            let mut block = RowBlock::new(rows);
             block.load(0, n);
             for (r, out_row) in out.chunks_exact_mut(stride).enumerate() {
                 row_op(&block, forest, r, out_row);
@@ -191,7 +190,7 @@ impl BoostedModel {
         out.par_chunks_mut(PREDICT_BLOCK_ROWS * stride)
             .enumerate()
             .for_each_init(
-                || RowBlock::new(data),
+                || RowBlock::new(rows),
                 |block, (bi, out_block)| {
                     let start = bi * PREDICT_BLOCK_ROWS;
                     let rows = out_block.len() / stride;
@@ -425,7 +424,7 @@ impl BoostedModel {
     /// [`Self::predict_margin`] does.
     fn row_request(&self, row: &[f32], iterations: Iterations) -> Result<Range<usize>> {
         check_len("prediction feature count", row.len(), self.n_features)?;
-        if row.iter().any(|v| v.is_infinite()) {
+        if rejects_dense_values(row, f32::NAN) {
             return Err(HessboostError::invalid_data(
                 "row",
                 "non-missing feature values must be finite",
@@ -617,7 +616,7 @@ impl BoostedModel {
             return Ok(Predictions::new(out, n, t));
         }
         self.traverse_blocks(
-            data,
+            data.into(),
             &mut out,
             t,
             0..t,
@@ -658,12 +657,91 @@ impl BoostedModel {
         iterations: impl Into<Iterations>,
     ) -> Result<Predictions> {
         self.validate_prediction_data(data)?;
-        let iterations = self.margin_iterations(iterations.into())?;
+        self.margins_of(data.into(), iterations.into())
+    }
+
+    /// The margins of the checked `rows` from `iterations`, as
+    /// [`Self::predict_margin`] defines them.
+    fn margins_of(&self, rows: Rows<'_>, iterations: Iterations) -> Result<Predictions> {
+        let iterations = self.margin_iterations(iterations)?;
         let values = match &self.shrinkage {
-            Some(shrinkage) => self.shrunk_margins(shrinkage, data, iterations.end),
-            None => self.margin_from_trees(data, self.iteration_trees(iterations)),
+            Some(shrinkage) => self.shrunk_margins(shrinkage, rows, iterations.end),
+            None => self.margin_from_trees(rows, self.iteration_trees(iterations)),
         };
-        Ok(Predictions::new(values, data.n_rows(), self.n_outputs()))
+        Ok(Predictions::new(values, rows.n_rows(), self.n_outputs()))
+    }
+
+    /// The margins of rows of feature values, read in place: `rows` is
+    /// row-major, [`Self::n_features`] values per row, `NaN` for a missing
+    /// one. Bit for bit [`Self::predict_margin`] of a matrix of them from
+    /// [`DMatrix::from_dense`], without copying them into one (the batch
+    /// counterpart of [`Self::predict_margin_row_into`]); no rows give no
+    /// margins.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] when `rows` is not whole rows,
+    /// [`HessboostError::InvalidData`] (`rows`) for an infinite value, plus
+    /// the errors of [`Self::predict_margin`] for `iterations`.
+    pub fn predict_margin_rows(
+        &self,
+        rows: &[f32],
+        iterations: impl Into<Iterations>,
+    ) -> Result<Predictions> {
+        let rows = self.dense_rows(rows)?;
+        self.margins_of(rows, iterations.into())
+    }
+
+    /// The predictions of rows of feature values, read in place (as
+    /// [`Self::predict_margin_rows`] reads them): bit for bit
+    /// [`Self::predict`] of a matrix of them, without copying them into one.
+    ///
+    /// ```
+    /// use hessboost::prelude::*;
+    ///
+    /// # fn main() -> Result<()> {
+    /// let x: Vec<f32> = (0..40).map(|i| i as f32).collect();
+    /// let dtrain = DMatrix::from_dense(&x, 20, 2)?.with_labels(&x[..20])?;
+    /// let model = train(&TrainingParams::default(), &dtrain, 3)?;
+    /// let rows = [1.0, f32::NAN, 7.5, 3.0];
+    /// let matrix = DMatrix::from_dense(&rows, 2, 2)?;
+    /// assert_eq!(
+    ///     model.predict_rows(&rows, Iterations::Best)?,
+    ///     model.predict(&matrix, Iterations::Best)?,
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::predict_margin_rows`].
+    pub fn predict_rows(
+        &self,
+        rows: &[f32],
+        iterations: impl Into<Iterations>,
+    ) -> Result<Predictions> {
+        Ok(self.transform_margins(self.predict_margin_rows(rows, iterations)?))
+    }
+
+    /// Check borrowed dense rows: whole rows of the model's features, every
+    /// value finite or `NaN` (what a dense matrix accepts).
+    fn dense_rows<'a>(&self, values: &'a [f32]) -> Result<Rows<'a>> {
+        let n_cols = self.n_features;
+        if !values.len().is_multiple_of(n_cols) {
+            return Err(HessboostError::dimension_mismatch(
+                "rows (whole rows of the model's features)",
+                values.len().next_multiple_of(n_cols),
+                values.len(),
+            ));
+        }
+        if rejects_dense_values(values, f32::NAN) {
+            return Err(HessboostError::invalid_data(
+                "rows",
+                "non-missing feature values must be finite",
+            ));
+        }
+        Ok(Rows::Dense { values, n_cols })
     }
 
     /// The iterations of a margin prediction ([`Self::resolve_iterations`]),
@@ -690,10 +768,10 @@ impl BoostedModel {
     /// [`Shrinkage::start_margins`], every iteration shrinks every margin
     /// ([`shrink_margins`]) and then adds its trees, each once per cell in
     /// tree order (the blocked traversal keeps that order per cell).
-    fn shrunk_margins(&self, shrinkage: &Shrinkage, data: &DMatrix, k: usize) -> Vec<f32> {
-        let mut out = shrinkage.start_margins(data);
-        self.shrink_and_add(shrinkage, data, &mut out, 0..k);
-        shrinkage.finish_margins(data, &mut out);
+    fn shrunk_margins(&self, shrinkage: &Shrinkage, rows: Rows<'_>, k: usize) -> Vec<f32> {
+        let mut out = shrinkage.start_margins(rows);
+        self.shrink_and_add(shrinkage, rows, &mut out, 0..k);
+        shrinkage.finish_margins(rows, &mut out);
         out
     }
 
@@ -705,7 +783,7 @@ impl BoostedModel {
     fn shrink_and_add(
         &self,
         shrinkage: &Shrinkage,
-        data: &DMatrix,
+        rows: Rows<'_>,
         out: &mut [f32],
         iterations: Range<usize>,
     ) {
@@ -724,7 +802,7 @@ impl BoostedModel {
                     &self.trees,
                     i * per..(i + 1) * per,
                     |t| self.tree_output(t),
-                    data,
+                    rows,
                     out,
                     n_out,
                     unit,
@@ -734,7 +812,7 @@ impl BoostedModel {
             let vector = self.has_vector_leaves();
             let parallel = self.num_parallel_tree;
             self.traverse_blocks(
-                data,
+                rows,
                 out,
                 n_out,
                 trees,
@@ -776,23 +854,24 @@ impl BoostedModel {
     /// does.
     pub(crate) fn prefix_margins(&self, data: &DMatrix, ends: &[usize]) -> Result<Vec<f32>> {
         self.validate_prediction_data(data)?;
+        let rows = Rows::from(data);
         let cells = data.n_rows() * self.n_outputs();
         let mut margins = Vec::with_capacity(ends.len() * cells);
         let mut start = 0;
         if let Some(shrinkage) = &self.shrinkage {
-            let mut out = shrinkage.start_margins(data);
+            let mut out = shrinkage.start_margins(rows);
             for &end in ends {
-                self.shrink_and_add(shrinkage, data, &mut out, start..end);
+                self.shrink_and_add(shrinkage, rows, &mut out, start..end);
                 let member = margins.len();
                 margins.extend_from_slice(&out);
-                shrinkage.finish_margins(data, &mut margins[member..]);
+                shrinkage.finish_margins(rows, &mut margins[member..]);
                 start = end;
             }
         } else {
-            let mut out = self.initial_margins(data);
+            let mut out = self.initial_margins(rows);
             for &end in ends {
                 let trees = self.iteration_trees(start..end);
-                self.accumulate_forest(data, &mut out, trees, |ti| self.tree_weight(ti));
+                self.accumulate_forest(rows, &mut out, trees, |ti| self.tree_weight(ti));
                 margins.extend_from_slice(&out);
                 start = end;
             }
@@ -865,14 +944,14 @@ impl BoostedModel {
     }
 }
 
-/// Margin buffer for `data` (`[row][output]`): the per-output intercepts
+/// Margin buffer for `rows` (`[row][output]`): the per-output intercepts
 /// `base_score` broadcast to every row, overridden by the dataset's
 /// per-instance `base_margin` when present (one value per row, or one per row
 /// and output). Shared by every model representation that predicts.
-pub(crate) fn initial_margins(base_score: &[f32], data: &DMatrix) -> Vec<f32> {
-    let n = data.n_rows();
+pub(crate) fn initial_margins(base_score: &[f32], rows: Rows<'_>) -> Vec<f32> {
+    let n = rows.n_rows();
     let k = base_score.len();
-    match data.base_margin() {
+    match rows.base_margin() {
         Some(bm) if bm.len() == n * k => bm.to_vec(),
         Some(bm) if bm.len() == n => bm.iter().flat_map(|&m| std::iter::repeat_n(m, k)).collect(),
         _ => {
@@ -944,26 +1023,31 @@ pub(super) enum RowBlock<'a> {
 
 impl<'a> RowBlock<'a> {
     /// Blocks for batch traversal: wide CSR matrices stay sparse.
-    fn new(data: &'a DMatrix) -> Self {
-        Self::build(data, Densify::UpTo(MAX_DENSIFY_COLS))
+    fn new(rows: Rows<'a>) -> Self {
+        Self::build(rows, Densify::UpTo(MAX_DENSIFY_COLS))
     }
 
     /// Blocks that are loaded one row at a time and always expose a dense row
     /// (for per-row algorithms such as TreeSHAP whose cost per row already
     /// scales with the feature count).
-    pub(super) fn single_rows(data: &'a DMatrix) -> Self {
-        Self::build(data, Densify::Always)
+    pub(super) fn single_rows(rows: Rows<'a>) -> Self {
+        Self::build(rows, Densify::Always)
     }
 
-    fn build(data: &'a DMatrix, densify: Densify) -> Self {
+    fn build(rows: Rows<'a>, densify: Densify) -> Self {
+        let view = |data, n_cols| RowBlock::View {
+            data,
+            n_cols,
+            start: 0,
+            lanes: Vec::new(),
+        };
+        let data = match rows {
+            Rows::Dense { values, n_cols } => return view(values, n_cols),
+            Rows::Matrix(data) => data,
+        };
         let n_cols = data.n_cols();
         match data.dense_values() {
-            Some(dense) if data.missing().is_nan() => RowBlock::View {
-                data: dense,
-                n_cols,
-                start: 0,
-                lanes: Vec::new(),
-            },
+            Some(dense) if data.missing().is_nan() => view(dense, n_cols),
             None if matches!(densify, Densify::UpTo(max) if n_cols > max) => {
                 RowBlock::Wide { data, start: 0 }
             }

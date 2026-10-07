@@ -390,6 +390,88 @@ impl GHistIndex {
         let (s, e) = (self.row_ptr[r], self.row_ptr[r + 1]);
         self.store.find(s, e, fs, fe)
     }
+
+    /// Every feature's bin in every row (`[f][r]`), local to the feature
+    /// (`0` up to its bin count) and `u32::MAX` where the row lacks it: from
+    /// the feature-major copy when the index keeps one, else from one pass
+    /// over the rows.
+    pub(crate) fn feature_columns(&self) -> Vec<Vec<u32>> {
+        let starts: Vec<u32> = (0..self.n_cols)
+            .map(|f| self.cuts.feature_bins(f).0 as u32)
+            .collect();
+        let (store, missing) = match &self.columns {
+            Columns::Dense(store) => (store, false),
+            Columns::WithMissing(store) => (store, true),
+            Columns::None => {
+                let owner = bin_features(&self.cuts);
+                return match &self.store {
+                    BinStore::U16(bins) => rows_to_columns(bins, &self.row_ptr, &owner, &starts),
+                    BinStore::U32(bins) => rows_to_columns(bins, &self.row_ptr, &owner, &starts),
+                };
+            }
+        };
+        let n = self.n_rows;
+        (0..self.n_cols)
+            .into_par_iter()
+            .map(|f| match store {
+                BinStore::U16(v) => local_bins(
+                    &v[f * n..(f + 1) * n],
+                    starts[f],
+                    missing.then_some(u16::MAX),
+                ),
+                BinStore::U32(v) => local_bins(
+                    &v[f * n..(f + 1) * n],
+                    starts[f],
+                    missing.then_some(u32::MAX),
+                ),
+            })
+            .collect()
+    }
+}
+
+/// One feature-major column of global bins as bins local to the feature,
+/// whose first global bin is `start`; `missing` (the column's sentinel, if it
+/// has one) becomes `u32::MAX`.
+fn local_bins<B: Copy + Into<u32> + PartialEq>(
+    column: &[B],
+    start: u32,
+    missing: Option<B>,
+) -> Vec<u32> {
+    column
+        .iter()
+        .map(|&b| {
+            if Some(b) == missing {
+                u32::MAX
+            } else {
+                b.into() - start
+            }
+        })
+        .collect()
+}
+
+/// [`GHistIndex::feature_columns`] of an index without a feature-major copy:
+/// each row's entries (`bins` sliced by `row_ptr`) go to their feature's
+/// column (`owner`, local to the feature's first bin in `starts`), a row's
+/// first entry of a feature winning as in [`GHistIndex::feature_bin`].
+fn rows_to_columns<B: Copy + Into<u32>>(
+    bins: &[B],
+    row_ptr: &[usize],
+    owner: &[u32],
+    starts: &[u32],
+) -> Vec<Vec<u32>> {
+    let n_rows = row_ptr.len() - 1;
+    let mut columns = vec![vec![u32::MAX; n_rows]; starts.len()];
+    for r in 0..n_rows {
+        for &bin in &bins[row_ptr[r]..row_ptr[r + 1]] {
+            let bin: u32 = bin.into();
+            let f = owner[bin as usize] as usize;
+            let slot = &mut columns[f][r];
+            if *slot == u32::MAX {
+                *slot = bin - starts[f];
+            }
+        }
+    }
+    columns
 }
 
 /// Feature-major copy of a dense row-major matrix (`n_rows * n_cols` entries,
@@ -623,6 +705,7 @@ fn bin_rows_into<B: FromBin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::FeatureType;
 
     #[cfg(all(target_os = "linux", feature = "cuda"))]
     #[test]
@@ -682,7 +765,6 @@ mod tests {
 
     #[test]
     fn parallel_binning_preserves_cuts_rows_and_width() {
-        use crate::data::FeatureType;
         let serial = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
@@ -770,5 +852,62 @@ mod tests {
         assert!((b as usize) >= f0s && (b as usize) < f0e);
         // A feature range with no entry for a fully-present row still resolves.
         assert!(ghist.feature_bin(1, f0s, f0e).is_some());
+    }
+
+    /// Every layout's columns (dense, sparse with a feature-major copy, sparser
+    /// without one; both widths) hold each row's feature bin, local to the
+    /// feature, and `u32::MAX` where the row lacks the feature.
+    #[test]
+    fn feature_columns_match_row_lookups() {
+        for (rows, cols, missing_percent, wide) in [
+            (500, 6, 0, false),
+            (500, 6, 30, false),
+            (500, 6, 80, false),
+            (500, 300, 30, true),
+        ] {
+            let values: Vec<f32> = (0..rows * cols)
+                .map(|i| {
+                    // A residue that varies along rows and columns alike.
+                    if (i * 7919 + i / cols * 104_729) % 100 < missing_percent {
+                        -1.0
+                    } else if i % cols == 1 {
+                        (i / cols % 5) as f32
+                    } else {
+                        ((i / cols * 17 + i % cols * 31) % 509) as f32
+                    }
+                })
+                .collect();
+            let mut types = vec![FeatureType::Numerical; cols];
+            types[1] = FeatureType::Categorical;
+            let data = DMatrix::from_dense_with_missing(&values, rows, cols, -1.0)
+                .unwrap()
+                .with_feature_types(&types)
+                .unwrap();
+            let ghist = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256));
+            let layout = (
+                ghist.column_bins().is_some(),
+                ghist.missing_columns().is_some(),
+            );
+            let expected_layout = match missing_percent {
+                0 => (true, false),
+                30 => (false, true),
+                _ => (false, false),
+            };
+            assert_eq!(layout, expected_layout, "{missing_percent}% missing");
+            assert_eq!(matches!(ghist.bins(), Bins::U32(_)), wide);
+            let columns = ghist.feature_columns();
+            assert_eq!(columns.len(), cols);
+            for (f, column) in columns.iter().enumerate() {
+                let (fs, fe) = ghist.cuts().feature_bins(f);
+                let expected: Vec<u32> = (0..rows)
+                    .map(|r| {
+                        ghist
+                            .feature_bin(r, fs, fe)
+                            .map_or(u32::MAX, |b| b - fs as u32)
+                    })
+                    .collect();
+                assert_eq!(column, &expected, "feature {f}, {missing_percent}% missing");
+            }
+        }
     }
 }

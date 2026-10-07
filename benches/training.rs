@@ -8,8 +8,8 @@ use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use hessboost::config::{
-    BoosterKind, Dart, ExtraTrees, GrowPolicy, LinearTree, Monotone, MultiStrategy, QuantizedGrad,
-    TrainingParamsBuilder,
+    BoosterKind, Dart, Ebm, ExtraTrees, GrowPolicy, LinearTree, Monotone, MultiStrategy,
+    QuantizedGrad, TrainingParamsBuilder,
 };
 use hessboost::data::FeatureType;
 use hessboost::internals::{
@@ -1208,6 +1208,31 @@ fn bench_data_prep(c: &mut Criterion) {
     group.finish();
 }
 
+/// FAST pair ranking (`booster = ebm`): one round of 20 main effects, then
+/// FAST over all 190 feature pairs (`interactions_1`) or no pairs at all
+/// (`interactions_0`); the difference is FAST.
+fn bench_ebm_fast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ebm_fast_x20_1round");
+    group.sample_size(10);
+    for (label, rows) in [("10k", 10_000), ("100k", 100_000)] {
+        let data = make_data(rows, 20);
+        for interactions in [0, 1] {
+            let params = TrainingParams::builder()
+                .booster(BoosterKind::Ebm(
+                    Ebm::builder().interactions(interactions).build().unwrap(),
+                ))
+                .grow_policy(GrowPolicy::LossGuide)
+                .max_leaves(3)
+                .build()
+                .unwrap();
+            group.bench_function(format!("{label}_interactions_{interactions}"), |b| {
+                b.iter(|| black_box(train(&params, &data, 1).unwrap()));
+            });
+        }
+    }
+    group.finish();
+}
+
 /// One GPU backend's entry points for [`bench_gpu`].
 #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 struct GpuBench<H, G> {
@@ -1432,6 +1457,7 @@ criterion_group!(
     bench_predict_csr,
     bench_model_io,
     bench_data_prep,
+    bench_ebm_fast,
     bench_metal,
     bench_wgpu,
     bench_cuda

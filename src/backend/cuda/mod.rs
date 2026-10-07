@@ -26,18 +26,21 @@
 //! the gradients on the host each round, upload them once per tree, and
 //! read the leaf rows back once per tree to update the margins.
 //!
+//! # Kernels
+//!
+//! The kernels are Rust, compiled to PTX by
+//! [cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/) from the
+//! repository's `cuda-kernels/` crate and embedded here; the driver
+//! JIT-compiles the PTX for the device's own architecture the first time a
+//! process loads it (and caches the machine code). Building this crate
+//! needs neither cuda-oxide nor a CUDA toolkit.
+//!
 //! # Requirements
 //!
-//! - Linux with an NVIDIA GPU and a driver supporting CUDA 12.8 or later.
-//! - NVRTC (`libnvrtc`), loadable as `libnvrtc.so` or `libnvrtc.so.12`:
-//!   the CUDA toolkit's `lib64` directory on the loader path (CUDA 13
-//!   toolkits ship `libnvrtc.so` there), or `LD_LIBRARY_PATH` pointing at it.
-//!   The kernels are compiled once per process, for the device's own
-//!   architecture, straight to machine code (CUBIN), so no PTX JIT runs and
-//!   a newer NVRTC than the driver is not a problem.
-//! - Nothing at build time: both libraries are opened at run time, and
-//!   their absence makes the backend unavailable rather than failing to
-//!   load the crate.
+//! - Linux with an NVIDIA GPU of compute capability 7.5 (Turing) or newer
+//!   and a driver supporting CUDA 12.8 or later. The driver (`libcuda`) is
+//!   opened at run time: its absence makes the backend unavailable rather
+//!   than failing to load the crate. No CUDA toolkit is needed.
 //!
 //! # Exactness
 //!
@@ -63,13 +66,14 @@
 //! The root's statistics follow the same chunks (`sum_rows`): each chunk's
 //! total is summed on the GPU (in integers when the chunks' sums are exact,
 //! else as `f64` chains) and the totals are added on the host in chunk
-//! order. The kernels are compiled without FP contraction, flush-to-zero,
-//! or approximate division, so every `f64` operation is the single IEEE
-//! operation the CPU performs; there are no floating-point atomics. Trees
-//! with a non-finite gradient or Hessian (NaN payloads differ between CPU
-//! and GPU arithmetic) build every node on the CPU. A CUDA error is sticky
-//! (the context is unusable afterwards): the tree in progress is regrown on
-//! the host, and every later tree too, so the result is unchanged.
+//! order. The kernels are compiled without floating-point contraction
+//! (cuda-oxide's `--no-fmad`), flush-to-zero, or approximate division, so
+//! every `f64` operation is the single IEEE operation the CPU performs;
+//! there are no floating-point atomics. Trees with a non-finite gradient
+//! or Hessian (NaN payloads differ between CPU and GPU arithmetic) build
+//! every node on the CPU. A CUDA error is sticky (the context is unusable
+//! afterwards): the tree in progress is regrown on the host, and every
+//! later tree too, so the result is unchanged.
 //!
 //! CUDA prediction is explicit through [`BoostedModel::to_cuda`](crate::model::BoostedModel::to_cuda).
 //! Tree traversal and ordered margin summation run on a dedicated tracked
@@ -91,7 +95,7 @@
 //!   retains open-node histograms when they fit in half the free memory.
 
 mod categorical;
-pub(crate) mod compile;
+mod kernels;
 pub use categorical::ScanDiagnostics;
 mod predict;
 pub use predict::{GpuModel, prediction_available, prediction_device_name};
@@ -119,15 +123,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const THREADS: u32 = 256;
 /// Grid-stride kernels launch at most this many blocks per SM.
 const BLOCKS_PER_SM: u32 = 8;
-/// Threads per histogram block (`HIST_THREADS` in `kernels.cu`). A starting
-/// point for occupancy tuning; actual residency also depends on registers
-/// and shared memory and must be measured on the target GPU.
+/// Threads per histogram block (the histogram entries' `launch_bounds` in
+/// `cuda-kernels/src/train.rs`). A starting point for occupancy tuning;
+/// actual residency also depends on registers and shared memory and must be
+/// measured on the target GPU.
 const HIST_THREADS: u32 = 512;
-/// Rows per partition tile (`PART_TILE` in `kernels.cu`).
+/// Rows per partition tile (`PART_TILE` in `cuda-kernels/src/train.rs`).
 const PART_TILE: usize = 4096;
 /// Threads per partition block.
 const PART_THREADS: u32 = 512;
-/// Warps per split-scan block (`SCAN_WARPS` in `kernels.cu`).
+/// Warps per split-scan block (`SCAN_WARPS` in `cuda-kernels/src/lib.rs`).
 const SCAN_WARPS: usize = 4;
 /// Rows per histogram tile of an exact node.
 const HIST_TILE: usize = 4096;
@@ -223,7 +228,7 @@ struct Device {
 
 impl Device {
     fn open(ordinal: usize) -> std::result::Result<Self, String> {
-        libraries()?;
+        driver()?;
         let count = match CudaContext::device_count() {
             Ok(count) => count,
             Err(e) if e.0 == sys::CUresult::CUDA_ERROR_NO_DEVICE => 0,
@@ -238,11 +243,7 @@ impl Device {
         // own stream, including retained preparation bins. Only immutable
         // kernel/module handles cross backend boundaries.
         unsafe { ctx.disable_event_tracking() };
-        let (major, minor) = ctx
-            .compute_capability()
-            .map_err(|e| format!("CUDA compute capability: {e}"))?;
-        let arch = format!("sm_{major}{minor}");
-        let module = compile::load(&ctx, &arch)?;
+        let module = kernels::load(&ctx, kernels::Module::Training)?;
         let function = |name: &str| {
             module
                 .load_function(name)
@@ -386,21 +387,13 @@ impl Device {
     }
 }
 
-/// The driver and NVRTC both load, and the driver is new enough. Checked
-/// before any other `cudarc` call: its lazy loaders panic when a library
-/// is missing, and the release profile aborts on panic.
-fn libraries() -> std::result::Result<(), String> {
-    // SAFETY: only tries to open the shared libraries by name.
+/// The driver loads and is new enough. Checked before any other `cudarc`
+/// call: its lazy loaders panic when the library is missing, and the
+/// release profile aborts on panic.
+fn driver() -> std::result::Result<(), String> {
+    // SAFETY: only tries to open the shared library by name.
     if !unsafe { sys::is_culib_present() } {
         return Err("libcuda not found (no NVIDIA driver is installed)".into());
-    }
-    // SAFETY: as above.
-    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-        return Err(
-            "libnvrtc not found: install the CUDA toolkit's NVRTC and put the \
-                    directory holding `libnvrtc.so` on the loader path"
-                .into(),
-        );
     }
     let mut version = 0;
     // SAFETY: the driver library loads (checked above), and the call only
@@ -844,7 +837,7 @@ fn download_pinned<'a, T: Copy + DeviceRepr + ValidAsZeroBits>(
 /// never reach the GPU and take the CPU path, which checks them.
 pub struct CudaHistBackend {
     device: Arc<Device>,
-    index_identity: u32,
+    index_identity: u64,
     n_rows: usize,
     n_cols: usize,
     total_bins: usize,

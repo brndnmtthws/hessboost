@@ -7,7 +7,7 @@
 //! categorical splits, multiclass and vector leaves. Leaf weighting happens
 //! once on the CPU in f32; the GPU adds in tree order without FMA or FTZ.
 
-use super::{Pinned, compile, libraries, upload_pinned};
+use super::{Pinned, driver, kernels, upload_pinned};
 use crate::backend::shared::{ensure_forest_model, materialize_rows};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -39,7 +39,7 @@ static CONTEXTS: Mutex<Vec<(usize, Opened)>> = Mutex::new(Vec::new());
 
 impl Context {
     fn open(ordinal: usize) -> std::result::Result<Self, String> {
-        libraries()?;
+        driver()?;
         let count = match CudaContext::device_count() {
             Ok(count) => count,
             Err(e) if e.0 == sys::CUresult::CUDA_ERROR_NO_DEVICE => 0,
@@ -52,15 +52,7 @@ impl Context {
         // context, which must never govern this multi-stream pipeline.
         let cuda = CudaContext::new_non_primary(ordinal, 0)
             .map_err(|e| format!("CUDA prediction context: {e}"))?;
-        let (major, minor) = cuda
-            .compute_capability()
-            .map_err(|e| format!("CUDA compute capability: {e}"))?;
-        let module = compile::load_source(
-            &cuda,
-            &format!("sm_{major}{minor}"),
-            include_str!("predict.cu"),
-            c"hessboost_predict.cu",
-        )?;
+        let module = kernels::load(&cuda, kernels::Module::Prediction)?;
         let predict8 = module
             .load_function("predict8")
             .map_err(|e| format!("CUDA predict8: {e}"))?;
@@ -480,7 +472,8 @@ fn upload_forest<
 
 impl BoostedModel {
     /// Upload the compact forest once to NVIDIA CUDA device `ordinal`.
-    /// Requires Linux, the `cuda` feature, a CUDA 12.8+ driver and NVRTC.
+    /// Requires Linux, the `cuda` feature, a CUDA 12.8+ driver and a device of
+    /// compute capability 7.5 or newer.
     /// Refuses `gblinear` and per-leaf linear models. Predictions preserve CPU
     /// bits (including categorical splits, DART weights and vector leaves);
     /// objective transforms and model-shrinkage prediction run on the CPU.
@@ -600,9 +593,13 @@ mod tests {
                     "{reason}"
                 );
                 assert!(
-                    ["libcuda not found", "libnvrtc not found", "no CUDA device"]
-                        .iter()
-                        .any(|expected| reason.contains(expected)),
+                    [
+                        "libcuda not found",
+                        "no CUDA device",
+                        "has compute capability"
+                    ]
+                    .iter()
+                    .any(|expected| reason.contains(expected)),
                     "{reason}"
                 );
                 false

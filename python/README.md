@@ -463,15 +463,14 @@ as Mesa's lavapipe (correct, but slower than the CPU) only when there is no
 other; `GpuModel.device_name("wgpu")` names the adapter it picked, and the
 `WGPU_ADAPTER_NAME` environment variable picks one by name.
 
-Linux wheels include CUDA support, but bundle neither the NVIDIA driver
-nor NVRTC. Building and importing a wheel needs no CUDA toolkit. At run
-time CUDA needs an NVIDIA GPU, a driver supporting CUDA 12.8 or newer,
-and `libnvrtc.so` (or `libnvrtc.so.12`) on the library loader path. The
-CUDA toolkit provides NVRTC; alternatively install NVIDIA's
-`nvidia-cuda-nvrtc` pip package and add its `lib` directory to
-`LD_LIBRARY_PATH` (a versioned-only library needs a `libnvrtc.so` link).
-Missing libraries/device return an error rather than silently predicting
-on the CPU. CUDA prediction stages bounded dense or CSR row blocks
+Linux wheels include CUDA support with its kernels compiled in (Rust,
+compiled to PTX by cuda-oxide), but do not bundle the NVIDIA driver.
+Building and importing a wheel needs no CUDA toolkit, and neither does
+running it: CUDA needs only an NVIDIA GPU of compute capability 7.5
+(Turing) or newer and a driver supporting CUDA 12.8 or newer, which
+compiles the kernels for the GPU on first use and caches them. A missing
+driver or device returns an error rather than silently predicting on the
+CPU. CUDA prediction stages bounded dense or CSR row blocks
 through two pinned buffers, overlapping upload, compute and download.
 
 ```python

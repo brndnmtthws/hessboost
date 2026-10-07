@@ -1,0 +1,27 @@
+[package]
+name = "hessboost-cuda-kernels"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "hessboost's CUDA kernels, compiled to PTX by cuda-oxide"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# cuda-oxide's device crate. `build.sh` builds the codegen backend from this
+# same revision (cargo-oxide resolves it through Cargo.lock), so the pin here,
+# `rust-toolchain.toml`'s nightly, and mise.toml's cargo-oxide move together.
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust", rev = "6921d3ee07e28ec62895ea40fc2fef39977ca411" }
+
+# cuda-oxide writes one PTX module per crate build: `build.sh` builds the
+# training kernels and the prediction kernels separately, so that a
+# prediction context JIT-compiles only its own two.
+[features]
+train = []
+predict = []
+
+# Keep this crate out of hessboost's build: it needs cuda-oxide's nightly.
+[workspace]
+members = ["."]

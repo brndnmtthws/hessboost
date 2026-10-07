@@ -611,7 +611,8 @@ class GpuModel:
         on it: for Metal, a device with working compute pipelines (``False``
         off macOS); for wgpu, an adapter with 64-bit shader integers whose
         float additions passed the backend's addition-order check; for CUDA,
-        a CUDA 12.8+ driver, NVRTC and the selected NVIDIA device on Linux.
+        a CUDA 12.8+ driver and the selected NVIDIA device (compute
+        capability 7.5 or newer) on Linux.
         ``backend`` selects the same backend as ``device``; ``ordinal``
         selects the CUDA device. The first call initializes that backend.
 

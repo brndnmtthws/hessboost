@@ -4,8 +4,10 @@ hessboost reimplements XGBoost in Rust as one library crate. No C/C++ or FFI
 besides `zstd` (libzstd, for native model files), with the macOS-only
 `metal` feature `objc2-metal`, with the `wgpu` feature `wgpu` (whose
 Vulkan, Metal, and DirectX 12 backends load the drivers at run time), and
-with the Linux-only `cuda` feature `cudarc` (the CUDA driver and NVRTC,
-opened at run time; building needs no CUDA toolkit). User docs:
+with the Linux-only `cuda` feature `cudarc` (the CUDA driver, opened at run
+time). The CUDA kernels are Rust too: `cuda-kernels/`, compiled to PTX by
+[cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/) and committed,
+so building the crate needs neither cuda-oxide nor a CUDA toolkit. User docs:
 `README.md` (overview only; details belong in rustdoc), rustdoc
 (`src/lib.rs`, module docs), `examples/`, `docs/performance.md`. No
 changelog: release notes are written at release time.
@@ -27,6 +29,7 @@ what the published crate ships.
 ```sh
 cargo fmt --all --check
 cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # from the root, as CI does: fuzz/'s nightly has no rustfmt
+cargo fmt --all --check --manifest-path cuda-kernels/Cargo.toml   # likewise
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --all-features   # CI adds --cargo-profile ci
 cargo test --doc --all-features   # nextest skips doctests; CI adds --profile ci
@@ -55,14 +58,24 @@ uv run --with-requirements scripts/requirements-lightgbm.txt python scripts/gen_
 cargo nextest run --test lightgbm_parity --release --run-ignored only --no-capture
 ```
 
-CUDA (`--features cuda`, Linux): `tests/cuda.rs` compiles the kernels
-whenever NVRTC is loadable, GPU or not. Linux CI sets
-`HESSBOOST_REQUIRE_NVRTC=1` so a missing compiler cannot skip that guard.
+CUDA (`--features cuda`, Linux): the kernels are `cuda-kernels/`, its own
+crate (like `fuzz/`; its `mise.toml` and `rust-toolchain.toml` pin
+cuda-oxide's nightly, its `mise.toml` cargo-oxide, its committed
+`Cargo.lock` the cuda-oxide revision). `./build.sh` there compiles them
+with `cargo oxide build --arch sm_75 --no-fmad` (no GPU or toolkit needed),
+once per feature, into the committed `src/backend/cuda/training.ptx`
+(`train`) and `prediction.ptx` (`predict`, so a prediction context
+JIT-compiles only its kernels), refusing PTX with a non-IEEE
+floating-point instruction or a libdevice call; run it after changing a
+kernel. The PTX is byte-for-byte reproducible per host architecture
+(rustc's crate hashes name its shared-memory symbols): commit an x86_64
+Linux build, as CI's `cuda-kernels` job rebuilds and compares (it uploads
+its build on a mismatch, then assembles the PTX for every supported
+architecture with ptxas from the pip `nvidia-cuda-nvcc` wheel).
 Device tests skip without a GPU unless `HESSBOOST_REQUIRE_CUDA` is set.
-Without a toolkit, the pip `nvidia-cuda-nvrtc` wheel works: link its
-`libnvrtc.so.13` as `libnvrtc.so` and add that directory to `LD_LIBRARY_PATH`.
 
 ```sh
+cd cuda-kernels && mise exec -- ./build.sh   # after changing a kernel
 HESSBOOST_REQUIRE_CUDA=1 cargo nextest run --features cuda --test cuda --release
 cargo bench --features cuda --bench training -- cuda
 ```
@@ -72,7 +85,8 @@ CI (`.github/workflows/ci.yml`) runs the Rust checks through `mbx` with
 loads `mise.ci.toml`, which moves rustup's toolchains into that cache. Rust
 tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal and CUDA
 tests needing a device skip without one; guard tests still fail if the
-kernels do not compile, and the Linux jobs install NVRTC for the CUDA one;
+Metal or wgpu kernels do not compile, and the `cuda-kernels` job checks the
+CUDA PTX;
 the Linux runners also install Mesa's lavapipe and set
 `HESSBOOST_REQUIRE_WGPU=1` (`.github/scripts/install-lavapipe.sh`), so
 `tests/wgpu.rs` and the `backend::wgpu` unit tests run the GPU paths there)
@@ -182,8 +196,18 @@ Fix findings rather than suppress them.
 |`ebm/`|public: `EbmInfo` (terms, tree→term map, term means; crate-private `stages`, the Boulevard stage layout validation, inference, and refit share), `shape_functions`, `term_shape`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds and category sets, leaves as boxes, difference arrays)|
 |`model/`|`mod.rs` (`BoostedModel`, accessors, `TreeWeights`; XGBoost interchange docs), `io` (`ModelFormat`, its detection, the four codec verbs), `embed` (`EmbeddedModel`: `include_bytes!` in a `static`, decoded on first successful `get`), `serde` (native JSON mirror `UncheckedBoostedModel`), `validate` (`validate_structure`, prediction-data and objective-width checks), `predict` (`Iterations`, prediction dispatch, `accumulate_forest`, shrunk and multi-prefix margins, `RowBlock` traversal), `slice` (`slice`, `shrunk_prefix`), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `container` (`ContainerSpec`: the magic/version/checksum framing, zstd packing and expansion bound shared by `HBM`, `HBDM` and `HBFF`; embedded-model blobs), `native`, `sections` (shared by every container and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact/` (public, `HBTD`; `mod.rs` model and layout docs, `bitstream`, `decode`, `encode`), `xgboost/` (JSON/UBJSON schema: `document` model mapping, `tree` node columns, `objective` objective and `base_score`, `parse` scalar parsers), `categories` (`CategoryPool`, shared by the XGBoost and LightGBM importers), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `SampleOptions`, `Samples`, the borrowed `SamplesView`, `Quantiles`), `io` (`DiffusionFormat`, shared with `forest`), `format` (`HBDM` container embedding native GBDT containers; JSON), `forest/` (public, ForestFlow/ForestDiffusion: per-level GBDTs, generation, RePaint imputation; `fit`: table preparation and per-level training; `encoding`: column ranges, one-hot encoding, scaling; `format`: `HBFF`)|
-|`backend/`|`metal.rs` (MSL histograms/prediction), `wgpu.rs` (portable WGSL GPU training/prediction), `shared.rs` (Metal/wgpu histogram staging; shared forest validation and row materialization), `cuda/` (`mod.rs`: exact histogram strategies, CSR storage, device bin preparation and row engine; `categorical.rs`/`.cu`: stable category sorting, resident node winners and diagnostics; `predict.rs`/`.cu`: compact forests and bounded three-stream prediction; `compile.rs`: NVRTC to IEEE-preserving CUBIN), `exact_sum.rs` (`SumDomain` proof on every platform)|
+|`backend/`|`metal.rs` (MSL histograms/prediction), `wgpu.rs` (portable WGSL GPU training/prediction), `shared.rs` (Metal/wgpu histogram staging; shared forest validation and row materialization), `cuda/` (`mod.rs`: exact histogram strategies, CSR storage, device bin preparation and row engine; `categorical.rs`: stable category sorting, resident node winners and diagnostics; `predict.rs`: compact forests and bounded three-stream prediction; `kernels.rs`: the embedded `training.ptx`/`prediction.ptx`, built from `cuda-kernels/`, one loaded per context), `exact_sum.rs` (`SumDomain` proof on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
+
+The CUDA kernels live outside `src/`, in `cuda-kernels/src/` (not part of
+the crate's build or package): `lib.rs` (exactness and ABI rules, the
+`#[repr(C)]` records, the `Bin` widths), `train.rs` (binning, gradients,
+histograms, partitions, reductions, numeric split search; per-width entries
+from `per_width!`) and `categorical.rs` (category keys, merge sort,
+partition scan, `merge_scans`) behind the `train` feature, `predict.rs`
+(compact-forest walks) behind `predict`. Entries take raw pointers and
+scalars, one PTX parameter each, in the order the host's launch builders
+push them; a kernel's signature and its launch change together.
 
 Tests: `tests/parity.rs` and `tests/lightgbm_parity.rs` are ignored without fixtures; `properties.rs` is
 proptest; shared helpers are in `tests/common/` and `examples/common/`;
@@ -262,8 +286,10 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   for bit, per node, following `tree::hist::sum_order`: exact integer sums
   when the node's sums are exact, exact integer chunks reduced in `f64` in
   chunk order when only the chunks are, otherwise one GPU thread per
-  (chunk, feature) running the CPU's `f64` chain (kernels compiled with
-  `--fmad=false`, no FTZ, IEEE division; no floating-point atomics).
+  (chunk, feature) running the CPU's `f64` chain (the `cuda-kernels/`
+  build passes cuda-oxide's `--no-fmad` and refuses PTX with an
+  approximate, flush-to-zero, or contractible floating-point instruction;
+  no floating-point atomics).
   Under device-resident growth (`tree/builder/hist/device.rs`) the host
   still owns node order, the column sampler, bounds, interaction state,
   and the merge of per-feature split results; device-side rounds compute
@@ -308,8 +334,9 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   root's `sum_rows`, so a GPU can reproduce every node in parallel.
 - **Unsafe:** only in `simd/`, hot loops of `tree/compact.rs`, `tree/hist/`,
   `tree/builder/partition.rs`, `backend/metal.rs`, and `backend/cuda/`
-  (`backend/wgpu.rs` has none: `bytemuck` casts). Each block needs
-  `// SAFETY:`.
+  (`backend/wgpu.rs` has none: `bytemuck` casts), and in the
+  `cuda-kernels/` crate (every kernel is an `unsafe fn` over device
+  pointers). Each block needs `// SAFETY:`.
 - **SIMD:** covers objective gradients, exp/sigmoid/softmax, metric sums,
   cut search (`count_le`), and SHAP's per-lane kernels (return-edge terms
   `shap_edge_terms`, child basis `shap_scaled_basis`/`shap_divided_basis`),

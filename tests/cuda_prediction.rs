@@ -31,9 +31,13 @@ impl GpuBackend for Cuda {
             "{reason}"
         );
         assert!(
-            ["libcuda not found", "libnvrtc not found", "no CUDA device"]
-                .iter()
-                .any(|expected| reason.contains(expected)),
+            [
+                "libcuda not found",
+                "no CUDA device",
+                "has compute capability"
+            ]
+            .iter()
+            .any(|expected| reason.contains(expected)),
             "CUDA predictor failed to initialize: {reason}"
         );
         Some(reason)

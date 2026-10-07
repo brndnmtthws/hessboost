@@ -1,8 +1,8 @@
 //! `GpuModel`: Metal, wgpu or NVIDIA CUDA batch prediction.
 //!
 //! wgpu is compiled into every wheel, Metal into macOS wheels and CUDA
-//! into Linux wheels. Drivers and NVRTC are loaded at run time; absence
-//! never prevents importing the package. Forests upload once; prediction
+//! into Linux wheels. Drivers are loaded at run time; absence never
+//! prevents importing the package. Forests upload once; prediction
 //! preserves CPU bits, with CPU objective transforms and model shrinkage.
 
 use crate::booster::{dense, iterations};
@@ -61,7 +61,10 @@ impl Backend {
             #[cfg(target_os = "linux")]
             Self::Cuda => hessboost::backend::cuda::prediction_available(ordinal),
             #[cfg(not(target_os = "linux"))]
-            Self::Cuda => { let _ = ordinal; false }
+            Self::Cuda => {
+                let _ = ordinal;
+                false
+            }
         }
     }
 
@@ -76,7 +79,10 @@ impl Backend {
             #[cfg(target_os = "linux")]
             Self::Cuda => hessboost::backend::cuda::prediction_device_name(ordinal),
             #[cfg(not(target_os = "linux"))]
-            Self::Cuda => { let _ = ordinal; None }
+            Self::Cuda => {
+                let _ = ordinal;
+                None
+            }
         }
     }
 }
@@ -92,7 +98,12 @@ enum Predictor {
 
 impl Predictor {
     /// `model` laid out on `backend`, without the GIL.
-    fn build(py: Python<'_>, model: &BoostedModel, backend: Backend, ordinal: usize) -> PyResult<Self> {
+    fn build(
+        py: Python<'_>,
+        model: &BoostedModel,
+        backend: Backend,
+        ordinal: usize,
+    ) -> PyResult<Self> {
         match backend {
             #[cfg(target_os = "macos")]
             Backend::Metal => py.detached(|| model.to_gpu()).map(Self::Metal),
@@ -186,7 +197,12 @@ impl GpuModel {
     /// addition-order probe.
     #[staticmethod]
     #[pyo3(signature = (device=None, *, backend=None, ordinal=0))]
-    fn available(py: Python<'_>, device: Option<&str>, backend: Option<&str>, ordinal: usize) -> PyResult<bool> {
+    fn available(
+        py: Python<'_>,
+        device: Option<&str>,
+        backend: Option<&str>,
+        ordinal: usize,
+    ) -> PyResult<bool> {
         let backend = Backend::parse(device, backend, ordinal)?;
         Ok(py.detach(|| backend.available(ordinal)))
     }
@@ -195,7 +211,12 @@ impl GpuModel {
     /// benchmarks).
     #[staticmethod]
     #[pyo3(signature = (device=None, *, backend=None, ordinal=0))]
-    fn device_name(py: Python<'_>, device: Option<&str>, backend: Option<&str>, ordinal: usize) -> PyResult<Option<String>> {
+    fn device_name(
+        py: Python<'_>,
+        device: Option<&str>,
+        backend: Option<&str>,
+        ordinal: usize,
+    ) -> PyResult<Option<String>> {
         let backend = Backend::parse(device, backend, ordinal)?;
         Ok(py.detach(|| backend.device_name(ordinal)))
     }

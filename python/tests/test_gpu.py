@@ -1,6 +1,6 @@
 """GPU training and batch prediction: Metal, wgpu and CUDA. Device tests
 skip without a usable backend; HESSBOOST_REQUIRE_WGPU/CUDA forbid skips.
-CUDA is dynamically loaded on Linux and needs a driver and NVRTC."""
+CUDA is dynamically loaded on Linux and needs only a driver and a GPU."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def test_wgpu_is_available_or_the_machine_has_no_adapter(
 
 
 def test_cuda_is_available_or_missing_runtime(trained: tuple[Booster, np.ndarray]) -> None:
-    """A CUDA compiler or kernel error is never a valid device-test skip."""
+    """A kernel-load error is never a valid device-test skip."""
     if GpuModel.available(backend="cuda"):
         return
     with pytest.raises(HessboostError) as refused:
@@ -72,7 +72,7 @@ def test_cuda_is_available_or_missing_runtime(trained: tuple[Booster, np.ndarray
         expected in reason
         for expected in (
             "libcuda not found",
-            "libnvrtc not found",
+            "has compute capability",
             "no CUDA device",
             "only available on Linux",
         )

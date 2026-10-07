@@ -206,7 +206,9 @@
 //!     ([`device`](config::TrainingParams::device) = `cuda`/`cuda:<n>`;
 //!     exact integer sums, `f64` chains in the CPU's order outside them),
 //!     with the tree's rows, and for the common objectives the margins and
-//!     gradients, kept on the GPU; the driver and NVRTC load at run time.
+//!     gradients, kept on the GPU. The kernels are Rust, compiled to
+//!     embedded PTX by [cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/);
+//!     the driver loads at run time, and nothing else is needed.
 //!     [`to_cuda`](model::BoostedModel::to_cuda) uploads compact forests for
 //!     ordered GPU batch prediction. CPU bit-parity tests pass on an NVIDIA
 //!     L40S ([`backend::cuda`]).
@@ -312,8 +314,6 @@ pub mod prelude {
 /// part of the public API: hidden from the docs and changed without notice.
 #[doc(hidden)]
 pub mod internals {
-    #[cfg(all(target_os = "linux", feature = "cuda"))]
-    pub use crate::backend::cuda::compile::compile_kernels;
     pub use crate::data::ghist::GHistIndex;
     pub use crate::data::quantile::HistCuts;
     pub use crate::tree::builder::HistTreeBuilder;

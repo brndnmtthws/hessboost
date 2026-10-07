@@ -196,7 +196,6 @@ def main():
         Path("Cargo.toml"),
         Path("Cargo.lock"),
         *sorted(Path("src").rglob("*.rs")),
-        *sorted(Path("src/backend/cuda").glob("*.cu")),
     ]
     report = {
         "metadata": {
@@ -210,7 +209,6 @@ def main():
             "xgboost": xgb.__version__,
             "xgboost_build_info": xgb.build_info(),
             "xgboost_library_sha256": sha256(library),
-            "cuda_kernels_runtime_compiled": args.device == "cuda",
             "hessboost_executable_sha256": sha256(executable),
             "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
             "source_sha256": {str(p): sha256(p) for p in sources},

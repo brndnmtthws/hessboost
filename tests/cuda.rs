@@ -3,9 +3,9 @@
 //! Tests that need a CUDA device skip when one is absent (CI runners have
 //! no GPU) unless `HESSBOOST_REQUIRE_CUDA` is set, which turns every skip
 //! into a failure: set it on a GPU machine so a broken setup cannot pass
-//! vacuously. Kernel compilation is checked whenever NVRTC is loadable,
-//! GPU or not; `HESSBOOST_REQUIRE_NVRTC` makes a missing NVRTC an error.
-//! Parameter-refusal tests always run.
+//! vacuously. The embedded PTX itself is checked without a GPU by CI's
+//! `cuda-kernels` job (rebuilt from source, assembled for every supported
+//! architecture). Parameter-refusal tests always run.
 
 #![cfg(all(target_os = "linux", feature = "cuda"))]
 
@@ -41,38 +41,23 @@ fn device() -> bool {
 }
 
 /// The backend is either available or absent for a reason outside the
-/// crate (no driver, no NVRTC, no device). A kernel compile or module load
-/// failure is never an acceptable skip: without this guard, every
-/// device-dependent test would pass vacuously while the backend is broken.
+/// crate (no driver, no device, a device older than the kernels' target). A
+/// module load failure is never an acceptable skip: without this guard,
+/// every device-dependent test would pass vacuously while the backend is
+/// broken.
 #[test]
 fn backend_available_or_no_device() {
     if let Some(reason) = cuda::unavailable_reason() {
         assert!(
-            ["libcuda not found", "libnvrtc not found", "no CUDA device"]
-                .iter()
-                .any(|expected| reason.starts_with(expected)),
+            [
+                "libcuda not found",
+                "no CUDA device",
+                "CUDA device 0 has compute capability"
+            ]
+            .iter()
+            .any(|expected| reason.starts_with(expected)),
             "the CUDA backend failed to initialize: {reason}"
         );
-    }
-}
-
-/// The kernels compile for every architecture CUDA 12 and 13 both target,
-/// with or without a GPU, whenever NVRTC is loadable.
-#[test]
-fn kernels_compile_for_supported_architectures() {
-    for arch in ["sm_75", "sm_80", "sm_86", "sm_89", "sm_90"] {
-        match hessboost::internals::compile_kernels(arch) {
-            Ok(bytes) => assert!(bytes > 0, "{arch}: empty CUBIN"),
-            Err(error) if error.to_string().contains("libnvrtc not found") => {
-                assert!(
-                    std::env::var_os("HESSBOOST_REQUIRE_NVRTC").is_none(),
-                    "HESSBOOST_REQUIRE_NVRTC is set but libnvrtc was not found"
-                );
-                eprintln!("skipping kernel compile check: libnvrtc not found");
-                return;
-            }
-            Err(error) => panic!("{error}"),
-        }
     }
 }
 

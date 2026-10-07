@@ -1,0 +1,7 @@
+# cuda-oxide's codegen backend is a rustc plugin: it builds against, and
+# only loads into, the nightly its source names (the `cuda-device` revision
+# in Cargo.toml). mise.toml selects the same toolchain for mise users.
+[toolchain]
+channel = "nightly-2026-08-28"
+components = ["rust-src", "rustc-dev", "llvm-tools"]
+profile = "minimal"

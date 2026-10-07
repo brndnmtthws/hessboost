@@ -43,6 +43,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo fmt --all --check --manifest-path python/Cargo.toml
       - run: cargo fmt --all --check --manifest-path fuzz/Cargo.toml
+      - run: cargo fmt --all --check --manifest-path cuda-kernels/Cargo.toml
 
   clippy:
     name: clippy (${{ matrix.name }})
@@ -94,18 +95,6 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: test-ci
-      # NVRTC alone (no driver, no GPU): `tests/cuda.rs` then compiles the
-      # CUDA kernels for every target architecture, while the tests that
-      # need a device skip. The wheel ships only `libnvrtc.so.13`, so link
-      # the `libnvrtc.so` name the loader looks for.
-      - name: Install NVRTC
-        if: runner.os == 'Linux'
-        run: |
-          uv pip install --quiet --target "$RUNNER_TEMP/nvrtc" nvidia-cuda-nvrtc==13.4.92
-          so=$(find "$RUNNER_TEMP/nvrtc" -name 'libnvrtc.so.[0-9]*' ! -name '*builtins*' | head -1)
-          ln -sf "$so" "$(dirname "$so")/libnvrtc.so"
-          echo "LD_LIBRARY_PATH=$(dirname "$so")" >> "$GITHUB_ENV"
-          echo "HESSBOOST_REQUIRE_NVRTC=1" >> "$GITHUB_ENV"
       # The `ci` Cargo profile (Cargo.toml): opt-level 1 with debug
       # assertions, about ten times faster than `dev` for this suite.
       # nextest's own `--profile` would pick a nextest profile.
@@ -224,6 +213,57 @@ jobs:
             echo "== $input"
             base64 -w0 "$input"
             echo
+          done
+
+  # The CUDA kernels are Rust (cuda-kernels/), compiled to PTX by cuda-oxide,
+  # and the two PTX modules src/backend/cuda/ embeds are committed. Rebuild
+  # them and fail if a committed file differs (the build is byte-for-byte
+  # reproducible on x86_64 Linux; on a mismatch the rebuilt files are
+  # uploaded), then assemble them for every architecture the backend
+  # supports with ptxas from NVIDIA's pip wheel: no GPU and no CUDA toolkit.
+  cuda-kernels:
+    name: CUDA kernels (cuda-oxide)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # cuda-kernels/mise.toml layers cuda-oxide's nightly Rust and
+      # cargo-oxide over mise.toml.
+      - uses: jdx/mise-action@v4
+        with:
+          cache_key_prefix: mise-v1-cuda-kernels
+          working_directory: cuda-kernels
+      # cargo-oxide builds its codegen backend on first use (about a
+      # minute) into ~/.cargo/cuda-oxide, from the git dependency's source;
+      # the cached library is reused while that revision and the nightly
+      # match (its build tree is not needed).
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/cuda-oxide
+            !~/.cargo/cuda-oxide/target
+            ~/.cargo/git/db
+          key: cuda-oxide-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cuda-kernels/Cargo.lock', 'cuda-kernels/rust-toolchain.toml') }}
+      - name: Rebuild the PTX
+        working-directory: cuda-kernels
+        run: mise exec -- ./build.sh
+      - name: Check that the committed PTX is the source's
+        run: git diff --stat --exit-code -- 'src/backend/cuda/*.ptx'
+      - name: Upload the rebuilt PTX
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cuda-ptx
+          path: src/backend/cuda/*.ptx
+      - name: Assemble the PTX for every supported architecture
+        run: |
+          uv pip install --quiet --target "$RUNNER_TEMP/nvcc" nvidia-cuda-nvcc==13.4.92
+          ptxas=$(find "$RUNNER_TEMP/nvcc" -name ptxas -type f | head -1)
+          for ptx in src/backend/cuda/*.ptx; do
+            for arch in 75 80 86 89 90 100 120; do
+              "$ptxas" --gpu-name "sm_$arch" --output-file /dev/null "$ptx"
+            done
           done
 
   # One abi3 wheel per platform, tested on the newest and oldest supported
@@ -396,7 +436,7 @@ jobs:
 
   all-checks-passed:
     permissions: {}
-    needs: [fmt, clippy, test, docs, msrv, parity, semver, fuzz, python, python-lint, python-sdist]
+    needs: [fmt, clippy, test, docs, msrv, parity, semver, fuzz, cuda-kernels, python, python-lint, python-sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     # Run on upstream failure too (so branch protection sees a failure), but

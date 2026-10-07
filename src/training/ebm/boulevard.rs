@@ -36,6 +36,7 @@ pub(super) fn boulevard(
         let margins: Vec<f32> = fitted.iter().map(|&m| m as f32).collect();
         pairs = fast_pairs(
             run,
+            prepared,
             &gradients(run, &margins, rounds),
             params.ebm_settings().interactions(),
         );

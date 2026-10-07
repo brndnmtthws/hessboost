@@ -1,8 +1,9 @@
 //! FAST pair ranking: the interaction terms worth boosting.
 
+use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
-use crate::training::prepare::TrainContext;
+use crate::training::prepare::{Prepared, TrainContext};
 use rayon::prelude::*;
 
 /// FAST (Lou, Caruana, Gehrke & Hooker, KDD 2013): rank every feature pair
@@ -12,24 +13,27 @@ use rayon::prelude::*;
 /// categorical feature has one bin per category, ordered by the category's
 /// mean gradient `G / (H + λ)` (the order in which a binary partition's
 /// best split is a cut, as in LightGBM's and XGBoost's categorical search).
-pub(super) fn fast_pairs(run: &TrainContext, gpair: &[GradPair], k: usize) -> Vec<Vec<u32>> {
+/// The bins are those of `tree_method = hist`'s index (`prepared`), whose
+/// cuts are `max_bin`'s; other tree methods get the same index built here.
+pub(super) fn fast_pairs(
+    run: &TrainContext,
+    prepared: &Prepared,
+    gpair: &[GradPair],
+    k: usize,
+) -> Vec<Vec<u32>> {
     let TrainContext { params, dtrain, .. } = *run;
-    let p = dtrain.n_cols();
-    let cuts = HistCuts::from_dmatrix(dtrain, params.max_bin);
-    let bins: Vec<Vec<u32>> = (0..p)
-        .into_par_iter()
-        .map(|f| {
-            let start = cuts.feature_bins(f).0 as u32;
-            (0..dtrain.n_rows())
-                .map(|row| match dtrain.get(row, f) {
-                    Some(v) if !v.is_nan() => cuts.bin_of(f, v) - start,
-                    _ => u32::MAX,
-                })
-                .collect()
-        })
-        .collect();
+    let built;
+    let index = if let Prepared::Hist { index, .. } = prepared {
+        index
+    } else {
+        built = GHistIndex::from_dmatrix(dtrain, HistCuts::from_dmatrix(dtrain, params.max_bin));
+        &built
+    };
+    let cuts = index.cuts();
     let lambda = params.lambda;
-    let bins: Vec<Vec<u32>> = bins
+    let hess_total = hess_total(gpair);
+    let bins: Vec<Vec<u32>> = index
+        .feature_columns()
         .into_iter()
         .enumerate()
         .map(|(f, b)| {
@@ -40,14 +44,15 @@ pub(super) fn fast_pairs(run: &TrainContext, gpair: &[GradPair], k: usize) -> Ve
             }
         })
         .collect();
+    let p = bins.len();
     let pairs: Vec<(usize, usize)> = (0..p)
         .flat_map(|a| (a + 1..p).map(move |b| (a, b)))
         .collect();
-    // One pair of prefix grids per worker, reused across its pairs.
+    // One grid per worker, reused across its pairs.
     let mut scored: Vec<(f64, usize)> = pairs
         .par_iter()
         .enumerate()
-        .map_init(PairGrids::default, |grids, (i, &(a, b))| {
+        .map_init(Vec::new, |grid, (i, &(a, b))| {
             let gain = pair_gain(
                 &PairBins {
                     a: &bins[a],
@@ -57,7 +62,8 @@ pub(super) fn fast_pairs(run: &TrainContext, gpair: &[GradPair], k: usize) -> Ve
                 },
                 gpair,
                 lambda,
-                grids,
+                hess_total,
+                grid,
             );
             (gain, i)
         })
@@ -109,65 +115,344 @@ struct PairBins<'a> {
     mb: usize,
 }
 
-/// The gradient and Hessian prefix grids [`pair_gain`] fills, kept by a
-/// worker across pairs (resized, and zeroed, per pair).
-#[derive(Default)]
-struct PairGrids {
-    g: Vec<f64>,
-    h: Vec<f64>,
+/// Rows of a pair's grid whose prefix sums [`prefix_sums`] runs together.
+const PREFIX_BAND: usize = 4;
+
+/// The total of `gpair`'s Hessians if every one is finite and
+/// non-negative, the bound [`pair_gain`]'s guard-free scan needs.
+fn hess_total(gpair: &[GradPair]) -> Option<f64> {
+    gpair.iter().try_fold(0.0, |total, gp| {
+        (gp.hess >= 0.0 && gp.hess.is_finite()).then(|| total + f64::from(gp.hess))
+    })
 }
 
-/// FAST's score of one pair, computed in `grids`.
-fn pair_gain(bins: &PairBins, gpair: &[GradPair], lambda: f64, grids: &mut PairGrids) -> f64 {
+/// FAST's score of one pair, scored in `grid`, a worker's buffer reused
+/// across pairs.
+fn pair_gain(
+    bins: &PairBins,
+    gpair: &[GradPair],
+    lambda: f64,
+    hess_total: Option<f64>,
+    grid: &mut Vec<[f64; 2]>,
+) -> f64 {
+    pair_grid(bins, gpair, grid);
+    let (ma, mb) = (bins.ma, bins.mb);
+    if denominators_positive(lambda, hess_total, grid.len()) {
+        best_cut::<false>(grid, ma, mb, lambda)
+    } else {
+        best_cut::<true>(grid, ma, mb, lambda)
+    }
+}
+
+/// Fill `grid` with `ma + 1` rows of `mb + 1` cells of `[gradient,
+/// Hessian]` sums: the pair's bin histogram below a zero row and right of
+/// a zero column, then its 2D prefix sums.
+fn pair_grid(bins: &PairBins, gpair: &[GradPair], grid: &mut Vec<[f64; 2]>) {
     let PairBins {
         a: bins_a,
         b: bins_b,
         ma,
         mb,
     } = *bins;
-    // Prefix sums over the `ma × mb` bin histogram, `(ma + 1) × (mb + 1)`.
     let s = mb + 1;
-    let PairGrids { g, h } = grids;
-    for grid in [&mut *g, &mut *h] {
-        grid.clear();
-        grid.resize((ma + 1) * s, 0.0);
-    }
+    grid.clear();
+    grid.resize((ma + 1) * s, [0.0; 2]);
     for ((&a, &b), gp) in bins_a.iter().zip(bins_b).zip(gpair) {
         if a == u32::MAX || b == u32::MAX {
             continue;
         }
-        let cell = (a as usize + 1) * s + b as usize + 1;
-        g[cell] += f64::from(gp.grad);
-        h[cell] += f64::from(gp.hess);
+        let cell = &mut grid[(a as usize + 1) * s + b as usize + 1];
+        cell[0] += f64::from(gp.grad);
+        cell[1] += f64::from(gp.hess);
     }
-    for arr in [&mut *g, &mut *h] {
-        for i in 1..=ma {
-            for j in 1..=mb {
-                arr[i * s + j] +=
-                    arr[(i - 1) * s + j] + arr[i * s + j - 1] - arr[(i - 1) * s + j - 1];
-            }
+    prefix_sums(grid, s);
+}
+
+/// Whether every quadrant's `H + λ` in a grid of `cells` prefix sums over
+/// Hessians totalling `hess_total` is positive, so the guard in
+/// [`best_cut`] would always pass. A quadrant's computed Hessian sum, its
+/// rows' at least 0, can fall short by the rounding of its cells in
+/// [`prefix_sums`] (five roundings a cell, each at most the total) and of
+/// the scan's three differences: past 32 roundings a cell it cannot reach
+/// `−λ`.
+fn denominators_positive(lambda: f64, hess_total: Option<f64>, cells: usize) -> bool {
+    hess_total.is_some_and(|total| lambda > 16.0 * f64::EPSILON * cells as f64 * total)
+}
+
+/// Turn the histogram in `grid` (rows of `s` cells, the first row and
+/// column zero) into its 2D prefix sums in place,
+/// `P[i][j] = c[i][j] + ((P[i - 1][j] + P[i][j - 1]) - P[i - 1][j - 1])`.
+/// Along a row that recurrence is one chain of dependent additions, so
+/// [`PREFIX_BAND`] rows run at once, each a column behind the row above.
+fn prefix_sums(grid: &mut [[f64; 2]], s: usize) {
+    let rows = grid.len() / s;
+    let mut i = 1;
+    while i < rows {
+        let (above, below) = grid.split_at_mut(i * s);
+        let prev = &above[(i - 1) * s..];
+        if i + PREFIX_BAND <= rows {
+            prefix_band::<PREFIX_BAND>(prev, &mut below[..PREFIX_BAND * s], s);
+            i += PREFIX_BAND;
+        } else {
+            prefix_band::<1>(prev, &mut below[..s], s);
+            i += 1;
         }
     }
+}
+
+/// [`prefix_sums`] of the `R` rows of `band` below the finished row
+/// `prev`: step `t` computes column `t - r` of band row `r`, whose
+/// neighbors above were computed by earlier steps.
+#[inline(always)]
+fn prefix_band<const R: usize>(prev: &[[f64; 2]], band: &mut [[f64; 2]], s: usize) {
+    // Each row's left neighbor, starting at its zero column.
+    let mut lefts = [[0.0f64; 2]; R];
+    for t in 1..s - 1 + R {
+        for (r, left) in lefts.iter_mut().enumerate() {
+            if t <= r || t - r >= s {
+                continue;
+            }
+            let j = t - r;
+            let (up, diag) = if r == 0 {
+                (prev[j], prev[j - 1])
+            } else {
+                (band[(r - 1) * s + j], band[(r - 1) * s + j - 1])
+            };
+            let cell = &mut band[r * s + j];
+            *cell = [
+                cell[0] + ((up[0] + left[0]) - diag[0]),
+                cell[1] + ((up[1] + left[1]) - diag[1]),
+            ];
+            *left = *cell;
+        }
+    }
+}
+
+/// The best four-quadrant score over the prefix sums in `grid`, less the
+/// unsplit score: cut `(i, j)` splits the first feature's bins below `i`
+/// from the rest and the second's below `j`. A feature with one bin has
+/// no cut. A quadrant scores 0 unless its `H + λ` is positive; without
+/// `GUARDED` the caller has shown it always is, and the vectorized scan
+/// runs a quarter fewer instructions.
+fn best_cut<const GUARDED: bool>(grid: &[[f64; 2]], ma: usize, mb: usize, lambda: f64) -> f64 {
     let score = |gs: f64, hs: f64| {
-        if hs + lambda > 0.0 {
+        if !GUARDED || hs + lambda > 0.0 {
             gs * gs / (hs + lambda)
         } else {
             0.0
         }
     };
-    let (gt, ht) = (g[ma * s + mb], h[ma * s + mb]);
-    let mut best = score(gt, ht);
-    for i in 1..ma {
-        for j in 1..mb {
-            let (g00, h00) = (g[i * s + j], h[i * s + j]);
-            let (g0, h0) = (g[i * s + mb], h[i * s + mb]);
-            let (g1, h1) = (g[ma * s + j], h[ma * s + j]);
-            let quadrants = score(g00, h00)
-                + score(g0 - g00, h0 - h00)
-                + score(g1 - g00, h1 - h00)
-                + score(gt - g0 - g1 + g00, ht - h0 - h1 + h00);
-            best = best.max(quadrants);
+    let s = mb + 1;
+    let last = &grid[ma * s..];
+    let [gt, ht] = last[mb];
+    let root = score(gt, ht);
+    let mut best = root;
+    if ma > 1 && mb > 1 {
+        for row in grid[s..ma * s].chunks_exact(s) {
+            let [g0, h0] = row[mb];
+            let (gr, hr) = (gt - g0, ht - h0);
+            for (&[g00, h00], &[g1, h1]) in row[1..mb].iter().zip(&last[1..mb]) {
+                let quadrants = score(g00, h00)
+                    + score(g0 - g00, h0 - h00)
+                    + score(g1 - g00, h1 - h00)
+                    + score(gr - g1 + g00, hr - h1 + h00);
+                best = best.max(quadrants);
+            }
         }
     }
-    best - score(gt, ht)
+    best - root
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FAST's score of one pair from its definition: each cut's quadrant
+    /// sums added up over the rows.
+    fn reference_gain(bins: &PairBins, gpair: &[GradPair], lambda: f64) -> f64 {
+        let score = |g: f64, h: f64| {
+            if h + lambda > 0.0 {
+                g * g / (h + lambda)
+            } else {
+                0.0
+            }
+        };
+        let rows: Vec<(usize, usize, [f64; 2])> = bins
+            .a
+            .iter()
+            .zip(bins.b)
+            .zip(gpair)
+            .filter(|&((&a, &b), _)| a != u32::MAX && b != u32::MAX)
+            .map(|((&a, &b), gp)| {
+                let stats = [f64::from(gp.grad), f64::from(gp.hess)];
+                (a as usize, b as usize, stats)
+            })
+            .collect();
+        let (g, h) = rows
+            .iter()
+            .fold((0.0, 0.0), |(g, h), &(_, _, [dg, dh])| (g + dg, h + dh));
+        let root = score(g, h);
+        let mut best = root;
+        for i in 1..bins.ma {
+            for j in 1..bins.mb {
+                let mut quadrants = [[0.0f64; 2]; 4];
+                for &(a, b, [dg, dh]) in &rows {
+                    let q = &mut quadrants[2 * usize::from(a >= i) + usize::from(b >= j)];
+                    q[0] += dg;
+                    q[1] += dh;
+                }
+                best = best.max(quadrants.iter().map(|&[g, h]| score(g, h)).sum());
+            }
+        }
+        best - root
+    }
+
+    /// Integer gradients keep every sum exact, so the prefix-sum scan and
+    /// the definition agree bit for bit, over grids whose row counts leave
+    /// every remainder of [`PREFIX_BAND`], with missing rows, zero
+    /// Hessians, and one-bin features; `lambda = 1` takes the guard-free
+    /// scan, `lambda = 0` (empty quadrants score 0, not `0 / 0`) the guarded.
+    #[test]
+    fn pair_gain_matches_the_definition() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        let mut grid = Vec::new();
+        for (ma, mb) in [
+            (1, 1),
+            (1, 4),
+            (4, 1),
+            (2, 2),
+            (3, 5),
+            (5, 3),
+            (6, 9),
+            (8, 2),
+            (13, 7),
+        ] {
+            for lambda in [0.0, 1.0] {
+                let n = 300;
+                let mut column = |m: usize| -> Vec<u32> {
+                    (0..n)
+                        .map(|_| {
+                            if next(5) == 0 {
+                                u32::MAX
+                            } else {
+                                next(m as u64) as u32
+                            }
+                        })
+                        .collect()
+                };
+                let (a, b) = (column(ma), column(mb));
+                let gpair: Vec<GradPair> = (0..n)
+                    .map(|_| GradPair::new(next(7) as f32 - 3.0, next(3) as f32))
+                    .collect();
+                let bins = PairBins {
+                    a: &a,
+                    b: &b,
+                    ma,
+                    mb,
+                };
+                let gain = pair_gain(&bins, &gpair, lambda, hess_total(&gpair), &mut grid);
+                let want = reference_gain(&bins, &gpair, lambda);
+                assert_eq!(
+                    gain.to_bits(),
+                    want.to_bits(),
+                    "{ma} x {mb}, lambda {lambda}"
+                );
+            }
+        }
+    }
+
+    /// The smallest computed `H + λ` over every quadrant of every cut and
+    /// the unsplit node, each formed as [`best_cut`] forms it.
+    fn smallest_denominator(grid: &[[f64; 2]], ma: usize, mb: usize, lambda: f64) -> f64 {
+        let s = mb + 1;
+        let last = &grid[ma * s..];
+        let ht = last[mb][1];
+        let mut smallest = ht + lambda;
+        for row in grid[s..ma * s].chunks_exact(s) {
+            let h0 = row[mb][1];
+            let hr = ht - h0;
+            for (&[_, h00], &[_, h1]) in row[1..mb].iter().zip(&last[1..mb]) {
+                for h in [h00, h0 - h00, h1 - h00, hr - h1 + h00] {
+                    smallest = smallest.min(h + lambda);
+                }
+            }
+        }
+        smallest
+    }
+
+    /// Hessians spread over 80 binades round in every prefix sum, and rows
+    /// in every seventh bin leave most quadrants empty, so their computed
+    /// Hessian sums are rounding alone, some of them negative. Once
+    /// `lambda` passes the gate, even by one ulp, every `H + λ` is still
+    /// positive and the guard-free scan returns the guarded scan's bits;
+    /// up to the gate `pair_gain` keeps the guard.
+    #[test]
+    fn the_guard_free_gate_covers_prefix_rounding() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        let (mut grid, mut scratch) = (Vec::new(), Vec::new());
+        let mut negative = false;
+        for (ma, mb) in [(3, 9), (64, 64), (256, 200)] {
+            let n = 4000;
+            let mut column =
+                |m: usize| -> Vec<u32> { (0..n).map(|_| next(m as u64) as u32 / 7 * 7).collect() };
+            let (a, b) = (column(ma), column(mb));
+            let mut spread = |center: f32, binades: u64| {
+                let mantissa = next(1 << 24) as f32 / (1 << 24) as f32 + center;
+                mantissa * 2f32.powi(next(2 * binades + 1) as i32 - binades as i32)
+            };
+            let gpair: Vec<GradPair> = (0..n)
+                .map(|_| GradPair::new(spread(-0.5, 20), spread(0.5, 40)))
+                .collect();
+            let bins = PairBins {
+                a: &a,
+                b: &b,
+                ma,
+                mb,
+            };
+            let total = hess_total(&gpair).expect("finite, non-negative Hessians");
+            pair_grid(&bins, &gpair, &mut grid);
+            negative |= smallest_denominator(&grid, ma, mb, 0.0) < 0.0;
+            // The largest `lambda` the gate refuses, by bisecting the bit
+            // patterns of positive floats (ordered as their values).
+            let refused = |lambda: f64| !denominators_positive(lambda, Some(total), grid.len());
+            let (mut below, mut above) = (0u64, f64::MAX.to_bits());
+            while above - below > 1 {
+                let mid = below + (above - below) / 2;
+                if refused(f64::from_bits(mid)) {
+                    below = mid;
+                } else {
+                    above = mid;
+                }
+            }
+            let above = f64::from_bits(above);
+            for lambda in [f64::from_bits(below), above, 4.0 * above] {
+                let guarded = best_cut::<true>(&grid, ma, mb, lambda);
+                if !refused(lambda) {
+                    let smallest = smallest_denominator(&grid, ma, mb, lambda);
+                    assert!(smallest > 0.0, "{ma} x {mb}, lambda {lambda}: {smallest}");
+                    let unguarded = best_cut::<false>(&grid, ma, mb, lambda);
+                    assert_eq!(unguarded.to_bits(), guarded.to_bits(), "{ma} x {mb}");
+                }
+                let gain = pair_gain(&bins, &gpair, lambda, Some(total), &mut scratch);
+                assert_eq!(
+                    gain.to_bits(),
+                    guarded.to_bits(),
+                    "{ma} x {mb}, lambda {lambda}"
+                );
+            }
+        }
+        assert!(negative, "some quadrant's Hessian sum must round below 0");
+    }
 }

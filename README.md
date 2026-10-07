@@ -180,6 +180,7 @@ See [`python/README.md`](python/README.md).
 ## Caveats
 
 - Full technical details, invariants, and statistical assumptions are documented in the [API reference](https://docs.rs/hessboost).
+- CUDA is introduced for the 0.3.0 release: `Device` now carries CUDA ordinals and can no longer be cast to a numeric discriminant. CPU histogram/root sums use fixed blocks above 8,191 rows; outside the exact-sum domain this can change the low bits of newly trained models. Existing model files and prediction semantics remain supported.
 - Approximate in-place updates are designed for incremental shifts (under ~1% of rows); larger changes benefit from a retrain.
 - Asymptotic Boulevard inference and prediction intervals require specific noise and structure assumptions; see the [`inference` docs](https://docs.rs/hessboost/latest/hessboost/inference/#validation) for conditions and empirical coverage validation.
 ## Not implemented

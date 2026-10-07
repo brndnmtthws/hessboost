@@ -89,6 +89,7 @@ impl SumDomain {
     /// commutative and associative — so this agrees with [`of`](Self::of)
     /// bit for bit. Staging runs it once per tree on the whole gradient
     /// slice, where one thread's fold is a measurable share of the round.
+    #[cfg(any(test, all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
     pub(crate) fn of_slice<T: Sync>(values: &[T], project: impl Fn(&T) -> f32 + Sync) -> Self {
         use rayon::prelude::*;
         /// Values per fold chunk: enough to amortize the reduction.
@@ -101,6 +102,7 @@ impl SumDomain {
 
     /// The statistics of both domains together; see [`of`](Self::of) and
     /// [`of_slice`](Self::of_slice).
+    #[cfg(any(test, all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
     fn combine(self, other: Self) -> Self {
         Self {
             max: self.max.max(other.max),

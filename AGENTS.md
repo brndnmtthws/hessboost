@@ -56,11 +56,11 @@ cargo nextest run --test lightgbm_parity --release --run-ignored only --no-captu
 ```
 
 CUDA (`--features cuda`, Linux): `tests/cuda.rs` compiles the kernels
-whenever `libnvrtc.so` (or `.so.12`) is loadable, GPU or not; its device
-tests skip without a GPU unless `HESSBOOST_REQUIRE_CUDA` is set, which
-turns a skip into a failure (set it on GPU machines). Without a toolkit,
-the pip `nvidia-cuda-nvrtc` wheel works: link its `libnvrtc.so.13` as
-`libnvrtc.so` and put that directory on `LD_LIBRARY_PATH`, as CI does.
+whenever NVRTC is loadable, GPU or not. Linux CI sets
+`HESSBOOST_REQUIRE_NVRTC=1` so a missing compiler cannot skip that guard.
+Device tests skip without a GPU unless `HESSBOOST_REQUIRE_CUDA` is set.
+Without a toolkit, the pip `nvidia-cuda-nvrtc` wheel works: link its
+`libnvrtc.so.13` as `libnvrtc.so` and add that directory to `LD_LIBRARY_PATH`.
 
 ```sh
 HESSBOOST_REQUIRE_CUDA=1 cargo nextest run --features cuda --test cuda --release
@@ -275,6 +275,17 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   binned index is matched by immutable identity (moves and clones retain
   it), not aggregate shape. A fresh margin run invalidates cached labels
   and weights. GPU parity tests reject sticky runtime fallback.
+  No Rayon work may run under the backend state mutex: pool work stealing
+  can re-enter another histogram call and deadlock. Locked CPU fallback
+  uses the serial helper with the same chunk order, not one long chain.
+  Integer conversion runs only when both component domains pass
+  `sums_exact(1)`; metadata is retained otherwise for chain/CPU dispatch.
+  All CUDA mutexes use `parking_lot` without poisoning boilerplate.
+  Each backend forks its stream before allocating or raw-binning data;
+  immutable kernel handles are cached, not mutable submission streams.
+  All retained bins, encoder use and frees stay on the owning stream.
+  Pageable H2D sources explicitly complete before their slices leave
+  scope; asynchronous large copies use event-owned pinned memory.
   Numeric split search assigns one warp per feature: lane 0 forms exact
   CPU-order prefix/suffix chains, lanes score candidates independently,
   and argmax keeps score then earliest forward/backward position. All

@@ -55,6 +55,16 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dtrain = DMatrix::from_dense(&x, meta.n_rows, meta.n_cols)?.with_labels(&y)?;
         let model = train(&params, &dtrain, meta.num_round)?;
         let elapsed = start.elapsed().as_secs_f64();
+        #[cfg(all(target_os = "linux", feature = "cuda"))]
+        if matches!(params.device, hessboost::config::Device::Cuda { .. })
+            && !hessboost::backend::cuda::available()
+        {
+            return Err(format!(
+                "CUDA timing is invalid after fallback: {:?}",
+                hessboost::backend::cuda::unavailable_reason()
+            )
+            .into());
+        }
         if run > 0 {
             samples.push(elapsed);
         }

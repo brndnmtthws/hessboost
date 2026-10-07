@@ -105,6 +105,7 @@ jobs:
           so=$(find "$RUNNER_TEMP/nvrtc" -name 'libnvrtc.so.[0-9]*' ! -name '*builtins*' | head -1)
           ln -sf "$so" "$(dirname "$so")/libnvrtc.so"
           echo "LD_LIBRARY_PATH=$(dirname "$so")" >> "$GITHUB_ENV"
+          echo "HESSBOOST_REQUIRE_NVRTC=1" >> "$GITHUB_ENV"
       # The `ci` Cargo profile (Cargo.toml): opt-level 1 with debug
       # assertions, about ten times faster than `dev` for this suite.
       # nextest's own `--profile` would pick a nextest profile.

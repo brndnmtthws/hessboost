@@ -1,6 +1,6 @@
 [package]
 name = "hessboost"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.93"
 license = "Apache-2.0"
@@ -66,7 +66,7 @@ wgpu = ["dep:wgpu", "dep:bytemuck", "dep:parking_lot"]
 # NVIDIA CUDA acceleration for histogram training on Linux. Opt-in and off
 # by default; `libcuda` (the driver, CUDA 12.8 or later) and `libnvrtc` are
 # loaded at run time, so building needs no CUDA toolkit. See `src/backend/`.
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:parking_lot"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `cuda-12080`: the oldest driver API the backend needs (CUDA 12.8), so any

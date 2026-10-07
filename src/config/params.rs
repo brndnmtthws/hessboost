@@ -160,10 +160,10 @@ pub enum GrowPolicy {
 /// the other GPU backends here are `metal` and `wgpu`. Serializes as those
 /// strings (`cuda` for ordinal 0).
 ///
-/// Every GPU moves histogram construction to the GPU for every node whose
-/// sums it can compute exactly and keeps the rest on the CPU, reproducing
-/// single-threaded CPU training bit for bit. All require `tree_method =
-/// hist`/`auto` and a tree booster, and are opt-in.
+/// GPU backends preserve CPU training bits. Metal/wgpu offload nodes within
+/// their exact integer-sum domain; CUDA can also replay the CPU's ordered
+/// floating-point chunks. Work unsupported by a backend remains on the CPU.
+/// All require `tree_method = hist`/`auto` and a tree booster, and are opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Device {

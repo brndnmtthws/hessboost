@@ -4,7 +4,8 @@
 //! no GPU) unless `HESSBOOST_REQUIRE_CUDA` is set, which turns every skip
 //! into a failure: set it on a GPU machine so a broken setup cannot pass
 //! vacuously. Kernel compilation is checked whenever NVRTC is loadable,
-//! GPU or not; parameter-refusal tests always run.
+//! GPU or not; `HESSBOOST_REQUIRE_NVRTC` makes a missing NVRTC an error.
+//! Parameter-refusal tests always run.
 
 #![cfg(all(target_os = "linux", feature = "cuda"))]
 
@@ -18,6 +19,10 @@ use hessboost::config::{
 use hessboost::internals::{CpuBackend, GHistIndex, HistCuts, HistogramBackend, zeroed};
 use hessboost::objective::{GradPair, Multiclass, RegLoss};
 use hessboost::prelude::*;
+use hessboost::training::{EvalHistory, TrainResult};
+use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
+use std::sync::Barrier;
 
 const CUDA: Device = Device::Cuda { ordinal: 0 };
 
@@ -59,6 +64,10 @@ fn kernels_compile_for_supported_architectures() {
         match hessboost::internals::compile_kernels(arch) {
             Ok(bytes) => assert!(bytes > 0, "{arch}: empty CUBIN"),
             Err(error) if error.to_string().contains("libnvrtc not found") => {
+                assert!(
+                    std::env::var_os("HESSBOOST_REQUIRE_NVRTC").is_none(),
+                    "HESSBOOST_REQUIRE_NVRTC is set but libnvrtc was not found"
+                );
                 eprintln!("skipping kernel compile check: libnvrtc not found");
                 return;
             }
@@ -229,6 +238,20 @@ fn histograms_match_cpu_for_every_strategy() {
         let cpu = histogram(&CpuBackend, index, rows, gpair);
         assert_eq!(histogram(&gpu, index, rows, gpair), cpu, "{what}");
         let counts = gpu.node_counts();
+        if gpair
+            .iter()
+            .all(|p| p.grad.is_finite() && p.hess.is_finite())
+        {
+            assert_eq!(
+                counts.cpu_nodes, 0,
+                "{what}: finite histograms must run on CUDA"
+            );
+        }
+        assert!(
+            cuda::available(),
+            "{what}: {:?}",
+            cuda::unavailable_reason()
+        );
         seen.exact_nodes += counts.exact_nodes;
         seen.exact_chunk_nodes += counts.exact_chunk_nodes;
         seen.chain_nodes += counts.chain_nodes;
@@ -326,6 +349,7 @@ fn histograms_match_cpu_for_every_strategy() {
     assert!(seen.exact_chunk_nodes > 0, "{seen:?}");
     assert!(seen.chain_nodes > 0, "{seen:?}");
     assert!(seen.cpu_nodes > 0, "{seen:?}");
+    assert!(cuda::available(), "{:?}", cuda::unavailable_reason());
 }
 
 /// Inputs that do not fit the backend's device buffers never reach the
@@ -754,6 +778,366 @@ fn resident_scan_ragged_bins_and_duplicate_feature_ties_match_cpu() {
         );
         assert!(cuda::available(), "{:?}", cuda::unavailable_reason());
     }
+}
+
+fn history_bits(history: &EvalHistory) -> Vec<(usize, Vec<u64>)> {
+    history
+        .rounds()
+        .map(|round| {
+            (
+                round.iteration(),
+                round.values().iter().map(|value| value.to_bits()).collect(),
+            )
+        })
+        .collect()
+}
+
+fn assert_training_bits(cpu: &TrainResult, gpu: &TrainResult) {
+    assert_eq!(
+        cpu.model.encode(ModelFormat::Binary).unwrap(),
+        gpu.model.encode(ModelFormat::Binary).unwrap()
+    );
+    assert_eq!(cpu.model.best_iteration(), gpu.model.best_iteration());
+    assert_eq!(
+        cpu.best_score.map(f64::to_bits),
+        gpu.best_score.map(f64::to_bits)
+    );
+    assert_eq!(cpu.history.datasets(), gpu.history.datasets());
+    assert_eq!(cpu.history.metrics(), gpu.history.metrics());
+    assert_eq!(cpu.history.first_iteration(), gpu.history.first_iteration());
+    assert_eq!(history_bits(&cpu.history), history_bits(&gpu.history));
+    for dataset in cpu.history.datasets() {
+        for metric in cpu.history.metrics() {
+            let bits = |history: &EvalHistory| {
+                history
+                    .series(dataset, metric)
+                    .unwrap()
+                    .map(f64::to_bits)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&cpu.history), bits(&gpu.history), "{dataset}/{metric}");
+        }
+    }
+    assert!(cuda::available(), "{:?}", cuda::unavailable_reason());
+}
+
+/// Resident rounds must synchronize the margins for every eval metric and
+/// hook, including a callback break, patience exhaustion, and continuation.
+#[test]
+fn resident_training_eval_stop_and_continuation_match_cpu() {
+    if !device() {
+        return;
+    }
+    let n = 4_096;
+    let x: Vec<f32> = (0..n).map(|row| (row % 2) as f32).collect();
+    let labels: Vec<f32> = x.iter().map(|&value| 4.0 * value - 2.0).collect();
+    let margins: Vec<f32> = (0..n)
+        .map(|row| (row % 7) as f32 * 0.0625 - 0.1875)
+        .collect();
+    let data = DMatrix::from_dense(&x, n, 1)
+        .unwrap()
+        .with_labels(&labels)
+        .unwrap()
+        .with_base_margin(&margins)
+        .unwrap();
+    // The validation target is deliberately opposed to the training target:
+    // each fitted round worsens it, so patience really expires at round 2.
+    let valid_labels: Vec<f32> = labels.iter().map(|&label| -label).collect();
+    let valid = data.clone().with_labels(&valid_labels).unwrap();
+    let base = TrainingParams::builder()
+        .objective(Objective::SquaredError(RegLoss::default()))
+        .tree_method(TreeMethod::Hist)
+        .nthread(1)
+        .max_depth(2)
+        .lambda(0.0)
+        .eta(0.5)
+        .eval_metric(EvalMetric::Mae)
+        .eval_metric(EvalMetric::Rmse);
+    let cpu = base.clone().build().unwrap();
+    let gpu = base.device(CUDA).build().unwrap();
+    let fit = |params: &TrainingParams,
+               rounds: usize,
+               initial: Option<&BoostedModel>,
+               patience: Option<NonZeroUsize>,
+               break_at: Option<usize>| {
+        let mut seen = Vec::new();
+        let mut trainer = Trainer::new(params, &data, rounds)
+            .eval(&data, "train")
+            .eval(&valid, "valid");
+        if let Some(initial) = initial {
+            trainer = trainer.init_model(initial);
+        }
+        if let Some(patience) = patience {
+            trainer = trainer.early_stopping_rounds(patience);
+        }
+        let out = trainer
+            .on_round(|round| {
+                seen.push((
+                    round.iteration(),
+                    round.values().iter().map(|value| value.to_bits()).collect(),
+                ));
+                if break_at == Some(round.iteration()) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .train()
+            .unwrap();
+        assert_eq!(seen, history_bits(&out.history));
+        let first = initial.map_or(0, BoostedModel::num_boost_rounds);
+        assert_eq!(out.history.first_iteration(), first);
+        assert_eq!(
+            seen.iter()
+                .map(|(iteration, _)| *iteration)
+                .collect::<Vec<_>>(),
+            (first..out.model.num_boost_rounds()).collect::<Vec<_>>()
+        );
+        out
+    };
+    for break_at in [Some(1), None] {
+        let patience = NonZeroUsize::new(2);
+        let expected = fit(&cpu, 100, None, patience, break_at);
+        let actual = fit(&gpu, 100, None, patience, break_at);
+        assert_training_bits(&expected, &actual);
+        let rounds = if break_at.is_some() { 2 } else { 3 };
+        assert_eq!(actual.model.num_boost_rounds(), rounds);
+        assert_eq!(actual.history.len(), rounds);
+        assert_eq!(actual.model.best_iteration(), Some(0));
+        assert_eq!(
+            actual.best_score.map(f64::to_bits),
+            actual
+                .history
+                .round(0)
+                .unwrap()
+                .score("valid", "rmse")
+                .map(f64::to_bits)
+        );
+        let scores: Vec<_> = actual.history.series("valid", "rmse").unwrap().collect();
+        assert!(scores.windows(2).all(|pair| pair[1] > pair[0]));
+    }
+
+    let whole = fit(&cpu, 8, None, None, None);
+    let whole_gpu = fit(&gpu, 8, None, None, None);
+    assert_training_bits(&whole, &whole_gpu);
+    let first = fit(&cpu, 100, None, None, Some(2));
+    let first_gpu = fit(&gpu, 100, None, None, Some(2));
+    assert_training_bits(&first, &first_gpu);
+    assert_eq!(first.model.num_boost_rounds(), 3);
+    let suffix: Vec<_> = history_bits(&whole.history).into_iter().skip(3).collect();
+    // Both backends can resume either backend's model, with absolute hook
+    // iterations and exactly the uninterrupted model and history suffix.
+    for initial in [&first.model, &first_gpu.model] {
+        let continued = fit(&cpu, 5, Some(initial), None, None);
+        let continued_gpu = fit(&gpu, 5, Some(initial), None, None);
+        assert_training_bits(&continued, &continued_gpu);
+        assert_eq!(
+            continued_gpu.model.encode(ModelFormat::Binary).unwrap(),
+            whole.model.encode(ModelFormat::Binary).unwrap()
+        );
+        assert_eq!(history_bits(&continued_gpu.history), suffix);
+        assert_eq!(initial.num_boost_rounds(), 3);
+    }
+}
+
+/// Actual logistic inputs move across the vector kernel's +/-80 boundary,
+/// rather than staying exceptional for the entire run. Prefix predictions
+/// prove which round's inputs require the host and which permit residency.
+#[test]
+fn logistic_rounds_cross_host_resident_boundary_in_both_directions() {
+    if !device() {
+        return;
+    }
+    let n = 256;
+    let rounds = 6;
+    let x: Vec<f32> = (0..n).map(|row| (row / (n / 2)) as f32).collect();
+    let labels: Vec<f32> = (0..n)
+        .map(|row| {
+            // A minority opposite label in each leaf keeps its gradient
+            // nonzero after saturation, driving the next boundary crossing.
+            f32::from((row < n / 2) != (row % (n / 2) == 0))
+        })
+        .collect();
+    for (name, magnitude, delta, exceptional) in [
+        (
+            "host to resident",
+            81.0,
+            16.0,
+            [true, false, false, false, false, false, false],
+        ),
+        (
+            "resident to host and back",
+            79.0,
+            160.0,
+            [false, true, false, true, false, true, false],
+        ),
+    ] {
+        let margins: Vec<f32> = (0..n)
+            .map(|row| {
+                let sign = if row < n / 2 { -1.0 } else { 1.0 };
+                sign * (magnitude + (row % 4) as f32 * 0.125 - 0.1875)
+            })
+            .collect();
+        let data = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_labels(&labels)
+            .unwrap()
+            .with_base_margin(&margins)
+            .unwrap();
+        let base = TrainingParams::builder()
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
+            .tree_method(TreeMethod::Hist)
+            .nthread(1)
+            .max_depth(1)
+            .min_child_weight(0.0)
+            .lambda(0.0)
+            .eta(1.0)
+            .max_delta_step(MaxDeltaStep::Bounded(delta));
+        let cpu = train(&base.clone().build().unwrap(), &data, rounds).unwrap();
+        let gpu = train(&base.device(CUDA).build().unwrap(), &data, rounds).unwrap();
+        assert_eq!(
+            cpu.encode(ModelFormat::Binary).unwrap(),
+            gpu.encode(ModelFormat::Binary).unwrap(),
+            "{name}"
+        );
+        assert_eq!(cpu.num_boost_rounds(), rounds);
+        for (iteration, &outside) in exceptional.iter().enumerate() {
+            let before = cpu.predict_margin(&data, ..iteration).unwrap();
+            let actual = gpu.predict_margin(&data, ..iteration).unwrap();
+            assert!(
+                before
+                    .as_slice()
+                    .iter()
+                    .all(|margin| { margin.is_finite() && (margin.abs() > 80.0) == outside }),
+                "{name}: inputs to round {iteration} must be exceptional={outside}"
+            );
+            assert_eq!(
+                before
+                    .as_slice()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                actual
+                    .as_slice()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{name}: prefix {iteration}"
+            );
+            if iteration == 0 {
+                assert_eq!(before.as_slice(), margins.as_slice());
+            }
+        }
+        assert!(
+            cuda::available(),
+            "{name}: {:?}",
+            cuda::unavailable_reason()
+        );
+    }
+}
+
+/// Distinct resident training runs and an uploaded prediction model share
+/// the CUDA device, but not thread bindings, margin buffers, or staging.
+#[test]
+fn concurrent_resident_training_and_prediction_match_cpu() {
+    if !device() {
+        return;
+    }
+    let a = dataset_with(8_192, 3, true, false);
+    let a_margins: Vec<f32> = (0..a.n_rows())
+        .map(|row| (row % 7) as f32 * 0.125)
+        .collect();
+    let a = a.with_base_margin(&a_margins).unwrap();
+    let b = dataset_with(12_288, 4, false, false);
+    let b_labels: Vec<f32> = b
+        .labels()
+        .unwrap()
+        .iter()
+        .map(|&label| f32::from(label >= 1.5))
+        .collect();
+    let b_margins: Vec<f32> = (0..b.n_rows())
+        .map(|row| (row % 5) as f32 * 0.125 - 0.25)
+        .collect();
+    let b = b
+        .with_labels(&b_labels)
+        .unwrap()
+        .with_base_margin(&b_margins)
+        .unwrap();
+    let base = TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .nthread(1)
+        .max_depth(3)
+        .eta(0.3);
+    let a_cpu = base
+        .clone()
+        .objective(Objective::SquaredError(RegLoss::default()))
+        .build()
+        .unwrap();
+    let b_cpu = base
+        .objective(Objective::BinaryLogistic(RegLoss::default()))
+        .build()
+        .unwrap();
+    let mut a_gpu = a_cpu.clone();
+    a_gpu.device = CUDA;
+    let mut b_gpu = b_cpu.clone();
+    b_gpu.device = CUDA;
+    let expected_a = train(&a_cpu, &a, 6)
+        .unwrap()
+        .encode(ModelFormat::Binary)
+        .unwrap();
+    let expected_b = train(&b_cpu, &b, 6)
+        .unwrap()
+        .encode(ModelFormat::Binary)
+        .unwrap();
+    let prediction_cpu = train(&b_cpu, &b, 4).unwrap();
+    let prediction_gpu = train(&b_gpu, &b, 4).unwrap();
+    assert_eq!(
+        prediction_cpu.encode(ModelFormat::Binary).unwrap(),
+        prediction_gpu.encode(ModelFormat::Binary).unwrap()
+    );
+    let resident = prediction_gpu.to_cuda(0).unwrap();
+    let bits = |values: &[f32]| {
+        values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    };
+    let expected_margins = bits(prediction_cpu.predict_margin(&b, ..).unwrap().as_slice());
+    let expected_predictions = bits(prediction_cpu.predict(&b, ..).unwrap().as_slice());
+    let barrier = Barrier::new(3);
+    std::thread::scope(|scope| {
+        let fit_a = scope.spawn(|| {
+            barrier.wait();
+            train(&a_gpu, &a, 6)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
+        });
+        let fit_b = scope.spawn(|| {
+            barrier.wait();
+            train(&b_gpu, &b, 6)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
+        });
+        let predict = scope.spawn(|| {
+            barrier.wait();
+            for _ in 0..8 {
+                assert_eq!(
+                    bits(resident.predict_margin(&b, ..).unwrap().as_slice()),
+                    expected_margins
+                );
+                assert_eq!(
+                    bits(resident.predict(&b, ..).unwrap().as_slice()),
+                    expected_predictions
+                );
+            }
+        });
+        assert_eq!(fit_a.join().unwrap(), expected_a);
+        assert_eq!(fit_b.join().unwrap(), expected_b);
+        predict.join().unwrap();
+    });
+    assert!(cuda::available(), "{:?}", cuda::unavailable_reason());
 }
 
 /// Training on a device ordinal that does not exist fails with a GPU error

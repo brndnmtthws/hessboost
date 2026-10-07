@@ -124,10 +124,7 @@ impl CudaHistBackend {
     /// of either growth policy run entirely on the device.
     #[must_use]
     pub fn scan_diagnostics(&self) -> ScanDiagnostics {
-        match self.state.lock() {
-            Ok(state) => state.scan.snapshot(),
-            Err(poisoned) => poisoned.into_inner().scan.snapshot(),
-        }
+        self.state.lock().scan.snapshot()
     }
 
     #[cfg(test)]
@@ -142,7 +139,8 @@ impl CudaHistBackend {
         }
         let flat: Vec<_> = hist.iter().flat_map(|s| [s.grad, s.hess]).collect();
         let offset = slot as usize * self.total_bins * 2;
-        let copied = self.device.stream.memcpy_htod(
+        let copied = super::copy_host(
+            &self.device.stream,
             &flat,
             &mut state.pool.slice_mut(offset..offset + flat.len()),
         );

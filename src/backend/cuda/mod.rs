@@ -110,9 +110,10 @@ use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     DeviceRepr, DriverError, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits, sys,
 };
+use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 /// Threads per block of the elementwise kernels.
 const THREADS: u32 = 256;
@@ -171,6 +172,7 @@ pub fn device_name() -> Option<String> {
 
 /// The kernels of one device's module; per-width kernels are indexed by
 /// [`DeviceBins::width`] (`u8`, `u16`, `u32`).
+#[derive(Clone)]
 struct Kernels {
     stage_units: CudaFunction,
     bin_dense: CudaFunction,
@@ -205,8 +207,8 @@ struct Kernels {
     merge_scans: CudaFunction,
 }
 
-/// One opened CUDA device: the stream every backend on it uses (holding
-/// its primary context), its compiled kernels, and its limits.
+/// Cached CUDA resources plus a stream. Each training backend forks its
+/// own stream before allocating buffers; kernels and failure state are shared.
 struct Device {
     stream: Arc<CudaStream>,
     kernels: Kernels,
@@ -216,7 +218,7 @@ struct Device {
     shared_bytes: usize,
     /// Set by the first CUDA error: the context is unusable afterwards, so
     /// every later build on this device runs on the CPU.
-    failed: AtomicBool,
+    failed: Arc<AtomicBool>,
 }
 
 impl Device {
@@ -232,9 +234,9 @@ impl Device {
             return Err(format!("no CUDA device {ordinal} ({count} found)"));
         }
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("CUDA context: {e}"))?;
-        // SAFETY: called before this context allocates any slice, and every
-        // slice of it is used on the one stream below only, so no slice
-        // needs cross-stream event tracking.
+        // SAFETY: each backend allocates, uses and frees every slice on its
+        // own stream, including retained preparation bins. Only immutable
+        // kernel/module handles cross backend boundaries.
         unsafe { ctx.disable_event_tracking() };
         let (major, minor) = ctx
             .compute_capability()
@@ -336,8 +338,20 @@ impl Device {
             name,
             sm_count: u32::try_from(sm_count).unwrap_or(1).max(1),
             shared_bytes,
-            failed: AtomicBool::new(false),
+            failed: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    fn for_backend(&self) -> std::result::Result<Arc<Self>, DriverError> {
+        let stream = self.stream.context().new_stream()?;
+        Ok(Arc::new(Self {
+            stream,
+            kernels: self.kernels.clone(),
+            name: self.name.clone(),
+            sm_count: self.sm_count,
+            shared_bytes: self.shared_bytes,
+            failed: self.failed.clone(),
+        }))
     }
 
     /// A launch shape for a grid-stride kernel over `work` items.
@@ -413,9 +427,7 @@ type Opened = std::result::Result<Arc<Device>, String>;
 
 /// Open (once) CUDA device `ordinal`.
 fn device(ordinal: usize) -> std::result::Result<Arc<Device>, String> {
-    let mut devices = DEVICES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut devices = DEVICES.lock();
     if let Some((_, opened)) = devices.iter().find(|(o, _)| *o == ordinal) {
         return opened.clone();
     }
@@ -772,10 +784,12 @@ fn upload_pinned<T: Copy + Send + Sync + DeviceRepr + ValidAsZeroBits>(
     let copied = (|| {
         let host = &mut staging.as_mut_slice()[..src.len()];
         for (k, (h, s)) in host.chunks_mut(piece).zip(src.chunks(piece)).enumerate() {
-            h.par_chunks_mut(1 << 16)
-                .zip(s.par_chunks(1 << 16))
-                .for_each(|(a, b)| a.copy_from_slice(b));
+            // This helper also runs under the backend mutex. Rayon here
+            // could steal another build and block recursively on that mutex.
+            h.copy_from_slice(s);
             let offset = (k * piece * std::mem::size_of::<T>()) as u64;
+            // Other host work can change the thread's current CUDA context.
+            stream.context().bind_to_thread()?;
             // SAFETY: disjoint pinned pieces remain owned and untouched until
             // completion; the destination range lies within `dst`.
             unsafe {
@@ -878,7 +892,28 @@ fn upload<T: DeviceRepr + ValidAsZeroBits>(
         return Ok(());
     }
     fit(stream, buf, data.len())?;
-    stream.memcpy_htod(data, &mut buf.slice_mut(..data.len()))
+    copy_host(stream, data, &mut buf.slice_mut(..data.len()))
+}
+
+/// Pageable source slices are not event-tracked by cudarc. Complete their
+/// copy before returning to a caller that may immediately drop/reuse them.
+fn copy_host<T: DeviceRepr, D: DevicePtrMut<T>>(
+    stream: &Arc<CudaStream>,
+    data: &[T],
+    destination: &mut D,
+) -> std::result::Result<(), DriverError> {
+    let copied = stream.memcpy_htod(data, destination);
+    let completed = stream.synchronize();
+    copied.and(completed)
+}
+
+fn clone_host<T: DeviceRepr + ValidAsZeroBits>(
+    stream: &Arc<CudaStream>,
+    data: &[T],
+) -> std::result::Result<CudaSlice<T>, DriverError> {
+    let mut result = stream.alloc_zeros(data.len().max(1))?;
+    copy_host(stream, data, &mut result.slice_mut(..data.len()))?;
+    Ok(result)
 }
 
 /// Feature groups over `bins_of` (bins per feature): contiguous features
@@ -1008,7 +1043,11 @@ impl CudaHistBackend {
     /// Build the backend for `index` on CUDA device `ordinal`: upload its
     /// bins and allocate the per-tree buffers.
     pub fn new(index: &GHistIndex, ordinal: usize) -> Result<Self> {
-        Self::with_global(index, device(ordinal).map_err(HessboostError::gpu)?, None)
+        let device = device(ordinal)
+            .map_err(HessboostError::gpu)?
+            .for_backend()
+            .map_err(gpu_error)?;
+        Self::with_global(index, device, None)
     }
 
     /// Bin dense values on CUDA against CPU-authoritative cuts, then retain
@@ -1037,7 +1076,10 @@ impl CudaHistBackend {
             let backend = Self::new(&index, ordinal)?;
             return Ok((index, backend));
         };
-        let device = device(ordinal).map_err(HessboostError::gpu)?;
+        let device = device(ordinal)
+            .map_err(HessboostError::gpu)?
+            .for_backend()
+            .map_err(gpu_error)?;
         let stream = &device.stream;
         let binned = (|| {
             let count = sized::<u32>(values.len())?;
@@ -1057,9 +1099,9 @@ impl CudaHistBackend {
                 .map(|f| u8::from(cuts.is_categorical(f)))
                 .collect();
             let cut_values: Vec<f32> = (0..cuts.total_bins()).map(|b| cuts.cut_value(b)).collect();
-            let first = stream.clone_htod(&first)?;
-            let categories = stream.clone_htod(&categories)?;
-            let cut_values = stream.clone_htod(&cut_values)?;
+            let first = clone_host(stream, &first)?;
+            let categories = clone_host(stream, &categories)?;
+            let cut_values = clone_host(stream, &cut_values)?;
             let mut global = stream.alloc_zeros::<u32>(count)?;
             let (cells, n_cols, missing) = (count as u64, data.n_cols() as u32, data.missing());
             let mut launch = stream.launch_builder(&device.kernels.bin_dense);
@@ -1164,7 +1206,7 @@ impl CudaHistBackend {
         let dense = index.dense_stride().is_some();
         let mut first: Vec<u32> = (0..n_cols).map(|f| cuts.feature_bins(f).0 as u32).collect();
         first.push(total_bins as u32);
-        let feature_first = stream.clone_htod(&first)?;
+        let feature_first = clone_host(stream, &first)?;
         let global_bins = match retained {
             Some(bins) => bins,
             None => global_bins(stream, index)?,
@@ -1201,7 +1243,7 @@ impl CudaHistBackend {
             (bins, Some(cols), None, stride)
         } else {
             let offsets: Vec<u64> = index.row_ptr().iter().map(|&off| off as u64).collect();
-            (global_bins, None, Some(stream.clone_htod(&offsets)?), 0)
+            (global_bins, None, Some(clone_host(stream, &offsets)?), 0)
         };
         let sentinel = u32::MAX;
         let row_words = sized::<i64>(
@@ -1293,15 +1335,11 @@ impl CudaHistBackend {
     }
 
     /// Lock the device state, unless the device has failed.
-    fn lock(&self) -> Option<std::sync::MutexGuard<'_, State>> {
+    fn lock(&self) -> Option<MutexGuard<'_, State>> {
         if self.device.failed.load(Ordering::Acquire) {
             return None;
         }
-        Some(
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        Some(self.state.lock())
     }
 
     /// `result`'s value, or `None` after marking the device failed (CUDA
@@ -1321,8 +1359,10 @@ impl CudaHistBackend {
         if gpair.len() != self.n_rows {
             return Ok(());
         }
-        let grad = SumDomain::of_slice(gpair, |p| p.grad);
-        let hess = SumDomain::of_slice(gpair, |p| p.hess);
+        // Do not enter Rayon while holding state: a waiting worker can steal
+        // another histogram task that needs this same mutex.
+        let grad = SumDomain::of(gpair.iter().map(|p| p.grad));
+        let hess = SumDomain::of(gpair.iter().map(|p| p.hess));
         // SAFETY: `GradPair` is `repr(C)` of two `f32`s, so the slice is
         // `2 * len` contiguous `f32`s.
         let flat =
@@ -1344,20 +1384,22 @@ impl CudaHistBackend {
         grad: SumDomain,
         hess: SumDomain,
     ) -> std::result::Result<(), DriverError> {
-        let stream = &self.device.stream;
-        let n = self.n_rows as u64;
-        let (to_grad, to_hess) = (grad.unit_scale(), hess.unit_scale());
-        let mut launch = stream.launch_builder(&self.device.kernels.stage_units);
-        launch
-            .arg(&state.gpair)
-            .arg(&mut state.units)
-            .arg(&n)
-            .arg(&to_grad)
-            .arg(&to_hess);
-        // SAFETY: the kernel reads `n` `float2`s of `gpair` and writes `n`
-        // `longlong2`s of `units`, both sized `2 * n_rows` words, and takes
-        // `(u64, f64, f64)` scalars as passed.
-        unsafe { launch.launch(self.device.grid(self.n_rows)) }?;
+        if grad.sums_exact(1) && hess.sums_exact(1) {
+            let stream = &self.device.stream;
+            let n = self.n_rows as u64;
+            let (to_grad, to_hess) = (grad.unit_scale(), hess.unit_scale());
+            let mut launch = stream.launch_builder(&self.device.kernels.stage_units);
+            launch
+                .arg(&state.gpair)
+                .arg(&mut state.units)
+                .arg(&n)
+                .arg(&to_grad)
+                .arg(&to_hess);
+            // SAFETY: both per-value conversions are finite, exact integers
+            // bounded by 2^53. Other domains use floating chains/CPU and
+            // must never execute an undefined C++ float-to-integer cast.
+            unsafe { launch.launch(self.device.grid(self.n_rows)) }?;
+        }
         state.staged = Staged {
             addr: 0,
             len: self.n_rows,
@@ -1797,12 +1839,13 @@ impl CudaHistBackend {
                 rows
             };
             let mut hist = zeroed(bins);
-            CpuBackend.build(ghist, &rows, gpair, &mut hist);
+            CpuBackend::build_serial(ghist, &rows, gpair, &mut hist);
             match targets {
                 Some(t) => {
                     let s = t[k] as usize;
                     let flat: Vec<f64> = hist.iter().flat_map(|b| [b.grad, b.hess]).collect();
-                    stream.memcpy_htod(
+                    copy_host(
+                        stream,
                         &flat,
                         &mut state.out.slice_mut(s * bins * 2..(s + 1) * bins * 2),
                     )?;
@@ -1823,10 +1866,8 @@ impl CudaHistBackend {
             let all = unsafe {
                 std::slice::from_raw_parts(all.as_ptr().cast::<GradStats>(), slots.len() * bins)
             };
-            // Fresh histograms fault their pages in on first write: copy
-            // them out in parallel.
+            // Copy while holding state without Rayon work stealing.
             let copied: Vec<Histogram> = (0..slots.len())
-                .into_par_iter()
                 .map(|slot| all[slot * bins..(slot + 1) * bins].to_vec())
                 .collect();
             for (hist, &k) in copied.into_iter().zip(&slots) {
@@ -2272,7 +2313,7 @@ impl RowEngine for CudaHistBackend {
             .and_then(|staging| download_pinned(stream, staging, &state.tree_rows, end));
         let all = self.ok(all)?;
         Some(
-            segs.par_iter()
+            segs.iter()
                 .map(|s| all[s.offset..s.offset + s.len].to_vec())
                 .collect(),
         )
@@ -2285,11 +2326,9 @@ impl RowEngine for CudaHistBackend {
         }
         let stream = &self.device.stream;
         let loaded = if let Some(buffer) = &mut state.margins {
-            stream.memcpy_htod(margins, buffer)
+            copy_host(stream, margins, buffer)
         } else {
-            stream
-                .clone_htod(margins)
-                .map(|buffer| state.margins = Some(buffer))
+            clone_host(stream, margins).map(|buffer| state.margins = Some(buffer))
         };
         self.ok(loaded)?;
         // A fresh margin run may reuse the same host allocation with new
@@ -2319,7 +2358,7 @@ impl RowEngine for CudaHistBackend {
             // host slice they came from).
             let key = |s: &[f32]| s.as_ptr().addr();
             if state.labels.as_ref().is_none_or(|(k, _)| *k != key(labels)) {
-                state.labels = Some((key(labels), stream.clone_htod(labels)?));
+                state.labels = Some((key(labels), clone_host(stream, labels)?));
             }
             if let Some(weights) = weights
                 && state
@@ -2327,7 +2366,7 @@ impl RowEngine for CudaHistBackend {
                     .as_ref()
                     .is_none_or(|(k, _)| *k != key(weights))
             {
-                state.weights = Some((key(weights), stream.clone_htod(weights)?));
+                state.weights = Some((key(weights), clone_host(stream, weights)?));
             }
             let (Some(margins), Some((_, dev_labels))) = (&state.margins, &state.labels) else {
                 return Ok(None);
@@ -2376,7 +2415,8 @@ impl RowEngine for CudaHistBackend {
                             &mut pairs,
                         );
                         let flat: Vec<f32> = pairs.iter().flat_map(|p| [p.grad, p.hess]).collect();
-                        stream.memcpy_htod(
+                        copy_host(
+                            stream,
                             &flat,
                             &mut state.gpair.slice_mut(2 * split.rows..2 * n),
                         )?;
@@ -2665,6 +2705,66 @@ mod tests {
         // Drop with the last pinned upload still in flight.
         backend.prepare(&index, &first);
         drop(backend);
+        assert!(available(), "{:?}", unavailable_reason());
+    }
+
+    #[test]
+    fn nonrepresentable_domains_skip_integer_conversion_and_keep_chain_bits() {
+        let Some((index, backend)) = backend() else {
+            return;
+        };
+        let stream = &backend.device.stream;
+        let rows: Vec<u32> = (1..index.n_rows() as u32).collect();
+        for value in [f32::NAN, f32::INFINITY, 2.0f32.powi(-100)] {
+            let mut pairs = vec![GradPair::new(1.0, 1.0); index.n_rows()];
+            pairs[0].grad = value;
+            {
+                let mut state = backend.lock().unwrap();
+                stream.memset_zeros(&mut state.units).unwrap();
+                stream.synchronize().unwrap();
+            }
+            backend.prepare(&index, &pairs);
+            {
+                let state = backend.lock().unwrap();
+                assert!(!state.staged.grad.sums_exact(1));
+                let units = stream.clone_dtoh(&state.units).unwrap();
+                stream.synchronize().unwrap();
+                assert!(units.iter().all(|&v| v == 0), "unsafe integer staging ran");
+            }
+            let mut actual = zeroed(index.total_bins());
+            let mut expected = zeroed(index.total_bins());
+            backend.build(&index, &rows, &pairs, &mut actual);
+            CpuBackend.build(&index, &rows, &pairs, &mut expected);
+            assert_eq!(bits(&actual), bits(&expected));
+        }
+        assert!(available(), "{:?}", unavailable_reason());
+    }
+
+    #[test]
+    fn same_rayon_pool_concurrent_backend_calls_do_not_reenter_state_lock() {
+        let Some((index, backend)) = backend() else {
+            return;
+        };
+        let rows: Vec<u32> = (1..index.n_rows() as u32).collect();
+        let mut pairs = vec![GradPair::new(1.0, 1.0); index.n_rows()];
+        pairs[0].grad = f32::NAN; // excluded from rows, but forces CPU fallback
+        backend.prepare(&index, &pairs);
+        let mut expected = zeroed(index.total_bins());
+        CpuBackend.build(&index, &rows, &pairs, &mut expected);
+        let expected = bits(&expected);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            (0..16).into_par_iter().for_each(|_| {
+                backend.prepare(&index, &pairs);
+                let mut actual = zeroed(index.total_bins());
+                backend.build(&index, &rows, &pairs, &mut actual);
+                assert_eq!(bits(&actual), expected);
+            });
+        });
+        assert_eq!(backend.node_counts().cpu_nodes, 16);
         assert!(available(), "{:?}", unavailable_reason());
     }
 

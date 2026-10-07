@@ -969,6 +969,61 @@ stable category counts 1/3/4/64/257/4097, missing/default directions,
 CSR unsorted/empty rows, all bin widths, scalar/vector subnormals,
 oversized compact trees, iteration ranges and concurrent prediction.
 
+### Release and workload qualification
+
+The CUDA cutover is a 0.3.0 change. Adding CUDA ordinals to the formerly
+unit-only `Device` enum makes numeric discriminant casts invalid. Fixed
+CPU histogram/root chunking can also alter newly trained models' low bits
+outside the exact-sum domain; existing saved models remain supported.
+
+Permanent Criterion groups now cover categorical/lossguide/CSR training
+and reused CUDA prediction. The final lifetime-safe L40S qualification
+run (8 host threads, 200k × 30, 20 depth-6 rounds; 1 s warmup, 3 s target,
+10 samples) gave the point estimates below. This is a CPU-versus-CUDA
+comparison on these shapes, not an alternating optimization experiment.
+
+| Permanent benchmark | CPU | CUDA | CPU/CUDA |
+|---|---:|---:|---:|
+| Categorical training | 178.9 ms | 96.1 ms | 1.86× |
+| Lossguide training | 207.5 ms | 338.4 ms | 0.61× |
+| CSR training, ~40% present | 122.7 ms | 99.7 ms | 1.23× |
+| Predict 500k × 30, 100 depth-6 trees | 29.87 ms | 8.16 ms | 3.66× |
+
+Small lossguide frontiers do not amortize GPU/host decision boundaries;
+choose CPU when this workload is latency-sensitive. Sparse memory
+improvements similarly do not guarantee a speedup for every shape. Keep
+transfer/setup costs inside end-to-end training and prediction timings.
+The comparison harness rejects sticky CUDA fallback and checks XGBoost's
+effective device; its reports hash every `.cu` runtime compilation input.
+
+Linux CI requires NVRTC compilation while remaining GPU-independent.
+Python's local extension cache includes CUDA source inputs. Release
+artifacts were built as wheel and sdist; installed consumers without a
+CUDA driver could import, train on CPU, and obtain the documented CUDA
+availability/refusal results. An actual manylinux 2.28 aarch64 wheel was
+built in the release container without a CUDA toolkit and smoke-tested.
+
+Additional required L40S cases cover callback break and actual patience
+exhaustion, eval-history/best metadata, CPU/CUDA continuation, logistic
+host-to-device and device-to-host transitions, concurrent training plus
+prediction, unrepresentable integer domains, and same-pool CPU fallback.
+Backend state locking deliberately contains no Rayon work, avoiding
+work-stealing re-entry; integer staging skips unsafe conversions while
+retaining the domains used by floating chains and CPU fallback.
+
+Each backend owns its allocation/submission stream. Pageable descriptors
+complete before their source slices leave scope; large asynchronous copies
+use completion-owned pinned buffers. These lifetime fences add host/device
+boundaries, particularly for lossguide. The earlier optimization tables are
+historical measurements, not assertions of final-release wall time.
+
+An intermittent driver-side host crash exposed by concurrent-trainer
+memcheck was investigated rather than ignored. After source-lifetime and
+per-backend stream isolation fixes, the concurrent case passed ten
+consecutive memcheck runs; the full 14-test training suite passed memcheck,
+and concurrency passed racecheck/synccheck/initcheck with zero errors.
+The underlying driver fault is not attributed beyond the observed fix.
+
 ### Warp-parallel split scoring
 
 The 2026-10-06 L40S audit compared baseline `18022de` with warp-parallel

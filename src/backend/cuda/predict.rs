@@ -16,8 +16,9 @@ use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     DriverError, LaunchConfig, PushKernelArg, result, sys,
 };
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 const BLOCK_ROWS: usize = 16_384;
 /// Each slot's feature rows plus margins fit in 32 MiB on the device.
@@ -77,9 +78,7 @@ impl Context {
     }
 
     fn get(ordinal: usize) -> Opened {
-        let mut contexts = CONTEXTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut contexts = CONTEXTS.lock();
         if let Some((_, opened)) = contexts.iter().find(|(o, _)| *o == ordinal) {
             return opened.clone();
         }
@@ -423,10 +422,7 @@ impl GpuModel {
                 cols: data.n_cols(),
                 outputs,
             };
-            let mut pool = self
-                .pool
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pool = self.pool.lock();
             let cached = pool
                 .iter()
                 .position(|call| call.shape.serves(shape))
@@ -438,10 +434,7 @@ impl GpuModel {
             };
             call.run(self, data, trees, &mut margins)
                 .map_err(|e| self.ctx.error(e))?;
-            let mut pool = self
-                .pool
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pool = self.pool.lock();
             if pool.len() < POOL_CALLS {
                 pool.push(call);
             }

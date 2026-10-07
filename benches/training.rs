@@ -1410,6 +1410,11 @@ fn bench_cuda(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new("cuda", n), &n, |b, _| {
                 b.iter(|| gpu.build(&ghist, &rows, &gpair, &mut gpu_out));
             });
+            assert!(
+                cuda::available(),
+                "CUDA benchmark fell back: {:?}",
+                cuda::unavailable_reason()
+            );
             eprintln!("cuda_histogram_build/{n}: {:?}", gpu.node_counts());
         }
         group.finish();
@@ -1430,7 +1435,67 @@ fn bench_cuda(c: &mut Criterion) {
             group.bench_function(name, |b| {
                 b.iter(|| black_box(train(&params, &data, 20).unwrap()));
             });
+            if matches!(device, Device::Cuda { .. }) {
+                assert!(
+                    cuda::available(),
+                    "CUDA benchmark fell back: {:?}",
+                    cuda::unavailable_reason()
+                );
+            }
         }
+        group.finish();
+    }
+    {
+        let mut group = c.benchmark_group("cuda_train_variants_200k_x30_20rounds_depth6");
+        group.sample_size(10);
+        for (case, data, policy) in [
+            (
+                "categorical",
+                make_categorical_data(200_000, 30),
+                GrowPolicy::DepthWise,
+            ),
+            ("lossguide", make_data(200_000, 30), GrowPolicy::LossGuide),
+            ("csr", make_csr_data(200_000, 30), GrowPolicy::DepthWise),
+        ] {
+            for (engine, device) in [("cpu", Device::Cpu), ("cuda", Device::Cuda { ordinal: 0 })] {
+                let params = base_hist_params()
+                    .grow_policy(policy)
+                    .max_leaves(64)
+                    .device(device)
+                    .build()
+                    .unwrap();
+                group.bench_function(format!("{case}/{engine}"), |b| {
+                    b.iter(|| black_box(train(&params, &data, 20).unwrap()));
+                });
+                if matches!(device, Device::Cuda { .. }) {
+                    assert!(
+                        cuda::available(),
+                        "CUDA benchmark fell back: {:?}",
+                        cuda::unavailable_reason()
+                    );
+                }
+            }
+        }
+        group.finish();
+    }
+    {
+        let model_data = make_data(100_000, 30);
+        let model = trained_model(&model_data, 100);
+        let gpu = model.to_cuda(0).unwrap();
+        let data = make_data(500_000, 30);
+        // Warm both paths outside timing; CUDA context/forest upload stays
+        // separate from reused-predictor timings, input transfers stay inside.
+        model.predict_margin(&data, ..).unwrap();
+        gpu.predict_margin(&data, ..).unwrap();
+        let mut group = c.benchmark_group("cuda_predict_500k_x30_100trees_depth6");
+        group.sample_size(10);
+        group.throughput(Throughput::Elements(data.n_rows() as u64));
+        group.bench_function("cpu", |b| {
+            b.iter(|| model.predict_margin(black_box(&data), ..).unwrap());
+        });
+        group.bench_function("cuda", |b| {
+            b.iter(|| gpu.predict_margin(black_box(&data), ..).unwrap());
+        });
         group.finish();
     }
 }

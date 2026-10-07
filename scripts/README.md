@@ -207,6 +207,23 @@ batch discards one warmup fit and records three fits. The report uses the
 median of all six measurements for each engine. Held-out RMSE or log loss
 checks model quality alongside timing.
 
+The comparison report hashes Rust sources and every runtime-compiled
+`src/backend/cuda/*.cu` kernel. An executable hash alone does not identify
+the CUDA code NVRTC compiled, so retain `source_sha256` with the results.
+
+Permanent CUDA Criterion groups cover histogram construction, dense
+training, categorical/lossguide/CSR training variants, and reused forest
+prediction including row transfers:
+
+```sh
+RAYON_NUM_THREADS=8 cargo bench --features cuda --bench training -- cuda_train_variants
+RAYON_NUM_THREADS=8 cargo bench --features cuda --bench training -- cuda_predict
+```
+
+Build baseline and candidate benchmark binaries from identical benchmark
+source and use `compare_benchmarks.py` for alternating-order comparisons.
+Forest upload and NVRTC startup are outside reused-predictor timings.
+
 ```sh
 cargo build --release --example bench_compare
 uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \

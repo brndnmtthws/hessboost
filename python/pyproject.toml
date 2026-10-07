@@ -91,4 +91,5 @@ cache-keys = [
   { file = "src/**/*.rs" },
   { file = "../Cargo.toml" },
   { file = "../src/**/*.rs" },
+  { file = "../src/**/*.cu" },
 ]

@@ -127,11 +127,16 @@ def xgboost_batch(folder, meta, threads, repeats, device):
         dtrain = xgb.QuantileDMatrix(x, label=y, nthread=threads, max_bin=meta["max_bin"])
         booster = xgb.train(params, dtrain, num_boost_round=meta["num_round"])
         elapsed = time.perf_counter() - start
+        config = json.loads(booster.save_config())
+        effective_device = config["learner"]["generic_param"]["device"]
+        if device == "cuda" and not effective_device.startswith("cuda"):
+            raise RuntimeError(
+                f"XGBoost CUDA timing is invalid: effective device is {effective_device!r}"
+            )
         if run:
             samples.append(elapsed)
         if run == repeats:
             score = test_score(booster.predict(dtest), yt, meta["metric"])
-            config = json.loads(booster.save_config())
         del booster, dtrain
     return {
         "engine": "xgboost",
@@ -191,6 +196,7 @@ def main():
         Path("Cargo.toml"),
         Path("Cargo.lock"),
         *sorted(Path("src").rglob("*.rs")),
+        *sorted(Path("src/backend/cuda").glob("*.cu")),
     ]
     report = {
         "metadata": {
@@ -204,6 +210,7 @@ def main():
             "xgboost": xgb.__version__,
             "xgboost_build_info": xgb.build_info(),
             "xgboost_library_sha256": sha256(library),
+            "cuda_kernels_runtime_compiled": args.device == "cuda",
             "hessboost_executable_sha256": sha256(executable),
             "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
             "source_sha256": {str(p): sha256(p) for p in sources},

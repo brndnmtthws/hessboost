@@ -343,6 +343,35 @@ pub(crate) fn sum_order(len: usize) -> SumOrder {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+impl CpuBackend {
+    /// CUDA's locked fallback must never enter Rayon: work stealing can
+    /// re-enter the same backend mutex. This reproduces `build`'s fixed
+    /// chunk order with one reusable partial and no pool tasks.
+    pub(crate) fn build_serial(
+        ghist: &GHistIndex,
+        rows: &[u32],
+        gpair: &[GradPair],
+        out: &mut [GradStats],
+    ) {
+        out.fill(GradStats::default());
+        let SumOrder::Blocked { grain } = sum_order(rows.len()) else {
+            accumulate(ghist, rows, gpair, out);
+            return;
+        };
+        let mut chunks = rows.chunks(grain);
+        accumulate(ghist, chunks.next().unwrap_or(&[]), gpair, out);
+        let mut partial = zeroed(out.len());
+        for chunk in chunks {
+            partial.fill(GradStats::default());
+            accumulate(ghist, chunk, gpair, &mut partial);
+            for (total, value) in out.iter_mut().zip(&partial) {
+                total.add(*value);
+            }
+        }
+    }
+}
+
 impl HistogramBackend for CpuBackend {
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
         let SumOrder::Blocked { grain } = sum_order(rows.len()) else {
@@ -469,6 +498,56 @@ mod tests {
     use crate::data::DMatrix;
     use crate::data::ghist::Bins;
     use crate::data::quantile::HistCuts;
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    #[test]
+    fn locked_serial_fallback_matches_blocked_and_chain_bits() {
+        for n in [8191, 8192, 16_513] {
+            for missing in [false, true] {
+                let values: Vec<f32> = (0..n * 3)
+                    .map(|i| {
+                        if missing && i % 7 == 0 {
+                            f32::NAN
+                        } else {
+                            (i % 13) as f32
+                        }
+                    })
+                    .collect();
+                let data = DMatrix::from_dense(&values, n, 3).unwrap();
+                let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 16));
+                for nonfinite in [false, true] {
+                    let mut pairs: Vec<_> = (0..n)
+                        .map(|i| {
+                            let scale = 2.0f32.powi((i * 37 % 61) as i32 - 30);
+                            GradPair::new(((i % 17) as f32 - 8.0) * scale, scale)
+                        })
+                        .collect();
+                    if nonfinite {
+                        pairs[31].grad = f32::NAN;
+                    }
+                    let rows: Vec<u32> = (0..n as u32).collect();
+                    let mut serial = zeroed(index.total_bins());
+                    CpuBackend::build_serial(&index, &rows, &pairs, &mut serial);
+                    let mut parallel = zeroed(index.total_bins());
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(4)
+                        .build()
+                        .unwrap()
+                        .install(|| CpuBackend.build(&index, &rows, &pairs, &mut parallel));
+                    let bits = |hist: &[GradStats]| {
+                        hist.iter()
+                            .map(|v| [v.grad.to_bits(), v.hess.to_bits()])
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        bits(&serial),
+                        bits(&parallel),
+                        "rows={n}, missing={missing}, nonfinite={nonfinite}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn subtraction_identity() {

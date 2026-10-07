@@ -15,6 +15,34 @@
 //! element, or as one flat slice via [`as_slice`](Predictions::as_slice) /
 //! [`into_vec`](Predictions::into_vec).
 //!
+//! A row of feature values predicts without a matrix:
+//! [`predict_row`](BoostedModel::predict_row) /
+//! [`predict_margin_row`](BoostedModel::predict_margin_row) return a
+//! single-output model's value, and
+//! [`predict_row_into`](BoostedModel::predict_row_into) /
+//! [`predict_margin_row_into`](BoostedModel::predict_margin_row_into) write a
+//! row of [`prediction_width`](BoostedModel::prediction_width) (or
+//! [`n_outputs`](BoostedModel::n_outputs)) values into a caller's buffer,
+//! allocating nothing; [`predict_rows`](BoostedModel::predict_rows) /
+//! [`predict_margin_rows`](BoostedModel::predict_margin_rows) read many rows
+//! in place. Every path gives the same bits as [`BoostedModel::predict`] of
+//! any matrix holding the rows: the trees add up in the same order, and the
+//! objective's transform applies to each value (each row, for softmax and
+//! the sorted quantiles) on its own, with XGBoost's scalar `expf`, sigmoid,
+//! and softmax. [`transform_margin`](BoostedModel::transform_margin) and
+//! [`transform_margins_into`](BoostedModel::transform_margins_into) apply that
+//! transform to margins: `predict` is exactly the transform of
+//! `predict_margin`.
+//!
+//! Read-only accessors describe the model in memory, so callers never parse
+//! a model file: its [`trees`](BoostedModel::trees) (nodes, category sets,
+//! leaf vectors, and linear leaves), their
+//! [`tree_weights`](BoostedModel::tree_weights), its
+//! [`num_class`](BoostedModel::num_class), a `gblinear` model's
+//! [`linear`](BoostedModel::linear) weights, and the
+//! [`shrinkage`](BoostedModel::shrinkage) record of a model trained with
+//! model shrinkage.
+//!
 //! Every prediction method takes the boosting iterations it uses
 //! ([`Iterations`], XGBoost's `iteration_range`): [`Iterations::Best`] for
 //! the effective iterations (through `best_iteration` after early stopping,
@@ -360,24 +388,27 @@ mod serde;
 mod shap;
 mod shrinkage;
 mod slice;
+mod transform;
 mod ubjson;
 pub mod uncertainty;
 mod validate;
 mod xgboost;
 
-pub(crate) use shrinkage::{Shrinkage, shrink_margins};
+pub use shrinkage::Shrinkage;
+pub(crate) use shrinkage::shrink_margins;
 
 pub use embed::EmbeddedModel;
 pub use io::ModelFormat;
 pub use objective::ModelObjective;
 pub use predict::Iterations;
 use predict::RowBlock;
-pub(crate) use predict::{initial_margins, transform_margins_in_place, transform_model_margins};
+pub(crate) use predict::initial_margins;
 pub use predictions::{Contributions, Interactions, Predictions};
+pub(crate) use transform::Transform;
 pub(crate) use validate::{check_objective_width, validate_prediction_data};
 
 use self::serde::UncheckedBoostedModel;
-use crate::data::DMatrix;
+use crate::data::{DMatrix, Rows};
 use crate::ebm::EbmInfo;
 use crate::error::{HessboostError, Result};
 use crate::inference::BoulevardInfo;
@@ -484,6 +515,9 @@ pub struct BoostedModel {
     /// Prediction layout of `trees` ([`CompactForest`]), derived lazily and
     /// never serialized. Reset whenever `trees` changes.
     compact: OnceLock<CompactForest>,
+    /// The prediction transform of `objective` ([`Transform`]), derived
+    /// lazily and never serialized. Reset whenever `objective` changes.
+    transform: OnceLock<Transform>,
 }
 
 /// Per-tree contribution weights of a [`BoostedModel`]. Every format stores
@@ -568,15 +602,17 @@ impl TreeWeights {
     }
 }
 
-/// The parameters of a linear (`gblinear`) booster: a per-output weight vector
-/// plus a per-output bias, fit by coordinate descent.
+/// The parameters of a linear (`gblinear`) booster, read through
+/// [`BoostedModel::linear`]: a weight per feature and output plus a bias per
+/// output, fit by coordinate descent. Output `k`'s margin of a row is
+/// `base_score[k] + bias[k] + Σ_f weights[f * n_outputs + k] · x[f]` over the
+/// row's present features, each product formed in `f64` and added in `f32`
+/// in feature order.
 ///
-/// `weights` has length `n_features * n_outputs` laid out `[feature][output]`
-/// (the weight for feature `f`, output `k` is `weights[f * n_outputs + k]`).
-/// `bias` has length `n_outputs`. Checked by the owning model
-/// ([`BoostedModel::validate_structure`]).
+/// The owning model checks its lengths and values when it is trained or
+/// loaded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct LinearModel {
+pub struct LinearModel {
     weights: Vec<f32>,
     bias: Vec<f32>,
 }
@@ -588,11 +624,15 @@ impl LinearModel {
         LinearModel { weights, bias }
     }
 
-    pub(crate) fn bias(&self) -> &[f32] {
+    /// The per-output bias (`n_outputs` values).
+    pub fn bias(&self) -> &[f32] {
         &self.bias
     }
 
-    pub(crate) fn weights(&self) -> &[f32] {
+    /// The weights, `n_features * n_outputs` values laid out
+    /// `[feature][output]`: feature `f`'s weight for output `k` is
+    /// `weights()[f * n_outputs + k]`.
+    pub fn weights(&self) -> &[f32] {
         &self.weights
     }
 }
@@ -600,9 +640,9 @@ impl LinearModel {
 /// Invoke `f(feature, value)` for each present feature of `row` in feature
 /// order. Shared by the gblinear training and prediction paths; arithmetic
 /// stays at each call site to preserve exact conversion points.
-pub(crate) fn for_each_present_value(data: &DMatrix, row: usize, mut f: impl FnMut(usize, f32)) {
-    for feat in 0..data.n_cols() {
-        if let Some(x) = data.get(row, feat) {
+pub(crate) fn for_each_present_value(rows: Rows<'_>, row: usize, mut f: impl FnMut(usize, f32)) {
+    for feat in 0..rows.n_cols() {
+        if let Some(x) = rows.get(row, feat) {
             f(feat, x);
         }
     }
@@ -669,6 +709,7 @@ impl BoostedModel {
             boulevard: None,
             ebm: None,
             compact: OnceLock::new(),
+            transform: self.transform.clone(),
         }
     }
 
@@ -688,11 +729,30 @@ impl BoostedModel {
             .get_or_init(|| CompactForest::from_trees(&self.trees))
     }
 
+    /// The prediction transform of the model's objective, built on first use
+    /// and dropped whenever the objective changes.
+    pub(crate) fn transform(&self) -> &Transform {
+        self.transform
+            .get_or_init(|| Transform::of(&self.objective, self.max_delta_step, self.n_targets))
+    }
+
     /// Contribution weight of tree `i` (`1.0` when weights are absent, e.g. for
     /// imported models or plain `gbtree`).
     #[inline]
     pub(crate) fn tree_weight(&self, i: usize) -> f32 {
         self.tree_weights.get(i)
+    }
+
+    /// Every tree's contribution weight, in [`Self::trees`] order (one per
+    /// tree): `1.0` for plain `gbtree` models, imported ones, and slices of
+    /// them; DART's dropout-rescaled weights; and for a model trained with
+    /// model shrinkage the closed-form weights its [`shrinkage`](Self::shrinkage)
+    /// record determines. A margin is `base_score + Σ weight · tree(x)`
+    /// over the iterations' trees, except that a shrunk model's predictions
+    /// repeat training's shrink-then-add recurrence instead (equal up to
+    /// `f32` rounding; TreeSHAP and XGBoost export use these weights).
+    pub fn tree_weights(&self) -> impl ExactSizeIterator<Item = f32> + '_ {
+        (0..self.trees.len()).map(|t| self.tree_weights.get(t))
     }
 
     /// Whether tree `t` stores a weight vector per leaf (vector-leaf trees).
@@ -712,7 +772,7 @@ impl BoostedModel {
     /// ensembles.
     pub(crate) fn for_each_linear_contribution(
         &self,
-        data: &DMatrix,
+        rows: Rows<'_>,
         row: usize,
         mut f: impl FnMut(usize, usize, f64),
     ) {
@@ -720,7 +780,7 @@ impl BoostedModel {
             return;
         };
         let k = self.n_outputs();
-        for_each_present_value(data, row, |feat, x| {
+        for_each_present_value(rows, row, |feat, x| {
             for c in 0..k {
                 f(feat, c, f64::from(lm.weights[feat * k + c]) * f64::from(x));
             }
@@ -737,7 +797,7 @@ impl BoostedModel {
     /// gradients from the ensemble minus its dropout set. Output is laid out
     /// `[instance][output]`.
     pub(crate) fn predict_margin_dropout(&self, data: &DMatrix, dropped: &[bool]) -> Vec<f32> {
-        let mut out = self.initial_margins(data);
+        let mut out = self.initial_margins(data.into());
         // Dropped trees contribute a zero weight, leaving per-cell accumulation
         // in ascending tree order (a `0.0` addend is a no-op).
         let weight = |ti: usize| {
@@ -747,7 +807,7 @@ impl BoostedModel {
                 self.tree_weight(ti)
             }
         };
-        self.accumulate_forest(data, &mut out, 0..self.trees.len(), weight);
+        self.accumulate_forest(data.into(), &mut out, 0..self.trees.len(), weight);
         out
     }
 
@@ -811,11 +871,14 @@ impl BoostedModel {
             boulevard: None,
             ebm: None,
             compact: OnceLock::new(),
+            transform: OnceLock::new(),
         }
     }
 
-    /// The configured `num_class` (`0` for regression / binary objectives).
-    pub(crate) fn num_class(&self) -> usize {
+    /// The configured `num_class`: a multiclass objective's class count
+    /// (equal to [`Self::n_outputs`]), `0` for every other objective (a model
+    /// with a custom objective keeps what it was trained or saved with).
+    pub fn num_class(&self) -> usize {
         self.num_class
     }
 
@@ -824,10 +887,11 @@ impl BoostedModel {
         self.max_delta_step
     }
 
-    /// Number of raw outputs per instance: `num_class` for multiclass, the
-    /// objective's output count otherwise (`1` for every built-in scalar
-    /// objective, [`BoostedModel::n_targets`] for a multi-target model; custom
-    /// objectives may declare more).
+    /// Number of raw outputs (margins) per row: `num_class` for multiclass,
+    /// one per alpha for a `reg:quantileerror` or `reg:expectileerror` alpha
+    /// list, one per natural parameter for `dist:*`,
+    /// [`BoostedModel::n_targets`] for a label matrix, `1` for every other
+    /// built-in objective, and what a custom objective declares.
     #[inline]
     pub fn n_outputs(&self) -> usize {
         self.n_outputs
@@ -940,7 +1004,9 @@ impl BoostedModel {
         self.n_features
     }
 
-    pub(crate) fn linear(&self) -> Option<&LinearModel> {
+    /// The fitted weights and biases of a `gblinear` model, which predicts
+    /// from them alone (it has no trees); `None` for every tree model.
+    pub fn linear(&self) -> Option<&LinearModel> {
         self.linear.as_ref()
     }
 
@@ -948,12 +1014,12 @@ impl BoostedModel {
         (0..self.trees.len()).any(|i| self.tree_weight(i) != 1.0)
     }
 
-    /// Margin buffer for `data`: the per-output intercepts broadcast to every
+    /// Margin buffer for `rows`: the per-output intercepts broadcast to every
     /// row, overridden by the dataset's per-instance `base_margin` when
     /// present (one value per row, or one per row and output). Shared by
     /// prediction, TreeSHAP, and the training margin caches.
-    pub(crate) fn initial_margins(&self, data: &DMatrix) -> Vec<f32> {
-        initial_margins(&self.base_score, data)
+    pub(crate) fn initial_margins(&self, rows: Rows<'_>) -> Vec<f32> {
+        initial_margins(&self.base_score, rows)
     }
 
     /// Validated prologue for the TreeSHAP paths over the iterations in
@@ -986,7 +1052,7 @@ impl BoostedModel {
             nf,
             width: nf + 1,
             trees,
-            initial: self.initial_margins(data),
+            initial: self.initial_margins(data.into()),
         })
     }
 
@@ -1008,6 +1074,7 @@ impl BoostedModel {
     pub(crate) fn set_objective(&mut self, objective: ModelObjective, max_delta_step: f64) {
         self.objective = objective;
         self.max_delta_step = max_delta_step;
+        self.transform = OnceLock::new();
     }
 
     /// Give every tree an explicit contribution weight (`1.0` where absent),
@@ -1221,9 +1288,11 @@ impl BoostedModel {
         }
     }
 
-    /// The per-iteration shrinkage record, if the model was trained with
-    /// model shrinkage.
-    pub(crate) fn shrinkage(&self) -> Option<&Shrinkage> {
+    /// The per-iteration shrinkage record of a model trained with model
+    /// shrinkage ([`model_shrink`](crate::config::TrainingParams::model_shrink),
+    /// posterior sampling), from which its predictions are computed exactly as
+    /// training computed its margins; `None` for every other model.
+    pub fn shrinkage(&self) -> Option<&Shrinkage> {
         self.shrinkage.as_ref()
     }
 

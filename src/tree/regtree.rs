@@ -45,10 +45,11 @@ pub struct Node {
     /// and leaves.
     pub is_categorical: bool,
     /// For a categorical node, the start index into the owning tree's category
-    /// list of the categories routed left. Unused (`0`) otherwise.
+    /// pool of the categories routed left ([`RegTree::split_categories`] reads
+    /// them). Unused (`0`) otherwise.
     pub cat_begin: u32,
     /// For a categorical node, the end index (exclusive) into the owning tree's
-    /// category list of the categories routed left. Unused (`0`) otherwise.
+    /// category pool of the categories routed left. Unused (`0`) otherwise.
     pub cat_end: u32,
 }
 
@@ -404,6 +405,23 @@ impl RegTree {
         &self.categories[node.cat_begin as usize..node.cat_end as usize]
     }
 
+    /// The categories node `nid` sends left when it splits on a categorical
+    /// feature ([`Node::is_categorical`]), from the tree's category pool
+    /// (its `cat_begin..cat_end`); empty for every other node.
+    ///
+    /// # Panics
+    ///
+    /// When `nid` is not a node of the tree (as [`Self::node`]).
+    pub fn split_categories(&self, nid: usize) -> &[u32] {
+        let node = &self.nodes[nid];
+        if !node.is_categorical {
+            return &[];
+        }
+        self.categories
+            .get(node.cat_begin as usize..node.cat_end as usize)
+            .unwrap_or_default()
+    }
+
     /// The per-leaf linear models, when this is a linear-leaf tree (trained
     /// with `linear_tree`). Such a leaf predicts its linear model, or its
     /// constant `leaf_value` for rows missing one of the model's features.
@@ -570,9 +588,21 @@ impl RegTree {
     /// Crate-internal: vector-leaf trees hold one weight per output, which
     /// callers read with [`RegTree::leaf_vector`].
     pub(crate) fn predict_row(&self, data: &DMatrix, row: usize) -> f32 {
+        self.predict_with(|f| data.get(row, f as usize))
+    }
+
+    /// [`Self::predict_row`] of one dense `row` (`NaN` = missing).
+    pub(crate) fn predict_dense(&self, row: &[f32]) -> f32 {
+        self.predict_with(|f| {
+            let v = row[f as usize];
+            (!v.is_nan()).then_some(v)
+        })
+    }
+
+    /// [`Self::predict_row`] of a row read through `get` (`None` = missing).
+    pub(crate) fn predict_with(&self, get: impl Fn(u32) -> Option<f32>) -> f32 {
         debug_assert!(!self.is_vector_leaf(), "predict_row on a vector-leaf tree");
-        let get = |f: u32| data.get(row, f as usize);
-        let leaf = self.leaf_id_with(get);
+        let leaf = self.leaf_id_with(&get);
         let constant = self.nodes[leaf].leaf_value;
         match &self.linear {
             Some(linear) => linear.predict(leaf, constant, get),

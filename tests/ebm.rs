@@ -11,11 +11,14 @@ use hessboost::ebm::shape_functions;
 use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance, honest_refit};
 use hessboost::objective::{LambdaRank, Objective, RegLoss};
 use hessboost::prelude::*;
+use hessboost::training::TrainResult;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 mod common;
-use common::{incompatible_model, invalid_data, invalid_param, labeled_dense, lcg, with_threads};
+use common::{
+    incompatible_model, invalid_data, invalid_param, labeled_dense, lcg, rmse, with_threads,
+};
 
 /// Early stopping after `rounds` rounds at the default tolerance.
 fn stopping(rounds: usize) -> EbmEarlyStopping {
@@ -343,10 +346,19 @@ fn unsupported_combinations_are_refused() {
 
     let (_, dtrain) = data(100, 7);
     let params = classic().build().unwrap();
-    let evals = Trainer::new(&params, &dtrain, 5)
-        .eval(&dtrain, "train")
-        .train();
-    assert_eq!(invalid_param(evals), "early_stopping_rounds");
+    // Both stopping rules would pick different models; a Boulevard EBM
+    // averages every round, so no round is a best one.
+    let patience = NonZeroUsize::new(3).unwrap();
+    let both = classic_with(classic_ebm().early_stopping(stopping(5)))
+        .build()
+        .unwrap();
+    for params in [both, boulevard().build().unwrap()] {
+        let stopped = Trainer::new(&params, &dtrain, 5)
+            .eval(&dtrain, "train")
+            .early_stopping_rounds(patience)
+            .train();
+        assert_eq!(invalid_param(stopped), "early_stopping_rounds");
+    }
     let too_many = classic_with(classic_ebm().interactions(4)).build().unwrap();
     assert_eq!(
         invalid_param(train(&too_many, &dtrain, 2)),
@@ -882,4 +894,215 @@ fn label_matrices_are_refused_as_labels() {
         .unwrap();
     let params = classic().build().unwrap();
     assert_eq!(invalid_data(train(&params, &dtrain, 2)), ("labels", None));
+}
+
+/// The model of an `on_round` `Break` after round `k` of `rounds`.
+fn stopped_after(
+    params: &TrainingParams,
+    dtrain: &DMatrix,
+    rounds: usize,
+    k: usize,
+) -> BoostedModel {
+    Trainer::new(params, dtrain, rounds)
+        .on_round(move |round| {
+            if round.iteration() == k {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .train()
+        .unwrap()
+        .model
+}
+
+/// A classic EBM of two outer bags with a pair term.
+fn two_bags() -> TrainingParams {
+    classic_with(classic_ebm().outer_bags(2)).build().unwrap()
+}
+
+/// The value of the last metric on `valid` in every recorded round.
+fn watched(result: &TrainResult) -> Vec<f64> {
+    let metric = result.history.metrics().last().unwrap();
+    result.history.series("valid", metric).unwrap().collect()
+}
+
+/// The bits of `model`'s predictions of `data`.
+fn prediction_bits(model: &BoostedModel, data: &DMatrix) -> Vec<u32> {
+    let preds = model.predict(data, Iterations::Best).unwrap();
+    preds.as_slice().iter().map(|p| p.to_bits()).collect()
+}
+
+/// Every classic round's eval score is the metric of the model formed by
+/// the trees through that round, bit for bit, in either stage (an eval
+/// set's base margin replacing the intercept, as in prediction).
+#[test]
+fn classic_eval_scores_are_those_of_the_model_through_each_round() {
+    let (_, dtrain) = data(300, 30);
+    let (_, valid) = data(200, 31);
+    let valid = valid.with_base_margin(&[0.25; 200]).unwrap();
+    let params = two_bags();
+    let rounds = 6;
+    let result = Trainer::new(&params, &dtrain, rounds)
+        .eval(&valid, "valid")
+        .train()
+        .unwrap();
+    let history = watched(&result);
+    assert_eq!(history.len(), 2 * rounds);
+    let rmse = EvalMetric::Rmse.build(1).unwrap();
+    let score = |model: &BoostedModel| {
+        let preds = model.predict(&valid, Iterations::Best).unwrap();
+        rmse.eval_info(preds.as_slice(), &valid.info())
+    };
+    // Main-effect rounds, the last one, then pair rounds.
+    for r in [0, 2, 5, 6, 8, 11] {
+        let model = stopped_after(&params, &dtrain, rounds, r);
+        assert_eq!(score(&model).to_bits(), history[r].to_bits(), "round {r}");
+    }
+}
+
+/// Under early stopping a classic EBM returns the model training held
+/// after the best round (the `Break`-after-it model: trees, terms,
+/// predictions), with that round's score and its last tree as
+/// `best_iteration`.
+#[test]
+fn early_stopping_returns_the_best_rounds_model() {
+    use hessboost::metric::CustomMetric;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_, dtrain) = data(300, 32);
+    let (_, valid) = data(200, 33);
+    let params = two_bags();
+    let rounds = 6;
+    let rmse = |preds: &[f32], labels: &[f32], _: Option<&[f32]>| {
+        let sse: f64 = preds
+            .iter()
+            .zip(labels)
+            .map(|(p, y)| f64::from(p - y).powi(2))
+            .sum();
+        (sse / labels.len() as f64).sqrt()
+    };
+    // Maximizing the RMSE makes the first round the best: a main-effect
+    // round, though patience lasts through the pair stage.
+    let worst = CustomMetric::new("worst", true, rmse);
+    // Best at round 8 (it counts its calls, one per round): patience runs
+    // out in the pair stage.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let at_8 = CustomMetric::new("at-8", false, move |_, _, _| {
+        (calls.fetch_add(1, Ordering::Relaxed) as f64 - 8.0).abs()
+    });
+    for (metric, patience, best, recorded) in [(worst, 20, 0, 2 * rounds), (at_8, 2, 8, 11)] {
+        let result = Trainer::new(&params, &dtrain, rounds)
+            .eval(&valid, "valid")
+            .custom_metric(Box::new(metric))
+            .early_stopping_rounds(NonZeroUsize::new(patience).unwrap())
+            .train()
+            .unwrap();
+        let scores = watched(&result);
+        assert_eq!(scores.len(), recorded);
+        let model = &result.model;
+        let expected = stopped_after(&params, &dtrain, rounds, best);
+        assert_eq!(model.trees(), expected.trees());
+        assert_eq!(model.ebm(), expected.ebm());
+        assert_eq!(
+            prediction_bits(model, &valid),
+            prediction_bits(&expected, &valid)
+        );
+        let terms = shape_functions(model).unwrap().terms.len();
+        assert_eq!(terms, if best < rounds { 3 } else { 4 });
+        assert_eq!(model.best_iteration(), Some(model.num_boost_rounds() - 1));
+        assert_eq!(
+            result.best_score.map(f64::to_bits),
+            Some(scores[best].to_bits())
+        );
+        if best == 0 {
+            let preds = model.predict(&valid, Iterations::Best).unwrap();
+            let own = rmse(preds.as_slice(), valid.labels().unwrap(), None);
+            assert_eq!(result.best_score.map(f64::to_bits), Some(own.to_bits()));
+        }
+    }
+}
+
+/// A Boulevard EBM scores each round's stage average (as `booster =
+/// boulevard` does, summed in `f64`): the model a `Break` after that round
+/// returns, up to `f32` rounding.
+#[test]
+fn boulevard_eval_scores_follow_the_stage_averages() {
+    let (_, dtrain) = data(300, 37);
+    let (_, valid) = data(200, 38);
+    let params = boulevard().build().unwrap();
+    let rounds = 5;
+    let result = Trainer::new(&params, &dtrain, rounds)
+        .eval(&valid, "valid")
+        .train()
+        .unwrap();
+    let history = watched(&result);
+    assert_eq!(history.len(), 2 * rounds);
+    for r in [0, 3, 4, 5, 9] {
+        let got = rmse(&stopped_after(&params, &dtrain, rounds, r), &valid);
+        assert!(
+            (got - history[r]).abs() < 1e-5,
+            "round {r}: {got} vs {}",
+            history[r]
+        );
+    }
+}
+
+/// Eval histories and early-stopped models do not depend on the thread
+/// count, with per-bag early stopping (whose pair stage restarts its eval
+/// margins from the kept main effects) too.
+#[test]
+fn eval_histories_are_identical_across_thread_counts() {
+    let run = || {
+        let (_, dtrain) = data(300, 34);
+        let (_, valid) = data(200, 35);
+        let bag_stopping = classic_with(classic_ebm().early_stopping(stopping(2)))
+            .eta(0.3)
+            .build()
+            .unwrap();
+        let configs = [
+            (two_bags(), NonZeroUsize::new(3)),
+            (bag_stopping, None),
+            (boulevard().build().unwrap(), None),
+        ];
+        configs
+            .iter()
+            .map(|(params, patience)| {
+                let mut trainer = Trainer::new(params, &dtrain, 8).eval(&valid, "valid");
+                if let Some(patience) = *patience {
+                    trainer = trainer.early_stopping_rounds(patience);
+                }
+                let result = trainer.train().unwrap();
+                let history: Vec<u64> = watched(&result).into_iter().map(f64::to_bits).collect();
+                (history, result.model.encode(ModelFormat::Binary).unwrap())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(with_threads(1, run), with_threads(4, run));
+}
+
+/// Cross-validation scores every fold on an eval set, which EBMs take, and
+/// stops on the fold means; bag early stopping, which would end every
+/// fold's stages at a round of its own, is refused.
+#[test]
+fn cross_validation_early_stops_an_ebm() {
+    use hessboost::training::{CrossValidation, Fold};
+    let (_, data) = data(300, 36);
+    let params = two_bags();
+    let folds = || Fold::k_fold(300, 3, 1).unwrap();
+    let results = CrossValidation::new(&params, &data, 6, folds())
+        .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
+        .run()
+        .unwrap();
+    let rmse = &results[0];
+    assert_eq!(rmse.metric, "rmse");
+    assert!((1..=12).contains(&rmse.rounds.len()));
+    assert!(rmse.rounds.iter().all(|round| round.mean.is_finite()));
+
+    let bag_stopping = classic_with(classic_ebm().outer_bags(2).early_stopping(stopping(2)))
+        .build()
+        .unwrap();
+    let cv = || CrossValidation::new(&bag_stopping, &data, 6, folds());
+    assert_eq!(invalid_param(cv().run()), "ebm_early_stopping_rounds");
+    assert_eq!(invalid_param(cv().refit()), "ebm_early_stopping_rounds");
 }

@@ -476,11 +476,18 @@ fn fit(case: &Case, nthread: usize) -> Option<BoostedModel> {
     let mut params = case.params.clone();
     params.nthread = NonZeroUsize::new(nthread);
     let mut trainer = Trainer::new(&params, &case.dtrain, case.rounds);
-    // gblinear and ebm refuse evaluation sets and early stopping; attaching
-    // them would reject every such case before it trains.
-    if !matches!(params.booster, BoosterKind::GbLinear | BoosterKind::Ebm(_)) {
+    // gblinear refuses evaluation sets and early stopping, and an EBM
+    // refuses early stopping when its bags stop early or it is a Boulevard
+    // EBM; attaching them would reject every such case before it trains.
+    if !matches!(params.booster, BoosterKind::GbLinear) {
         trainer = trainer.eval(&case.dtrain, "train");
-        if let Some(rounds) = case.early_stopping {
+        let refuses_stopping = matches!(
+            params.booster,
+            BoosterKind::Ebm(ebm) if ebm.boulevard() || ebm.early_stopping().is_some()
+        );
+        if let Some(rounds) = case.early_stopping
+            && !refuses_stopping
+        {
             trainer = trainer.early_stopping_rounds(rounds);
         }
     }

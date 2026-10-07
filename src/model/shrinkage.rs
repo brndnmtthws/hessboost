@@ -36,7 +36,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::DMatrix;
+use crate::data::Rows;
 use crate::error::{HessboostError, Result};
 
 use super::initial_margins;
@@ -52,11 +52,14 @@ pub(crate) fn shrink_margins(margins: &mut [f32], factor: f64) {
     }
 }
 
-/// The per-iteration shrinkage record of a model: the coefficient `s_i`
-/// applied at the start of every iteration `i` (`s_0 = 1`) and the
-/// intercepts before shrinkage, in margin space.
+/// The per-iteration shrinkage record of a model trained with model
+/// shrinkage, read through [`BoostedModel::shrinkage`](super::BoostedModel::shrinkage):
+/// the coefficient `s_i` applied at the start of every iteration `i` (`s_0 =
+/// 1`) and the intercepts before shrinkage, in margin space.
+/// [`BoostedModel::predict_margin`](super::BoostedModel::predict_margin)
+/// explains how predictions use it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Shrinkage {
+pub struct Shrinkage {
     factors: Vec<f64>,
     base_score: Vec<f32>,
 }
@@ -71,13 +74,17 @@ impl Shrinkage {
         }
     }
 
-    /// The coefficient of every iteration.
-    pub(crate) fn factors(&self) -> &[f64] {
+    /// The coefficient of every iteration, in iteration order: iteration
+    /// `i` multiplies every margin by `factors()[i]` (in `f64`, rounded to
+    /// `f32` once per margin) before adding its trees. The first is `1`.
+    pub fn factors(&self) -> &[f64] {
         &self.factors
     }
 
-    /// The intercepts before shrinkage.
-    pub(crate) fn base_score(&self) -> &[f32] {
+    /// The per-output intercepts before shrinkage, which the recurrence
+    /// starts from (the model's [`base_scores`](super::BoostedModel::base_scores)
+    /// are their closed-form shrunk values).
+    pub fn base_scores(&self) -> &[f32] {
         &self.base_score
     }
 
@@ -129,24 +136,24 @@ impl Shrinkage {
             && base.iter().zip(base_score).all(|(&a, &b)| same(a, b))
     }
 
-    /// The margins `[row][output]` the recurrence starts from for `data`:
-    /// the unshrunk intercepts, or zeros when `data` carries a
+    /// The margins `[row][output]` the recurrence starts from for `rows`:
+    /// the unshrunk intercepts, or zeros when `rows` carry a
     /// `base_margin`, which replaces the shrunk intercepts and is added by
     /// [`Self::finish_margins`] (training refuses `base_margin` with
     /// shrinkage, so prediction does not shrink it).
-    pub(crate) fn start_margins(&self, data: &DMatrix) -> Vec<f32> {
-        if data.base_margin().is_some() {
-            vec![0.0; data.n_rows() * self.base_score.len()]
+    pub(crate) fn start_margins(&self, rows: Rows<'_>) -> Vec<f32> {
+        if rows.base_margin().is_some() {
+            vec![0.0; rows.n_rows() * self.base_score.len()]
         } else {
-            initial_margins(&self.base_score, data)
+            initial_margins(&self.base_score, rows)
         }
     }
 
-    /// Add `data`'s `base_margin`, if any, to the shrunk trees' `margins`
-    /// (see [`Self::start_margins`]).
-    pub(crate) fn finish_margins(&self, data: &DMatrix, margins: &mut [f32]) {
-        if data.base_margin().is_some() {
-            let base = initial_margins(&self.base_score, data);
+    /// Add the `base_margin` of `rows`, if any, to the shrunk trees'
+    /// `margins` (see [`Self::start_margins`]).
+    pub(crate) fn finish_margins(&self, rows: Rows<'_>, margins: &mut [f32]) {
+        if rows.base_margin().is_some() {
+            let base = initial_margins(&self.base_score, rows);
             for (m, b) in margins.iter_mut().zip(base) {
                 *m += b;
             }

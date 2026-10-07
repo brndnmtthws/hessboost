@@ -5,11 +5,11 @@ use crate::booster::Booster;
 use crate::data::{DMatrix, row_major, to_numpy};
 use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::Params;
-use crate::target_stats::OrderedTargetEncoder;
+use crate::target_stats::{FittedTargetEncoder, OrderedTargetEncoder};
 use hessboost::metric::CustomMetric;
 use hessboost::objective::{CustomLoss, GradPair, Objective};
 use hessboost::training::budget::{self, BudgetConfig};
-use hessboost::training::{CrossValidation, Fold, RoundEval, Trainer};
+use hessboost::training::{CrossValidation, CvResult, Fold, RoundEval, Trainer};
 use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArrayDyn, PyReadonlyArray1, ToPyArray};
 use pyo3::panic::PanicException;
@@ -174,39 +174,50 @@ fn round_hook(
     }
 }
 
-/// Where a [`CommitGate`] is.
+/// State of a [`CommitGate::Caller`] question.
 enum Phase {
     Working,
     Asking,
     Answered(bool),
 }
 
-/// The worker's last question to its waiting caller: may the finished work
-/// be applied? The caller answers after one more signal check and checks no
-/// more signals after answering, so an interruption either reaches the work
-/// before it is applied or is left for the interpreter to raise after the
-/// call returns, never raised over applied work.
-#[derive(Clone)]
-pub(crate) struct CommitGate(Arc<GateState>);
+/// The worker's last question to its caller: may the finished work be
+/// applied?
+pub(crate) enum CommitGate<'a> {
+    /// The work runs on a pool thread while its caller waits. The caller
+    /// answers after one more signal check and checks no more signals after
+    /// answering, so an interruption either reaches the work before it is
+    /// applied or is left for the interpreter to raise after the call
+    /// returns, never raised over applied work.
+    Caller(Arc<GateState>),
+    /// The work runs on its caller's own pool thread, nested in an outer
+    /// call, and no signal reaches it: signal handlers run on the main
+    /// thread only, whose outer call polls them. The answer is the verdict,
+    /// taken when asked.
+    Inline(&'a (dyn Fn() -> bool + Sync)),
+}
 
-struct GateState {
+/// State of a [`CommitGate::Caller`] question and the caller thread to wake.
+pub(crate) struct GateState {
     phase: Mutex<Phase>,
     answered: Condvar,
     caller: Thread,
 }
 
-impl CommitGate {
-    fn new(caller: Thread) -> Self {
-        Self(Arc::new(GateState {
-            phase: Mutex::new(Phase::Working),
-            answered: Condvar::new(),
-            caller,
-        }))
-    }
-
-    /// Worker side: wakes the caller and waits for its answer.
+impl CommitGate<'_> {
+    /// Worker side: returns the answer from the waiting caller (woken for it)
+    /// or from the inline verdict.
     pub(crate) fn confirm(&self) -> ControlFlow<()> {
-        let state = &self.0;
+        let state = match self {
+            Self::Caller(state) => state,
+            Self::Inline(may_commit) => {
+                return if may_commit() {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                };
+            }
+        };
         let mut phase = state.phase.lock().unwrap_or_else(PoisonError::into_inner);
         *phase = Phase::Asking;
         state.caller.unpark();
@@ -223,17 +234,26 @@ impl CommitGate {
             }
         }
     }
+}
+
+impl GateState {
+    fn new(caller: Thread) -> Self {
+        Self {
+            phase: Mutex::new(Phase::Working),
+            answered: Condvar::new(),
+            caller,
+        }
+    }
 
     /// Caller side: answers a pending question with `commit()`; whether it
     /// has been answered.
     fn answer(&self, commit: impl FnOnce() -> bool) -> bool {
-        let state = &self.0;
-        let mut phase = state.phase.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
         match *phase {
             Phase::Working => false,
             Phase::Asking => {
                 *phase = Phase::Answered(commit());
-                state.answered.notify_all();
+                self.answered.notify_all();
                 true
             }
             Phase::Answered(_) => true,
@@ -241,23 +261,38 @@ impl CommitGate {
     }
 }
 
-/// Runs `work` on a worker thread while the caller, detached, wakes every
-/// [`SIGNAL_POLL`] to run the interpreter's signal handlers (only the main
-/// thread's do anything), passing a raised exception (`KeyboardInterrupt`)
-/// to `on_signal`, and answers `gate` with `may_commit` after a signal
-/// check. `work` sees the interruption through its round hook and stops at
-/// the end of the round.
+/// Runs `work` inside the extension's rayon pool. From a thread outside the
+/// pool, `work` runs on a worker thread while the caller, detached, wakes
+/// every [`SIGNAL_POLL`] to run the interpreter's signal handlers (only the
+/// main thread's do anything), passing a raised exception
+/// (`KeyboardInterrupt`) to `on_signal`, and answers `work`'s
+/// [`CommitGate`] with `may_commit` after a signal check; `work` sees the
+/// interruption through its round hook and stops at the end of the round.
+///
+/// On a pool thread (a Python callback of an outer call), `work` runs
+/// inline instead: handed to the pool from another thread, it could wait
+/// indefinitely for a pool thread while every pool thread waits on it,
+/// this one included. Its gate then answers with `may_commit` on the spot
+/// ([`CommitGate::Inline`]). A callback on a training's own `nthread` pool
+/// is on no thread of this pool and takes the waiting path: the training
+/// was installed into its `nthread` pool from a thread of this one, and
+/// rayon keeps that thread running this pool's queued work while it waits,
+/// so `work` starts there.
 fn interruptible<T: Send>(
     py: Python<'_>,
-    work: impl FnOnce() -> T + Send,
+    work: impl FnOnce(CommitGate<'_>) -> T + Send,
     on_signal: impl Fn(PyErr),
-    gate: &CommitGate,
-    may_commit: impl Fn() -> bool,
+    may_commit: impl Fn() -> bool + Sync,
 ) -> PyResult<T> {
+    if crate::pool::on_pool_thread() {
+        return Ok(py.detach(|| work(CommitGate::Inline(&may_commit))));
+    }
     let caller = std::thread::current();
+    let state = Arc::new(GateState::new(caller.clone()));
+    let gate = CommitGate::Caller(Arc::clone(&state));
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
-            let out = work();
+            let out = crate::pool::install(move || work(gate));
             caller.unpark();
             out
         });
@@ -270,11 +305,11 @@ fn interruptible<T: Send>(
             if let Err(error) = py.check_signals() {
                 on_signal(error);
             }
-            answered = gate.answer(&may_commit);
+            answered = state.answer(&may_commit);
         }
         worker
             .join()
-            .map_err(|_| PanicException::new_err("the training thread panicked"))
+            .map_err(|_| PanicException::new_err("the training thread panicked"))?
     })
 }
 
@@ -290,7 +325,7 @@ pub(crate) fn run_hooked<T: Send>(
     py: Python<'_>,
     on_round: Option<Py<PyAny>>,
     failure: &Failure,
-    work: impl FnOnce(RoundHook, CommitGate) -> T + Send,
+    work: impl FnOnce(RoundHook, CommitGate<'_>) -> T + Send,
 ) -> PyResult<T> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let hook = Box::new(round_hook(
@@ -298,16 +333,13 @@ pub(crate) fn run_hooked<T: Send>(
         failure.clone(),
         Arc::clone(&interrupted),
     ));
-    let gate = CommitGate::new(std::thread::current());
-    let worker_gate = gate.clone();
     let out = interruptible(
         py,
-        move || work(hook, worker_gate),
+        move |gate| work(hook, gate),
         |error| {
             interrupted.store(true, Ordering::Relaxed);
             failure.record(error);
         },
-        &gate,
         || !interrupted.load(Ordering::Relaxed) && !failure.failed(),
     )?;
     match failure.take() {
@@ -449,39 +481,66 @@ pub(crate) fn train_with_budget(
 /// `(metric, per-round test means, per-round test standard deviations)`.
 type CvHistory = Vec<(String, Vec<f64>, Vec<f64>)>;
 
-/// Cross-validates over explicit `(train rows, test rows)` folds, with
-/// `target_stats = (encoder, columns)` fitted inside each fold.
-#[pyfunction]
-#[pyo3(signature = (
-    params, data, num_boost_round, folds, early_stopping_rounds=None, target_stats=None
-))]
-pub(crate) fn cv(
-    py: Python<'_>,
-    params: &Params,
-    data: &DMatrix,
+/// One cross-validation run, passed from Python as a `dict`: explicit
+/// `(train rows, test rows)` folds, with `target_stats = (encoder, columns)`
+/// fitted inside each fold (over `target_stats_label` when given) and an
+/// `init_model` every fold continues.
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+pub(crate) struct CvRequest<'py> {
+    params: Py<Params>,
+    dtrain: Py<DMatrix>,
     num_boost_round: usize,
     folds: Vec<(Vec<usize>, Vec<usize>)>,
+    #[pyo3(default)]
     early_stopping_rounds: Option<usize>,
+    #[pyo3(default)]
     target_stats: Option<(Py<OrderedTargetEncoder>, Vec<usize>)>,
-) -> PyResult<CvHistory> {
-    let early_stopping_rounds = patience(early_stopping_rounds)?;
-    let folds = folds
-        .into_iter()
-        .map(|(train, test)| Fold::new(train, test))
-        .collect();
-    let target_stats =
-        target_stats.map(|(encoder, columns)| (encoder.get().inner.clone(), columns));
-    let results = py.detached(|| {
-        let mut cv = CrossValidation::new(&params.inner, &data.inner, num_boost_round, folds);
+    #[pyo3(default)]
+    target_stats_label: Option<PyReadonlyArray1<'py, f32>>,
+    #[pyo3(default)]
+    init_model: Option<Py<Booster>>,
+}
+
+impl CvRequest<'_> {
+    /// The configured run (a cheap builder; the work is its `run` or
+    /// `refit`), borrowing the request's matrix, labels and model.
+    fn configured(&mut self) -> PyResult<CrossValidation<'_>> {
+        let early_stopping_rounds = patience(self.early_stopping_rounds)?;
+        let folds = std::mem::take(&mut self.folds)
+            .into_iter()
+            .map(|(train, test)| Fold::new(train, test))
+            .collect();
+        let target_stats = self
+            .target_stats
+            .take()
+            .map(|(encoder, columns)| (encoder.get().inner.clone(), columns));
+        let request = &*self;
+        let mut cv = CrossValidation::new(
+            &request.params.get().inner,
+            &request.dtrain.get().inner,
+            request.num_boost_round,
+            folds,
+        );
         if let Some(rounds) = early_stopping_rounds {
             cv = cv.early_stopping_rounds(rounds);
         }
         if let Some((encoder, columns)) = target_stats {
             cv = cv.target_stats(encoder, columns);
         }
-        cv.run()
-    })?;
-    Ok(results
+        if let Some(labels) = &request.target_stats_label {
+            cv = cv.target_stats_label(row_major(labels, "target_stats_label")?);
+        }
+        if let Some(booster) = &request.init_model {
+            cv = cv.init_model(&booster.get().model);
+        }
+        Ok(cv)
+    }
+}
+
+/// The Python form of `results`: one [`CvHistory`] entry per metric.
+fn history(results: Vec<CvResult>) -> CvHistory {
+    results
         .into_iter()
         .map(|result| {
             let (means, stds) = result
@@ -491,7 +550,34 @@ pub(crate) fn cv(
                 .unzip();
             (result.metric, means, stds)
         })
-        .collect())
+        .collect()
+}
+
+/// Cross-validates as `request` describes; returns the history.
+#[pyfunction]
+pub(crate) fn cv(py: Python<'_>, mut request: CvRequest<'_>) -> PyResult<CvHistory> {
+    let cv = request.configured()?;
+    py.detached(move || cv.run()).map(history)
+}
+
+/// Cross-validates as `request` describes, then retrains on every row for
+/// the chosen round count: `(history, booster, rounds, the encoder fitted
+/// on every row with target_stats)`.
+#[pyfunction]
+pub(crate) fn cv_refit(
+    py: Python<'_>,
+    mut request: CvRequest<'_>,
+) -> PyResult<(CvHistory, Booster, usize, Option<FittedTargetEncoder>)> {
+    let cv = request.configured()?;
+    let refit = py.detached(move || cv.refit())?;
+    Ok((
+        history(refit.results),
+        Booster::new(refit.model),
+        refit.num_boost_round,
+        refit
+            .target_encoder
+            .map(|inner| FittedTargetEncoder { inner }),
+    ))
 }
 
 type FoldArrays<'py> = Vec<(Bound<'py, PyArrayDyn<i64>>, Bound<'py, PyArrayDyn<i64>>)>;

@@ -90,6 +90,7 @@ impl BoostedModel {
             boulevard: None,
             ebm: None,
             compact: OnceLock::new(),
+            transform: self.transform.clone(),
         })
     }
 
@@ -116,6 +117,7 @@ impl BoostedModel {
             boulevard: None,
             ebm: None,
             compact: OnceLock::new(),
+            transform: self.transform.clone(),
         }
     }
 }

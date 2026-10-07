@@ -15,14 +15,6 @@ mod tests;
 pub(crate) use aft::{AftLoss, aft_nloglik};
 pub(crate) use cox::Cox;
 
-/// `exp` of every element in `f32` (XGBoost's `std::exp` on a float), used
-/// by both survival objectives' prediction transform.
-fn exp_transform(preds: &mut [f32]) {
-    for p in preds {
-        *p = p.exp();
-    }
-}
-
 /// Row indices sorted by increasing `|label|`, ties in row order (XGBoost
 /// `MetaInfo::LabelAbsSort`, a stable sort). Shared with the `cox-nloglik`
 /// metric.

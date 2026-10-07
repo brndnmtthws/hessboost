@@ -283,10 +283,11 @@ fn validate_boulevard_request(
 
 /// The data-dependent refusals of `booster = ebm`: one output, numerical
 /// features, no feature weights or base margins (the terms and their
-/// centering assume the intercept alone), and no eval sets or early stopping (the
-/// terms of one run are boosted round by round, so no prefix of the trees
-/// is a model of every term); with `ebm_boulevard` also Boulevard's
-/// refusals (squared error, unit row weights, no base margins).
+/// centering assume the intercept alone), and not both early-stopping
+/// rules (`Trainer::early_stopping_rounds` and the per-bag
+/// `ebm_early_stopping_rounds` would pick different models); with
+/// `ebm_boulevard` also Boulevard's refusals (squared error, unit row
+/// weights, no base margins, no early stopping).
 fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
     let refuse = |name: &'static str, reason: &str| {
         Err(HessboostError::invalid_param(
@@ -300,10 +301,13 @@ fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<
             format!("`booster = ebm`: {reason}"),
         ))
     };
-    if request.early_stopping_rounds.is_some() || !request.evals.is_empty() {
+    if request.early_stopping_rounds.is_some()
+        && request.params.ebm_settings().early_stopping().is_some()
+    {
         return refuse(
             "early_stopping_rounds",
-            "eval sets and early stopping are not supported; evaluate the trained model",
+            "cannot be combined with `ebm_early_stopping_rounds`: the two stopping rules would \
+             pick different models",
         );
     }
     if request.dtrain.n_targets() != 1 {

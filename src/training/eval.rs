@@ -11,6 +11,7 @@ use crate::model::BoostedModel;
 use crate::objective::Loss;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 /// A named evaluation dataset watched during training.
 #[derive(Clone, Copy)]
@@ -26,7 +27,9 @@ pub(super) struct EvalPlan<'a> {
     objective: &'a dyn Loss,
     evals: &'a [EvalSet<'a>],
     infos: Vec<MetaInfo<'a>>,
-    pub(super) metrics: Vec<Box<dyn Metric>>,
+    /// Shared, so a booster can also score other rows with one (the EBM's
+    /// per-bag early stopping).
+    pub(super) metrics: Vec<Arc<dyn Metric>>,
     preds: Vec<f32>,
     /// One round's values, `[dataset][metric]`.
     scores: Vec<f64>,
@@ -45,8 +48,11 @@ impl<'a> EvalPlan<'a> {
         n_targets: usize,
     ) -> Result<Self> {
         let n_out = objective.n_outputs();
-        let mut metrics = configured_metrics(params, objective)?;
-        metrics.extend(metric_override);
+        let mut metrics: Vec<Arc<dyn Metric>> = configured_metrics(params, objective)?
+            .into_iter()
+            .map(Arc::from)
+            .collect();
+        metrics.extend(metric_override.map(Arc::from));
         if n_targets > 1
             && let Some(metric) = metrics.iter().find(|m| !m.supports_label_matrix())
         {
@@ -290,19 +296,28 @@ impl<'a> RoundReporter<'a> {
         }
     }
 
+    /// Under early stopping, the best round so far and the watched metric's
+    /// value there (XGBoost's `best_score`); `None` without early stopping
+    /// or before any round was scored.
+    pub(super) fn best(&self) -> Option<(usize, f64)> {
+        let stopping = self.stopping.as_ref()?;
+        let round = stopping.best_round();
+        let score = *self.history.round(round)?.values().last()?;
+        Some((round, score))
+    }
+
+    /// The recorded history, for a booster that builds its own
+    /// [`TrainResult`] from [`Self::best`].
+    pub(super) fn into_history(self) -> EvalHistory {
+        self.history
+    }
+
     /// The run's result for the trained `model`, with the history and, under
     /// early stopping, the best round. XGBoost records the best iteration
     /// whenever early stopping is on, not only when patience runs out.
     pub(super) fn into_result(self, mut model: BoostedModel) -> TrainResult {
-        let mut best_score = None;
-        if let Some(stopping) = &self.stopping
-            && !self.history.is_empty()
-        {
-            let best_iter = stopping.best_round();
-            best_score = self
-                .history
-                .round(best_iter)
-                .and_then(|round| round.values().last().copied());
+        let best = self.best();
+        if let Some((best_iter, _)) = best {
             // A shrunk model's later iterations rescaled the best one, so keep
             // the model as it was after the best iteration (CatBoost's
             // `use_best_model`) instead of hiding the rest behind the selection.
@@ -312,7 +327,7 @@ impl<'a> RoundReporter<'a> {
         TrainResult {
             model,
             history: self.history,
-            best_score,
+            best_score: best.map(|(_, score)| score),
         }
     }
 }

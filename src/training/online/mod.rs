@@ -816,7 +816,7 @@ fn compose(data: &DMatrix, deleted: &[bool], additions: Option<&DMatrix>) -> Res
             labels.push(m.labels().map_or(0.0, |l| l[row]));
         }
         let n = labels.len();
-        DMatrix::from_dense(&values, n, p)?
+        DMatrix::from_dense_vec(values, n, p)?
     } else {
         let mut indptr = vec![0usize];
         let (mut indices, mut values) = (Vec::new(), Vec::new());

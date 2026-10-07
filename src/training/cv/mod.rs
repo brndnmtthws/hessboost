@@ -2,20 +2,29 @@
 //! caller-supplied folds ([`CrossValidation`], [`Fold`]), including
 //! forward-chaining folds for time-ordered rows, forward folds purged by
 //! each row's label window ([`Fold::purged_forward`]), whole-query folds of
-//! ranking data, and per-fold ordered target statistics
-//! ([`CrossValidation::target_stats`]).
+//! ranking data, per-fold ordered target statistics
+//! ([`CrossValidation::target_stats`], optionally fitted on a separate
+//! per-row target), continuing a model in every fold
+//! ([`CrossValidation::init_model`]), and retraining on every row for the
+//! round count cross-validation chose ([`CrossValidation::refit`],
+//! [`CvRefit`]).
+//!
+//! Rounds are boosting rounds as [`Trainer::on_round`] counts them; for
+//! `booster = ebm` they are EBM rounds, counted on through both stages.
 
 mod fold;
 
 pub use fold::Fold;
 
-use crate::config::TrainingParams;
+use crate::config::{BoosterKind, TrainingParams};
 use crate::data::DMatrix;
-use crate::data::target_stats::OrderedTargetEncoder;
+use crate::data::target_stats::{FittedTargetEncoder, OrderedTargetEncoder};
 use crate::error::{HessboostError, Result};
+use crate::model::BoostedModel;
 use crate::training::Trainer;
 use crate::training::eval::{EarlyStopping, configured_metrics};
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 
 /// Per-metric cross-validation history, aggregated across folds.
 #[derive(Debug, Clone)]
@@ -37,13 +46,35 @@ pub struct CvRound {
     pub std: f64,
 }
 
+/// What [`CrossValidation::refit`] returns: the cross-validation results
+/// and the model retrained on every row for the chosen round count.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct CvRefit {
+    /// The cross-validation results, as [`CrossValidation::run`] returns
+    /// them.
+    pub results: Vec<CvResult>,
+    /// The chosen round count: the length of every result's `rounds` (the
+    /// best round's index plus one under early stopping, else every round
+    /// the folds ran).
+    pub num_boost_round: usize,
+    /// The model trained on every row for `num_boost_round` rounds
+    /// (continuing [`CrossValidation::init_model`] when set).
+    pub model: BoostedModel,
+    /// With [`CrossValidation::target_stats`], the encoder fitted on every
+    /// row, whose encoding `model` was trained on: encode new data with it
+    /// before predicting. `None` otherwise.
+    pub target_encoder: Option<FittedTargetEncoder>,
+}
+
 /// Cross-validation over caller-supplied [`Fold`]s (XGBoost's `cv(...,
 /// folds=...)`), optionally with early stopping.
 ///
 /// Each fold trains `params` for `num_boost_round` rounds on its training
 /// rows and evaluates the metrics (`params.eval_metric`, or the objective's
 /// default) on its test rows after every round; [`run`](Self::run)
-/// averages them across folds.
+/// averages them across folds, and [`refit`](Self::refit) also retrains on
+/// every row for the chosen round count.
 ///
 /// On ranking data (query groups attached), each fold's training and test
 /// rows must be whole query groups ([`DMatrix::select_rows`]); the folds
@@ -80,6 +111,8 @@ pub struct CrossValidation<'a> {
     folds: Vec<Fold>,
     early_stopping_rounds: Option<NonZeroUsize>,
     target_stats: Option<(OrderedTargetEncoder, Vec<usize>)>,
+    target_stats_label: Option<&'a [f32]>,
+    init_model: Option<&'a BoostedModel>,
 }
 
 impl<'a> CrossValidation<'a> {
@@ -98,6 +131,8 @@ impl<'a> CrossValidation<'a> {
             folds,
             early_stopping_rounds: None,
             target_stats: None,
+            target_stats_label: None,
+            init_model: None,
         }
     }
 
@@ -125,10 +160,43 @@ impl<'a> CrossValidation<'a> {
     /// Encoding the whole matrix before cross-validating would leak every
     /// test row's label into its own encoding.
     ///
-    /// [`FittedTargetEncoder::transform`]: crate::data::target_stats::FittedTargetEncoder::transform
+    /// The statistics are taken over the data's labels (one per row), or
+    /// over [`target_stats_label`](Self::target_stats_label) when set.
     #[must_use]
     pub fn target_stats(mut self, encoder: OrderedTargetEncoder, columns: Vec<usize>) -> Self {
         self.target_stats = Some((encoder, columns));
+        self
+    }
+
+    /// The per-row target the [`target_stats`](Self::target_stats) encoder
+    /// is fitted on instead of the data's labels, which stay the training
+    /// target: one column of a multi-target matrix, or a class's 0/1
+    /// indicator. Each fold passes the values of its training rows to
+    /// [`OrderedTargetEncoder::fit_transform_with_labels`] (which checks
+    /// them), and [`refit`](Self::refit) all of them.
+    ///
+    /// [`run`](Self::run) and `refit` refuse it without `target_stats`
+    /// ([`HessboostError::InvalidParameter`] `target_stats_label`) and
+    /// unless it holds one value per row of `data`
+    /// ([`HessboostError::DimensionMismatch`]).
+    #[must_use]
+    pub fn target_stats_label(mut self, labels: &'a [f32]) -> Self {
+        self.target_stats_label = Some(labels);
+        self
+    }
+
+    /// Continue `model` in every fold (and in [`refit`](Self::refit)) as
+    /// [`Trainer::init_model`] does, with its checks of `params` and the
+    /// data against the model. The results count this run's rounds from 0.
+    ///
+    /// [`run`](Self::run) and `refit` refuse it together with
+    /// [`target_stats`](Self::target_stats)
+    /// ([`HessboostError::InvalidParameter`] `target_stats`): the model was
+    /// trained on its own encoding of those columns, which statistics
+    /// refitted per fold would change.
+    #[must_use]
+    pub fn init_model(mut self, model: &'a BoostedModel) -> Self {
+        self.init_model = Some(model);
         self
     }
 
@@ -137,38 +205,148 @@ impl<'a> CrossValidation<'a> {
     ///
     /// Fails when there are no folds, a fold's training or test rows are
     /// empty, out of bounds, or (on ranking data) not whole query groups,
-    /// or when encoding or training a fold fails.
+    /// when [`target_stats_label`](Self::target_stats_label) or
+    /// [`init_model`](Self::init_model) is refused, or when encoding or
+    /// training a fold fails. An EBM that stops its bags early
+    /// ([`Ebm::early_stopping`](crate::config::Ebm::early_stopping)) is refused
+    /// ([`HessboostError::InvalidParameter`] `ebm_early_stopping_rounds`):
+    /// each fold would end its stages at a different round, so the folds'
+    /// rounds would not line up.
+    /// [`early_stopping_rounds`](Self::early_stopping_rounds) stops on the
+    /// fold means instead.
     pub fn run(self) -> Result<Vec<CvResult>> {
-        let CrossValidation {
-            params,
-            data,
-            num_boost_round,
-            folds,
-            early_stopping_rounds,
-            target_stats,
-        } = self;
-        if folds.is_empty() {
+        self.results()
+    }
+
+    /// Cross-validate as [`run`](Self::run) does, then retrain on every row
+    /// of `data` for the chosen round count
+    /// ([`CvRefit::num_boost_round`]: through the best round under
+    /// [`early_stopping_rounds`](Self::early_stopping_rounds), else every
+    /// round the folds ran). The retraining continues
+    /// [`init_model`](Self::init_model) when set and has no eval sets. With
+    /// [`target_stats`](Self::target_stats), it trains on `data` encoded by
+    /// the encoder fitted on every row (over
+    /// [`target_stats_label`](Self::target_stats_label) when set), which is
+    /// returned as [`CvRefit::target_encoder`].
+    ///
+    /// The retraining is configured for all `num_boost_round` rounds and
+    /// stopped through [`Trainer::on_round`] after the chosen count, so its
+    /// model equals one trained on `data` for that many rounds. For
+    /// `booster = ebm` the count is of EBM rounds across both stages
+    /// (`num_boost_round` still caps each stage), so the model is the one
+    /// after that many rounds of the full run.
+    ///
+    /// Fails as `run` does, or when encoding or retraining on `data` fails.
+    ///
+    /// ```
+    /// use hessboost::training::{CrossValidation, Fold};
+    /// use hessboost::prelude::*;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// # fn main() -> Result<()> {
+    /// let x: Vec<f32> = (0..90).map(|i| (i % 30) as f32).collect();
+    /// let y: Vec<f32> = x.iter().map(|v| (v / 10.0).floor()).collect();
+    /// let data = DMatrix::from_dense(&x, 90, 1)?.with_labels(&y)?;
+    /// let params = TrainingParams::builder().max_depth(2).build()?;
+    ///
+    /// let refit = CrossValidation::new(&params, &data, 50, Fold::k_fold(90, 3, 0)?)
+    ///     .early_stopping_rounds(NonZeroUsize::new(5).unwrap())
+    ///     .refit()?;
+    /// // Trained on all 90 rows for as many rounds as the results report.
+    /// assert_eq!(refit.num_boost_round, refit.results[0].rounds.len());
+    /// assert_eq!(refit.model.num_boost_rounds(), refit.num_boost_round);
+    /// let predictions = refit.model.predict(&data, Iterations::Best)?;
+    /// assert_eq!(predictions.as_slice().len(), 90);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn refit(self) -> Result<CvRefit> {
+        let results = self.results()?;
+        let rounds = results.first().map_or(0, |result| result.rounds.len());
+        let (encoded, target_encoder) = match &self.target_stats {
+            Some((encoder, columns)) => {
+                let (encoded, fitted) =
+                    fit_encoder(encoder, columns, self.data, self.target_stats_label)?;
+                (Some(encoded), Some(fitted))
+            }
+            None => (None, None),
+        };
+        let dtrain = encoded.as_ref().unwrap_or(self.data);
+        // The hook cannot stop before the first round.
+        let num_boost_round = if rounds == 0 { 0 } else { self.num_boost_round };
+        let mut completed = 0;
+        let model = self
+            .trainer(dtrain, num_boost_round)
+            .on_round(move |_| {
+                completed += 1;
+                if completed == rounds {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .train()?
+            .model;
+        Ok(CvRefit {
+            results,
+            num_boost_round: rounds,
+            model,
+            target_encoder,
+        })
+    }
+
+    /// The validated cross-validation results [`run`](Self::run) and
+    /// [`refit`](Self::refit) share: every fold's scores aggregated per
+    /// round, truncated at the best round under early stopping.
+    fn results(&self) -> Result<Vec<CvResult>> {
+        if self.folds.is_empty() {
             return Err(HessboostError::invalid_param("folds", "no folds"));
         }
-        validate_folds(&folds, data)?;
-        let objective = params.loss(data.n_targets())?;
-        let metrics = configured_metrics(params, objective.as_ref())?;
+        if let BoosterKind::Ebm(ebm) = &self.params.booster
+            && ebm.early_stopping().is_some()
+        {
+            return Err(HessboostError::invalid_param(
+                "ebm_early_stopping_rounds",
+                "cross-validation averages the folds round by round, but stopping each \
+                 fold's bags on its own held-out rows ends the folds' stages at different \
+                 rounds; stop on the fold means with early_stopping_rounds instead",
+            ));
+        }
+        if let Some(labels) = self.target_stats_label {
+            if self.target_stats.is_none() {
+                return Err(HessboostError::invalid_param(
+                    "target_stats_label",
+                    "needs target_stats: it is the target the encoder is fitted on",
+                ));
+            }
+            if labels.len() != self.data.n_rows() {
+                return Err(HessboostError::dimension_mismatch(
+                    "target_stats_label length (one per row)",
+                    self.data.n_rows(),
+                    labels.len(),
+                ));
+            }
+        }
+        if self.init_model.is_some() && self.target_stats.is_some() {
+            return Err(HessboostError::invalid_param(
+                "target_stats",
+                "cannot be refitted per fold when continuing init_model, which was trained on \
+                 its own encoding of those columns",
+            ));
+        }
+        validate_folds(&self.folds, self.data)?;
+        let objective = self.params.loss(self.data.n_targets())?;
+        let metrics = configured_metrics(self.params, objective.as_ref())?;
         let maximize = metrics.last().is_some_and(|m| m.maximize());
 
-        let run = FoldRun {
-            params,
-            data,
-            num_boost_round,
-            target_stats: target_stats.as_ref(),
-        };
-        let values = run.scores(&folds, metrics.len())?;
+        let values = self.scores(metrics.len())?;
         let mut out: Vec<CvResult> = metrics
             .iter()
             .zip(values)
             .map(|(metric, per_round)| aggregate(metric.name(), &per_round))
             .collect();
 
-        if let Some(patience) = early_stopping_rounds
+        if let Some(patience) = self.early_stopping_rounds
             && let Some(watched) = out.last()
             && !watched.rounds.is_empty()
         {
@@ -179,6 +357,73 @@ impl<'a> CrossValidation<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Train on every fold in order and collect its test scores as
+    /// `values[metric][round][fold]`, grown as rounds arrive (not sized by
+    /// `num_boost_round`, which is caller input).
+    fn scores(&self, n_metrics: usize) -> Result<Vec<Vec<Vec<f64>>>> {
+        let mut values: Vec<Vec<Vec<f64>>> = vec![Vec::new(); n_metrics];
+        for fold in &self.folds {
+            let (dtrain, dtest) = self.fold_data(fold)?;
+            let res = self
+                .trainer(&dtrain, self.num_boost_round)
+                .eval(&dtest, "test")
+                .train()?;
+            for (round, eval) in res.history.rounds().enumerate() {
+                for (per_round, &value) in values.iter_mut().zip(eval.values()) {
+                    if per_round.len() == round {
+                        per_round.push(Vec::with_capacity(self.folds.len()));
+                    }
+                    per_round[round].push(value);
+                }
+            }
+        }
+        Ok(values)
+    }
+
+    /// A [`Trainer`] of `params` on `dtrain`, continuing the initial model
+    /// when set.
+    fn trainer<'b>(&self, dtrain: &'b DMatrix, num_boost_round: usize) -> Trainer<'b>
+    where
+        'a: 'b,
+    {
+        let trainer = Trainer::new(self.params, dtrain, num_boost_round);
+        match self.init_model {
+            Some(model) => trainer.init_model(model),
+            None => trainer,
+        }
+    }
+
+    /// A fold's training and test matrices, target-encoded with statistics
+    /// of its training rows when configured.
+    fn fold_data(&self, fold: &Fold) -> Result<(DMatrix, DMatrix)> {
+        let dtrain = self.data.select_rows(&fold.train)?;
+        let dtest = self.data.select_rows(&fold.test)?;
+        let Some((encoder, columns)) = &self.target_stats else {
+            return Ok((dtrain, dtest));
+        };
+        // `results` checked the length and `validate_folds` the rows.
+        let labels: Option<Vec<f32>> = self
+            .target_stats_label
+            .map(|labels| fold.train.iter().map(|&row| labels[row]).collect());
+        let (dtrain, fitted) = fit_encoder(encoder, columns, &dtrain, labels.as_deref())?;
+        let dtest = fitted.transform(&dtest)?;
+        Ok((dtrain, dtest))
+    }
+}
+
+/// `encoder` fitted on `data` with its encoding of `columns`, over `labels`
+/// when given, else over `data`'s own labels.
+fn fit_encoder(
+    encoder: &OrderedTargetEncoder,
+    columns: &[usize],
+    data: &DMatrix,
+    labels: Option<&[f32]>,
+) -> Result<(DMatrix, FittedTargetEncoder)> {
+    match labels {
+        Some(labels) => encoder.fit_transform_with_labels(data, columns, labels),
+        None => encoder.fit_transform(data, columns),
     }
 }
 
@@ -209,51 +454,6 @@ fn validate_folds(folds: &[Fold], data: &DMatrix) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// What every fold of a [`CrossValidation`] shares.
-struct FoldRun<'a> {
-    params: &'a TrainingParams,
-    data: &'a DMatrix,
-    num_boost_round: usize,
-    target_stats: Option<&'a (OrderedTargetEncoder, Vec<usize>)>,
-}
-
-impl FoldRun<'_> {
-    /// Train on every fold in order and collect its test scores as
-    /// `values[metric][round][fold]`, grown as rounds arrive (not sized by
-    /// `num_boost_round`, which is caller input).
-    fn scores(&self, folds: &[Fold], n_metrics: usize) -> Result<Vec<Vec<Vec<f64>>>> {
-        let mut values: Vec<Vec<Vec<f64>>> = vec![Vec::new(); n_metrics];
-        for fold in folds {
-            let (dtrain, dtest) = self.fold_data(fold)?;
-            let res = Trainer::new(self.params, &dtrain, self.num_boost_round)
-                .eval(&dtest, "test")
-                .train()?;
-            for (round, eval) in res.history.rounds().enumerate() {
-                for (per_round, &value) in values.iter_mut().zip(eval.values()) {
-                    if per_round.len() == round {
-                        per_round.push(Vec::with_capacity(folds.len()));
-                    }
-                    per_round[round].push(value);
-                }
-            }
-        }
-        Ok(values)
-    }
-
-    /// A fold's training and test matrices, target-encoded with statistics
-    /// of its training rows when configured.
-    fn fold_data(&self, fold: &Fold) -> Result<(DMatrix, DMatrix)> {
-        let dtrain = self.data.select_rows(&fold.train)?;
-        let dtest = self.data.select_rows(&fold.test)?;
-        let Some((encoder, columns)) = self.target_stats else {
-            return Ok((dtrain, dtest));
-        };
-        let (dtrain, fitted) = encoder.fit_transform(&dtrain, columns)?;
-        let dtest = fitted.transform(&dtest)?;
-        Ok((dtrain, dtest))
-    }
 }
 
 /// A metric's per-round fold mean and (population) standard deviation.

@@ -563,6 +563,66 @@ def test_ranking_cv_keeps_whole_query_groups() -> None:
         hessboost.cv({"objective": "rank:ndcg"}, dtrain, 5)
 
 
+@pytest.mark.parametrize("early_stopping_rounds", [None, 3])
+def test_cv_refit_trains_every_row_for_the_chosen_rounds(
+    early_stopping_rounds: int | None,
+) -> None:
+    x, y = regression()
+    dtrain = DMatrix(x, y, feature_names=[f"x{i}" for i in range(5)])
+    params = {"eta": 0.8, "max_depth": 3}
+    refit = hessboost.cv(
+        params, dtrain, 40, early_stopping_rounds=early_stopping_rounds, refit=True
+    )
+    assert isinstance(refit, hessboost.CvRefit)
+    plain = hessboost.cv(params, dtrain, 40, early_stopping_rounds=early_stopping_rounds)
+    assert refit.history.keys() == plain.keys()
+    for name, values in plain.items():
+        np.testing.assert_array_equal(refit.history[name], values)
+    assert refit.num_boost_round == len(plain["test-rmse-mean"])
+    if early_stopping_rounds is None:
+        assert refit.num_boost_round == 40
+    else:
+        assert refit.num_boost_round < 40
+    assert refit.target_encoder is None
+    booster = refit.booster
+    assert booster.num_boosted_rounds() == refit.num_boost_round
+    assert booster.feature_names == dtrain.feature_names
+    trained = hessboost.train(params, dtrain, refit.num_boost_round)
+    np.testing.assert_array_equal(booster.predict(x), trained.predict(x))
+
+
+def test_cv_continues_xgb_model_in_every_fold() -> None:
+    x, y = regression()
+    dtrain = DMatrix(x, y)
+    params = {"max_depth": 3}
+    init = hessboost.train(params, dtrain, 4)
+    folds = hessboost.folds.k_fold(400, 3, seed=1)
+    result = hessboost.cv(params, dtrain, 5, folds=folds, xgb_model=init, refit=True)
+    scores = []
+    for train_rows, test_rows in folds:
+        history: hessboost.EvalsResult = {}
+        hessboost.train(
+            params,
+            dtrain.slice(train_rows),
+            5,
+            evals=[(dtrain.slice(test_rows), "test")],
+            evals_result=history,
+            verbose_eval=False,
+            xgb_model=init,
+        )
+        scores.append(history["test"]["rmse"])
+    np.testing.assert_allclose(
+        result.history["test-rmse-mean"], np.mean(scores, axis=0), rtol=1e-12
+    )
+    np.testing.assert_allclose(result.history["test-rmse-std"], np.std(scores, axis=0), rtol=1e-9)
+    assert result.booster.num_boosted_rounds() == 4 + result.num_boost_round
+    continued = hessboost.train(params, dtrain, 5, xgb_model=init)
+    np.testing.assert_array_equal(result.booster.predict(x), continued.predict(x))
+    # The model must take dtrain's features.
+    with pytest.raises(HessboostError):
+        hessboost.cv(params, DMatrix(x[:, :4], y), 2, xgb_model=init)
+
+
 def test_train_with_budget_fits_and_refuses_tuned_parameters() -> None:
     x, y = regression()
     dtrain = DMatrix(x[:300], y[:300], feature_names=[f"f{i}" for i in range(x.shape[1])])
@@ -724,6 +784,54 @@ def test_callback_exceptions_stop_training_and_propagate() -> None:
     with pytest.raises(ValueError, match="callback exploded"):
         hessboost.train({}, DMatrix(x, y), 1000, callbacks=[Broken()])
     assert calls == [0, 1, 2]
+
+
+_NESTED = """
+import numpy as np
+import hessboost
+from hessboost import DMatrix
+
+rng = np.random.default_rng(0)
+x = rng.normal(size=(200, 3))
+dtrain = DMatrix(x, x[:, 0])
+inner = []
+
+class Nested(hessboost.TrainingCallback):
+    def after_iteration(self, iteration, evals_log):
+        booster = hessboost.train(PARAMS, dtrain, 2)
+        inner.append((booster.num_boosted_rounds(), booster.predict(x[:4]).shape))
+        return False
+
+outer = hessboost.train(PARAMS, dtrain, 3, callbacks=[Nested()])
+assert outer.num_boosted_rounds() == 3
+assert inner == [(2, (4,))] * 3, inner
+print("ok")
+"""
+
+
+@pytest.mark.parametrize("nthread", [0, 2])
+def test_a_callback_trains_and_predicts_on_a_one_thread_pool(nthread: int) -> None:
+    """A callback runs on a thread of the training's pool, and training or
+    predicting from it never waits for a pool thread while holding one.
+    Runs in a subprocess on a one-thread pool, so a deadlock fails the test
+    by timeout. The callback holds that pool's only thread, or, with
+    ``nthread``, a thread of the training's own pool, for which the only
+    pool thread waits."""
+    import os
+    import subprocess
+    import sys
+
+    params = {"max_depth": 2, "nthread": nthread}
+    done = subprocess.run(
+        [sys.executable, "-c", _NESTED.replace("PARAMS", repr(params))],
+        env={**os.environ, "RAYON_NUM_THREADS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
 
 
 def test_verbose_eval_prints_each_round_as_it_completes(

@@ -10,6 +10,9 @@
 //! `β = −(XᵀHX + Λ)⁻¹ Xᵀg`,  `Λ = diag(λ, …, λ, 0)`,
 //!
 //! so `linear_lambda` (`λ`) penalizes the slopes but not the intercept.
+//! `g` and `h` are whatever the objective trains on: for `reg:absoluteerror`
+//! and `reg:quantileerror` their smooth surrogates' gradients and curvatures,
+//! which makes the L1 fit an iteratively reweighted least-squares step.
 //! Following LightGBM:
 //!
 //! - categorical features route rows but never enter a leaf model;
@@ -29,7 +32,7 @@
 //! fitted slopes (as in LightGBM). Numerical features should be on comparable
 //! scales, since the slope penalty is not scale invariant.
 
-use crate::data::DMatrix;
+use crate::data::Rows;
 use crate::error::HessboostError;
 use crate::tree::regtree::{Node, RegTree};
 use rayon::prelude::*;
@@ -203,17 +206,17 @@ pub(crate) fn accumulate_forest(
     trees: &[RegTree],
     range: std::ops::Range<usize>,
     output: impl Fn(usize) -> usize + Sync,
-    data: &DMatrix,
+    rows: Rows<'_>,
     out: &mut [f32],
     k: usize,
     weight: impl Fn(usize) -> f32 + Sync,
 ) {
     let row = |(r, out_row): (usize, &mut [f32])| {
         for t in range.clone() {
-            out_row[output(t)] += weight(t) * trees[t].predict_row(data, r);
+            out_row[output(t)] += weight(t) * trees[t].predict_with(|f| rows.get(r, f as usize));
         }
     };
-    if data.n_rows() >= 1024 && rayon::current_num_threads() > 1 {
+    if rows.n_rows() >= 1024 && rayon::current_num_threads() > 1 {
         out.par_chunks_mut(k)
             .with_min_len(256)
             .enumerate()

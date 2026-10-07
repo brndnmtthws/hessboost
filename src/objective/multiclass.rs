@@ -54,9 +54,15 @@ impl Loss for Softmax {
         });
     }
 
+    /// XGBoost's `common::Softmax` of every row (`multi:softprob`'s
+    /// prediction, and both objectives' evaluation transform), one row at a
+    /// time, so a row's probabilities never depend on the other rows. A
+    /// `multi:softmax` model predicts the index of each row's largest margin
+    /// instead ([`BoostedModel::predict`](crate::model::BoostedModel::predict)).
     fn pred_transform(&self, preds: &mut [f32]) {
-        // Convert every instance's margins to a probability distribution.
-        crate::simd::softmax_rows_inplace(preds, self.num_class);
+        for row in preds.chunks_mut(self.num_class) {
+            crate::simd::softmax_scalar(row);
+        }
     }
 
     fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
@@ -109,7 +115,7 @@ mod tests {
     fn softmax_normalizes() {
         let mut r = [1.0f32, 2.0, 3.0];
         let num_class = r.len();
-        crate::simd::softmax_rows_inplace(&mut r, num_class);
+        Softmax::new(num_class, true).pred_transform(&mut r);
         assert_relative_eq!(r.iter().sum::<f32>(), 1.0, epsilon = 1e-6);
         assert!(r[2] > r[1] && r[1] > r[0]);
     }

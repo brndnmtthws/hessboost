@@ -138,7 +138,7 @@ use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::ModelFormat;
 use crate::model::{
-    BoostedModel, RowBlock, Shrinkage, initial_margins, shrink_margins, transform_model_margins,
+    BoostedModel, RowBlock, Shrinkage, Transform, initial_margins, shrink_margins,
     validate_prediction_data,
 };
 use crate::tree::{RegTree, scalar_tree_output};
@@ -536,9 +536,9 @@ impl CompactModel {
         let (mut out, weights) = match shrinkage {
             // The record's own recurrence; the stored weights are its
             // closed form.
-            Some(shrinkage) => (shrinkage.start_margins(data), None),
+            Some(shrinkage) => (shrinkage.start_margins(data.into()), None),
             None => (
-                initial_margins(&self.base_score, data),
+                initial_margins(&self.base_score, data.into()),
                 self.tree_weights.as_deref(),
             ),
         };
@@ -549,7 +549,7 @@ impl CompactModel {
             .enumerate()
             .with_min_len(256)
             .for_each_init(
-                || RowBlock::single_rows(data),
+                || RowBlock::single_rows(data.into()),
                 |block, (r, margins)| {
                     block.load(r, 1);
                     let row = block.row(0).expect("single-row blocks are dense");
@@ -565,7 +565,7 @@ impl CompactModel {
                 },
             );
         if let Some(shrinkage) = shrinkage {
-            shrinkage.finish_margins(data, &mut out);
+            shrinkage.finish_margins(data.into(), &mut out);
         }
         Ok(super::Predictions::new(out, data.n_rows(), k))
     }
@@ -575,12 +575,8 @@ impl CompactModel {
     /// logistic objectives, class indices for `multi:softmax`, ...).
     pub fn predict(&self, data: &DMatrix) -> Result<super::Predictions> {
         let margin = self.predict_margin(data)?;
-        Ok(transform_model_margins(
-            &self.meta.objective,
-            self.meta.max_delta_step,
-            self.meta.n_targets,
-            margin,
-        ))
+        let meta = &self.meta;
+        Ok(Transform::of(&meta.objective, meta.max_delta_step, meta.n_targets).predictions(margin))
     }
 
     /// The serialized model (the exact bytes it was parsed from).

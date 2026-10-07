@@ -13,7 +13,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _data, _hessboost
 from hessboost._core import Uncertainty
-from hessboost._exceptions import HessboostError
+from hessboost._exceptions import HessboostError, InvalidDataError
 from hessboost._matrix import _matrix_for
 from hessboost._model_io import PathLike, _SchemaState, read_bytes, write_bytes
 
@@ -25,10 +25,15 @@ __all__ = [
     "Booster",
     "CompactModel",
     "Distributions",
+    "GbLinearInfo",
     "GpuModel",
     "ImportanceType",
+    "LinearLeavesInfo",
     "ModelFormat",
+    "ModelInfo",
     "ModelSizeReport",
+    "ShrinkageInfo",
+    "TreeInfo",
 ]
 
 Distributions = _hessboost.Distributions
@@ -66,6 +71,46 @@ def _format_for(path: PathLike, format: ModelFormat | None) -> ModelFormat:
     return "binary"
 
 
+def _nan_missing(values: NDArray[np.float32], missing: float) -> NDArray[np.float32] | None:
+    """``values`` with ``missing`` (as ``float32``) replaced by NaN, on a
+    copy unless ``missing`` is NaN; ``None`` when ``missing`` is not NaN and
+    ``values`` holds a NaN, which a :class:`DMatrix` refuses as a
+    non-missing value that is not finite."""
+    marker = np.float32(missing)
+    if np.isnan(marker):
+        return values
+    if np.isnan(values).any():
+        return None
+    return np.where(values == marker, np.float32(np.nan), values)
+
+
+def _dense_rows(data: object, missing: float) -> NDArray[np.float32] | None:
+    """``data`` as the C-contiguous ``float32`` rows :meth:`Booster.predict`
+    reads in place (NaN missing) when it is a plain, non-empty 2-D numeric
+    numpy array; ``None`` for anything that goes through a
+    :class:`DMatrix` (whose errors it then raises)."""
+    if (
+        type(data) is not np.ndarray
+        or data.ndim != 2
+        or data.size == 0
+        or data.dtype.kind not in "biuf"
+    ):
+        return None
+    return _nan_missing(np.ascontiguousarray(data, dtype=np.float32), missing)
+
+
+def _out_array(out: NDArray[np.float32] | None, shape: tuple[int, ...]) -> NDArray[np.float32]:
+    """``out`` checked to be a C-contiguous ``float32`` array of ``shape``
+    (which a native call then writes), or a new one."""
+    if out is None:
+        return np.empty(shape, dtype=np.float32)
+    if not isinstance(out, np.ndarray) or out.dtype != np.float32 or not out.flags.c_contiguous:
+        raise TypeError("out must be a C-contiguous float32 numpy array")
+    if out.shape != shape:
+        raise HessboostError(f"out must have shape {shape}, got {out.shape}")
+    return out
+
+
 @dataclass(frozen=True)
 class ModelSizeReport:
     """A booster's size in the native binary and compact formats, with the
@@ -100,6 +145,144 @@ class ModelSizeReport:
         (thresholds + leaf_values)``: how often each threshold or leaf value
         is shared."""
         return (self.splits + self.leaves) / max(self.thresholds + self.leaf_values, 1)
+
+
+@dataclass(frozen=True)
+class LinearLeavesInfo:
+    """The per-leaf linear models of a ``linear_tree`` tree
+    (:attr:`TreeInfo.linear`), node-indexed: leaf ``n`` predicts
+    ``intercept[n] + sum(coefficients[i] * x[features[i]])`` over ``i`` in
+    ``offsets[n]:offsets[n + 1]``, or its constant :attr:`TreeInfo.value`
+    when any of those features is missing. Internal nodes have no terms."""
+
+    intercept: NDArray[np.float64]
+    """Every node's intercept (``0`` for internal nodes), ``(nodes,)``."""
+    offsets: NDArray[np.int64]
+    """Node ``n``'s terms are ``offsets[n]:offsets[n + 1]``, ``(nodes + 1,)``."""
+    features: NDArray[np.int32]
+    """Every term's feature, node by node in evaluation order."""
+    coefficients: NDArray[np.float64]
+    """Every term's slope, aligned with :attr:`features`."""
+
+
+@dataclass(frozen=True)
+class TreeInfo:
+    """One tree of :attr:`ModelInfo.trees` as node-indexed arrays; node 0
+    is the root. At internal node ``n``, a row branches to ``left[n]`` if its
+    value of ``feature[n]`` is missing and ``default_left[n]`` is true, or if
+    it is present and either below ``threshold[n]`` (numerical splits) or
+    contained in ``categories[n]`` (categorical splits by integer code).
+    Otherwise, the row branches to ``right[n]``. Leaves have ``left[n] == -1``."""
+
+    left: NDArray[np.int32]
+    """Left child of every node, ``-1`` for leaves."""
+    right: NDArray[np.int32]
+    """Right child of every node, ``-1`` for leaves."""
+    feature: NDArray[np.int32]
+    """The feature each internal node splits on, ``-1`` for leaves."""
+    threshold: NDArray[np.float32]
+    """Numerical split thresholds (present values below go left); NaN for
+    leaves and categorical splits."""
+    default_left: NDArray[np.bool_]
+    """Whether rows missing the split feature go left."""
+    categorical: NDArray[np.bool_]
+    """Whether a node splits on category membership."""
+    categories: tuple[NDArray[np.int32], ...]
+    """Per node, the category codes a categorical split sends left (empty
+    for every other node)."""
+    value: NDArray[np.float32]
+    """Leaf weights, ``(nodes,)``, or ``(nodes, K)`` leaf vectors for a
+    vector-leaf tree; NaN for internal nodes."""
+    cover: NDArray[np.float32]
+    """The sum of Hessians training routed through every node."""
+    gain: NDArray[np.float32]
+    """Every node's split gain (``0`` for leaves)."""
+    linear: LinearLeavesInfo | None
+    """The leaves' linear models of a ``linear_tree`` tree, else ``None``."""
+
+    @classmethod
+    def _from_core(cls, tree: dict[str, Any]) -> TreeInfo:
+        fields = dict(tree)
+        categories, linear = fields.pop("categories"), fields.pop("linear")
+        return cls(
+            **fields,
+            categories=tuple(categories),
+            linear=None if linear is None else LinearLeavesInfo(**linear),
+        )
+
+
+@dataclass(frozen=True)
+class GbLinearInfo:
+    """A ``gblinear`` model's coefficients (:attr:`ModelInfo.gblinear`):
+    output ``k``'s margin is ``base_margins[k] + bias[k]`` plus
+    ``weights[f, k] * x[f]`` over the present features in feature order
+    (each product formed in ``float64`` and added in ``float32``)."""
+
+    weights: NDArray[np.float32]
+    """``(num_features, num_outputs)`` weights."""
+    bias: NDArray[np.float32]
+    """Per-output bias, ``(num_outputs,)``."""
+
+
+@dataclass(frozen=True)
+class ShrinkageInfo:
+    """The model-shrinkage record of a model trained with ``model_shrink``
+    or posterior sampling (:attr:`ModelInfo.shrinkage`): margins start at
+    :attr:`base_margins`, and every iteration ``i`` multiplies them by
+    ``factors[i]`` (in ``float64``, rounded to ``float32``) before adding
+    its trees (unweighted)."""
+
+    factors: NDArray[np.float64]
+    """The coefficient of every iteration; the first is ``1``."""
+    base_margins: NDArray[np.float32]
+    """The per-output intercepts before shrinkage."""
+
+
+@dataclass(frozen=True)
+class ModelInfo:
+    """A booster's structure (:meth:`Booster.model_info`): its layout,
+    ``gblinear`` and model-shrinkage records, and every tree's nodes."""
+
+    objective: str
+    """The objective, e.g. ``"binary:logistic"``."""
+    num_features: int
+    """Features the model takes."""
+    num_outputs: int
+    """Raw outputs (margins) per row."""
+    num_targets: int
+    """Label columns the model was trained on."""
+    num_class: int
+    """A multiclass objective's class count, else ``0``."""
+    num_parallel_tree: int
+    """Trees per output per iteration."""
+    trees_per_iteration: int
+    """``num_outputs * num_parallel_tree`` scalar trees, or
+    ``num_parallel_tree`` vector-leaf trees."""
+    num_boosted_rounds: int
+    """Boosting iterations."""
+    best_iteration: int | None
+    """The iteration early stopping chose, or ``None``."""
+    base_margins: NDArray[np.float32]
+    """Per-output intercepts in margin space (for a shrunk model, their
+    closed-form shrunk values)."""
+    vector_leaves: bool
+    """Whether every tree predicts every output."""
+    linear_leaves: bool
+    """Whether any tree has ``linear_tree`` leaf models."""
+    tree_weights: NDArray[np.float32]
+    """Every tree's contribution weight (``1`` for plain ``gbtree``, DART's
+    rescaled weights), in tree order."""
+    tree_outputs: NDArray[np.int32]
+    """The output every tree feeds, ``(t // num_parallel_tree) %
+    num_outputs`` for tree ``t``; ``0`` for vector-leaf trees, which feed
+    every output."""
+    gblinear: GbLinearInfo | None
+    """A ``gblinear`` model's coefficients (it has no trees), else ``None``."""
+    shrinkage: ShrinkageInfo | None
+    """The model-shrinkage record, else ``None``."""
+    trees: tuple[TreeInfo, ...]
+    """Every tree, in iteration order (``trees_per_iteration`` per
+    iteration)."""
 
 
 class Booster(_SchemaState):
@@ -302,8 +485,12 @@ class Booster(_SchemaState):
                 "output_margin, pred_leaf, pred_contribs and pred_interactions are exclusive"
             )
         model = self._model
-        matrix = self._matrix(data, base_margin, missing, validate_features)
         iterations = self._range(iteration_range)
+        if base_margin is None and not (pred_leaf or pred_contribs or pred_interactions):
+            rows = _dense_rows(data, missing)
+            if rows is not None:
+                return model.predict_rows(rows, output_margin, iterations)
+        matrix = self._matrix(data, base_margin, missing, validate_features)
         if pred_leaf:
             return model.predict_leaf(matrix, iterations)
         kind = (
@@ -316,6 +503,141 @@ class Booster(_SchemaState):
             else "value"
         )
         return model.predict(matrix, kind, iterations)
+
+    def predict_row(
+        self,
+        row: ArrayLike,
+        *,
+        output_margin: bool = False,
+        iteration_range: tuple[int, int] | None = None,
+        missing: float = np.nan,
+        out: NDArray[np.float32] | None = None,
+    ) -> NDArray[np.float32]:
+        """Predicts one row for low-latency serving, without building a
+        :class:`DMatrix`: bit for bit ``predict(row[None, :], ...)[0]``.
+
+        Args:
+            row: One value per feature (``(num_features(),)``, converted to
+                ``float32``); categorical features as the model's integer
+                codes.
+            output_margin: Return raw margins instead of the objective's
+                predictions.
+            iteration_range: As for :meth:`predict` (``None``: through
+                :attr:`best_iteration`).
+            missing: The missing-value marker (default NaN). If set to another
+                value, NaN in ``row`` is rejected as invalid data.
+            out: A C-contiguous 1-D ``float32`` array of exactly the result's
+                length, written in place and returned, so no result array is
+                allocated.
+
+        Returns:
+            The row's ``num_outputs`` predictions (margins with
+            ``output_margin``), or its one class index for
+            ``multi:softmax``, as a 1-D ``float32`` array.
+
+        Raises:
+            HessboostError: ``row`` is not 1-D or holds the wrong number of
+                values, or ``out`` has the wrong shape, is read-only, or
+                shares memory with ``row``.
+            InvalidDataError: ``row`` holds an infinity, or a NaN while
+                ``missing`` is not NaN.
+            TypeError: ``out`` is not a C-contiguous ``float32`` numpy
+                array.
+        """
+        model = self._model
+        values = _data.as_float32(row, "row")
+        if values.ndim != 1:
+            raise HessboostError(
+                f"row must be 1-D (one value per feature), got shape {values.shape}; "
+                "predict() takes 2-D data"
+            )
+        values = _nan_missing(values, missing)
+        if values is None:
+            raise InvalidDataError(
+                f"row: a NaN is not missing with missing={missing!r}; non-missing feature "
+                "values must be finite"
+            )
+        width = model.num_outputs if output_margin else model.prediction_width
+        out = _out_array(out, (width,))
+        model.predict_row_into(values, output_margin, out, self._range(iteration_range))
+        return out
+
+    def transform_margin(self, margin: float) -> float:
+        """The prediction of one margin of a single-output model by its
+        objective's transform (the sigmoid of ``binary:logistic``, the
+        ``exp`` of log-link objectives, the identity for squared error, ...),
+        bit for bit what :meth:`predict` reports for a row with that margin
+        (``float32``).
+
+        Raises:
+            IncompatibleModelError: The model has several outputs; use
+                :meth:`transform_margins`.
+        """
+        return self._model.transform_margin(float(margin))
+
+    def transform_margins(
+        self, margins: ArrayLike, *, out: NDArray[np.float32] | None = None
+    ) -> NDArray[np.float32]:
+        """Applies the objective's prediction transform to rows of margins,
+        such as those ``predict(output_margin=True)`` returns:
+        ``transform_margins(predict(d, output_margin=True))`` is bit for bit
+        ``predict(d)``.
+
+        Args:
+            margins: ``(rows,)`` margins of a single-output model, or
+                ``(rows, num_outputs)``; converted to ``float32``.
+            out: A C-contiguous ``float32`` array of the result's shape,
+                written in place and returned, so no result array is
+                allocated.
+
+        Returns:
+            ``(rows,)`` predictions for a model predicting one value per row
+            (``multi:softmax``'s class indices included), else ``(rows, K)``.
+
+        Raises:
+            HessboostError: ``margins`` does not hold rows of
+                ``num_outputs`` margins, or ``out`` has the wrong shape, is
+                read-only, or shares memory with ``margins``.
+            TypeError: ``out`` is not a C-contiguous ``float32`` numpy
+                array.
+        """
+        model = self._model
+        values = _data.as_float32(margins, "margins")
+        outputs = model.num_outputs
+        if not (
+            (values.ndim == 1 and outputs == 1) or (values.ndim == 2 and values.shape[1] == outputs)
+        ):
+            expected = "(rows,)" if outputs == 1 else f"(rows, {outputs})"
+            raise HessboostError(f"margins must have shape {expected}, got {values.shape}")
+        width = model.prediction_width
+        rows = values.shape[0]
+        out = _out_array(out, (rows,) if width == 1 else (rows, width))
+        model.transform_margins_into(values, out)
+        return out
+
+    def model_info(self) -> ModelInfo:
+        """The model's structure as numpy arrays: its layout, the
+        ``gblinear`` weights or model-shrinkage record when it has one, and
+        every tree's nodes (see :class:`ModelInfo`), for inspection and
+        custom inference without parsing a model file.
+
+        For a tree model, the margin for output ``k`` is ``base_margins[k]``
+        plus ``tree_weights[t] * leaf value`` over the trees ``t`` of the
+        iterations used that feed ``k`` (:attr:`ModelInfo.tree_outputs`; a
+        vector-leaf tree feeds every output), summed in ``float32`` in tree
+        order; a ``linear_tree`` leaf predicts its linear model. A model with
+        :attr:`ModelInfo.shrinkage` instead repeats training's recurrence
+        (see :class:`ShrinkageInfo`).
+        """
+        fields = self._model.model_info()
+        gblinear, shrinkage = fields.pop("gblinear"), fields.pop("shrinkage")
+        trees = fields.pop("trees")
+        return ModelInfo(
+            **fields,
+            gblinear=None if gblinear is None else GbLinearInfo(**gblinear),
+            shrinkage=None if shrinkage is None else ShrinkageInfo(**shrinkage),
+            trees=tuple(TreeInfo._from_core(tree) for tree in trees),
+        )
 
     def to_gpu(
         self,

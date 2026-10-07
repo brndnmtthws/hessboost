@@ -1,5 +1,10 @@
 //! Runtime-dispatched numeric kernels for operations the compiler cannot
-//! auto-vectorize, chiefly transcendental objective functions.
+//! auto-vectorize: objective gradients (with their exponentials, sigmoids,
+//! and softmax), metric sums, cut search, and SHAP's per-lane terms.
+//!
+//! Prediction transforms are not here: they apply the scalar functions
+//! ([`sigmoid_scalar`], [`softmax_scalar`], `f32::exp`) to every value, so a
+//! prediction never depends on the batch it is computed in.
 
 mod scalar;
 
@@ -29,8 +34,8 @@ const _: () = assert!(MIN_SIMD_LEN <= crate::objective::GRADIENT_BLOCK_ROWS);
 // Layout contract the deinterleaving vector loads and stores rely on.
 const _: () = assert!(std::mem::size_of::<GradPair>() == 2 * std::mem::size_of::<f32>());
 
-/// Inputs with a larger magnitude take the scalar path in the fast
-/// exponential, sigmoid, and softmax kernels.
+/// Inputs with a larger magnitude take the scalar path in the gradient
+/// kernels' vector exponential, sigmoid, and softmax.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const MAX_FAST_EXP_INPUT: f32 = 80.0;
 
@@ -77,27 +82,6 @@ static AVX2_FMA_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
     std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
 });
 
-/// Run the per-arch kernel for a `&mut [f32]` unary inplace op when the slice
-/// is long enough, falling through to the caller's scalar tail otherwise.
-macro_rules! dispatch_unary_inplace {
-    ($values:expr, $kernel:ident) => {
-        #[cfg(target_arch = "aarch64")]
-        if $values.len() >= MIN_SIMD_LEN && neon_available() {
-            // SAFETY: runtime detection proves NEON is present and the kernel
-            // bounds vector accesses by the slice length.
-            unsafe { aarch64::$kernel($values) };
-            return;
-        }
-        #[cfg(target_arch = "x86_64")]
-        if $values.len() >= MIN_SIMD_LEN && avx2_fma_available() {
-            // SAFETY: AVX2/FMA are present and the kernel bounds vector
-            // accesses by the slice length.
-            unsafe { x86_64::$kernel($values) };
-            return;
-        }
-    };
-}
-
 /// Run the per-arch gradient kernel when `$gate` (typically `gradient_gate`
 /// or `metric_gate`) holds, falling through to the caller's scalar
 /// tail otherwise. The three-arm form also dispatches the `x86_64` kernel; the
@@ -125,7 +109,7 @@ macro_rules! dispatch_gradient {
     };
 }
 
-/// Dispatch a softmax entry point to the vector kernels: on AArch64 the
+/// Dispatch the softmax gradient to the vector kernels: on AArch64 the
 /// wide-row kernel (`$wide`) for 8+ classes and the short-row kernels for
 /// 2–4 classes, on `x86_64` the short-row kernels for 2 and 4 classes, each
 /// when `$eligible` holds. `$short` calls the short-row kernel as
@@ -421,22 +405,6 @@ pub(crate) fn sigmoid_scalar(x: f32) -> f32 {
     1.0 / ((-x).min(88.7).exp() + 1.0)
 }
 
-#[inline]
-pub(crate) fn exp_inplace(values: &mut [f32]) {
-    dispatch_unary_inplace!(values, exp_inplace);
-    for value in values.iter_mut() {
-        *value = value.exp();
-    }
-}
-
-#[inline]
-pub(crate) fn sigmoid_inplace(values: &mut [f32]) {
-    dispatch_unary_inplace!(values, sigmoid_inplace);
-    for value in values.iter_mut() {
-        *value = sigmoid_scalar(*value);
-    }
-}
-
 pub(crate) fn logistic_gradient(
     preds: &[f32],
     labels: &[f32],
@@ -510,21 +478,6 @@ pub(crate) fn tweedie_gradient(
     scalar::tweedie_gradient(preds, labels, weights, rho, out, 0..preds.len());
 }
 
-/// Apply softmax to every contiguous `num_class` row while resolving the SIMD
-/// backend only once for the whole matrix.
-pub(crate) fn softmax_rows_inplace(values: &mut [f32], num_class: usize) {
-    dispatch_softmax!(
-        num_class,
-        values.len() >= MIN_SIMD_LEN,
-        wide: aarch64::softmax_rows_inplace(values, num_class),
-        short: |K| arch::short_softmax_rows::<K>(values)
-    );
-
-    for row in values.chunks_mut(num_class) {
-        softmax_scalar(row);
-    }
-}
-
 pub(crate) fn softmax_gradient(
     preds: &[f32],
     labels: &[f32],
@@ -582,7 +535,8 @@ pub(super) fn softmax_gradient_rows_scalar(
 
 /// XGBoost's `common::Softmax`: shift by the row maximum, sum the
 /// exponentials in `f64`, and divide each entry by that sum rounded to `f32`.
-pub(super) fn softmax_scalar(values: &mut [f32]) {
+/// The `multi:softprob` prediction transform of every row.
+pub(crate) fn softmax_scalar(values: &mut [f32]) {
     let Some(&first) = values.first() else {
         return;
     };

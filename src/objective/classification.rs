@@ -119,9 +119,13 @@ impl Loss for LogisticLoss {
         );
     }
 
+    /// XGBoost's `common::Sigmoid` of every margin, one value at a time, so a
+    /// margin's probability never depends on its neighbors.
     fn pred_transform(&self, preds: &mut [f32]) {
         if self.variant != LogisticVariant::Raw {
-            crate::simd::sigmoid_inplace(preds);
+            for p in preds {
+                *p = crate::simd::sigmoid_scalar(*p);
+            }
         }
     }
 

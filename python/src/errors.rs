@@ -1,6 +1,7 @@
 //! Error mapping onto the Python exception hierarchy of
 //! `hessboost/_exceptions.py`.
 
+use crate::pool;
 use hessboost::error::HessboostError as RustError;
 use pyo3::prelude::*;
 
@@ -44,19 +45,21 @@ impl<T> OrRaise<T> for Result<T, RustError> {
 }
 
 /// `Python::detach` for fallible hessboost work: runs `f` without the GIL
-/// (attached thread state) and raises its error.
+/// (attached thread state), inside the extension's rayon pool
+/// ([`pool::install`]), and raises its error. Work that never touches
+/// rayon uses plain `Python::detach`, sparing the hand-off to a pool thread.
 pub(crate) trait DetachExt {
     fn detached<T: Send>(
         self,
-        f: impl FnOnce() -> Result<T, RustError> + pyo3::marker::Ungil,
+        f: impl FnOnce() -> Result<T, RustError> + Send + pyo3::marker::Ungil,
     ) -> PyResult<T>;
 }
 
 impl DetachExt for Python<'_> {
     fn detached<T: Send>(
         self,
-        f: impl FnOnce() -> Result<T, RustError> + pyo3::marker::Ungil,
+        f: impl FnOnce() -> Result<T, RustError> + Send + pyo3::marker::Ungil,
     ) -> PyResult<T> {
-        self.detach(f).or_raise()
+        self.detach(|| pool::install(f))?.or_raise()
     }
 }

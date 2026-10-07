@@ -12,6 +12,8 @@ UBJSON.
   model at any `nthread`.
 - **Typed** (`py.typed`, complete type information), with the GIL released
   while training and predicting, and free-threaded CPython supported.
+  Native work runs on the extension's own thread pool, which a child
+  forked with `os.fork()` rebuilds instead of hanging.
 - **Modern modeling (opt-in).** Conformal prediction intervals,
   confidence intervals for the regression function (Boulevard boosting),
   distributional boosting (a predictive distribution per row), LightGBM/CatBoost
@@ -76,6 +78,28 @@ leaves = booster.predict(X[800:], pred_leaf=True)  # (rows, trees) int32, all tr
 print(booster.best_iteration, booster.get_score(importance_type="gain"))
 ```
 
+Values and margins of a plain 2-D numpy array are predicted from the array
+itself, without building a `DMatrix` (bit-identical to the `DMatrix` path).
+For serving one row at a time, `predict_row` skips the matrix altogether;
+`out=` reuses a result array, and `transform_margin(s)` applies the
+objective's transform to margins computed elsewhere (bit for bit what
+`predict` reports):
+
+```python
+row = booster.predict_row(X[0])  # == booster.predict(X[:1])[0], 1-D float32
+out = np.empty(1, dtype=np.float32)
+booster.predict_row(X[1], output_margin=True, out=out)  # writes into out
+probability = booster.transform_margin(float(out[0]))
+probabilities = booster.transform_margins(margins)  # == booster.predict(X[800:])
+```
+
+`booster.model_info()` returns the model's structure as numpy arrays, enough
+to walk the trees and recompute the margins without parsing a model file: a
+`ModelInfo` with the layout, base margins, per-tree weights and outputs, and
+the `gblinear` and model-shrinkage records, and per tree a `TreeInfo` of node
+arrays (children, split features, thresholds, categories, leaf values, covers,
+gains, linear leaves).
+
 ### Input data
 
 `DMatrix` takes numpy arrays of any numeric dtype and memory layout (a
@@ -127,7 +151,18 @@ and `callbacks`. Ctrl-C stops training at the end of the current round
 and raises `KeyboardInterrupt`. `hessboost.cv` cross-validates over
 shuffled folds, explicit folds, or a scikit-learn splitter; on ranking data
 each fold must hold whole query groups (e.g. `GroupKFold` over the query
-ids). `hessboost.train_with_budget(params, dtrain, budget)` trains with one
+ids). `cv(xgb_model=...)` continues a model in every fold, and
+`cv(refit=True)` also retrains on every row for the chosen round count (the
+best one under early stopping), returning a `CvRefit` with the `history`
+and that `booster`:
+
+```python
+refit = hessboost.cv(params, dtrain, 500, early_stopping_rounds=20, refit=True)
+refit.history["test-rmse-mean"], refit.num_boost_round
+predictions = refit.booster.predict(X_test)
+```
+
+`hessboost.train_with_budget(params, dtrain, budget)` trains with one
 fitting budget in place of `eta`, tree limits, and a round count
 (PerpetualBooster's algorithm).
 
@@ -349,6 +384,13 @@ A Boulevard EBM (`{"booster": "ebm", "ebm_boulevard": True}`) additionally
 supports confidence bands on its shapes via
 `hessboost.inference.EbmInference.term_bands`.
 
+EBMs take eval sets like any booster: `train(..., evals=[(dvalid, "valid")],
+early_stopping_rounds=5)` records the history and `best_score` (classic
+EBMs stop early on it), and `cv` (with `refit=True` too) cross-validates
+them. `cv` refuses `ebm_early_stopping_rounds`, which would stop each fold's
+stages at different rounds; its `early_stopping_rounds` stops on the fold
+means instead.
+
 ### Boulevard inference
 
 Boulevard boosting (`{"booster": "boulevard"}`) samples trees with dropout
@@ -517,7 +559,10 @@ result = hessboost.cv({"max_depth": 4}, dtrain, 100, folds=splits)
 with CatBoost-style ordered target means: a training row's encoding never
 sees its own label. `label=` supplies the target for a multi-target matrix
 or a class's 0/1 indicator. In `cv`, `target_stats=` fits the encoder on
-each fold's training rows only, so no held-out label reaches an encoding:
+each fold's training rows only, so no held-out label reaches an encoding
+(`target_stats_label=` supplies its target, split with the folds); with
+`refit=True`, `CvRefit.target_encoder` is the encoder fitted on every row,
+which encodes new data for the refit booster:
 
 ```python
 from hessboost.target_stats import OrderedTargetEncoder
@@ -527,7 +572,14 @@ dtrain_encoded, stats = encoder.fit_transform(dtrain, ["city"])
 booster = hessboost.train({"max_depth": 4}, dtrain_encoded, 100)
 predictions = booster.predict(stats.transform(X_test))
 result = hessboost.cv({"max_depth": 4}, dtrain, 100, target_stats=["city"], target_encoder=encoder)
+refit = hessboost.cv({"max_depth": 4}, dtrain, 100, target_stats=["city"], refit=True)
+predictions = refit.booster.predict(refit.target_encoder.transform(X_test))
 ```
+
+`stats.save(path)` / `FittedTargetEncoder.load(path)` (and
+`to_bytes`/`from_bytes`) store the Rust crate's serde JSON, which keeps
+column indices and category codes but not feature names or frame
+categories; pickle the statistics to keep them.
 
 ### Extra training options
 
@@ -564,7 +616,8 @@ LightGBM's `rank_xendcg` stream.
   Unlike XGBoost, which accepts both, hessboost refuses `objective` alongside
   `obj`: drop `objective` from ported `params`; the callback needs no change.
 - `cv` returns a dict of numpy arrays (`test-<metric>-mean`/`-std`) with
-  held-out metrics only; there is no `stratified` or `as_pandas`.
+  held-out metrics only (or, with `refit=True`, a `CvRefit` holding it and
+  the retrained booster); there is no `stratified` or `as_pandas`.
 - `predict` defaults to the iterations through `best_iteration` (XGBoost's
   scikit-learn behavior); pass `iteration_range=(0, 0)` for all. SHAP and
   leaf ranges start at iteration 0; `pred_leaf` defaults to every iteration
@@ -575,9 +628,10 @@ LightGBM's `rank_xendcg` stream.
   instead of assuming prediction uses the training device.
 - Model files do not store feature names or categories (pickles do).
 - Not available: `DMatrix` from files or `QuantileDMatrix`, `inplace_predict`
-  (`predict` takes arrays directly), `Booster.get_dump`/`trees_to_dataframe`
-  /`dump_model`, attributes (`set_attr`), plotting, distributed (Dask/Spark),
-  `approx_contribs`, and `strict_shape`.
+  (`predict` takes arrays directly, and `predict_row` single rows),
+  `Booster.get_dump`/`trees_to_dataframe`/`dump_model` (`model_info()`
+  returns the trees as arrays), attributes (`set_attr`), plotting,
+  distributed (Dask/Spark), `approx_contribs`, and `strict_shape`.
 
 ## Development
 

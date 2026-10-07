@@ -3,14 +3,18 @@
 
 use crate::codec;
 use crate::compact::CompactModel;
-use crate::data::{DMatrix, to_numpy};
+use crate::data::{DMatrix, row_major, to_numpy};
 use crate::dist::Distributions;
-use crate::errors::{DetachExt, refuse};
+use crate::errors::{DetachExt, OrRaise, map_err, refuse};
 use crate::gpu::GpuModel;
+use hessboost::error::HessboostError;
 use hessboost::model::{
     BoostedModel, Contributions, ImportanceType, Interactions, Iterations, Predictions,
 };
-use numpy::PyArrayDyn;
+use numpy::{
+    PyArray1, PyArrayDyn, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    PyUntypedArrayMethods,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -145,6 +149,100 @@ impl Booster {
             })
         })?;
         to_numpy(py, values, &shape)
+    }
+
+    /// Predictions (`margin`: raw margins) of the C-contiguous `(rows,
+    /// features)` rows, read in place (`NaN` for a missing value), shaped as
+    /// `predict`'s; bit for bit `predict` of a matrix of them.
+    #[pyo3(signature = (rows, margin, iteration_range=None))]
+    fn predict_rows<'py>(
+        &self,
+        py: Python<'py>,
+        rows: PyReadonlyArray2<'_, f32>,
+        margin: bool,
+        iteration_range: Option<(usize, usize)>,
+    ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
+        let model = &*self.model;
+        let columns = rows.shape()[1];
+        if columns != model.n_features() {
+            // The crate checks whole rows only, which a matrix of another
+            // width could still be.
+            return Err(map_err(HessboostError::DimensionMismatch {
+                what: "prediction feature count",
+                expected: model.n_features(),
+                got: columns,
+            }));
+        }
+        let values = row_major(&rows, "rows")?;
+        let iterations = iterations(model, iteration_range, Iterations::Best);
+        let (values, shape) = py.detached(|| {
+            if margin {
+                model.predict_margin_rows(values, iterations)
+            } else {
+                model.predict_rows(values, iterations)
+            }
+            .map(dense)
+        })?;
+        to_numpy(py, values, &shape)
+    }
+
+    /// Writes the predictions (`margin`: raw margins) of one row of feature
+    /// values (`NaN` for a missing one) into `out`, which holds
+    /// `prediction_width` values (`margin`: `num_outputs`). Single-row work
+    /// never uses rayon, so it detaches without the pool.
+    #[pyo3(signature = (row, margin, out, iteration_range=None))]
+    fn predict_row_into(
+        &self,
+        py: Python<'_>,
+        row: PyReadonlyArray1<'_, f32>,
+        margin: bool,
+        out: &Bound<'_, PyArray1<f32>>,
+        iteration_range: Option<(usize, usize)>,
+    ) -> PyResult<()> {
+        let row = row_major(&row, "row")?;
+        // Fails for a read-only `out` or one sharing memory with `row`.
+        let mut out = out
+            .try_readwrite()
+            .map_err(|_| refuse("out must be writeable and must not share memory with row"))?;
+        let out = out.as_slice_mut()?;
+        let model = &*self.model;
+        let iterations = iterations(model, iteration_range, Iterations::Best);
+        py.detach(|| {
+            if margin {
+                model.predict_margin_row_into(row, iterations, out)
+            } else {
+                model.predict_row_into(row, iterations, out)
+            }
+        })
+        .or_raise()
+    }
+
+    /// The prediction of one margin of a single-output model, by the
+    /// objective's transform: bit for bit what `predict` reports for a row
+    /// with that margin.
+    fn transform_margin(&self, py: Python<'_>, margin: f32) -> PyResult<f32> {
+        let model = &*self.model;
+        py.detach(|| model.transform_margin(margin)).or_raise()
+    }
+
+    /// Writes the predictions of whole rows of `num_outputs` margins
+    /// (row-major, C-contiguous) into `out`, the same rows of
+    /// `prediction_width` values: `predict`'s transform of its margins.
+    fn transform_margins_into(
+        &self,
+        py: Python<'_>,
+        margins: PyReadonlyArrayDyn<'_, f32>,
+        out: &Bound<'_, PyArrayDyn<f32>>,
+    ) -> PyResult<()> {
+        let margins = row_major(&margins, "margins")?;
+        // Fails for a read-only `out` or one sharing memory with `margins`.
+        let mut out = out
+            .try_readwrite()
+            .map_err(|_| refuse("out must be writeable and must not share memory with margins"))?;
+        let out = out.as_slice_mut()?;
+        let model = &*self.model;
+        // Large batches are transformed in parallel.
+        py.detached(|| model.transform_margins_into(margins, out))
     }
 
     /// The leaf each row reaches in every tree, `(rows, trees)`; ranges
@@ -310,6 +408,12 @@ impl Booster {
         Ok(dict)
     }
 
+    /// The model's layout, `gblinear` and shrinkage records, and every
+    /// tree's node arrays, as the dict `hessboost.ModelInfo` wraps.
+    fn model_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        crate::info::model_info(py, &self.model)
+    }
+
     #[getter]
     fn objective(&self) -> &str {
         self.model.objective().name()
@@ -354,6 +458,13 @@ impl Booster {
     #[getter]
     fn base_margins(&self) -> Vec<f32> {
         self.model.base_scores().to_vec()
+    }
+
+    /// Values per row of a value prediction: `num_outputs`, except `1` for
+    /// `multi:softmax`.
+    #[getter]
+    fn prediction_width(&self) -> usize {
+        self.model.prediction_width()
     }
 
     #[getter]

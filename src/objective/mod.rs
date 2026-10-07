@@ -568,6 +568,16 @@ pub(crate) fn log_link(scores: &mut [f32]) {
     }
 }
 
+/// The inverse of [`log_link`], the log-link objectives'
+/// [`Loss::pred_transform`]: `exp` of every entry in `f32` (XGBoost's `expf`),
+/// one value at a time, so an entry's result never depends on its
+/// neighbors.
+pub(crate) fn inverse_log_link(margins: &mut [f32]) {
+    for m in margins {
+        *m = m.exp();
+    }
+}
+
 /// Shared [`Loss::validate_base_score`] check: refuse a `base_score`
 /// outside the output domain of the objective, `(0, 1)` for the logistic
 /// link and `(0, ∞)` for the log link.

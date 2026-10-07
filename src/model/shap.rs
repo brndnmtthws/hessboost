@@ -939,7 +939,7 @@ impl BoostedModel {
         };
         let k = self.n_outputs();
         let width = out.len() / k;
-        self.for_each_linear_contribution(data, row, |f, c, v| {
+        self.for_each_linear_contribution(data.into(), row, |f, c, v| {
             out[c * width + f] = v as f32;
         });
         for c in 0..k {
@@ -1007,7 +1007,7 @@ impl BoostedModel {
             .for_each_init(
                 || {
                     (
-                        RowBlock::single_rows(data),
+                        RowBlock::single_rows(data.into()),
                         GroupScratch::<SHAP_ROWS>::new(nf),
                         GroupScratch::<1>::new(nf),
                     )
@@ -1097,7 +1097,7 @@ impl BoostedModel {
         let mut out = vec![0f32; n * k * mwidth];
         out.par_chunks_mut(k * mwidth).enumerate().for_each_init(
             || Scratch {
-                rows: RowBlock::single_rows(data),
+                rows: RowBlock::single_rows(data.into()),
                 contribs: vec![0f32; k * width],
                 diag: vec![0f32; width],
                 path_prob: vec![[UNSEEN; 1]; nf],

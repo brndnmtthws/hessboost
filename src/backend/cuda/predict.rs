@@ -392,7 +392,7 @@ impl GpuModel {
         let trees = self
             .model
             .iteration_trees(self.model.resolve_iterations(iterations, "iterations")?);
-        let mut margins = self.model.initial_margins(data);
+        let mut margins = self.model.initial_margins(data.into());
         let outputs = self.model.n_outputs();
         if !trees.is_empty() && data.n_rows() != 0 {
             let width = data.n_cols().checked_add(outputs).ok_or_else(|| {

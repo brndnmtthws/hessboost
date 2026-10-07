@@ -273,7 +273,11 @@ impl GateState {
 /// inline instead: handed to the pool from another thread, it could wait
 /// indefinitely for a pool thread while every pool thread waits on it,
 /// this one included. Its gate then answers with `may_commit` on the spot
-/// ([`CommitGate::Inline`]).
+/// ([`CommitGate::Inline`]). A callback on a training's own `nthread` pool
+/// is on no thread of this pool and takes the waiting path: the training
+/// was installed into its `nthread` pool from a thread of this one, and
+/// rayon keeps that thread running this pool's queued work while it waits,
+/// so `work` starts there.
 fn interruptible<T: Send>(
     py: Python<'_>,
     work: impl FnOnce(CommitGate<'_>) -> T + Send,

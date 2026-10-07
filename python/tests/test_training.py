@@ -811,11 +811,12 @@ print("ok")
 
 @pytest.mark.parametrize("nthread", [0, 2])
 def test_a_callback_trains_and_predicts_on_a_one_thread_pool(nthread: int) -> None:
-    """A callback runs on a thread of the training pool, and training or
+    """A callback runs on a thread of the training's pool, and training or
     predicting from it never waits for a pool thread while holding one.
-    Runs in a subprocess on a one-thread pool, where the callback holds the
-    only pool thread (or, with ``nthread``, the training's own pool waits
-    on it), so a deadlock fails the test by timeout."""
+    Runs in a subprocess on a one-thread pool, so a deadlock fails the test
+    by timeout. The callback holds that pool's only thread, or, with
+    ``nthread``, a thread of the training's own pool, for which the only
+    pool thread waits."""
     import os
     import subprocess
     import sys

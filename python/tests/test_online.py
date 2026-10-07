@@ -233,6 +233,70 @@ def test_access_from_the_update_callback_fails_fast(mode: OnlineMode, nthread: i
     assert done.stdout.strip() == "ok"
 
 
+_CROSS_THREAD = """
+import threading
+
+import numpy as np
+
+from hessboost import DMatrix, HessboostError
+from hessboost.online import OnlineModel
+
+rng = np.random.default_rng(0)
+x = rng.normal(size=(300, 4))
+y = x[:, 0] - x[:, 1]
+online = OnlineModel.train({"tree_method": "hist", "max_depth": 3}, DMatrix(x, y), 6)
+inside, returned = threading.Event(), threading.Event()
+waits, refusals = [], []
+
+def callback(iteration):
+    if iteration == 0:
+        inside.set()
+        waits.append(returned.wait(60))
+    return False
+
+def other():
+    inside.wait(60)
+    for access in (lambda: online.model, lambda: online.update(None, [0])):
+        try:
+            access()
+        except HessboostError as error:
+            refusals.append("being updated" in str(error))
+    returned.set()
+
+thread = threading.Thread(target=other)
+thread.start()
+report = online.update(DMatrix(x[:5], y[:5]), [1, 2], callback=callback)
+thread.join(60)
+assert waits == [True], waits
+assert refusals == [True, True], refusals
+assert report is not None
+assert online.num_row() == 303 == online.data.num_row()
+print("ok")
+"""
+
+
+def test_access_from_another_thread_during_an_update_fails_fast() -> None:
+    """While an update's callback waits, another thread's read and update
+    are refused at once instead of queued behind the update: the other
+    thread returns before the callback stops waiting, and only the first
+    update is applied. Runs in a subprocess on a one-thread pool, which
+    the waiting callback holds, so a queued update fails the test."""
+    import os
+    import subprocess
+    import sys
+
+    done = subprocess.run(
+        [sys.executable, "-c", _CROSS_THREAD],
+        env={**os.environ, "RAYON_NUM_THREADS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
+
+
 @pytest.mark.parametrize("mode", MODES)
 def test_labels_retraining_refuses_are_refused(mode: OnlineMode) -> None:
     params = {**PARAMS, "objective": "binary:logistic"}

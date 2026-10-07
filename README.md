@@ -160,7 +160,8 @@ See [`python/README.md`](python/README.md).
   binary/multiclass classification, ranking (LambdaMART, XE-NDCG), count, and survival (Cox, AFT),
   plus typed objective and metric APIs and custom loss hooks.
 - **Validation & workflow:** Cross-validation (including purged and forward time-series folds,
-  whole-query ranking folds, and per-fold target statistics), early stopping, feature importance,
+  whole-query ranking folds, per-fold target statistics, continuing a model, and refitting on all
+  rows at the chosen round count), early stopping, feature importance,
   SHAP values and interactions, model slicing, and iteration ranges.
 - **Interchange:** Native binary and JSON formats, XGBoost JSON/UBJSON import/export, LightGBM model import, and models embedded in the binary at compile time.
 - **Modern modeling (opt-in):**

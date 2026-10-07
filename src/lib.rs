@@ -127,7 +127,10 @@
 //!   [`Fold`](training::Fold)s with fold-mean early stopping
 //!   ([`CrossValidation`](training::CrossValidation)); whole-query folds of
 //!   ranking data; ordered target statistics fitted inside each fold
-//!   ([`CrossValidation::target_stats`](training::CrossValidation::target_stats)).
+//!   ([`CrossValidation::target_stats`](training::CrossValidation::target_stats));
+//!   continuing a model in every fold; refitting on every row at the
+//!   chosen round count
+//!   ([`CrossValidation::refit`](training::CrossValidation::refit)).
 //! - **Advanced & experimental methods (opt-in):**
 //!   - split-conformal and conformalized-quantile intervals with
 //!     finite-sample marginal coverage ([`conformal`]);

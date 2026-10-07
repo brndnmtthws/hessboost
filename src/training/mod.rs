@@ -1,6 +1,7 @@
 //! Training: the boosting loop ([`train`], [`Trainer`]), cross-validation
 //! ([`cv`], or [`CrossValidation`] over caller-supplied or time-ordered
-//! [`Fold`]s), and opt-in [`budget`] training.
+//! [`Fold`]s, with [`CrossValidation::refit`] retraining on every row), and
+//! opt-in [`budget`] training.
 
 mod api;
 pub(crate) mod boulevard;
@@ -24,5 +25,5 @@ mod train;
 mod validate;
 
 pub use api::{EvalHistory, RoundEval, TrainResult, Trainer, train};
-pub use cv::{CrossValidation, CvResult, CvRound, Fold, cv};
+pub use cv::{CrossValidation, CvRefit, CvResult, CvRound, Fold, cv};
 pub(crate) use multi_output::reject_split_gradient;

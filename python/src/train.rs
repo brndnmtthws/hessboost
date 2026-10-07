@@ -241,8 +241,8 @@ impl CommitGate {
     }
 }
 
-/// Runs `work` on a worker thread while the caller, detached, wakes every
-/// [`SIGNAL_POLL`] to run the interpreter's signal handlers (only the main
+/// Runs `work` on a worker thread, inside the extension's rayon pool, while
+/// the caller, detached, wakes every [`SIGNAL_POLL`] to run the interpreter's signal handlers (only the main
 /// thread's do anything), passing a raised exception (`KeyboardInterrupt`)
 /// to `on_signal`, and answers `gate` with `may_commit` after a signal
 /// check. `work` sees the interruption through its round hook and stops at
@@ -257,7 +257,7 @@ fn interruptible<T: Send>(
     let caller = std::thread::current();
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
-            let out = work();
+            let out = crate::pool::install(work);
             caller.unpark();
             out
         });

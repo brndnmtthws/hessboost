@@ -12,6 +12,8 @@ UBJSON.
   model at any `nthread`.
 - **Typed** (`py.typed`, complete type information), with the GIL released
   while training and predicting, and free-threaded CPython supported.
+  Native work runs on the extension's own thread pool, which a child
+  forked with `os.fork()` rebuilds instead of hanging.
 - **Modern modeling (opt-in).** Conformal prediction intervals,
   confidence intervals for the regression function (Boulevard boosting),
   distributional boosting (a predictive distribution per row), LightGBM/CatBoost
@@ -510,6 +512,11 @@ booster = hessboost.train({"max_depth": 4}, dtrain_encoded, 100)
 predictions = booster.predict(stats.transform(X_test))
 result = hessboost.cv({"max_depth": 4}, dtrain, 100, target_stats=["city"], target_encoder=encoder)
 ```
+
+`stats.save(path)` / `FittedTargetEncoder.load(path)` (and
+`to_bytes`/`from_bytes`) store the Rust crate's serde JSON, which keeps
+column indices and category codes but not feature names or frame
+categories; pickle the statistics to keep them.
 
 ### Extra training options
 

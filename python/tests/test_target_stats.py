@@ -3,12 +3,17 @@ explicit labels for multi-target matrices, and per-fold encoding in cv."""
 
 from __future__ import annotations
 
+import copy as copy_module
+import pickle
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import pytest
 from numpy.typing import ArrayLike, NDArray
 
 import hessboost
-from hessboost import DMatrix, HessboostError, InvalidDataError
+from hessboost import DMatrix, HessboostError, InvalidDataError, ModelFormatError
 from hessboost.target_stats import FittedTargetEncoder, OrderedTargetEncoder
 
 
@@ -166,3 +171,57 @@ def test_cv_fits_the_encoder_on_each_folds_training_rows() -> None:
     assert result["test-rmse-mean"][-1] == pytest.approx(np.mean(scores), rel=1e-12)
     with pytest.raises(HessboostError, match="target_stats"):
         hessboost.cv({}, dtrain, 2, target_encoder=encoder)
+
+
+def frame_encoder() -> tuple[FittedTargetEncoder, pd.DataFrame, NDArray[np.float64]]:
+    """An encoder fitted on a frame, a frame of its and unseen categories
+    in another order, and numpy data."""
+    x, y = categorical_data()
+    cities = np.array(["a", "b", "c", "d"])[x[:, 0].astype(int) % 4]
+    train = pd.DataFrame({"city": pd.Categorical(cities), "noise": x[:, 1]})
+    _, stats = OrderedTargetEncoder(seed=1).fit_transform(DMatrix(train, y), ["city"])
+    test = pd.DataFrame(
+        {"city": pd.Categorical(["d", "z", "a", None], categories=["z", "d", "a"]), "noise": 0.5}
+    )
+    return stats, test, np.column_stack([np.arange(4.0), np.ones(4)])
+
+
+def assert_same_encoding(a: FittedTargetEncoder, b: FittedTargetEncoder, data: object) -> None:
+    """A linear probe's per-feature contributions (weight times value) agree."""
+    rng = np.random.default_rng(0)
+    fit = rng.normal(size=(50, 2))
+    probe = hessboost.train(
+        {"booster": "gblinear", "eta": 0.5}, DMatrix(fit, fit @ [2.0, -1.0] + 0.3), 20
+    )
+    np.testing.assert_array_equal(
+        probe.predict(a.transform(data), pred_contribs=True),
+        probe.predict(b.transform(data), pred_contribs=True),
+    )
+
+
+def test_persistence_round_trips(tmp_path: Path) -> None:
+    stats, test, x = frame_encoder()
+    restored = FittedTargetEncoder.from_bytes(memoryview(stats.to_bytes()))
+    stats.save(tmp_path / "stats.json")
+    loaded = FittedTargetEncoder.load(tmp_path / "stats.json")
+    # Without the schema, encoded columns must be marked categorical and a
+    # frame must carry the training categories in their order.
+    typed = DMatrix(x, feature_types=["c", "q"])
+    same_order = test.assign(city=test["city"].cat.set_categories(["a", "b", "c", "d"]))
+    for copy in (restored, loaded):
+        assert copy.to_bytes() == stats.to_bytes()
+        assert_same_encoding(stats, copy, typed)
+        assert_same_encoding(stats, copy, same_order)
+        assert copy.encode(0, 2) == stats.encode("city", 2)
+    for copy in (pickle.loads(pickle.dumps(stats)), copy_module.deepcopy(stats)):
+        assert_same_encoding(stats, copy, x)
+        assert_same_encoding(stats, copy, test)
+        assert copy.encode("city", 2) == stats.encode("city", 2)
+
+
+def test_corrupt_bytes_raise_model_format_error() -> None:
+    stats, _, _ = frame_encoder()
+    data = stats.to_bytes()
+    for corrupt in (data[:-3], b"\xff", data.replace(b'"prior":', b'"prior":1e999,"x":')):
+        with pytest.raises(ModelFormatError):
+            FittedTargetEncoder.from_bytes(corrupt)

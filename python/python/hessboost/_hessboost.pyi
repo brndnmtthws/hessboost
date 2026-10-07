@@ -149,16 +149,10 @@ class Booster:
         out: NDArray[np.float32],
         iteration_range: tuple[int, int] | None = None,
     ) -> None: ...
-    def transform_margin(self, margin: float) -> float:
-        """The prediction of one margin of a single-output model, by the
-        objective's transform: bit for bit what ``predict`` reports for a row
-        with that margin."""
+    def transform_margin(self, margin: float) -> float: ...
     def transform_margins_into(
         self, margins: NDArray[np.float32], out: NDArray[np.float32]
-    ) -> None:
-        """Writes the predictions of whole rows of ``num_outputs`` margins
-        (row-major, C-contiguous) into ``out``, the same rows of
-        ``prediction_width`` values: ``predict``'s transform of its margins."""
+    ) -> None: ...
     def predict_leaf(
         self, data: DMatrix, iteration_range: tuple[int, int] | None = None
     ) -> NDArray[np.int32]: ...

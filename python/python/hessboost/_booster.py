@@ -524,9 +524,9 @@ class Booster(_SchemaState):
                 predictions.
             iteration_range: As for :meth:`predict` (``None``: through
                 :attr:`best_iteration`).
-            missing: The missing-value marker (NaN is always missing when
-                it is NaN; with another marker a NaN is refused, as by
-                :class:`DMatrix`).
+            missing: The missing-value marker (default NaN); with another
+                marker, a NaN in ``row`` is refused, as :class:`DMatrix`
+                refuses it.
             out: A C-contiguous 1-D ``float32`` array of exactly the result's
                 length, written in place and returned, so no result array is
                 allocated.

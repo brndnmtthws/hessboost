@@ -165,7 +165,7 @@ struct ModelArrays {
 impl ModelArrays {
     fn of(model: &BoostedModel) -> Result<Self, String> {
         let vector = model.has_vector_leaves();
-        let (parallel, outputs) = (model.num_parallel_tree().max(1), model.n_outputs().max(1));
+        let (parallel, outputs) = (model.num_parallel_tree(), model.n_outputs());
         let tree_outputs = (0..model.trees().len())
             .map(|t| {
                 if vector {
@@ -225,7 +225,7 @@ pub(crate) fn model_info<'py>(
                 to_numpy(
                     py,
                     linear.weights().to_vec(),
-                    &[linear.weights().len() / outputs.max(1), outputs],
+                    &[linear.weights().len() / outputs, outputs],
                 )?,
             )?;
             d.set_item("bias", to_numpy(py, linear.bias().to_vec(), &[outputs])?)?;

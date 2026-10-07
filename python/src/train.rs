@@ -174,39 +174,50 @@ fn round_hook(
     }
 }
 
-/// Where a [`CommitGate`] is.
+/// Where a [`CommitGate::Caller`] question is.
 enum Phase {
     Working,
     Asking,
     Answered(bool),
 }
 
-/// The worker's last question to its waiting caller: may the finished work
-/// be applied? The caller answers after one more signal check and checks no
-/// more signals after answering, so an interruption either reaches the work
-/// before it is applied or is left for the interpreter to raise after the
-/// call returns, never raised over applied work.
-#[derive(Clone)]
-pub(crate) struct CommitGate(Arc<GateState>);
+/// The worker's last question to its caller: may the finished work be
+/// applied?
+pub(crate) enum CommitGate<'a> {
+    /// The work runs on a pool thread while its caller waits. The caller
+    /// answers after one more signal check and checks no more signals after
+    /// answering, so an interruption either reaches the work before it is
+    /// applied or is left for the interpreter to raise after the call
+    /// returns, never raised over applied work.
+    Caller(Arc<GateState>),
+    /// The work runs on its caller's own pool thread, nested in an outer
+    /// call, and no signal reaches it: signal handlers run on the main
+    /// thread only, whose outer call polls them. The answer is the verdict,
+    /// taken when asked.
+    Inline(&'a (dyn Fn() -> bool + Sync)),
+}
 
-struct GateState {
+/// A [`CommitGate::Caller`] question and the caller to wake for it.
+pub(crate) struct GateState {
     phase: Mutex<Phase>,
     answered: Condvar,
     caller: Thread,
 }
 
-impl CommitGate {
-    fn new(caller: Thread) -> Self {
-        Self(Arc::new(GateState {
-            phase: Mutex::new(Phase::Working),
-            answered: Condvar::new(),
-            caller,
-        }))
-    }
-
-    /// Worker side: wakes the caller and waits for its answer.
+impl CommitGate<'_> {
+    /// Worker side: the answer, from the waiting caller (woken for it) or
+    /// the inline verdict.
     pub(crate) fn confirm(&self) -> ControlFlow<()> {
-        let state = &self.0;
+        let state = match self {
+            Self::Caller(state) => state,
+            Self::Inline(may_commit) => {
+                return if may_commit() {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                };
+            }
+        };
         let mut phase = state.phase.lock().unwrap_or_else(PoisonError::into_inner);
         *phase = Phase::Asking;
         state.caller.unpark();
@@ -223,17 +234,26 @@ impl CommitGate {
             }
         }
     }
+}
+
+impl GateState {
+    fn new(caller: Thread) -> Self {
+        Self {
+            phase: Mutex::new(Phase::Working),
+            answered: Condvar::new(),
+            caller,
+        }
+    }
 
     /// Caller side: answers a pending question with `commit()`; whether it
     /// has been answered.
     fn answer(&self, commit: impl FnOnce() -> bool) -> bool {
-        let state = &self.0;
-        let mut phase = state.phase.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
         match *phase {
             Phase::Working => false,
             Phase::Asking => {
                 *phase = Phase::Answered(commit());
-                state.answered.notify_all();
+                self.answered.notify_all();
                 true
             }
             Phase::Answered(_) => true,
@@ -241,23 +261,34 @@ impl CommitGate {
     }
 }
 
-/// Runs `work` on a worker thread, inside the extension's rayon pool, while
-/// the caller, detached, wakes every [`SIGNAL_POLL`] to run the
-/// interpreter's signal handlers (only the main thread's do anything),
-/// passing a raised exception (`KeyboardInterrupt`) to `on_signal`, and
-/// answers `gate` with `may_commit` after a signal check. `work` sees the
+/// Runs `work` inside the extension's rayon pool. From a thread outside the
+/// pool, `work` runs on a worker thread while the caller, detached, wakes
+/// every [`SIGNAL_POLL`] to run the interpreter's signal handlers (only the
+/// main thread's do anything), passing a raised exception
+/// (`KeyboardInterrupt`) to `on_signal`, and answers `work`'s
+/// [`CommitGate`] with `may_commit` after a signal check; `work` sees the
 /// interruption through its round hook and stops at the end of the round.
+///
+/// On a pool thread (a Python callback of an outer call), `work` runs right
+/// there instead: handed to the pool from another thread, it could wait
+/// forever for a pool thread while every pool thread waits on it, this one
+/// included. Its gate then answers with `may_commit` on the spot
+/// ([`CommitGate::Inline`]).
 fn interruptible<T: Send>(
     py: Python<'_>,
-    work: impl FnOnce() -> T + Send,
+    work: impl FnOnce(CommitGate<'_>) -> T + Send,
     on_signal: impl Fn(PyErr),
-    gate: &CommitGate,
-    may_commit: impl Fn() -> bool,
+    may_commit: impl Fn() -> bool + Sync,
 ) -> PyResult<T> {
+    if crate::pool::on_pool_thread() {
+        return Ok(py.detach(|| work(CommitGate::Inline(&may_commit))));
+    }
     let caller = std::thread::current();
+    let state = Arc::new(GateState::new(caller.clone()));
+    let gate = CommitGate::Caller(Arc::clone(&state));
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
-            let out = crate::pool::install(work);
+            let out = crate::pool::install(move || work(gate));
             caller.unpark();
             out
         });
@@ -270,7 +301,7 @@ fn interruptible<T: Send>(
             if let Err(error) = py.check_signals() {
                 on_signal(error);
             }
-            answered = gate.answer(&may_commit);
+            answered = state.answer(&may_commit);
         }
         worker
             .join()
@@ -290,7 +321,7 @@ pub(crate) fn run_hooked<T: Send>(
     py: Python<'_>,
     on_round: Option<Py<PyAny>>,
     failure: &Failure,
-    work: impl FnOnce(RoundHook, CommitGate) -> T + Send,
+    work: impl FnOnce(RoundHook, CommitGate<'_>) -> T + Send,
 ) -> PyResult<T> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let hook = Box::new(round_hook(
@@ -298,16 +329,13 @@ pub(crate) fn run_hooked<T: Send>(
         failure.clone(),
         Arc::clone(&interrupted),
     ));
-    let gate = CommitGate::new(std::thread::current());
-    let worker_gate = gate.clone();
     let out = interruptible(
         py,
-        move || work(hook, worker_gate),
+        move |gate| work(hook, gate),
         |error| {
             interrupted.store(true, Ordering::Relaxed);
             failure.record(error);
         },
-        &gate,
         || !interrupted.load(Ordering::Relaxed) && !failure.failed(),
     )?;
     match failure.take() {

@@ -786,6 +786,53 @@ def test_callback_exceptions_stop_training_and_propagate() -> None:
     assert calls == [0, 1, 2]
 
 
+_NESTED = """
+import numpy as np
+import hessboost
+from hessboost import DMatrix
+
+rng = np.random.default_rng(0)
+x = rng.normal(size=(200, 3))
+dtrain = DMatrix(x, x[:, 0])
+inner = []
+
+class Nested(hessboost.TrainingCallback):
+    def after_iteration(self, iteration, evals_log):
+        booster = hessboost.train(PARAMS, dtrain, 2)
+        inner.append((booster.num_boosted_rounds(), booster.predict(x[:4]).shape))
+        return False
+
+outer = hessboost.train(PARAMS, dtrain, 3, callbacks=[Nested()])
+assert outer.num_boosted_rounds() == 3
+assert inner == [(2, (4,))] * 3, inner
+print("ok")
+"""
+
+
+@pytest.mark.parametrize("nthread", [0, 2])
+def test_a_callback_trains_and_predicts_on_a_one_thread_pool(nthread: int) -> None:
+    """A callback runs on a thread of the training's pool, and training or
+    predicting from it never waits for a pool thread while holding one.
+    Run in a subprocess on a one-thread pool, where the callback holds the
+    only pool thread (or, with ``nthread``, the training's own pool waits
+    on it), so a deadlock fails the test by timeout."""
+    import os
+    import subprocess
+    import sys
+
+    params = {"max_depth": 2, "nthread": nthread}
+    done = subprocess.run(
+        [sys.executable, "-c", _NESTED.replace("PARAMS", repr(params))],
+        env={**os.environ, "RAYON_NUM_THREADS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
+
+
 def test_verbose_eval_prints_each_round_as_it_completes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

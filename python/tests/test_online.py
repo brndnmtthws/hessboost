@@ -211,13 +211,20 @@ print("ok")
 def test_access_from_the_update_callback_fails_fast(mode: OnlineMode) -> None:
     """Reading the model or data, or updating again, from an update's own
     callback raises instead of deadlocking; the row count and mode stay
-    readable. Run in a subprocess, so a deadlock fails the test by timeout."""
+    readable. Run in a subprocess on a one-thread pool, where the callback
+    holds the only pool thread, so a deadlock fails the test by timeout."""
+    import os
     import subprocess
     import sys
 
     code = _REENTRANT.replace("MODE", repr(mode))
     done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=False
+        [sys.executable, "-c", code],
+        env={**os.environ, "RAYON_NUM_THREADS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "ok"

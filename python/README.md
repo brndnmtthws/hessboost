@@ -456,9 +456,8 @@ booster = hessboost.train({"device": "wgpu", "max_depth": 6}, dtrain, 100)
 ```
 
 Metal prediction is faster than the CPU from roughly a few thousand
-row-trees upward; Metal training and both wgpu paths are correctness paths
-so far (wgpu is unmeasured on real GPUs). wgpu needs an adapter with 64-bit
-shader integers: desktop Vulkan drivers, Apple GPUs, or DirectX 12 with
+row-trees upward. wgpu needs an adapter with 64-bit shader integers:
+desktop Vulkan drivers, Apple GPUs, or DirectX 12 with
 `dxcompiler.dll` where Windows finds DLLs. It uses a software adapter such
 as Mesa's lavapipe (correct, but slower than the CPU) only when there is no
 other; `GpuModel.device_name("wgpu")` names the adapter it picked, and the

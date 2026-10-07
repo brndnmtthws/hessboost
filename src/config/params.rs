@@ -173,20 +173,17 @@ pub enum Device {
     Cpu,
     /// Apple's Metal GPU, on macOS 10.15 or later with the `metal` feature.
     ///
-    /// A correctness path so far, not a speedup: with the earlier
-    /// floating-point kernels the GPU histograms were slower than the
-    /// multicore CPU's, and the current integer kernels are unmeasured
-    /// (see [`backend::metal`](crate::backend::metal)); the fast Metal path is
-    /// prediction, through
-    /// [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu).
+    /// Prediction goes through
+    /// [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu)
+    /// ([`backend::metal`](crate::backend::metal) has the design).
     Metal,
     /// A GPU through [wgpu](https://wgpu.rs) (Vulkan, Metal, or DirectX 12)
     /// with the `wgpu` feature, on Linux, macOS, and Windows. Needs an
     /// adapter with 64-bit shader integers; a software adapter (Mesa's
     /// lavapipe, Microsoft's WARP) is used only when it is the only one, so
-    /// the path is testable on machines without a GPU. Unmeasured on real
-    /// GPUs so far (see [`backend::wgpu`](crate::backend::wgpu)); prediction
-    /// goes through [`BoostedModel::to_wgpu`](crate::model::BoostedModel::to_wgpu).
+    /// the path runs on machines without a GPU too (see
+    /// [`backend::wgpu`](crate::backend::wgpu)); prediction goes through
+    /// [`BoostedModel::to_wgpu`](crate::model::BoostedModel::to_wgpu).
     Wgpu,
     /// An NVIDIA GPU through CUDA, on Linux with the `cuda` feature (see
     /// [`backend::cuda`](crate::backend::cuda)): the tree's rows stay on

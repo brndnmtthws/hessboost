@@ -428,9 +428,11 @@ pub struct TrainingParams {
     /// `linear_tree`) on the numerical features split on along the leaf's
     /// path; rows with a missing value in any of them predict the constant
     /// leaf value. The first boosting round keeps constant leaves. Requires
-    /// the histogram builder (`hist`/`approx`) and one output per tree;
-    /// refused with `reg:absoluteerror` and `reg:quantileerror`, whose leaves
-    /// are re-estimated after growth. Linear-leaf models use the native
+    /// the histogram builder (`hist`/`approx`) and one output per tree. The
+    /// leaf models fit the objective's gradient/Hessian Newton step; for
+    /// `reg:absoluteerror` and `reg:quantileerror` that is the step of their
+    /// smooth surrogates (for the L1 surrogate an iteratively reweighted
+    /// least-squares step). Linear-leaf models use the native
     /// formats only: SHAP, XGBoost export, and the compact format refuse
     /// them.
     pub linear_tree: Option<LinearTree>,
@@ -995,17 +997,7 @@ impl TrainingParams {
                 "is not supported with `grow_policy=symmetric` (level-wise split search)",
             )?;
         }
-        // LightGBM refuses `regression_l1` with linear trees: objectives whose
-        // leaves are re-estimated after growth (XGBoost's adaptive leaves)
-        // would overwrite the constant that linear leaves fall back to.
-        ensure(
-            "linear_tree",
-            !(self.linear_tree.is_some() && self.objective.has_adaptive_leaves()),
-            format!(
-                "is not supported with the adaptive-leaf objective `{}`",
-                self.objective.name()
-            ),
-        )
+        Ok(())
     }
 
     /// Whether Stochastic Gradient Langevin Boosting is on: set directly or
@@ -1839,23 +1831,6 @@ mod tests {
         assert_eq!(rejected(b()), Some("dist_split_direction"));
         assert!(
             b().multi_strategy(MultiStrategy::MultiOutputTree)
-                .build()
-                .is_ok()
-        );
-    }
-
-    /// Adaptive-leaf objectives re-estimate their leaves after growth, which
-    /// would overwrite the constants linear leaves fall back to.
-    #[test]
-    fn linear_leaves_refuse_adaptive_leaf_objectives() {
-        let linear = || TrainingParams::builder().linear_tree(LinearTree::default());
-        assert_eq!(
-            rejected(linear().objective(Objective::AbsoluteError)),
-            Some("linear_tree")
-        );
-        assert!(
-            linear()
-                .objective(Objective::Gamma(RegLoss::default()))
                 .build()
                 .is_ok()
         );

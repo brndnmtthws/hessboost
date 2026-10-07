@@ -10,6 +10,9 @@
 //! `β = −(XᵀHX + Λ)⁻¹ Xᵀg`,  `Λ = diag(λ, …, λ, 0)`,
 //!
 //! so `linear_lambda` (`λ`) penalizes the slopes but not the intercept.
+//! `g` and `h` are whatever the objective trains on: for `reg:absoluteerror`
+//! and `reg:quantileerror` their smooth surrogates' gradients and curvatures,
+//! which makes the L1 fit an iteratively reweighted least-squares step.
 //! Following LightGBM:
 //!
 //! - categorical features route rows but never enter a leaf model;

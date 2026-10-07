@@ -430,13 +430,15 @@ models save and load like `DiffusionModel`s.
 
 ### GPU training and prediction
 
-Two GPU backends reproduce the CPU's results bit for bit: native Metal
-(`"metal"`, macOS) and wgpu (`"wgpu"`: Vulkan on Linux and Windows, Metal
-on macOS, DirectX 12 on Windows). `Booster.to_gpu()` lays a model out for
-batch prediction (on Metal on macOS and on wgpu elsewhere;
-`to_gpu("wgpu")` asks for wgpu): the forest uploads once, and each call
-predicts bit-identically to `Booster.predict` (values or raw margins).
-`GpuModel.available()` says whether the device can predict here:
+Three GPU backends reproduce CPU results bit for bit: native Metal
+(`"metal"`, macOS), wgpu (`"wgpu"`: Vulkan, Metal or DirectX 12), and
+NVIDIA CUDA (`"cuda"`, Linux). `Booster.to_gpu()` still selects Metal on
+macOS and wgpu elsewhere; `to_gpu(backend="cuda", ordinal=0)` explicitly
+selects an NVIDIA device. The forest uploads once, and each call preserves
+`Booster.predict` values and raw margins. Objective transforms run on the
+CPU; model-shrinkage models explicitly use CPU prediction, as with the
+other backends. `gblinear` and linear-leaf models are refused.
+`GpuModel.available()` says whether the selected device can predict:
 
 ```python
 from hessboost import GpuModel
@@ -446,8 +448,8 @@ if GpuModel.available():
     probabilities = gpu.predict(X_test)
 ```
 
-Training with `device="metal"` or `device="wgpu"` builds the larger nodes'
-histograms on the GPU and gives the CPU's model bit for bit:
+Training with `device="metal"`, `device="wgpu"` or `device="cuda"` builds
+histograms on the selected GPU and gives the CPU's model bit for bit:
 
 ```python
 booster = hessboost.train({"device": "wgpu", "max_depth": 6}, dtrain, 100)
@@ -461,6 +463,23 @@ shader integers: desktop Vulkan drivers, Apple GPUs, or DirectX 12 with
 as Mesa's lavapipe (correct, but slower than the CPU) only when there is no
 other; `GpuModel.device_name("wgpu")` names the adapter it picked, and the
 `WGPU_ADAPTER_NAME` environment variable picks one by name.
+
+Linux wheels include CUDA support, but bundle neither the NVIDIA driver
+nor NVRTC. Building and importing a wheel needs no CUDA toolkit. At run
+time CUDA needs an NVIDIA GPU, a driver supporting CUDA 12.8 or newer,
+and `libnvrtc.so` (or `libnvrtc.so.12`) on the library loader path. The
+CUDA toolkit provides NVRTC; alternatively install NVIDIA's
+`nvidia-cuda-nvrtc` pip package and add its `lib` directory to
+`LD_LIBRARY_PATH` (a versioned-only library needs a `libnvrtc.so` link).
+Missing libraries/device return an error rather than silently predicting
+on the CPU. CUDA prediction stages bounded dense or CSR row blocks
+through two pinned buffers, overlapping upload, compute and download.
+
+```python
+if GpuModel.available(backend="cuda", ordinal=0):
+    gpu = booster.to_gpu(backend="cuda", ordinal=0)
+    probabilities = gpu.predict(X_test)
+```
 
 ### Compact models
 
@@ -552,17 +571,15 @@ LightGBM's `rank_xendcg` stream.
   scikit-learn behavior); pass `iteration_range=(0, 0)` for all. SHAP and
   leaf ranges start at iteration 0; `pred_leaf` defaults to every iteration
   instead, and returns `int32`.
-- GPUs: `device="metal"` (macOS) or `device="wgpu"` trains on one instead of
-  `device="cuda"`, and `Booster.to_gpu()` lays the model out for GPU batch
-  prediction (`GpuModel.predict`, bit-identical to `Booster.predict`)
-  instead of predicting on the training device.
+- GPUs: `device="metal"` (macOS), `device="wgpu"` or `device="cuda"`
+  (NVIDIA on Linux) selects GPU training. `Booster.to_gpu()` lays the
+  model out for GPU prediction; use `backend="cuda", ordinal=0` for CUDA
+  instead of assuming prediction uses the training device.
 - Model files do not store feature names or categories (pickles do).
 - Not available: `DMatrix` from files or `QuantileDMatrix`, `inplace_predict`
   (`predict` takes arrays directly), `Booster.get_dump`/`trees_to_dataframe`
-  /`dump_model`, attributes (`set_attr`), plotting, distributed (Dask/Spark)
-  and CUDA training (the Rust crate's `cuda` feature is not in the wheels
-  yet, so `device="cuda"` is refused), `approx_contribs`, and
-  `strict_shape`.
+  /`dump_model`, attributes (`set_attr`), plotting, distributed (Dask/Spark),
+  `approx_contribs`, and `strict_shape`.
 
 ## Development
 

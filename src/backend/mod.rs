@@ -11,8 +11,8 @@
 //!   through [wgpu](https://wgpu.rs) over Vulkan, Metal, or DirectX 12
 //!   (`device = wgpu`; [`GpuModel`](wgpu::GpuModel), from
 //!   `BoostedModel::to_wgpu`).
-//! - [`cuda`] (Linux only, `cuda` feature): NVIDIA GPU histogram
-//!   construction during training (`device = cuda`).
+//! - [`cuda`] (Linux only, `cuda` feature): NVIDIA GPU training
+//!   (`device = cuda`) and batch prediction (`BoostedModel::to_cuda`).
 //!
 //! The backends keep the crate's determinism contract: a GPU run reproduces
 //! the CPU result bit for bit (work the GPU cannot compute exactly runs on
@@ -34,23 +34,29 @@
 )]
 mod exact_sum;
 
-/// The host-side plumbing the Metal and wgpu backends share.
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+/// Host-side plumbing shared by GPU backends.
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    feature = "wgpu",
+    all(target_os = "linux", feature = "cuda")
+))]
 mod shared;
 
 /// The CUDA backend (Linux, `cuda` feature).
 #[cfg(all(target_os = "linux", feature = "cuda"))]
 pub mod cuda;
 
-/// The CUDA backend's stand-in when it is not compiled in (any other
-/// platform, or the feature off): the module exists so `backend::cuda`
-/// paths and doc links resolve on every platform. `device = cuda` is then
-/// refused by [`TrainingParams::validate`](crate::config::TrainingParams::validate).
-///
-/// The backend's design, exactness rules, and limitations are documented
-/// in the real module: run `cargo doc --features cuda --open` on Linux.
+/// The CUDA backend's stand-in when it is not compiled in. The module and
+/// predictor type remain available for documentation and return types;
+/// [`BoostedModel::to_cuda`](crate::model::BoostedModel::to_cuda) then
+/// returns an error naming the feature and platform requirement.
 #[cfg(not(all(target_os = "linux", feature = "cuda")))]
-pub mod cuda {}
+pub mod cuda {
+    /// The CUDA predictor handle when the backend is not compiled in.
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub struct GpuModel;
+}
 
 /// The native Metal backend (macOS, `metal` feature).
 #[cfg(all(target_os = "macos", feature = "metal"))]

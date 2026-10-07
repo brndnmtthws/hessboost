@@ -154,6 +154,13 @@ impl GHistIndex {
             vec![bin_rows(data, &search, 0..n_rows, narrow)]
         };
         drop(search);
+        Self::from_chunks(n_rows, cuts, chunks)
+    }
+
+    fn from_chunks(n_rows: usize, cuts: HistCuts, chunks: Vec<BinnedRows>) -> Self {
+        let n_cols = cuts.n_features();
+        let total_bins = cuts.total_bins();
+        let narrow = total_bins <= u16::MAX as usize + 1;
         let total = chunks.iter().map(|chunk| chunk.bins.len()).sum();
         let dense = chunks.iter().all(|chunk| chunk.dense);
         // The chunk maxima establish the bin-range invariant documented on the
@@ -232,6 +239,59 @@ impl GHistIndex {
             cuts,
             dense,
         }
+    }
+
+    /// Build the host fallback index from CUDA's exact row-major global
+    /// bins. Missing cells carry `u32::MAX`; no quantile or bin search is
+    /// repeated on the host. Feature-range checks protect the invariant.
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    pub(crate) fn from_dense_bins(data: &DMatrix, cuts: HistCuts, global: &[u32]) -> Self {
+        let n_rows = data.n_rows();
+        let n_cols = data.n_cols();
+        assert_eq!(cuts.n_features(), n_cols);
+        assert_eq!(n_rows.checked_mul(n_cols), Some(global.len()));
+        assert!(n_cols > 0);
+        let narrow = cuts.total_bins() <= u16::MAX as usize + 1;
+        let grain = n_rows.div_ceil(rayon::current_num_threads()).max(1024);
+        let chunks: Vec<_> = global
+            .par_chunks(grain * n_cols)
+            .map(|cells| {
+                let mut bins = if narrow {
+                    BinStore::U16(Vec::with_capacity(cells.len()))
+                } else {
+                    BinStore::U32(Vec::with_capacity(cells.len()))
+                };
+                let mut row_ends = Vec::with_capacity(cells.len() / n_cols);
+                let mut dense = true;
+                let mut max_bin = 0;
+                for row in cells.chunks_exact(n_cols) {
+                    for (f, &bin) in row.iter().enumerate() {
+                        if bin == u32::MAX {
+                            dense = false;
+                            continue;
+                        }
+                        let (start, end) = cuts.feature_bins(f);
+                        assert!(
+                            (start..end).contains(&(bin as usize)),
+                            "CUDA bin outside feature range"
+                        );
+                        max_bin = max_bin.max(bin);
+                        match &mut bins {
+                            BinStore::U16(values) => values.push(bin as u16),
+                            BinStore::U32(values) => values.push(bin),
+                        }
+                    }
+                    row_ends.push(bins.len());
+                }
+                BinnedRows {
+                    row_ends,
+                    bins,
+                    dense,
+                    max_bin,
+                }
+            })
+            .collect();
+        Self::from_chunks(n_rows, cuts, chunks)
     }
 
     #[cfg(all(target_os = "linux", feature = "cuda"))]
@@ -333,15 +393,15 @@ impl GHistIndex {
 }
 
 /// Feature-major copy of a dense row-major matrix (`n_rows * n_cols` entries,
-/// row `r` at `r * n_cols`). Features are handled in groups so each pass over
-/// the rows reads a short contiguous run per row and writes a few sequential
-/// column streams.
+/// row `r` at `r * n_cols`). Four-feature groups expose eight tasks for a
+/// 30-feature matrix while each pass reads a short contiguous run per row
+/// and writes sequential column streams.
 pub(crate) fn transpose_dense<B: Copy + Default + Send + Sync>(
     bins: &[B],
     n_rows: usize,
     n_cols: usize,
 ) -> Vec<B> {
-    const GROUP: usize = 8;
+    const GROUP: usize = 4;
     let mut columns = vec![B::default(); n_rows * n_cols];
     if n_rows == 0 || n_cols == 0 {
         return columns;
@@ -563,6 +623,62 @@ fn bin_rows_into<B: FromBin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    #[test]
+    fn imported_dense_bins_preserve_cpu_rows_columns_and_missing() {
+        use crate::data::FeatureType;
+        for missing in [f32::NAN, -99.0] {
+            let values: Vec<f32> = (0..2051 * 5)
+                .map(|i| {
+                    if i % 13 == 0 {
+                        missing
+                    } else if i % 5 == 0 {
+                        (i / 5 % 7) as f32
+                    } else {
+                        ((i * 31) % 1009) as f32 * 0.1
+                    }
+                })
+                .collect();
+            let data = DMatrix::from_dense_with_missing(&values, 2051, 5, missing)
+                .unwrap()
+                .with_feature_types(&[
+                    FeatureType::Categorical,
+                    FeatureType::Numerical,
+                    FeatureType::Numerical,
+                    FeatureType::Numerical,
+                    FeatureType::Numerical,
+                ])
+                .unwrap();
+            let cuts = HistCuts::from_dmatrix(&data, 33);
+            let global: Vec<u32> = values
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    if crate::data::dmatrix::is_missing(v, missing) {
+                        u32::MAX
+                    } else {
+                        cuts.bin_of(i % 5, v)
+                    }
+                })
+                .collect();
+            let expected = GHistIndex::from_dmatrix(&data, cuts.clone());
+            let actual = GHistIndex::from_dense_bins(&data, cuts, &global);
+            assert_eq!(actual.row_ptr, expected.row_ptr);
+            assert_eq!(actual.dense, expected.dense);
+            match (&actual.store, &expected.store) {
+                (BinStore::U16(a), BinStore::U16(b)) => assert_eq!(a, b),
+                _ => panic!("unexpected bin width"),
+            }
+            match (&actual.columns, &expected.columns) {
+                (
+                    Columns::WithMissing(BinStore::U16(a)),
+                    Columns::WithMissing(BinStore::U16(b)),
+                ) => assert_eq!(a, b),
+                _ => panic!("missing feature columns were not preserved"),
+            }
+        }
+    }
 
     #[test]
     fn parallel_binning_preserves_cuts_rows_and_width() {

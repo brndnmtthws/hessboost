@@ -30,7 +30,7 @@ _GrowPolicy: TypeAlias = Literal["depthwise", "lossguide", "symmetric"]
 _BoosterName: TypeAlias = Literal["gbtree", "dart", "gblinear", "boulevard", "ebm"]
 _TreeMethod: TypeAlias = Literal["auto", "exact", "approx", "hist"]
 _SamplingMethod: TypeAlias = Literal["uniform", "gradient_based"]
-_Device: TypeAlias = Literal["cpu", "metal", "wgpu"]
+_Device: TypeAlias = Literal["cpu", "metal", "wgpu", "cuda"]
 _MultiStrategy: TypeAlias = Literal["one_output_per_tree", "multi_output_tree"]
 
 EvalSet = Sequence[tuple[Any, ArrayLike]]

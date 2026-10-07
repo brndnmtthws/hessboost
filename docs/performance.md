@@ -811,12 +811,14 @@ cargo run --release --features wgpu --example wgpu
 
 ## CUDA GPU (Linux)
 
-The `cuda` feature keeps rows on the device and batches depthwise
-histogram construction and numeric split search by level. Squared-error
-and eligible logistic rounds also keep training margins and gradients
-resident. Other objectives upload gradients per tree; categorical search
-and loss-guided growth read histograms back to the host. CUDA prediction
-is not implemented.
+The `cuda` feature keeps rows and histograms on the device and batches
+depthwise numeric/categorical split search by level. Loss-guided growth
+retains its ordering-critical host heap but searches resident histograms
+on CUDA. Squared-error and eligible logistic rounds also keep margins and
+gradients resident. Other objectives upload gradients per tree. Non-total
+NaN sorting/scoring semantics explicitly replay the affected node on CPU.
+`BoostedModel::to_cuda(ordinal)` provides independent CUDA prediction;
+transforms and the existing model-shrinkage convention remain on the CPU.
 
 **Required CUDA tests passed on an NVIDIA L40S**, compute capability 8.9,
 driver 595.91.07, on 2026-10-06: 3 lifecycle/fallback regressions and all
@@ -835,14 +837,91 @@ configurations, not measured optima. Pinned uploads retain completion
 events before reuse or destruction; row readbacks use separate cacheable staging.
 Partial-histogram waves are capped by currently available device memory.
 
-The local-bin representation keeps both a padded row-major copy and a
-feature-major copy. Sparse CSR input is expanded into these dense copies:
-size GPU and host memory for `rows * features`, not just nonzero entries.
-Resident split scans return per-feature winners, not just one winner per
-node, and partitioning needs a left-count readback before child work can
-be scheduled. Profile these transfers and host synchronization in Nsight
-Systems before assuming one synchronization per level. Host evaluation
-sets and logistic scalar tails can add more synchronization.
+Complete dense input uses padded row-major and feature-major local bins,
+encoded/transposed on CUDA against CPU-authoritative cuts. Sparse input
+stays CSR (global `u16`/`u32` bins and `u64` offsets), including dense input
+with missing cells: GPU storage scales with present entries, not
+`rows * features`. Integer CSR scatter and ordered chain fallbacks visit
+each stored entry once; no sparse per-feature dense copies are allocated.
+
+Split search merges feature winners on CUDA, returning one packed pinned
+record per node: 40 bytes for numeric-only searches, a 56-byte header plus
+at most 256 category bytes otherwise. This replaces per-feature winner
+downloads and ordinary full-histogram/category-order readbacks. Partition
+counts still cross a host scheduling boundary to choose exact summation
+grains and smaller children; counts use reusable pinned staging. Host
+evaluation sets and logistic scalar tails can add synchronization.
+
+Raw dense values can be mapped to exact CPU cuts through
+`CudaHistBackend::from_dmatrix`; host fallback bins are constructed from
+global IDs without another bin search. This remains explicit rather than
+the training default: at 10M × 30, raw-float upload/global-bin readback
+made binning plus device setup about 2.08 s, versus roughly 1.07 s for
+compact CPU binning plus device encoding. Unit-weight sketch ingestion
+is batched without changing queue boundaries; four-feature transpose
+tasks improve 30-feature host parallelism. Weighted/approximate sketch
+arithmetic and pruning order remain unchanged.
+
+Prediction retains compact 8-byte numeric or 16-byte general forest nodes.
+Calls reuse bounded double buffers, with independent H2D/compute/D2H
+streams and explicit completion events on a separate event-tracked CUDA
+context. CSR prediction materializes only each bounded row block, not the
+whole batch. Categorical splits, multiclass/vector leaves, DART weights,
+base margins, iteration ranges, and tree-order `f32` accumulation retain
+CPU bits. Linear models are refused as with other GPU predictors.
+
+Python Linux wheels load CUDA/NVRTC dynamically; neither is bundled.
+Use `booster.to_gpu(backend="cuda", ordinal=0)` and
+`GpuModel.available(backend="cuda", ordinal=0)`; the previous Metal/wgpu
+defaults and positional `device` argument remain unchanged.
+
+### Resident search, compact sparse storage, and prediction
+
+Compared with `1da8f4b` on the same L40S and 8-thread host, the integrated
+changes below use 30 rounds, depth 6, max 64 leaves, and 30 features.
+Input generation and model encoding are excluded; cuts, binning, device
+setup and training are included. Baseline/candidate/candidate/baseline,
+one warmup plus three timed fits per process; medians of six fits.
+Encoded-model hashes matched in every case.
+
+| Workload | Previous | Integrated | Speedup |
+|---|---:|---:|---:|
+| Dense squared error, 1M × 30 | 369.9 ms | 330.8 ms | 1.12× |
+| Dense squared error, 10M × 30 | 3.514 s | 3.061 s | 1.15× |
+| Three 257-category features, 1M × 30 | 476.3 ms | 343.6 ms | 1.39× |
+| Numeric lossguide, 1M × 30 | 753.1 ms | 632.3 ms | 1.19× |
+| CSR, 20k × 5,000, 10 entries/row | 481.5 ms | 513.2 ms | 0.94× |
+
+Sparse storage prioritizes bounded memory and one-pass present-entry
+traversal, not a universal speedup: that small wide sparse workload is
+about 7% slower. Its CSR bins occupy about 400 kB plus 160 kB of row
+offsets, instead of two roughly 200 MB dense bin copies. Wide 70k-feature,
+70,003-row and entirely empty CSR regressions establish that device
+storage never expands to the full row-by-feature shape.
+
+Separated preparation at 10M × 30 measured baseline cuts about 1.55 s,
+CPU binning 0.88 s, device preparation 0.52 s. Direct unit-weight ingestion
+and narrower transpose task groups reduced cut time to about 1.34 s;
+CPU binning about 0.82 s and tiled device encoding about 0.25 s on the
+isolated candidate run. Timings vary with host load; the end-to-end table
+is the decision metric. Raw GPU binning's extra roundtrip was rejected
+as the default after measuring it slower, while retaining its explicit API.
+
+CUDA prediction on 500k × 30 through 100 depth-8 regression trees took
+8.94 ms versus 41.90 ms on eight CPU threads (4.68×): six alternating
+timed calls after warmup, including row materialization, H2D and D2H.
+First forest upload/context compilation took 218 ms and is excluded from
+reused-predictor timings. Every output margin bit matched the CPU.
+
+Required L40S verification covered 12 CUDA storage/binning/predictor unit
+tests, 3 categorical/lossguide compact-search tests, all 11 training
+integration tests, and 6 prediction integration tests. The 12 + 3 + 6
+groups passed all four Compute Sanitizer modes with zero errors/hazards.
+Python GPU tests on Linux passed 15 cases with CUDA required; only Metal
+and wgpu were unavailable on that host. Regression coverage includes
+stable category counts 1/3/4/64/257/4097, missing/default directions,
+CSR unsorted/empty rows, all bin widths, scalar/vector subnormals,
+oversized compact trees, iteration ranges and concurrent prediction.
 
 ### Warp-parallel split scoring
 
@@ -882,7 +961,7 @@ new ragged-bin/duplicate-feature-tie cases passed `memcheck`, `racecheck`,
 `synccheck`, and `initcheck`, with zero errors, hazards, or warnings.
 
 These synthetic results are not a universal optimum or an XGBoost
-comparison. Lossguide still searches on the host. On a selected histogram
+comparison. Lossguide searched on the host in that revision. On a selected histogram
 launch, Nsight Compute reported 40 registers/thread, zero spills, 32 KiB
 dynamic shared memory, 100% theoretical and 89% achieved occupancy.
 Increasing occupancy is not the first tuning target for that launch;
@@ -915,7 +994,7 @@ The trace does not isolate all of that remainder as quantile sketching.
   would violate the histogram and split-prefix contract.
 - [RAPIDS FIL](https://github.com/NVIDIA/cuml/blob/branch-25.04/cpp/src/fil/infer.cu)
   and [nvForest](https://github.com/rapidsai/nvforest/blob/7d7c1a70ac89b797ecaf46aea6772b13a5ba047c/cpp/include/nvforest/detail/infer_kernel/gpu.cuh)
-  provide batching and cached-input ideas for future CUDA prediction,
+  provide batching and cached-input ideas for CUDA prediction,
   not histogram-training implementations or ordered ensemble-sum oracles.
 
 On the target instance, require the device tests so missing CUDA cannot

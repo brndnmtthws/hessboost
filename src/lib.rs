@@ -207,7 +207,9 @@
 //!     exact integer sums, `f64` chains in the CPU's order outside them),
 //!     with the tree's rows, and for the common objectives the margins and
 //!     gradients, kept on the GPU; the driver and NVRTC load at run time.
-//!     CPU bit-parity tests pass on an NVIDIA L40S ([`backend::cuda`]).
+//!     [`to_cuda`](model::BoostedModel::to_cuda) uploads compact forests for
+//!     ordered GPU batch prediction. CPU bit-parity tests pass on an NVIDIA
+//!     L40S ([`backend::cuda`]).
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
@@ -230,7 +232,7 @@
 //! forests, DART) match in quality only — the random streams differ.
 //! ### Not implemented
 //!
-//! - Distributed and external-memory training; CUDA prediction.
+//! - Distributed and external-memory training.
 //! - XGBoost options available at one setting only (so they are not
 //!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
 //!   setting): gblinear uses `updater = coord_descent`

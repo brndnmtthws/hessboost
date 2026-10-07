@@ -175,7 +175,7 @@ See [`python/README.md`](python/README.md).
   - [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/): Training controlled by one budget value, based on PerpetualBooster.
   - [Metal GPU](https://docs.rs/hessboost/latest/hessboost/backend/metal/): Apple Silicon GPU prediction and training (`--features metal`).
   - [wgpu GPU](https://docs.rs/hessboost/latest/hessboost/backend/wgpu/): Vulkan, Metal, and DirectX 12 GPU prediction and training through wgpu (`--features wgpu`), bit-identical to the CPU and testable on a software adapter; unmeasured on real GPUs so far.
-  - [CUDA GPU](https://docs.rs/hessboost/latest/hessboost/backend/cuda/): NVIDIA GPU training on Linux (`--features cuda`) with the rows, and for common objectives the margins and gradients, resident on the GPU; CPU bit-parity tests pass on an L40S (see [verification](docs/performance.md#cuda-gpu-linux)).
+  - [CUDA GPU](https://docs.rs/hessboost/latest/hessboost/backend/cuda/): NVIDIA GPU training and batch prediction on Linux (`--features cuda`), device-resident numeric/categorical split search, compact CSR storage, and ordered prediction; CPU bit-parity tests pass on an L40S (see [verification](docs/performance.md#cuda-gpu-linux)).
 
 ## Caveats
 
@@ -186,7 +186,6 @@ See [`python/README.md`](python/README.md).
 
 - Distributed and external-memory training.
 - CLI and C bindings.
-- CUDA prediction. GPU prediction runs through Metal (macOS) or wgpu (Vulkan, Metal, DirectX 12).
 - A few XGBoost options exist at one setting only, and a few metrics are
   missing; the [API docs](https://docs.rs/hessboost/latest/hessboost/#not-implemented)
   list them.

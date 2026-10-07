@@ -29,7 +29,7 @@ def dtrain() -> DMatrix:
         ({"max_depth": -1}, r"parameter `max_depth`"),
         ({"max_depth": 2.5}, r"parameter `max_depth`"),
         ({"tree_method": "gpu_hist"}, r"unknown variant `gpu_hist`"),
-        ({"device": "cuda"}, r"`cuda` requires building with the `cuda` feature"),
+        ({"device": "cuda", "tree_method": "exact"}, r"parameter `device`"),
         ({"device": "cuda:x"}, r"unknown variant `cuda:x`"),
         ({"eta": 0.1, "learning_rate": 0.2}, r"`eta`: is set twice"),
         ({"subsample": 1.5}, r"subsample"),

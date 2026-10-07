@@ -8,8 +8,12 @@ use cudarc::nvrtc::{Ptx, result, sys};
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-/// The kernel source (`kernels.cu`).
-const SOURCE: &str = include_str!("kernels.cu");
+/// Training and categorical kernels share their exact arithmetic helpers.
+const SOURCE: &str = concat!(
+    include_str!("kernels.cu"),
+    "\n",
+    include_str!("categorical.cu")
+);
 
 /// NVRTC options besides the architecture. No FP contraction, no
 /// flush-to-zero, IEEE division and square root: every floating-point
@@ -38,11 +42,10 @@ impl Drop for Program {
 /// Compile the kernels to a CUBIN for `arch` (`sm_89`, ...), or the
 /// compiler's error and log. NVRTC must be loadable (checked by the
 /// caller).
-fn cubin(arch: &str) -> std::result::Result<Vec<u8>, String> {
-    let source = CString::new(SOURCE).map_err(|e| e.to_string())?;
+fn cubin(arch: &str, source: &str, name: &CStr) -> std::result::Result<Vec<u8>, String> {
+    let source = CString::new(source).map_err(|e| e.to_string())?;
     let program = Program(
-        result::create_program(&source, Some(c"hessboost_kernels.cu"))
-            .map_err(|e| format!("NVRTC program: {e}"))?,
+        result::create_program(&source, Some(name)).map_err(|e| format!("NVRTC program: {e}"))?,
     );
     let mut options = vec![format!("--gpu-architecture={arch}")];
     options.extend(OPTIONS.iter().map(|o| (*o).to_owned()));
@@ -80,9 +83,28 @@ pub(super) fn load(
     ctx: &Arc<CudaContext>,
     arch: &str,
 ) -> std::result::Result<Arc<CudaModule>, String> {
-    let image = cubin(arch)?;
+    load_source(ctx, arch, SOURCE, c"hessboost_kernels.cu")
+}
+
+/// Load independent kernels with the training module's IEEE compiler options.
+pub(super) fn load_source(
+    ctx: &Arc<CudaContext>,
+    arch: &str,
+    source: &str,
+    name: &CStr,
+) -> std::result::Result<Arc<CudaModule>, String> {
+    let image = cubin(arch, source, name)?;
     ctx.load_module(Ptx::from_binary(image))
         .map_err(|e| format!("CUDA module load for {arch}: {e}"))
+}
+
+/// Compile one source for the NVRTC-only architecture guard.
+pub(super) fn compile_source(
+    arch: &str,
+    source: &str,
+    name: &CStr,
+) -> std::result::Result<usize, String> {
+    cubin(arch, source, name).map(|image| image.len())
 }
 
 /// Compile the CUDA kernels for `arch` (for example `sm_89`) without a
@@ -94,7 +116,9 @@ pub fn compile_kernels(arch: &str) -> Result<usize> {
     if !unsafe { sys::is_culib_present() } {
         return Err(HessboostError::gpu("libnvrtc not found"));
     }
-    cubin(arch)
-        .map(|image| image.len())
-        .map_err(HessboostError::gpu)
+    let training =
+        compile_source(arch, SOURCE, c"hessboost_kernels.cu").map_err(HessboostError::gpu)?;
+    let prediction = compile_source(arch, include_str!("predict.cu"), c"hessboost_predict.cu")
+        .map_err(HessboostError::gpu)?;
+    Ok(training + prediction)
 }

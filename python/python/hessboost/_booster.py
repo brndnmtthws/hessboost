@@ -50,7 +50,7 @@ ImportanceType: TypeAlias = Literal["weight", "gain", "total_gain", "cover", "to
 """XGBoost's ``importance_type``: split counts, average or total gain,
 average or total cover (Hessian)."""
 
-_GpuDevice: TypeAlias = Literal["metal", "wgpu"]
+_GpuDevice: TypeAlias = Literal["metal", "wgpu", "cuda"]
 
 
 def _format_for(path: PathLike, format: ModelFormat | None) -> ModelFormat:
@@ -317,18 +317,28 @@ class Booster(_SchemaState):
         )
         return model.predict(matrix, kind, iterations)
 
-    def to_gpu(self, device: _GpuDevice | None = None) -> GpuModel:
+    def to_gpu(
+        self,
+        device: _GpuDevice | None = None,
+        *,
+        backend: _GpuDevice | None = None,
+        ordinal: int = 0,
+    ) -> GpuModel:
         """Lays this model out for GPU batch prediction: the forest, category
         pools, and per-tree weights are uploaded once, and each prediction
         call uploads its rows. Predictions are bit-identical to the CPU's.
+        Objective transforms run on the CPU. Models trained with model
+        shrinkage explicitly predict on the CPU, as on the other backends.
+        CUDA stages dense and CSR inputs in bounded double-buffered blocks.
 
         Args:
             device: ``"metal"`` (macOS; faster than the CPU from roughly a
-                few thousand row-trees upward) or ``"wgpu"`` (Vulkan, Metal,
-                or DirectX 12; unmeasured on real GPUs so far, and slower
-                than the CPU on a software adapter such as Mesa's lavapipe,
-                which it picks only when there is no other). ``None``: Metal
-                on macOS, wgpu elsewhere.
+                few thousand row-trees upward), ``"wgpu"`` (Vulkan, Metal,
+                or DirectX 12), or ``"cuda"`` (NVIDIA on Linux). ``None``:
+                Metal on macOS, wgpu elsewhere.
+            backend: Explicit backend selection, equivalent to ``device``.
+                If both are given they must agree.
+            ordinal: CUDA device index, default 0. Other backends require 0.
 
         Raises:
             HessboostError: ``device`` is unknown or cannot predict here
@@ -338,7 +348,7 @@ class Booster(_SchemaState):
                 is a ``gblinear`` or ``linear_tree`` model (which do not
                 predict through the forest).
         """
-        return GpuModel._wrap(self._model.to_gpu(device), self)
+        return GpuModel._wrap(self._model.to_gpu(device, backend=backend, ordinal=ordinal), self)
 
     def to_compact(self) -> CompactModel:
         """This model in the bit-packed compact layout (*Boosted Trees on a
@@ -558,8 +568,8 @@ class Booster(_SchemaState):
 
 class GpuModel:
     """A model laid out for GPU batch prediction, from
-    :meth:`Booster.to_gpu`: on Metal (macOS) or through wgpu (Vulkan, Metal,
-    DirectX 12). Wraps ``hessboost._hessboost.GpuModel`` with the same
+    :meth:`Booster.to_gpu`: on Metal (macOS), wgpu (Vulkan, Metal, DirectX
+    12), or CUDA (NVIDIA on Linux). Wraps ``hessboost._hessboost.GpuModel`` with the same
     feature-name checks as :meth:`Booster.predict`; unlike a booster it
     holds no file state and cannot be pickled.
     """
@@ -586,36 +596,49 @@ class GpuModel:
 
     @property
     def device(self) -> _GpuDevice:
-        """The backend this model predicts on: ``"metal"`` or ``"wgpu"``."""
+        """The backend this model predicts on: ``"metal"``, ``"wgpu"`` or ``"cuda"``."""
         return self._core.device
 
     @staticmethod
-    def available(device: _GpuDevice | None = None) -> bool:
+    def available(
+        device: _GpuDevice | None = None,
+        *,
+        backend: _GpuDevice | None = None,
+        ordinal: int = 0,
+    ) -> bool:
         """Whether ``device`` (``None``: Metal on macOS, wgpu elsewhere) can
         predict here, so that :meth:`Booster.to_gpu` lays forest models out
         on it: for Metal, a device with working compute pipelines (``False``
         off macOS); for wgpu, an adapter with 64-bit shader integers whose
-        float additions passed the backend's addition-order check. Training
-        with ``device`` needs the same GPU, except that wgpu also trains on
-        an adapter that fails the check. The first call per device sets its
-        backend up (picks the adapter, compiles the kernels, runs the check).
+        float additions passed the backend's addition-order check; for CUDA,
+        a CUDA 12.8+ driver, NVRTC and the selected NVIDIA device on Linux.
+        ``backend`` selects the same backend as ``device``; ``ordinal``
+        selects the CUDA device. The first call initializes that backend.
 
         Raises:
-            HessboostError: ``device`` is not ``"metal"`` or ``"wgpu"``.
+            HessboostError: The backend is unknown, the selectors disagree,
+                or a non-CUDA backend receives a nonzero ordinal.
         """
-        return _hessboost.GpuModel.available(device)
+        return _hessboost.GpuModel.available(device, backend=backend, ordinal=ordinal)
 
     @staticmethod
-    def device_name(device: _GpuDevice | None = None) -> str | None:
+    def device_name(
+        device: _GpuDevice | None = None,
+        *,
+        backend: _GpuDevice | None = None,
+        ordinal: int = 0,
+    ) -> str | None:
         """The name of the GPU ``device`` (``None``: Metal on macOS, wgpu
         elsewhere) picked, if it found one (for diagnostics and benchmarks),
         including a wgpu adapter that trains but fails the addition-order
         check.
+        ``backend`` and ``ordinal`` have the same meaning as in :meth:`available`.
 
         Raises:
-            HessboostError: ``device`` is not ``"metal"`` or ``"wgpu"``.
+            HessboostError: The backend is unknown, the selectors disagree,
+                or a non-CUDA backend receives a nonzero ordinal.
         """
-        return _hessboost.GpuModel.device_name(device)
+        return _hessboost.GpuModel.device_name(device, backend=backend, ordinal=ordinal)
 
     def predict(
         self,

@@ -1,7 +1,6 @@
-"""GPU training and batch prediction: Metal (macOS) and wgpu (Vulkan, Metal,
-DirectX 12). Tests that need a device skip without one; CI's Linux runners
-install Mesa's lavapipe, a software Vulkan adapter, and set
-``HESSBOOST_REQUIRE_WGPU``, so the wgpu tests run there without a GPU."""
+"""GPU training and batch prediction: Metal, wgpu and CUDA. Device tests
+skip without a usable backend; HESSBOOST_REQUIRE_WGPU/CUDA forbid skips.
+CUDA is dynamically loaded on Linux and needs a driver and NVRTC."""
 
 from __future__ import annotations
 
@@ -17,8 +16,8 @@ import hessboost
 from conftest import regression
 from hessboost import Booster, DMatrix, GpuModel, HessboostError, IncompatibleModelError
 
-Device: TypeAlias = Literal["metal", "wgpu"]
-DEVICES: list[Device] = ["metal", "wgpu"]
+Device: TypeAlias = Literal["metal", "wgpu", "cuda"]
+DEVICES: list[Device] = ["metal", "wgpu", "cuda"]
 
 
 def needs(device: Device) -> None:
@@ -61,6 +60,52 @@ def test_wgpu_is_available_or_the_machine_has_no_adapter(
         hessboost.train({"device": "wgpu"}, DMatrix(x, y), 1)
 
 
+def test_cuda_is_available_or_missing_runtime(trained: tuple[Booster, np.ndarray]) -> None:
+    """A CUDA compiler or kernel error is never a valid device-test skip."""
+    if GpuModel.available(backend="cuda"):
+        return
+    with pytest.raises(HessboostError) as refused:
+        trained[0].to_gpu(backend="cuda")
+    reason = str(refused.value)
+    assert "HESSBOOST_REQUIRE_CUDA" not in os.environ, reason
+    assert any(
+        expected in reason
+        for expected in (
+            "libcuda not found",
+            "libnvrtc not found",
+            "no CUDA device",
+            "only available on Linux",
+        )
+    ), reason
+    assert GpuModel.device_name(backend="cuda") is None
+
+
+def test_cuda_backend_and_ordinal(trained: tuple[Booster, np.ndarray]) -> None:
+    """Explicit selection shares the existing prediction API and validation."""
+    with pytest.raises(HessboostError, match="different GPU backends"):
+        trained[0].to_gpu("wgpu", backend="cuda")
+    with pytest.raises(HessboostError, match="ordinal is only supported"):
+        GpuModel.available("wgpu", ordinal=1)
+    needs("cuda")
+    booster, x = trained
+    gpu = booster.to_gpu(backend="cuda", ordinal=0)
+    assert gpu.device == "cuda"
+    np.testing.assert_array_equal(gpu.predict(x), booster.predict(x))
+
+
+def test_cuda_sparse_batches(trained: tuple[Booster, np.ndarray]) -> None:
+    """Sparse input spans both pinned slots without expanding the whole batch."""
+    needs("cuda")
+    sparse = pytest.importorskip("scipy.sparse")
+    booster, x = trained
+    batch = np.tile(x, (40, 1))
+    matrix = DMatrix(sparse.csr_matrix(batch))
+    gpu = booster.to_gpu(backend="cuda")
+    np.testing.assert_array_equal(
+        gpu.predict(matrix, output_margin=True), booster.predict(matrix, output_margin=True)
+    )
+
+
 @pytest.mark.parametrize("device", DEVICES)
 def test_a_device_that_predicts_has_a_name(device: Device) -> None:
     needs(device)
@@ -78,8 +123,8 @@ def test_default_device_is_metal_on_macos_and_wgpu_elsewhere(
 
 
 def test_unknown_devices_are_refused(trained: tuple[Booster, np.ndarray]) -> None:
-    with pytest.raises(HessboostError, match='unknown GPU device "cuda"'):
-        trained[0].to_gpu("cuda")  # ty: ignore[invalid-argument-type]
+    with pytest.raises(HessboostError, match='unknown GPU device "bogus"'):
+        trained[0].to_gpu("bogus")  # ty: ignore[invalid-argument-type]
     with pytest.raises(HessboostError, match='unknown GPU device "cpu"'):
         GpuModel.available("cpu")  # ty: ignore[invalid-argument-type]
     with pytest.raises(HessboostError, match='unknown GPU device "Metal"'):

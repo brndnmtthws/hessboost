@@ -1,24 +1,33 @@
-//! The host-side plumbing both GPU backends share: which nodes and
-//! prediction calls may run on the GPU, and the data movement around their
-//! kernels. The kernels themselves stay backend-specific.
+//! Host-side plumbing shared by GPU backends. Metal/wgpu share histogram
+//! staging and full-batch plans; all backends share forest validation and
+//! bounded row materialization.
 
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 use std::ops::Range;
 
 use rayon::prelude::*;
 
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 use crate::backend::exact_sum::SumDomain;
 use crate::data::DMatrix;
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 use crate::data::ghist::GHistIndex;
 use crate::error::{HessboostError, Result};
-use crate::model::{BoostedModel, Iterations, Predictions, initial_margins};
+use crate::model::BoostedModel;
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+use crate::model::{Iterations, Predictions, initial_margins};
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 use crate::objective::GradPair;
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 use crate::tree::gain::GradStats;
 
 /// Upper bound on GPU buffer sizes (entries), keeping index math in `u32`.
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 pub(crate) const MAX_BUFFER_ENTRIES: usize = 1 << 30;
 
 /// The shape of the binned index a GPU histogram backend sized its buffers
 /// for.
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IndexShape {
     pub(crate) n_rows: usize,
@@ -26,6 +35,7 @@ pub(crate) struct IndexShape {
     pub(crate) total_bins: usize,
 }
 
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 impl IndexShape {
     /// The shape of `index`.
     pub(crate) fn of(index: &GHistIndex) -> Self {
@@ -53,6 +63,7 @@ impl IndexShape {
 /// histogram backend has staged: a node goes to the GPU only when the slice
 /// it is built from is the staged one and its sums are exact on both paths
 /// (see `backend::exact_sum`).
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StagedSlice {
     /// (address, length) identity of the staged slice; length 0 when
@@ -63,6 +74,7 @@ pub(crate) struct StagedSlice {
     hess: SumDomain,
 }
 
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 impl StagedSlice {
     /// Nothing staged.
     pub(crate) const NONE: Self = Self {
@@ -154,6 +166,7 @@ pub(crate) fn ensure_forest_model(model: &BoostedModel) -> Result<()> {
 }
 
 /// What a GPU margin prediction leaves to the backend's forest walk.
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 pub(crate) enum MarginPlan {
     /// The margins, computed without the GPU: on the CPU for a model with
     /// model shrinkage (whose per-iteration shrink-then-add arithmetic
@@ -172,6 +185,7 @@ pub(crate) enum MarginPlan {
 /// before the forest walk: the CPU path for shrunk models, the data and
 /// iteration checks, the base margins, and the bound on the dense row copy
 /// the backends upload ([`materialize_rows`]).
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 pub(crate) fn plan_margins(
     model: &BoostedModel,
     data: &DMatrix,
@@ -235,7 +249,10 @@ pub(crate) fn materialize_rows(data: &DMatrix, begin: usize, rows: &mut [f32]) {
 }
 
 /// Helpers both backends' unit tests share.
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(all(target_os = "macos", feature = "metal"), feature = "wgpu")
+))]
 pub(crate) mod test_support {
     use crate::data::DMatrix;
     use crate::data::ghist::GHistIndex;

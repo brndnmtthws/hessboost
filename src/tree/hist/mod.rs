@@ -200,15 +200,16 @@ pub trait RowEngine: Sync {
         siblings: &[(HistSlot, HistSlot)],
     ) -> Option<()>;
 
-    /// The numeric split scan (`scan_numeric_splits` in
-    /// `tree::builder::split`) of every request's features on its slot's
-    /// histogram, request by request, feature by feature.
+    /// Search each request's numeric and categorical features on its slot's
+    /// histogram, retaining the host's feature-order merge and tie rule.
+    /// Only one winning split per node crosses the device boundary. A
+    /// non-total categorical comparison or NaN score requests host replay.
     fn scan_resident(
         &self,
         ghist: &GHistIndex,
         reg: &RegParams,
         requests: &[ScanRequest<'_>],
-    ) -> Option<Vec<FeatureScan>>;
+    ) -> Option<Vec<NodeScan>>;
 
     /// A slot's histogram, read back.
     fn read_hist(&self, slot: HistSlot) -> Option<Histogram>;
@@ -217,9 +218,9 @@ pub trait RowEngine: Sync {
 /// A [`RowEngine`] histogram slot.
 pub type HistSlot = u32;
 
-/// One node's split scan on the device: its histogram's slot, statistics,
+/// One node's split search on the device: its histogram's slot, statistics,
 /// `root_gain` and monotone bounds (as the scorer uses them, in `f32`), and
-/// the numeric features to scan, each with its monotone direction.
+/// the features to scan, each with its monotone direction.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanRequest<'a> {
     pub slot: HistSlot,
@@ -230,23 +231,42 @@ pub struct ScanRequest<'a> {
     pub features: &'a [(u32, i8)],
 }
 
-/// One feature's numeric split scan, as `scan_numeric_splits` reports it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum FeatureScan {
-    /// No candidate has a finite loss change.
+/// Why a resident search needs the CPU's sequential semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFallback {
+    /// A numeric candidate's score is NaN.
+    NumericScore,
+    /// A categorical weight is non-finite. NaN makes the comparator
+    /// non-total; infinite keys conservatively use the same host replay.
+    CategoricalOrder,
+    /// A categorical candidate's score is NaN.
+    CategoricalScore,
+}
+
+/// One node's device split search, after its feature-order merge.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeScan {
+    /// No candidate improves on the initial zero loss change.
     Empty,
-    /// Some candidate scored NaN: the host replays the feature.
-    Nan,
-    /// The first candidate with the largest finite loss change: in the
-    /// forward pass (bins `..= offset` left, missing right) or the backward
-    /// one (bins `>= offset` right, missing left), with that pass's
-    /// accumulated statistics (the left child's forward, the right's
-    /// backward).
-    Best {
+    /// Replay the node on the CPU, preserving non-total comparisons.
+    Replay(ScanFallback),
+    /// The winning numeric feature and that pass's accumulated statistics.
+    Numeric {
+        feature: u32,
         loss_chg: f32,
         backward: bool,
         offset: u32,
         acc: GradStats,
+    },
+    /// The winning categorical feature, already in the tree's orientation
+    /// (XGBoost's children swapped), with ascending category values.
+    Categorical {
+        feature: u32,
+        loss_chg: f32,
+        default_left: bool,
+        left: GradStats,
+        right: GradStats,
+        categories: Vec<u32>,
     },
 }
 

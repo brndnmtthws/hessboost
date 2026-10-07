@@ -31,6 +31,86 @@ typedef unsigned char u8;
     for (u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x; i < (n);      \
          i += (u64)gridDim.x * blockDim.x)
 
+// Global CPU bins are the cut authority. Reencode dense cells directly into
+// both layouts on device, with 64-bit cell offsets and no host transpose.
+template <typename G, typename L>
+__device__ void encode_dense(const G* global, const u32* first, u64 n_rows,
+                             u32 n_cols, u32 stride, L* rows, L* cols) {
+    // u32 shared cells keep 32 banks distinct for all output widths. The
+    // extra column removes transpose bank conflicts; both writes coalesce.
+    __shared__ u32 tile[32][33];
+    const u64 feature_tiles = ((u64)n_cols + 31) / 32;
+    const u64 row_tiles = (n_rows + 31) / 32;
+    for (u64 t = blockIdx.x; t < feature_tiles * row_tiles; t += gridDim.x) {
+        u64 row_base = (t / feature_tiles) * 32;
+        u64 feature_base = (t % feature_tiles) * 32;
+        u64 f = feature_base + threadIdx.x;
+        for (u32 j = 0; j < 32; j += 8) {
+            u64 r = row_base + threadIdx.y + j;
+            if (r < n_rows && f < n_cols) {
+                u32 local = (u32)global[r * n_cols + f] - first[f];
+                tile[threadIdx.y + j][threadIdx.x] = local;
+                rows[r * stride + f] = (L)local;
+            }
+        }
+        __syncthreads();
+        u64 r = row_base + threadIdx.x;
+        for (u32 j = 0; j < 32; j += 8) {
+            u64 out_f = feature_base + threadIdx.y + j;
+            if (r < n_rows && out_f < n_cols)
+                cols[out_f * n_rows + r] = (L)tile[threadIdx.x][threadIdx.y + j];
+        }
+        __syncthreads();
+    }
+}
+
+#define ENCODE(G, W, L, N)                                                   \
+    extern "C" __global__ void encode_##N##_##W(const G* global,              \
+        const u32* first, u64 n_rows, u32 n_cols, u32 stride, L* rows, L* cols) { \
+        encode_dense<G, L>(global, first, n_rows, n_cols, stride, rows, cols); \
+    }
+ENCODE(u16, u16, u8, u8)
+ENCODE(u32, u32, u8, u8)
+ENCODE(u8, u8, u8, u8)
+ENCODE(u16, u16, u16, u16)
+ENCODE(u32, u32, u16, u16)
+ENCODE(u8, u8, u16, u16)
+ENCODE(u16, u16, u32, u32)
+ENCODE(u32, u32, u32, u32)
+ENCODE(u8, u8, u32, u32)
+
+// Raw dense binning against CPU-owned cuts: upper_bound for numeric values,
+// exact binary search (unseen -> zero) for categories. Missing matches DMatrix.
+extern "C" __global__ void bin_dense(const float* values, u64 cells, u32 n_cols,
+    float missing, const float* cuts, const u32* first, const u8* categorical,
+    u32* global) {
+    GRID_STRIDE(i, cells) {
+        float v = values[i];
+        if (isnan(missing) ? isnan(v) : v == missing) {
+            global[i] = 0xffffffffu;
+            continue;
+        }
+        u32 f = (u32)(i % n_cols), fs = first[f], fe = first[f + 1];
+        u64 lo = fs, hi = fe;
+        if (categorical[f]) {
+            while (lo < hi) {
+                u64 mid = lo + (hi - lo) / 2;
+                if (cuts[mid] < v) lo = mid + 1;
+                else hi = mid;
+            }
+            global[i] = lo < fe && cuts[lo] == v ? (u32)lo : fs;
+        } else {
+            while (lo < hi) {
+                u64 mid = lo + (hi - lo) / 2;
+                if (cuts[mid] <= v) lo = mid + 1;
+                else hi = mid;
+            }
+            u32 local = (u32)(lo - fs), len = fe - fs;
+            global[i] = fs + (local < len ? local : (len == 0 ? 0 : len - 1));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Gradients and rows
 
@@ -397,6 +477,53 @@ __device__ void hist_chain(const B* __restrict__ bins, u32 stride, u32 n_cols,
     }
 }
 
+// Integer CSR scatter: one warp per listed row, each stored entry visited
+// once irrespective of the feature count. All sums were proven exact.
+template <typename B>
+__device__ void hist_sparse(const B* bins, const u64* row_ptr, const u32* rows,
+                            const Tile* tiles, const longlong2* units,
+                            u64* acc, u64* partials, u64 total_bins) {
+    const Tile tile = tiles[blockIdx.x];
+    const bool partial = (tile.target >> 31) != 0;
+    u64* target = (partial ? partials : acc)
+                  + (u64)(tile.target & 0x7fffffffu) * total_bins * 2;
+    const u32 lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (u64 i = warp; i < tile.count; i += blockDim.x / 32) {
+        u32 r = rows[tile.begin + i];
+        longlong2 p = units[r];
+        for (u64 at = row_ptr[r] + lane; at < row_ptr[(u64)r + 1]; at += 32) {
+            u32 b = (u32)bins[at];
+            atomicAdd(target + (u64)b * 2, (u64)p.x);
+            atomicAdd(target + (u64)b * 2 + 1, (u64)p.y);
+        }
+    }
+}
+
+// One owner per CPU chunk chains each stored CSR bin in row order. Unlike
+// feature sweeps this visits nnz once even for many mostly absent features.
+template <typename B>
+__device__ void hist_sparse_chain(const B* bins, const u64* row_ptr,
+                                  const u32* rows, u64 n, u64 seg_rows,
+                                  u64 segs, const float2* gpair,
+                                  double2* partials, u64 total_bins) {
+    GRID_STRIDE(seg, segs) {
+        u64 begin = seg * seg_rows;
+        u64 end = begin + seg_rows < n ? begin + seg_rows : n;
+        double2* h = partials + seg * total_bins;
+        for (u64 i = begin; i < end; ++i) {
+            u32 r = rows[i];
+            float2 p = gpair[r];
+            for (u64 at = row_ptr[r]; at < row_ptr[(u64)r + 1]; ++at) {
+                u32 b = (u32)bins[at];
+                double2 a = h[b];
+                a.x = a.x + (double)p.x;
+                a.y = a.y + (double)p.y;
+                h[b] = a;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Partition
 
@@ -436,6 +563,44 @@ __device__ void route_count(const B* __restrict__ cols, u64 n_rows, u32 sentinel
         u32 b = (u32)col[rows[off + i]];
         bool left = b == sentinel ? (rule.flags & 1u) != 0
                     : (rule.flags & 2u) ? table[rule.table_at + b] != 0
+                                        : b < rule.limit;
+        flags[off + i] = left ? 1 : 0;
+        count += left ? 1u : 0u;
+    }
+    for (int o = 16; o > 0; o >>= 1) count += __shfl_down_sync(FULL_MASK, count, o);
+    if ((threadIdx.x & 31) == 0) warp_sum[threadIdx.x >> 5] = count;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        u32 total = 0;
+        for (u32 w = 0; w < (blockDim.x + 31) / 32; ++w) total += warp_sum[w];
+        tile_left[blockIdx.x] = total;
+    }
+}
+
+// Sparse numeric/category routing locates the first bin in the feature's
+// global range, as CPU feature_bin does. Absence is missing, never bin zero.
+template <typename B>
+__device__ void route_sparse(const B* bins, const u64* row_ptr, const u32* first,
+                             const u64* segs, const Rule* rules, const u8* table,
+                             const u64* ptiles, const u32* rows, u8* flags,
+                             u32* tile_left) {
+    __shared__ u32 warp_sum[32];
+    u64 code = ptiles[blockIdx.x];
+    u32 s = (u32)(code >> 32);
+    u64 begin = (u64)(u32)code * PART_TILE;
+    u64 off = segs[2 * s], len = segs[2 * s + 1];
+    u64 end = begin + PART_TILE < len ? begin + PART_TILE : len;
+    Rule rule = rules[s];
+    u32 fs = first[rule.feature], fe = first[rule.feature + 1];
+    u32 count = 0;
+    for (u64 i = begin + threadIdx.x; i < end; i += blockDim.x) {
+        u32 r = rows[off + i], b = 0xffffffffu;
+        for (u64 at = row_ptr[r]; at < row_ptr[(u64)r + 1]; ++at) {
+            u32 global = (u32)bins[at];
+            if (global >= fs && global < fe) { b = global - fs; break; }
+        }
+        bool left = b == 0xffffffffu ? (rule.flags & 1u) != 0
+                    : (rule.flags & 2u) ? table[(u64)rule.table_at + b] != 0
                                         : b < rule.limit;
         flags[off + i] = left ? 1 : 0;
         count += left ? 1u : 0u;
@@ -808,3 +973,24 @@ extern "C" __global__ void __launch_bounds__(32 * SCAN_WARPS)
 INSTANTIATE(u8, u8)
 INSTANTIATE(u16, u16)
 INSTANTIATE(u32, u32)
+
+#define SPARSE(B, W)                                                         \
+    extern "C" __global__ void __launch_bounds__(HIST_THREADS)                \
+    hist_sparse_##W(const B* bins, const u64* rp, const u32* rows,            \
+        const Tile* tiles, const longlong2* units, u64* acc, u64* partials,   \
+        u64 total_bins) {                                                   \
+        hist_sparse<B>(bins, rp, rows, tiles, units, acc, partials, total_bins); \
+    }                                                                        \
+    extern "C" __global__ void hist_sparse_chain_##W(const B* bins,          \
+        const u64* rp, const u32* rows, u64 n, u64 seg_rows, u64 segs,        \
+        const float2* gp, double2* p, u64 total_bins) {                      \
+        hist_sparse_chain<B>(bins, rp, rows, n, seg_rows, segs, gp, p, total_bins); \
+    }                                                                        \
+    extern "C" __global__ void route_sparse_##W(const B* bins, const u64* rp, \
+        const u32* first, const u64* segs, const Rule* rules, const u8* table, \
+        const u64* tiles, const u32* rows, u8* flags, u32* left) {           \
+        route_sparse<B>(bins, rp, first, segs, rules, table, tiles, rows, flags, left); \
+    }
+SPARSE(u8, u8)
+SPARSE(u16, u16)
+SPARSE(u32, u32)

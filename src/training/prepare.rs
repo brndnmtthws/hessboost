@@ -299,6 +299,10 @@ pub(super) fn prepare_builder(
     Ok(match method {
         TreeMethod::Hist => {
             let cuts = HistCuts::from_dmatrix(dtrain, params.max_bin);
+            // A host index is required for exact fallback. Uploading raw
+            // floats and reading global bins back costs more than CPU binning
+            // at the measured large-data shapes; CUDA still reencodes and
+            // transposes the compact global bins on device.
             let index = GHistIndex::from_dmatrix(dtrain, cuts);
             let backend = hist_backend(params, &index)?;
             let rows_route_like_trees = dtrain.weights().is_none_or(|w| !w.contains(&0.0));

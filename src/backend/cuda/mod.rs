@@ -6,14 +6,12 @@
 //! and the tree's rows live on the GPU. Depthwise growth handles a whole
 //! level per round trip: the GPU partitions every splitting node (a stable
 //! partition, so each child keeps its rows in ascending order) and builds
-//! the smaller child of every split. On numeric features the histograms
-//! then stay on the GPU: it derives each sibling by subtraction and scans
-//! every feature's split candidates in the CPU's order and arithmetic, and
-//! the host merges the per-feature winners with XGBoost's tie rule (a node
-//! whose scan scores a NaN is searched on the host from its histogram).
-//! With categorical features the histograms are downloaded and searched on
-//! the host, as the CPU builder does; loss-guided growth does the same one
-//! expansion at a time. Symmetric (`grow_policy = symmetric`) trees build
+//! the smaller child of every split. Numeric and categorical histograms then
+//! stay on the GPU: it derives each sibling by subtraction, scans candidates
+//! in CPU order and arithmetic, and returns one compact winner per node.
+//! Unsupported NaN comparison/sort semantics replay the node on the host.
+//! Loss-guided growth keeps its heap on the host while histograms and split
+//! search stay resident. Symmetric (`grow_policy = symmetric`) trees build
 //! their histograms here node by node, with the rows uploaded per node.
 //!
 //! For `reg:squarederror` and the logistic objectives on one label column
@@ -58,9 +56,9 @@
 //! 2. **Exact chunks.** For a chunked node whose *chunks* are exact, each
 //!    chunk's integer sum is that chunk's `f64` chain, and the GPU then adds
 //!    the chunk partials in chunk order in `f64`, the CPU's own operations.
-//! 3. **Chains.** Otherwise one GPU thread per (chunk, feature) runs that
-//!    feature's `f64` chain in row order (a node below 8,192 rows is one
-//!    chunk), and the chunk partials are added in chunk order.
+//! 3. **Chains.** Otherwise dense storage uses one GPU thread per
+//!    (chunk, feature); CSR uses one per chunk visiting stored entries once.
+//!    Each bin follows the CPU's row-order `f64` chain and chunk reduction.
 //!
 //! The root's statistics follow the same chunks (`sum_rows`): each chunk's
 //! total is summed on the GPU (in integers when the chunks' sums are exact,
@@ -73,30 +71,39 @@
 //! (the context is unusable afterwards): the tree in progress is regrown on
 //! the host, and every later tree too, so the result is unchanged.
 //!
+//! CUDA prediction is explicit through [`BoostedModel::to_cuda`](crate::model::BoostedModel::to_cuda).
+//! Tree traversal and ordered margin summation run on a dedicated tracked
+//! stream; objective transforms use the model's CPU implementation.
+//!
 //! # Limitations
 //!
-//! - Training only; prediction stays on the CPU.
 //! - Refused with `device = cuda`: `tree_method = exact`/`approx`,
 //!   `use_quantized_grad`, `gblinear`, `process_type = update`,
 //!   `multi_strategy = multi_output_tree`, online updates, and budget mode.
 //!   Trees with reuse penalties (`toad_penalty_*`) grow on the host, with
 //!   per-node GPU histograms.
-//! - Resident on the device: the binned index as row-major feature-local
-//!   bins (1, 2 or 4 bytes per row and feature), the gradients (24 bytes
-//!   per row), three row buffers (12 bytes per row), the margins, labels
-//!   and weights of device-side rounds (12 bytes per row), and the
-//!   histograms of one level (resident growth: of every open node, at most
-//!   `2^(max_depth - 1)` of them, when that fits in half the free memory).
+//! - Dense bins are reencoded and transposed on device from CPU-authoritative
+//!   global bins (1, 2 or 4 bytes per feature-local cell in each layout).
+//!   Sparse bins stay CSR: 2 or 4 bytes per present global bin plus an 8-byte
+//!   row offset; no row-by-feature buffers are allocated. The gradients use
+//!   24 bytes per row, three row buffers 12 bytes per row, and device-side
+//!   margins, labels and weights another 12 bytes per row. Resident growth
+//!   retains open-node histograms when they fit in half the free memory.
 
+mod categorical;
 pub(crate) mod compile;
+pub use categorical::ScanDiagnostics;
+mod predict;
+pub use predict::{GpuModel, prediction_available, prediction_device_name};
 
 use crate::backend::exact_sum::SumDomain;
 use crate::data::ghist::{Bins, GHistIndex};
+use crate::data::{DMatrix, quantile::HistCuts};
 use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::hist::{
-    CpuBackend, DeviceLoss, FeatureScan, HistSlot, Histogram, HistogramBackend, Partitioned,
+    CpuBackend, DeviceLoss, HistSlot, Histogram, HistogramBackend, NodeScan, Partitioned,
     RowEngine, RowRule, RowSplit, ScanRequest, Segment, SumOrder, sum_order, zeroed,
 };
 use cudarc::driver::{
@@ -166,11 +173,18 @@ pub fn device_name() -> Option<String> {
 /// [`DeviceBins::width`] (`u8`, `u16`, `u32`).
 struct Kernels {
     stage_units: CudaFunction,
+    bin_dense: CudaFunction,
     iota_rows: CudaFunction,
     chunk_totals: CudaFunction,
     hist_shared: [CudaFunction; 3],
     hist_global: [CudaFunction; 3],
     hist_chain: [CudaFunction; 3],
+    hist_sparse: [CudaFunction; 3],
+    hist_sparse_chain: [CudaFunction; 3],
+    encode_u8: [CudaFunction; 3],
+    encode_u16: [CudaFunction; 3],
+    encode_u32: [CudaFunction; 3],
+    route_sparse: [CudaFunction; 3],
     route_count: [CudaFunction; 3],
     route_scatter: CudaFunction,
     route_scan: CudaFunction,
@@ -185,6 +199,10 @@ struct Kernels {
     chunk_chains: CudaFunction,
     subtract_hists: CudaFunction,
     scan_splits: CudaFunction,
+    category_keys: CudaFunction,
+    category_merge: CudaFunction,
+    scan_categorical: CudaFunction,
+    merge_scans: CudaFunction,
 }
 
 /// One opened CUDA device: the stream every backend on it uses (holding
@@ -237,11 +255,18 @@ impl Device {
         };
         let kernels = Kernels {
             stage_units: function("stage_units")?,
+            bin_dense: function("bin_dense")?,
             iota_rows: function("iota_rows")?,
             chunk_totals: function("chunk_totals")?,
             hist_shared: widths("hist_shared")?,
             hist_global: widths("hist_global")?,
             hist_chain: widths("hist_chain")?,
+            hist_sparse: widths("hist_sparse")?,
+            hist_sparse_chain: widths("hist_sparse_chain")?,
+            encode_u8: widths("encode_u8")?,
+            encode_u16: widths("encode_u16")?,
+            encode_u32: widths("encode_u32")?,
+            route_sparse: widths("route_sparse")?,
             route_count: widths("route_count")?,
             route_scatter: function("route_scatter")?,
             route_scan: function("route_scan")?,
@@ -256,6 +281,10 @@ impl Device {
             chunk_chains: function("chunk_chains")?,
             subtract_hists: function("subtract_hists")?,
             scan_splits: function("scan_splits")?,
+            category_keys: function("category_keys")?,
+            category_merge: function("category_merge")?,
+            scan_categorical: function("scan_categorical")?,
+            merge_scans: function("merge_scans")?,
         };
         let attribute = |attribute, what: &str| {
             ctx.attribute(attribute)
@@ -454,8 +483,7 @@ enum Strategy {
     Cpu = 3,
 }
 
-/// The device copy of the binned index: row-major, `n_cols` feature-local
-/// bins per row.
+/// Device bins: feature-local dense bins, or global CSR bins.
 enum DeviceBins {
     U8(CudaSlice<u8>),
     U16(CudaSlice<u16>),
@@ -521,13 +549,26 @@ enum RowSource<'a> {
     Upload(&'a [u32]),
 }
 
+/// Host partition descriptors retain capacity across levels and trees.
+#[derive(Default)]
+struct PartitionHost {
+    segs: Vec<u64>,
+    rules: Vec<u32>,
+    table: Vec<u8>,
+    tiles: Vec<u64>,
+    split_tiles: Vec<u32>,
+}
+
 /// Device buffers, used by one call at a time.
 struct State {
     bins: DeviceBins,
-    /// The same bins feature-major (`n_rows` per feature), which the
-    /// partition reads one column at a time.
-    cols: DeviceBins,
-    /// Entries per row of `bins`.
+    /// Dense feature-major bins for routing; absent for CSR storage.
+    cols: Option<DeviceBins>,
+    /// CSR row offsets; absent for dense storage. Sparse bins stay global.
+    row_ptr: Option<CudaSlice<u64>>,
+    partition_host: PartitionHost,
+    pin_counts: Option<Pinned<u32>>,
+    /// Entries per dense row (zero for CSR).
     stride: u32,
     /// The partition's per-row directions (1 = left), by row position.
     flags: CudaSlice<u8>,
@@ -597,12 +638,8 @@ struct State {
     /// and how many it holds.
     pool: CudaSlice<f64>,
     pool_slots: usize,
-    /// Split-scan descriptors and results (`scan_splits` in `kernels.cu`).
-    scan_tasks: CudaSlice<u32>,
-    scan_totals: CudaSlice<f64>,
-    scan_params: CudaSlice<f32>,
-    scan_meta: CudaSlice<u32>,
-    scan_acc: CudaSlice<f64>,
+    /// Reused resident split descriptors, sort workspaces and pinned results.
+    scan: categorical::ScanState,
 }
 
 /// Page-locked host memory: copies from and to it run at full PCIe speed
@@ -708,7 +745,8 @@ fn pinned<'a, T: Copy + ValidAsZeroBits>(
         *slot = None;
         *slot = Some(Pinned::new(
             stream,
-            len.next_power_of_two(),
+            len.checked_next_power_of_two()
+                .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?,
             write_combined,
         )?);
     }
@@ -822,7 +860,10 @@ fn fit<T: DeviceRepr + ValidAsZeroBits>(
     len: usize,
 ) -> std::result::Result<(), DriverError> {
     if buf.len() < len {
-        *buf = stream.alloc_zeros(len.next_power_of_two())?;
+        let capacity = len
+            .checked_next_power_of_two()
+            .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+        *buf = stream.alloc_zeros(sized::<T>(capacity)?)?;
     }
     Ok(())
 }
@@ -880,71 +921,181 @@ fn feature_groups(bins_of: &[usize], cap: usize) -> (Vec<u32>, Vec<u32>) {
     (shared, global)
 }
 
-/// The feature-local bins of `index`, with `missing` where a row lacks a
-/// feature: row-major with `stride` entries per row (the histogram
-/// kernels' layout; padding unread), and feature-major (`n_rows` per
-/// feature, the partition's layout).
-fn local_bins<T: Copy + Send + Sync>(
-    index: &GHistIndex,
-    missing: T,
-    stride: usize,
-    narrow: impl Fn(u32) -> T + Sync,
-) -> (Vec<T>, Vec<T>) {
-    let n_cols = index.n_cols();
-    let n_rows = index.n_rows();
-    let cuts = index.cuts();
-    let first: Vec<u32> = (0..n_cols).map(|f| cuts.feature_bins(f).0 as u32).collect();
-    let mut feature_of = vec![0u32; index.total_bins()];
-    for f in 0..n_cols {
-        let (fs, fe) = cuts.feature_bins(f);
-        feature_of[fs..fe].fill(f as u32);
-    }
-    let row_ptr = index.row_ptr();
-    let mut rows = vec![missing; n_rows * stride];
-    let fill = |row: &mut [T], global: u32| {
-        let f = feature_of[global as usize] as usize;
-        row[f] = narrow(global - first[f]);
-    };
-    match index.bins() {
-        Bins::U16(bins) => rows
-            .par_chunks_mut(stride)
-            .enumerate()
-            .for_each(|(r, row)| {
-                for &b in &bins[row_ptr[r]..row_ptr[r + 1]] {
-                    fill(row, u32::from(b));
-                }
-            }),
-        Bins::U32(bins) => rows
-            .par_chunks_mut(stride)
-            .enumerate()
-            .for_each(|(r, row)| {
-                for &b in &bins[row_ptr[r]..row_ptr[r + 1]] {
-                    fill(row, b);
-                }
-            }),
-    }
-    let mut cols = vec![missing; n_rows * n_cols];
-    cols.par_chunks_mut(n_rows)
-        .enumerate()
-        .for_each(|(f, col)| {
-            for (r, c) in col.iter_mut().enumerate() {
-                *c = rows[r * stride + f];
-            }
-        });
-    (rows, cols)
-}
-
 /// Row stride (entries) of `n_cols` bins of `width` bytes: rows start on
 /// 32-byte boundaries, so a row's bins span the fewest memory sectors.
 fn row_stride(n_cols: usize, width: usize) -> usize {
     (n_cols * width).div_ceil(32) * 32 / width
 }
 
+/// Checked element count bounded by Rust's allocation and CUDA offsets.
+fn sized<T>(len: usize) -> std::result::Result<usize, DriverError> {
+    len.checked_mul(std::mem::size_of::<T>())
+        .filter(|&bytes| isize::try_from(bytes).is_ok())
+        .map(|_| len)
+        .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))
+}
+
+/// Upload the CPU-authoritative global bins without a second host bin vector.
+fn global_bins(
+    stream: &Arc<CudaStream>,
+    index: &GHistIndex,
+) -> std::result::Result<DeviceBins, DriverError> {
+    fn copy<T: Copy + Send + Sync + DeviceRepr + ValidAsZeroBits>(
+        stream: &Arc<CudaStream>,
+        src: &[T],
+    ) -> std::result::Result<CudaSlice<T>, DriverError> {
+        let mut dst = stream.alloc_zeros(sized::<T>(src.len().max(1))?)?;
+        let mut staging = Pinned::new(stream, src.len(), true)?;
+        upload_pinned(stream, &mut staging, src, &mut dst)?;
+        Ok(dst)
+    }
+    match index.bins() {
+        Bins::U16(src) => copy(stream, src).map(DeviceBins::U16),
+        Bins::U32(src) => copy(stream, src).map(DeviceBins::U32),
+    }
+}
+
+/// Encode and transpose a complete dense index in one device pass.
+fn encode_dense<T: DeviceRepr + ValidAsZeroBits>(
+    device: &Device,
+    index: &GHistIndex,
+    global: &DeviceBins,
+    first: &CudaSlice<u32>,
+    kernels: &[CudaFunction; 3],
+) -> std::result::Result<(CudaSlice<T>, CudaSlice<T>, u32), DriverError> {
+    let width = std::mem::size_of::<T>();
+    let stride = row_stride(index.n_cols(), width);
+    let stride32 =
+        u32::try_from(stride).map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+    let row_len = index
+        .n_rows()
+        .checked_mul(stride)
+        .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+    let col_len = index
+        .n_rows()
+        .checked_mul(index.n_cols())
+        .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+    let mut rows = device.stream.alloc_zeros::<T>(sized::<T>(row_len)?)?;
+    let mut cols = device.stream.alloc_zeros::<T>(sized::<T>(col_len)?)?;
+    let n_rows = index.n_rows() as u64;
+    let n_cols = index.n_cols() as u32;
+    let mut launch = device.stream.launch_builder(&kernels[global.width()]);
+    global.push(&mut launch);
+    launch
+        .arg(first)
+        .arg(&n_rows)
+        .arg(&n_cols)
+        .arg(&stride32)
+        .arg(&mut rows)
+        .arg(&mut cols);
+    let tiles = index.n_rows().div_ceil(32) * index.n_cols().div_ceil(32);
+    let config = LaunchConfig {
+        grid_dim: (
+            tiles.min((device.sm_count * BLOCKS_PER_SM) as usize).max(1) as u32,
+            1,
+            1,
+        ),
+        block_dim: (32, 8, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY: complete 32x8 blocks cooperate on 32x32 tiles, with every
+    // boundary checked before loading; each dense local bin fits T.
+    unsafe { launch.launch(config) }?;
+    Ok((rows, cols, stride32))
+}
+
 impl CudaHistBackend {
     /// Build the backend for `index` on CUDA device `ordinal`: upload its
     /// bins and allocate the per-tree buffers.
     pub fn new(index: &GHistIndex, ordinal: usize) -> Result<Self> {
+        Self::with_global(index, device(ordinal).map_err(HessboostError::gpu)?, None)
+    }
+
+    /// Bin dense values on CUDA against CPU-authoritative cuts, then retain
+    /// the device bins while constructing the identical CPU index. CSR input
+    /// is binned in its compact CPU layout and uploaded without densification.
+    pub fn from_dmatrix(
+        data: &DMatrix,
+        cuts: HistCuts,
+        ordinal: usize,
+    ) -> Result<(GHistIndex, Self)> {
+        if data.n_rows() == 0
+            || data.n_cols() == 0
+            || cuts.total_bins() == 0
+            || cuts.n_features() != data.n_cols()
+            || u32::try_from(data.n_rows()).is_err()
+            || u32::try_from(data.n_cols()).is_err()
+            || u32::try_from(cuts.total_bins()).is_err()
+        {
+            return Err(HessboostError::invalid_data(
+                "data",
+                "CUDA binning needs a non-empty dataset with matching cuts and 32-bit row, feature and bin counts",
+            ));
+        }
+        let Some(values) = data.dense_values() else {
+            let index = GHistIndex::from_dmatrix(data, cuts);
+            let backend = Self::new(&index, ordinal)?;
+            return Ok((index, backend));
+        };
         let device = device(ordinal).map_err(HessboostError::gpu)?;
+        let stream = &device.stream;
+        let binned = (|| {
+            let count = sized::<u32>(values.len())?;
+            let mut raw = stream.alloc_zeros::<f32>(count)?;
+            let mut staging = Pinned::new(stream, count, true)?;
+            upload_pinned(stream, &mut staging, values, &mut raw)?;
+            let first: Vec<u32> = (0..=data.n_cols())
+                .map(|f| {
+                    if f == data.n_cols() {
+                        cuts.total_bins() as u32
+                    } else {
+                        cuts.feature_bins(f).0 as u32
+                    }
+                })
+                .collect();
+            let categories: Vec<u8> = (0..data.n_cols())
+                .map(|f| u8::from(cuts.is_categorical(f)))
+                .collect();
+            let cut_values: Vec<f32> = (0..cuts.total_bins()).map(|b| cuts.cut_value(b)).collect();
+            let first = stream.clone_htod(&first)?;
+            let categories = stream.clone_htod(&categories)?;
+            let cut_values = stream.clone_htod(&cut_values)?;
+            let mut global = stream.alloc_zeros::<u32>(count)?;
+            let (cells, n_cols, missing) = (count as u64, data.n_cols() as u32, data.missing());
+            let mut launch = stream.launch_builder(&device.kernels.bin_dense);
+            launch
+                .arg(&raw)
+                .arg(&cells)
+                .arg(&n_cols)
+                .arg(&missing)
+                .arg(&cut_values)
+                .arg(&first)
+                .arg(&categories)
+                .arg(&mut global);
+            // SAFETY: validated dense cells and matching cuts, one global
+            // output per cell; missing markers are excluded by the host index.
+            unsafe { launch.launch(device.grid(count)) }?;
+            let mut staging = Pinned::new(stream, count, false)?;
+            let host = download_pinned(stream, &mut staging, &global, count)?;
+            let index = GHistIndex::from_dense_bins(data, cuts, host);
+            Ok((index, global))
+        })();
+        let (index, global) = binned
+            .inspect_err(|_| device.failed.store(true, Ordering::Release))
+            .map_err(gpu_error)?;
+        let retained = index
+            .dense_stride()
+            .is_some()
+            .then_some(DeviceBins::U32(global));
+        let backend = Self::with_global(&index, device, retained)?;
+        Ok((index, backend))
+    }
+
+    fn with_global(
+        index: &GHistIndex,
+        device: Arc<Device>,
+        global: Option<DeviceBins>,
+    ) -> Result<Self> {
         let n_rows = index.n_rows();
         let n_cols = index.n_cols();
         let total_bins = index.total_bins();
@@ -954,7 +1105,10 @@ impl CudaHistBackend {
                 "the CUDA backend needs a non-empty binned dataset",
             ));
         }
-        if u32::try_from(n_rows).is_err() || u32::try_from(total_bins).is_err() {
+        if u32::try_from(n_rows).is_err()
+            || u32::try_from(n_cols).is_err()
+            || u32::try_from(total_bins).is_err()
+        {
             return Err(HessboostError::invalid_data(
                 "data",
                 format!(
@@ -963,7 +1117,9 @@ impl CudaHistBackend {
                 ),
             ));
         }
-        let state = Self::upload(&device, index).map_err(gpu_error)?;
+        let state = Self::upload(&device, index, global)
+            .inspect_err(|_| device.failed.store(true, Ordering::Release))
+            .map_err(gpu_error)?;
         Ok(CudaHistBackend {
             index_identity: index.identity(),
             n_rows,
@@ -988,7 +1144,11 @@ impl CudaHistBackend {
         self.counters.snapshot()
     }
 
-    fn upload(device: &Device, index: &GHistIndex) -> std::result::Result<State, DriverError> {
+    fn upload(
+        device: &Device,
+        index: &GHistIndex,
+        retained: Option<DeviceBins>,
+    ) -> std::result::Result<State, DriverError> {
         let stream = &device.stream;
         let n_rows = index.n_rows();
         let n_cols = index.n_cols();
@@ -1002,49 +1162,58 @@ impl CudaHistBackend {
             .collect();
         let widest = bins_of.iter().copied().max().unwrap_or(0);
         let dense = index.dense_stride().is_some();
-        // The narrowest width whose values cover every feature's bins and,
-        // with missing values, a sentinel above them.
-        let room = |max: usize| {
-            if dense {
-                widest <= max + 1
-            } else {
-                widest <= max
-            }
-        };
-        let (bins, cols, sentinel, stride) = if room(u8::MAX as usize) {
-            let missing = u8::MAX;
-            let stride = row_stride(n_cols, 1);
-            let (rows, cols) = local_bins(index, missing, stride, |b| b as u8);
-            (
-                DeviceBins::U8(stream.clone_htod(&rows)?),
-                DeviceBins::U8(stream.clone_htod(&cols)?),
-                u32::from(missing),
-                stride,
-            )
-        } else if room(u16::MAX as usize) {
-            let missing = u16::MAX;
-            let stride = row_stride(n_cols, 2);
-            let (rows, cols) = local_bins(index, missing, stride, |b| b as u16);
-            (
-                DeviceBins::U16(stream.clone_htod(&rows)?),
-                DeviceBins::U16(stream.clone_htod(&cols)?),
-                u32::from(missing),
-                stride,
-            )
-        } else {
-            let missing = u32::MAX;
-            let stride = row_stride(n_cols, 4);
-            let (rows, cols) = local_bins(index, missing, stride, |b| b);
-            (
-                DeviceBins::U32(stream.clone_htod(&rows)?),
-                DeviceBins::U32(stream.clone_htod(&cols)?),
-                missing,
-                stride,
-            )
-        };
-        let sentinel = if dense { u32::MAX } else { sentinel };
         let mut first: Vec<u32> = (0..n_cols).map(|f| cuts.feature_bins(f).0 as u32).collect();
         first.push(total_bins as u32);
+        let feature_first = stream.clone_htod(&first)?;
+        let global_bins = match retained {
+            Some(bins) => bins,
+            None => global_bins(stream, index)?,
+        };
+        let (bins, cols, row_ptr, stride) = if dense {
+            let (bins, cols, stride) = if widest <= u8::MAX as usize + 1 {
+                let (r, c, s) = encode_dense::<u8>(
+                    device,
+                    index,
+                    &global_bins,
+                    &feature_first,
+                    &device.kernels.encode_u8,
+                )?;
+                (DeviceBins::U8(r), DeviceBins::U8(c), s)
+            } else if widest <= u16::MAX as usize + 1 {
+                let (r, c, s) = encode_dense::<u16>(
+                    device,
+                    index,
+                    &global_bins,
+                    &feature_first,
+                    &device.kernels.encode_u16,
+                )?;
+                (DeviceBins::U16(r), DeviceBins::U16(c), s)
+            } else {
+                let (r, c, s) = encode_dense::<u32>(
+                    device,
+                    index,
+                    &global_bins,
+                    &feature_first,
+                    &device.kernels.encode_u32,
+                )?;
+                (DeviceBins::U32(r), DeviceBins::U32(c), s)
+            };
+            (bins, Some(cols), None, stride)
+        } else {
+            let offsets: Vec<u64> = index.row_ptr().iter().map(|&off| off as u64).collect();
+            (global_bins, None, Some(stream.clone_htod(&offsets)?), 0)
+        };
+        let sentinel = u32::MAX;
+        let row_words = sized::<i64>(
+            n_rows
+                .checked_mul(2)
+                .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?,
+        )?;
+        let hist_words = sized::<f64>(
+            total_bins
+                .checked_mul(2)
+                .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?,
+        )?;
         let cap = device.shared_bytes / 16;
         let (shared, global) = feature_groups(&bins_of, cap);
         let group_features = shared
@@ -1063,26 +1232,27 @@ impl CudaHistBackend {
         Ok(State {
             bins,
             cols,
-            stride: stride as u32,
+            row_ptr,
+            stride,
             flags: stream.alloc_zeros(n_rows)?,
             sentinel,
-            feature_first: stream.clone_htod(&first)?,
+            feature_first,
             n_shared: shared.len() / 4,
             groups_shared,
             n_global: global.len() / 4,
             groups_global,
             group_bins,
             group_features,
-            gpair: stream.alloc_zeros(n_rows * 2)?,
-            units: stream.alloc_zeros(n_rows * 2)?,
+            gpair: stream.alloc_zeros(row_words)?,
+            units: stream.alloc_zeros(row_words)?,
             tree_rows: stream.alloc_zeros(n_rows)?,
             scratch: stream.alloc_zeros(n_rows)?,
             tree_len: 0,
             upload: stream.alloc_zeros(n_rows)?,
-            acc: alloc_u64(total_bins * 2)?,
+            acc: alloc_u64(hist_words)?,
             partials: alloc_u64(1)?,
-            wave_slots: (PARTIAL_BYTES / (total_bins * 16)).max(1),
-            out: stream.alloc_zeros(total_bins * 2)?,
+            wave_slots: (PARTIAL_BYTES / (hist_words * 8)).max(1),
+            out: stream.alloc_zeros(hist_words)?,
             tiles: alloc_u64(1)?,
             nodes: alloc_u32(1)?,
             totals: stream.alloc_zeros(2)?,
@@ -1093,6 +1263,8 @@ impl CudaHistBackend {
             split_tiles: alloc_u32(1)?,
             tile_left: alloc_u32(1)?,
             left_len: alloc_u32(1)?,
+            partition_host: PartitionHost::default(),
+            pin_counts: None,
             domain: alloc_u32(6)?,
             chains: stream.alloc_zeros(2)?,
             margins: None,
@@ -1111,11 +1283,7 @@ impl CudaHistBackend {
             pin_row_upload: None,
             pool: stream.alloc_zeros(2)?,
             pool_slots: 0,
-            scan_tasks: alloc_u32(4)?,
-            scan_totals: stream.alloc_zeros(2)?,
-            scan_params: stream.alloc_zeros(3)?,
-            scan_meta: alloc_u32(4)?,
-            scan_acc: stream.alloc_zeros(2)?,
+            scan: categorical::ScanState::new(stream)?,
         })
     }
 
@@ -1233,6 +1401,7 @@ impl CudaHistBackend {
         let stream = &device.stream;
         let State {
             bins,
+            row_ptr,
             stride,
             sentinel,
             feature_first,
@@ -1256,6 +1425,32 @@ impl CudaHistBackend {
         let stride = *stride;
         let total_bins = self.total_bins as u64;
         let w = bins.width();
+        if let Some(row_ptr) = &*row_ptr {
+            let mut launch = stream.launch_builder(&device.kernels.hist_sparse[w]);
+            bins.push(&mut launch);
+            launch
+                .arg(row_ptr)
+                .arg(rows)
+                .arg(&*tiles)
+                .arg(&*units)
+                .arg(&mut *acc)
+                .arg(&mut *partials)
+                .arg(&total_bins);
+            let blocks = u32::try_from(n_tiles)
+                .ok()
+                .filter(|&n| i32::try_from(n).is_ok())
+                .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+            // SAFETY: CSR offsets and global bins match the index; tile
+            // slots are sized and cleared by the caller, sums are exact.
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (HIST_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }?;
+            return Ok(());
+        }
         for (kernel, groups, n_groups, shared) in [
             (
                 &device.kernels.hist_shared[w],
@@ -1276,10 +1471,8 @@ impl CudaHistBackend {
             let groups_u32 = n_groups as u32;
             let mut launch = stream.launch_builder(kernel);
             bins.push(&mut launch);
+            launch.arg(&stride).arg(&*sentinel).arg(&*feature_first);
             launch
-                .arg(&stride)
-                .arg(&*sentinel)
-                .arg(&*feature_first)
                 .arg(rows)
                 .arg(&*tiles)
                 .arg(groups)
@@ -1288,8 +1481,13 @@ impl CudaHistBackend {
                 .arg(&mut *partials)
                 .arg(&total_bins)
                 .arg(&groups_u32);
+            let blocks = n_tiles
+                .checked_mul(n_groups)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| i32::try_from(n).is_ok())
+                .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
             let config = LaunchConfig {
-                grid_dim: ((n_tiles * n_groups) as u32, 1, 1),
+                grid_dim: (blocks, 1, 1),
                 block_dim: (HIST_THREADS, 1, 1),
                 shared_mem_bytes: shared as u32,
             };
@@ -1358,7 +1556,11 @@ impl CudaHistBackend {
         // Rows per tile must keep `rows * features` of a group in a `u32`.
         // (Halved: the kernel's unrolled indices run up to four block widths
         // past the tile's last element.)
-        let max_tile = (u32::MAX as usize / 2 / state.group_features.max(1)).max(1);
+        let max_tile = if state.row_ptr.is_some() {
+            u32::MAX as usize
+        } else {
+            (u32::MAX as usize / 2 / state.group_features.max(1)).max(1)
+        };
         for (k, &seg) in nodes.iter().enumerate() {
             if seg.len == 0 {
                 match targets {
@@ -1464,6 +1666,9 @@ impl CudaHistBackend {
                     [begin as u64, count as u64 | ((s as u64) | 1 << 31) << 32]
                 })
                 .collect();
+            if state.row_ptr.is_some() {
+                stream.memset_zeros(&mut state.partials.slice_mut(..wave.len() * bins * 2))?;
+            }
             upload(stream, &mut state.tiles, &tiles)?;
             self.launch_tiles(state, source, wave.len())?;
             // Consecutive chunks of one node reduce together.
@@ -1509,6 +1714,7 @@ impl CudaHistBackend {
                 stream.memset_zeros(&mut state.partials.slice_mut(..wave * bins * 2))?;
                 let State {
                     bins: dev_bins,
+                    row_ptr,
                     stride,
                     sentinel,
                     feature_first,
@@ -1526,14 +1732,23 @@ impl CudaHistBackend {
                 let (n, seg_rows64, segs64) = ((end - begin) as u64, seg_rows as u64, wave as u64);
                 let n_cols = self.n_cols as u32;
                 let total_bins = bins as u64;
-                let mut launch =
-                    stream.launch_builder(&device.kernels.hist_chain[dev_bins.width()]);
+                let kernel = if row_ptr.is_some() {
+                    &device.kernels.hist_sparse_chain[dev_bins.width()]
+                } else {
+                    &device.kernels.hist_chain[dev_bins.width()]
+                };
+                let mut launch = stream.launch_builder(kernel);
                 dev_bins.push(&mut launch);
+                if let Some(row_ptr) = &*row_ptr {
+                    launch.arg(row_ptr);
+                } else {
+                    launch
+                        .arg(&*stride)
+                        .arg(&n_cols)
+                        .arg(&*sentinel)
+                        .arg(&*feature_first);
+                }
                 launch
-                    .arg(&*stride)
-                    .arg(&n_cols)
-                    .arg(&*sentinel)
-                    .arg(&*feature_first)
                     .arg(&rows)
                     .arg(&n)
                     .arg(&seg_rows64)
@@ -1541,9 +1756,14 @@ impl CudaHistBackend {
                     .arg(&*dev_gpair)
                     .arg(&mut *partials)
                     .arg(&total_bins);
-                // SAFETY: one thread per (chunk, feature) of the wave over
-                // listed rows below `n_rows`; each chunk's partial fits.
-                unsafe { launch.launch(Device::one_per(wave * self.n_cols)) }?;
+                let config = if row_ptr.is_some() {
+                    device.grid(wave)
+                } else {
+                    Device::one_per(wave * self.n_cols)
+                };
+                // SAFETY: dense chains own (chunk,feature), CSR chains own
+                // each whole chunk; all listed rows and partials fit.
+                unsafe { launch.launch(config) }?;
                 let init = i32::from(w == 0);
                 let mut target = out.slice_mut(slot * bins * 2..(slot + 1) * bins * 2);
                 let mut reduce = stream.launch_builder(&device.kernels.reduce_chains);
@@ -1625,17 +1845,31 @@ impl CudaHistBackend {
     ) -> std::result::Result<Vec<Partitioned>, DriverError> {
         let device = &*self.device;
         let stream = &device.stream;
-        let mut segs = Vec::with_capacity(splits.len() * 2);
-        let mut rules = Vec::with_capacity(splits.len() * 4);
-        let mut table: Vec<u8> = Vec::new();
-        let mut ptiles = Vec::new();
-        let mut split_tiles = Vec::with_capacity(splits.len() * 2);
+        let PartitionHost {
+            segs,
+            rules,
+            table,
+            tiles: ptiles,
+            split_tiles,
+        } = &mut state.partition_host;
+        segs.clear();
+        rules.clear();
+        table.clear();
+        ptiles.clear();
+        split_tiles.clear();
         for (s, split) in splits.iter().enumerate() {
             segs.extend([split.seg.offset as u64, split.seg.len as u64]);
             let (limit, table_at, kind) = match split.rule {
                 RowRule::Below(limit) => (limit, 0, 0),
                 RowRule::Table(left) => {
-                    let at = table.len() as u32;
+                    let at = u32::try_from(table.len())
+                        .map_err(|_| DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+                    let end = table
+                        .len()
+                        .checked_add(left.len())
+                        .filter(|&n| u32::try_from(n).is_ok())
+                        .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+                    sized::<u8>(end)?;
                     table.extend(left.iter().map(|&l| u8::from(l)));
                     (0, at, 2)
                 }
@@ -1647,18 +1881,30 @@ impl CudaHistBackend {
                 kind | u32::from(split.default_left),
             ]);
             let n = split.seg.len.div_ceil(PART_TILE);
+            let tile_end = ptiles
+                .len()
+                .checked_add(n)
+                .filter(|&n| u32::try_from(n).is_ok())
+                .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+            sized::<u64>(tile_end)?;
             split_tiles.extend([ptiles.len() as u32, n as u32]);
             ptiles.extend((0..n).map(|k| (s as u64) << 32 | k as u64));
         }
         let n_splits = splits.len() as u32;
         let n_tiles = ptiles.len();
-        upload(stream, &mut state.segs, &segs)?;
-        upload(stream, &mut state.rules, &rules)?;
-        upload(stream, &mut state.table, &table)?;
-        upload(stream, &mut state.split_tiles, &split_tiles)?;
+        upload(stream, &mut state.segs, segs)?;
+        upload(stream, &mut state.rules, rules)?;
+        upload(stream, &mut state.table, table)?;
+        upload(stream, &mut state.split_tiles, split_tiles)?;
+        if n_tiles > 0 {
+            upload(stream, &mut state.ptiles, ptiles)?;
+        }
         fit(stream, &mut state.left_len, splits.len())?;
         let State {
             cols,
+            bins,
+            row_ptr,
+            feature_first,
             flags,
             sentinel,
             tree_rows,
@@ -1670,23 +1916,31 @@ impl CudaHistBackend {
             split_tiles: d_split_tiles,
             tile_left,
             left_len,
+            pin_counts,
             ..
         } = state;
         let n_rows = self.n_rows as u64;
-        let w = cols.width();
         if n_tiles > 0 {
-            upload(stream, d_ptiles, &ptiles)?;
             fit(stream, tile_left, n_tiles)?;
             let tiles_config = LaunchConfig {
                 grid_dim: (n_tiles as u32, 1, 1),
                 block_dim: (PART_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut count = stream.launch_builder(&device.kernels.route_count[w]);
-            cols.push(&mut count);
+            let route_bins = cols.as_ref().unwrap_or(&*bins);
+            let kernel = if row_ptr.is_some() {
+                &device.kernels.route_sparse[route_bins.width()]
+            } else {
+                &device.kernels.route_count[route_bins.width()]
+            };
+            let mut count = stream.launch_builder(kernel);
+            route_bins.push(&mut count);
+            if let Some(row_ptr) = &*row_ptr {
+                count.arg(row_ptr).arg(&*feature_first);
+            } else {
+                count.arg(&n_rows).arg(&*sentinel);
+            }
             count
-                .arg(&n_rows)
-                .arg(&*sentinel)
                 .arg(&*d_segs)
                 .arg(&*d_rules)
                 .arg(&*d_table)
@@ -1732,14 +1986,13 @@ impl CudaHistBackend {
             // SAFETY: copies each tile's span within its segment.
             unsafe { copy.launch(tiles_config) }?;
         }
-        let mut host = vec![0u32; splits.len()];
-        stream.memcpy_dtoh(&left_len.slice(..host.len()), &mut host)?;
-        stream.synchronize()?;
+        let staging = pinned(stream, pin_counts, splits.len(), false)?;
+        let host = download_pinned(stream, staging, left_len, splits.len())?;
         Ok(splits
             .iter()
             .zip(host)
             .map(|(split, left_len)| {
-                let left_len = left_len as usize;
+                let left_len = *left_len as usize;
                 Partitioned {
                     left: Segment {
                         offset: split.seg.offset,
@@ -1964,9 +2217,14 @@ impl RowEngine for CudaHistBackend {
         let cuts = ghist.cuts();
         let valid = self.fits(ghist)
             && splits.iter().all(|s| {
+                if s.feature as usize >= self.n_cols {
+                    return false;
+                }
                 let (fs, fe) = cuts.feature_bins(s.feature as usize);
-                (s.feature as usize) < self.n_cols
-                    && s.seg.offset + s.seg.len <= state.tree_len
+                s.seg
+                    .offset
+                    .checked_add(s.seg.len)
+                    .is_some_and(|end| end <= state.tree_len)
                     && match s.rule {
                         RowRule::Below(_) => true,
                         RowRule::Table(table) => table.len() == fe - fs,
@@ -2026,8 +2284,14 @@ impl RowEngine for CudaHistBackend {
             return None;
         }
         let stream = &self.device.stream;
-        let loaded = stream.clone_htod(margins);
-        state.margins = Some(self.ok(loaded)?);
+        let loaded = if let Some(buffer) = &mut state.margins {
+            stream.memcpy_htod(margins, buffer)
+        } else {
+            stream
+                .clone_htod(margins)
+                .map(|buffer| state.margins = Some(buffer))
+        };
+        self.ok(loaded)?;
         // A fresh margin run may reuse the same host allocation with new
         // labels or weights; addresses are only stable within a run.
         state.labels = None;
@@ -2299,91 +2563,8 @@ impl RowEngine for CudaHistBackend {
         ghist: &GHistIndex,
         reg: &RegParams,
         requests: &[ScanRequest<'_>],
-    ) -> Option<Vec<FeatureScan>> {
-        let mut state = self.lock()?;
-        if !self.fits(ghist)
-            || requests.iter().any(|r| {
-                r.slot as usize >= state.pool_slots
-                    || r.features.iter().any(|&(f, _)| f as usize >= self.n_cols)
-            })
-        {
-            return None;
-        }
-        let mut tasks = Vec::new();
-        let mut totals = Vec::with_capacity(requests.len() * 2);
-        let mut params = Vec::with_capacity(requests.len() * 3);
-        for (i, r) in requests.iter().enumerate() {
-            totals.extend([r.total.grad, r.total.hess]);
-            params.extend([r.root_gain, r.lower, r.upper]);
-            for &(feature, dir) in r.features {
-                tasks.extend([i as u32, feature, r.slot, i32::from(dir) as u32]);
-            }
-        }
-        let n_tasks = tasks.len() / 4;
-        if n_tasks == 0 {
-            return Some(Vec::new());
-        }
-        let device = &*self.device;
-        let stream = &device.stream;
-        let state = &mut *state;
-        let scanned = (|| {
-            upload(stream, &mut state.scan_tasks, &tasks)?;
-            upload(stream, &mut state.scan_totals, &totals)?;
-            upload(stream, &mut state.scan_params, &params)?;
-            fit(stream, &mut state.scan_meta, n_tasks * 4)?;
-            fit(stream, &mut state.scan_acc, n_tasks * 2)?;
-            let (total_bins, n) = (self.total_bins as u64, n_tasks as u64);
-            let dense = i32::from(self.dense);
-            let mut launch = stream.launch_builder(&device.kernels.scan_splits);
-            launch
-                .arg(&state.pool)
-                .arg(&state.feature_first)
-                .arg(&total_bins)
-                .arg(&state.scan_tasks)
-                .arg(&n)
-                .arg(&state.scan_totals)
-                .arg(&state.scan_params)
-                .arg(&reg.lambda)
-                .arg(&reg.alpha)
-                .arg(&reg.max_delta_step)
-                .arg(&reg.min_child_weight)
-                .arg(&dense)
-                .arg(&mut state.scan_meta)
-                .arg(&mut state.scan_acc);
-            let config = LaunchConfig {
-                grid_dim: (n_tasks.div_ceil(SCAN_WARPS).max(1) as u32, 1, 1),
-                block_dim: ((32 * SCAN_WARPS) as u32, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            // SAFETY: a whole warp per feature task, with warp-local shared
-            // scratch; all lanes follow the same task bounds and pass order.
-            // Lane 0 writes that task's result words.
-            unsafe { launch.launch(config) }?;
-            let mut meta = vec![0u32; n_tasks * 4];
-            let mut acc = vec![0f64; n_tasks * 2];
-            stream.memcpy_dtoh(&state.scan_meta.slice(..meta.len()), &mut meta)?;
-            stream.memcpy_dtoh(&state.scan_acc.slice(..acc.len()), &mut acc)?;
-            stream.synchronize()?;
-            Ok((meta, acc))
-        })();
-        let (meta, acc) = self.ok(scanned)?;
-        Some(
-            meta.as_chunks::<4>()
-                .0
-                .iter()
-                .zip(acc.as_chunks::<2>().0)
-                .map(|(m, a)| match m[0] {
-                    0 => FeatureScan::Empty,
-                    1 => FeatureScan::Best {
-                        loss_chg: f32::from_bits(m[2]),
-                        backward: m[3] != 0,
-                        offset: m[1],
-                        acc: GradStats::new(a[0], a[1]),
-                    },
-                    _ => FeatureScan::Nan,
-                })
-                .collect(),
-        )
+    ) -> Option<Vec<NodeScan>> {
+        self.scan_on(ghist, reg, requests)
     }
 
     fn read_hist(&self, slot: HistSlot) -> Option<Histogram> {
@@ -2417,6 +2598,20 @@ mod tests {
     use super::*;
     use crate::data::DMatrix;
     use crate::data::quantile::HistCuts;
+
+    #[test]
+    fn raw_binning_refuses_mismatched_cuts_before_device_access() {
+        let cuts_data = DMatrix::from_dense(&[0.0, 1.0], 2, 1).unwrap();
+        let csr = DMatrix::from_csr(vec![0, 1, 1], vec![1], vec![1.0], 2).unwrap();
+        let dense = DMatrix::from_dense(&[0.0, 1.0, 2.0, 3.0], 2, 2).unwrap();
+        for data in [&csr, &dense] {
+            let cuts = HistCuts::from_dmatrix(&cuts_data, 16);
+            assert!(matches!(
+                CudaHistBackend::from_dmatrix(data, cuts, 0),
+                Err(HessboostError::InvalidData { .. })
+            ));
+        }
+    }
 
     fn backend() -> Option<(GHistIndex, CudaHistBackend)> {
         if let Some(reason) = unavailable_reason() {
@@ -2540,6 +2735,293 @@ mod tests {
             total,
             GradStats::new(-6.0 * index.n_rows() as f64, 2.0 * index.n_rows() as f64)
         );
+        assert!(available(), "{:?}", unavailable_reason());
+    }
+
+    #[test]
+    fn csr_storage_and_all_histogram_orders_match_cpu() {
+        if let Some(reason) = unavailable_reason() {
+            assert!(
+                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
+                "CUDA required: {reason}"
+            );
+            return;
+        }
+        let n = 40_003;
+        let mut offsets = vec![0];
+        let mut features = Vec::new();
+        let mut values = Vec::new();
+        for r in 0..n {
+            if r % 11 != 0 {
+                // Deliberately unsorted columns; zero is a present value.
+                features.extend([5, 1]);
+                values.extend([(r % 3) as f32, (r % 7) as f32]);
+            }
+            offsets.push(features.len());
+        }
+        let data = DMatrix::from_csr(offsets, features, values, 8).unwrap();
+        let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256));
+        let backend = CudaHistBackend::new(&index, 0).unwrap();
+        {
+            let state = backend.lock().unwrap();
+            assert!(state.cols.is_none());
+            assert_eq!(state.row_ptr.as_ref().unwrap().len(), n + 1);
+            assert_eq!(state.stride, 0);
+            let nnz = index.row_ptr()[n];
+            assert!(matches!(&state.bins, DeviceBins::U16(bins) if bins.len() == nnz));
+        }
+        let all: Vec<u32> = (0..n as u32).collect();
+        let subsets = [&all[..], &all[3..103]];
+        for mode in 0..3 {
+            let mut pairs: Vec<_> = (0..n)
+                .map(|r| GradPair::new((r % 3) as f32 - 1.0, 1.0))
+                .collect();
+            if mode == 1 {
+                pairs[17].grad = 2f32.powi(-38);
+            }
+            if mode == 2 {
+                pairs[17].grad = 2f32.powi(-100);
+            }
+            backend.prepare(&index, &pairs);
+            for rows in subsets {
+                let mut expected = zeroed(index.total_bins());
+                let mut actual = zeroed(index.total_bins());
+                CpuBackend.build(&index, rows, &pairs, &mut expected);
+                backend.build(&index, rows, &pairs, &mut actual);
+                assert_eq!(bits(&actual), bits(&expected));
+            }
+        }
+        assert_eq!(backend.node_counts().cpu_nodes, 0);
+        assert!(backend.node_counts().exact_nodes > 0);
+        assert!(backend.node_counts().exact_chunk_nodes > 0);
+        assert!(backend.node_counts().chain_nodes > 0);
+        let root = backend.begin_tree(&index, &all).unwrap();
+        for table_rule in [false, true] {
+            let (fs, fe) = index.cuts().feature_bins(1);
+            let table: Vec<bool> = (0..fe - fs).map(|b| b % 2 == 0).collect();
+            for default_left in [false, true] {
+                backend.begin_tree(&index, &all).unwrap();
+                let rule = if table_rule {
+                    RowRule::Table(&table)
+                } else {
+                    RowRule::Below(2)
+                };
+                let split = RowSplit {
+                    seg: root,
+                    feature: 1,
+                    rule,
+                    default_left,
+                };
+                let children = backend.partition(&index, &[split]).unwrap()[0];
+                let wanted = |left: bool| {
+                    all.iter()
+                        .copied()
+                        .filter(|&r| {
+                            let go_left =
+                                index
+                                    .feature_bin(r as usize, fs, fe)
+                                    .map_or(default_left, |b| {
+                                        let local = (b as usize) - fs;
+                                        if table_rule { table[local] } else { local < 2 }
+                                    });
+                            go_left == left
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    backend.rows(&[children.left, children.right]).unwrap(),
+                    vec![wanted(true), wanted(false)]
+                );
+            }
+        }
+        assert!(available(), "{:?}", unavailable_reason());
+    }
+
+    #[test]
+    fn device_raw_bins_match_cpu_with_categories_and_missing() {
+        if let Some(reason) = unavailable_reason() {
+            assert!(
+                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
+                "CUDA required: {reason}"
+            );
+            return;
+        }
+        for missing in [f32::NAN, -999.0] {
+            let values: Vec<f32> = (0..257 * 3)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        missing
+                    } else {
+                        (i % 17) as f32
+                    }
+                })
+                .collect();
+            let data = DMatrix::from_dense_with_missing(&values, 257, 3, missing)
+                .unwrap()
+                .with_feature_types(&[
+                    crate::data::FeatureType::Categorical,
+                    crate::data::FeatureType::Numerical,
+                    crate::data::FeatureType::Numerical,
+                ])
+                .unwrap();
+            let cuts = HistCuts::from_dmatrix(&data, 256);
+            let expected = GHistIndex::from_dmatrix(&data, cuts.clone());
+            let (actual, _) = CudaHistBackend::from_dmatrix(&data, cuts, 0).unwrap();
+            assert_eq!(actual.row_ptr(), expected.row_ptr());
+            for r in 0..257 {
+                for f in 0..3 {
+                    let (fs, fe) = expected.cuts().feature_bins(f);
+                    assert_eq!(
+                        actual.feature_bin(r, fs, fe),
+                        expected.feature_bin(r, fs, fe)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_global_csr_bins_keep_sparse_device_storage() {
+        if let Some(reason) = unavailable_reason() {
+            assert!(
+                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
+                "CUDA required: {reason}"
+            );
+            return;
+        }
+        // 70,000 feature bins force u32 globally; rows contain one entry
+        // each. Dense expansion would exceed a gigabyte for this tiny CSR.
+        let n = 70_003;
+        let offsets: Vec<usize> = (0..=n).collect();
+        let features: Vec<u32> = (0..n).map(|r| (r % 70_000) as u32).collect();
+        let data = DMatrix::from_csr(offsets, features, vec![0.0; n], 70_000).unwrap();
+        let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 2));
+        let backend = CudaHistBackend::new(&index, 0).unwrap();
+        {
+            let state = backend.lock().unwrap();
+            assert!(state.cols.is_none());
+            assert_eq!(state.row_ptr.as_ref().unwrap().len(), n + 1);
+            assert!(matches!(&state.bins, DeviceBins::U32(bins) if bins.len() == n));
+        }
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let pairs = vec![GradPair::new(1.0, 1.0); n];
+        backend.prepare(&index, &pairs);
+        let mut expected = zeroed(index.total_bins());
+        let mut actual = zeroed(index.total_bins());
+        CpuBackend.build(&index, &rows, &pairs, &mut expected);
+        backend.build(&index, &rows, &pairs, &mut actual);
+        assert_eq!(bits(&actual), bits(&expected));
+        assert_eq!(backend.node_counts().cpu_nodes, 0);
+        assert!(available(), "{:?}", unavailable_reason());
+    }
+
+    #[test]
+    fn dense_device_transpose_matches_cpu_at_every_bin_width() {
+        if let Some(reason) = unavailable_reason() {
+            assert!(
+                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
+                "CUDA required: {reason}"
+            );
+            return;
+        }
+        for (n, expected_width) in [(255, 0), (513, 1), (65_537, 2)] {
+            let values: Vec<f32> = (0..n * 3).map(|i| (i / 3) as f32).collect();
+            let data = DMatrix::from_dense(&values, n, 3)
+                .unwrap()
+                .with_feature_types(&[crate::data::FeatureType::Categorical; 3])
+                .unwrap();
+            let cuts = HistCuts::from_dmatrix(&data, 256);
+            let expected = GHistIndex::from_dmatrix(&data, cuts.clone());
+            let (actual, backend) = CudaHistBackend::from_dmatrix(&data, cuts, 0).unwrap();
+            assert_eq!(actual.row_ptr(), expected.row_ptr());
+            let state = backend.lock().unwrap();
+            assert_eq!(state.bins.width(), expected_width);
+            assert!(state.row_ptr.is_none());
+            assert!(state.cols.is_some());
+            let first: Vec<u32> = (0..3)
+                .map(|f| actual.cuts().feature_bins(f).0 as u32)
+                .collect();
+            let check = |rows: Vec<u32>, cols: Vec<u32>| {
+                for r in 0..n {
+                    for f in 0..3 {
+                        let (fs, fe) = expected.cuts().feature_bins(f);
+                        let local = expected.feature_bin(r, fs, fe).unwrap() - first[f];
+                        assert_eq!(rows[r * state.stride as usize + f], local);
+                        assert_eq!(cols[f * n + r], local);
+                    }
+                }
+            };
+            let read = |bins: &DeviceBins| -> Vec<u32> {
+                match bins {
+                    DeviceBins::U8(bins) => backend
+                        .device
+                        .stream
+                        .clone_dtoh(bins)
+                        .unwrap()
+                        .into_iter()
+                        .map(u32::from)
+                        .collect(),
+                    DeviceBins::U16(bins) => backend
+                        .device
+                        .stream
+                        .clone_dtoh(bins)
+                        .unwrap()
+                        .into_iter()
+                        .map(u32::from)
+                        .collect(),
+                    DeviceBins::U32(bins) => backend.device.stream.clone_dtoh(bins).unwrap(),
+                }
+            };
+            let rows = read(&state.bins);
+            let cols = read(state.cols.as_ref().unwrap());
+            backend.device.stream.synchronize().unwrap();
+            check(rows, cols);
+        }
+        assert!(available(), "{:?}", unavailable_reason());
+    }
+
+    #[test]
+    fn empty_csr_entries_keep_only_offsets_and_zero_histograms() {
+        if let Some(reason) = unavailable_reason() {
+            assert!(
+                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
+                "CUDA required: {reason}"
+            );
+            return;
+        }
+        let n = 257;
+        let data = DMatrix::from_csr(vec![0; n + 1], vec![], vec![], 5_000).unwrap();
+        let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256));
+        let backend = CudaHistBackend::new(&index, 0).unwrap();
+        {
+            let state = backend.lock().unwrap();
+            assert!(state.cols.is_none());
+            assert_eq!(state.row_ptr.as_ref().unwrap().len(), n + 1);
+            assert!(matches!(&state.bins, DeviceBins::U16(bins) if bins.len() == 1));
+        }
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let pairs = vec![GradPair::new(1.0, 1.0); n];
+        backend.prepare(&index, &pairs);
+        let mut actual = zeroed(index.total_bins());
+        backend.build(&index, &rows, &pairs, &mut actual);
+        assert_eq!(bits(&actual), bits(&zeroed(index.total_bins())));
+        let root = backend.begin_tree(&index, &rows).unwrap();
+        for default_left in [false, true] {
+            backend.begin_tree(&index, &rows).unwrap();
+            let parts = backend
+                .partition(
+                    &index,
+                    &[RowSplit {
+                        seg: root,
+                        feature: 4_999,
+                        rule: RowRule::Below(0),
+                        default_left,
+                    }],
+                )
+                .unwrap()[0];
+            assert_eq!(parts.left.len, if default_left { n } else { 0 });
+        }
+        assert_eq!(backend.node_counts().cpu_nodes, 0);
         assert!(available(), "{:?}", unavailable_reason());
     }
 }

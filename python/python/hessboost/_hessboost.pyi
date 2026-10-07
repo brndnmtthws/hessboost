@@ -125,7 +125,7 @@ _PredictKind: TypeAlias = Literal["value", "margin", "contribs", "interactions"]
 _ImportanceType: TypeAlias = Literal["weight", "gain", "total_gain", "cover", "total_cover"]
 _DiffusionPreset: TypeAlias = Literal["default", "treeffuser", "flow_matching"]
 _ForestPreset: TypeAlias = Literal["forest_flow", "forest_diffusion"]
-_GpuDevice: TypeAlias = Literal["metal", "wgpu"]
+_GpuDevice: TypeAlias = Literal["metal", "wgpu", "cuda"]
 
 @final
 class Booster:
@@ -178,7 +178,13 @@ class Booster:
     def boulevard(self) -> dict[str, Any] | None: ...
     @property
     def ebm(self) -> dict[str, Any] | None: ...
-    def to_gpu(self, device: _GpuDevice | None) -> GpuModel: ...
+    def to_gpu(
+        self,
+        device: _GpuDevice | None = None,
+        *,
+        backend: _GpuDevice | None = None,
+        ordinal: int = 0,
+    ) -> GpuModel: ...
     def to_compact(self) -> CompactModel: ...
     def size_report(self) -> dict[str, int]: ...
 
@@ -208,9 +214,19 @@ class CompactModel:
 @final
 class GpuModel:
     @staticmethod
-    def available(device: _GpuDevice | None) -> bool: ...
+    def available(
+        device: _GpuDevice | None = None,
+        *,
+        backend: _GpuDevice | None = None,
+        ordinal: int = 0,
+    ) -> bool: ...
     @staticmethod
-    def device_name(device: _GpuDevice | None) -> str | None: ...
+    def device_name(
+        device: _GpuDevice | None = None,
+        *,
+        backend: _GpuDevice | None = None,
+        ordinal: int = 0,
+    ) -> str | None: ...
     @property
     def device(self) -> _GpuDevice: ...
     def predict(

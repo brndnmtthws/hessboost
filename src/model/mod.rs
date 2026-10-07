@@ -696,7 +696,11 @@ impl BoostedModel {
     }
 
     /// Whether tree `t` stores a weight vector per leaf (vector-leaf trees).
-    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+    #[cfg(any(
+        all(target_os = "macos", feature = "metal"),
+        feature = "wgpu",
+        all(target_os = "linux", feature = "cuda")
+    ))]
     pub(crate) fn tree_is_vector_leaf(&self, t: usize) -> bool {
         self.trees[t].is_vector_leaf()
     }
@@ -913,6 +917,16 @@ impl BoostedModel {
     pub fn to_wgpu(&self) -> Result<crate::backend::wgpu::GpuModel> {
         Err(HessboostError::gpu(
             "wgpu prediction requires the `wgpu` feature",
+        ))
+    }
+
+    /// Lay this model out for GPU batch prediction on CUDA device `ordinal`.
+    /// Without the `cuda` feature on Linux this always returns an error;
+    /// see [`backend::cuda`](crate::backend::cuda) for the accelerated path.
+    #[cfg(not(all(target_os = "linux", feature = "cuda")))]
+    pub fn to_cuda(&self, _ordinal: usize) -> Result<crate::backend::cuda::GpuModel> {
+        Err(HessboostError::gpu(
+            "CUDA prediction requires the `cuda` feature on Linux",
         ))
     }
 

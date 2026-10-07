@@ -547,6 +547,32 @@ impl WQSketch {
         }
     }
 
+    /// Feed a dense unit-weight column without per-value callback and
+    /// weight dispatch. Queue boundaries, consecutive-value folding and
+    /// summary merge order are exactly those of repeated [`Self::push`].
+    pub(crate) fn push_unit_column(&mut self, values: &[f32], missing: f32) {
+        debug_assert!(self.unit_weights);
+        let capacity = 2 * self.limit_size;
+        self.queue
+            .reserve(capacity.saturating_sub(self.queue.len()));
+        for &value in values {
+            if crate::data::dmatrix::is_missing(value, missing) {
+                continue;
+            }
+            self.num_elements += 1;
+            if let Some(last) = self.queue.last_mut()
+                && last.0 == value
+            {
+                last.1 += 1.0;
+                continue;
+            }
+            if self.queue.len() == capacity {
+                self.flush_queue();
+            }
+            self.queue.push((value, 1.0));
+        }
+    }
+
     /// `Queue::Push`: merge into the last entry when the value repeats,
     /// otherwise append; `false` when the queue is full.
     #[inline]
@@ -701,6 +727,80 @@ mod tests {
             let expected = cuts_of(&values, 64);
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&out), bits(&expected), "case {case}");
+        }
+    }
+
+    #[test]
+    fn unit_column_ingestion_preserves_streaming_cuts() {
+        for missing in [f32::NAN, -1.0] {
+            let values: Vec<f32> = (0..40_017)
+                .map(|i| match i % 19 {
+                    0 => missing,
+                    1 => {
+                        if missing.is_nan() {
+                            f32::NAN
+                        } else {
+                            -1.0
+                        }
+                    }
+                    2 => -0.0,
+                    3 => 0.0,
+                    _ => ((i / 7 * 31) % 1009) as f32,
+                })
+                .collect();
+            let n = values
+                .iter()
+                .filter(|&&v| !crate::data::dmatrix::is_missing(v, missing))
+                .count();
+            let mut direct = WQSketch::new(n, 33).with_unit_weights();
+            direct.push_unit_column(&values, missing);
+            let mut reference = WQSketch::new(n, 33).with_unit_weights();
+            for &value in &values {
+                if !crate::data::dmatrix::is_missing(value, missing) {
+                    reference.push(value, 1.0);
+                }
+            }
+            let (mut actual, mut expected) = (Vec::new(), Vec::new());
+            direct.cut_values(&mut actual);
+            reference.cut_values(&mut expected);
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn unit_column_preserves_full_queue_repeat_and_large_count_flush() {
+        for count in [0, (1 << 24) - 2, 1 << 24] {
+            let mut direct = WQSketch::new(40_000, 33).with_unit_weights();
+            let mut reference = WQSketch::new(40_000, 33).with_unit_weights();
+            let capacity = 2 * direct.limit_size;
+            for i in 0..capacity {
+                direct.push(i as f32, 1.0);
+                reference.push(i as f32, 1.0);
+            }
+            direct.num_elements = count.max(capacity);
+            reference.num_elements = direct.num_elements;
+            let values = [
+                (capacity - 1) as f32,
+                (capacity - 1) as f32,
+                capacity as f32,
+                0.0,
+                -0.0,
+                0.0,
+            ];
+            direct.push_unit_column(&values, f32::NAN);
+            for &value in &values {
+                reference.push(value, 1.0);
+            }
+            let (mut actual, mut expected) = (Vec::new(), Vec::new());
+            direct.cut_values(&mut actual);
+            reference.cut_values(&mut expected);
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
         }
     }
 

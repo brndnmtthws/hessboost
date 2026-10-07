@@ -4,8 +4,10 @@
 use crate::data::{DMatrix, row_major};
 use crate::errors::{DetachExt, OrRaise, refuse};
 use hessboost::data::target_stats::{self, TargetKind};
+use hessboost::error::HessboostError;
 use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 /// An unfitted ordered target-statistics encoder.
 #[pyclass(frozen, module = "hessboost._hessboost")]
@@ -89,8 +91,27 @@ impl FittedTargetEncoder {
 
     /// The encoding of category `code` in `column`, or `None` when `column`
     /// is not encoded.
-    fn encode(&self, column: usize, code: u32) -> Option<f32> {
+    fn encoding(&self, column: usize, code: u32) -> Option<f32> {
         self.inner.encode(column, code)
+    }
+
+    /// The statistics as the crate's serde JSON (UTF-8), serialized without
+    /// the GIL.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = py
+            .detach(|| serde_json::to_vec(&self.inner).map_err(HessboostError::from))
+            .or_raise()?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Statistics read from [`encode`](Self::encode)'s JSON without the GIL;
+    /// invalid JSON or a table the crate refuses raises `ModelFormatError`.
+    #[staticmethod]
+    fn decode(py: Python<'_>, data: &[u8]) -> PyResult<Self> {
+        let inner = py
+            .detach(|| serde_json::from_slice(data).map_err(HessboostError::from))
+            .or_raise()?;
+        Ok(Self { inner })
     }
 
     #[getter]

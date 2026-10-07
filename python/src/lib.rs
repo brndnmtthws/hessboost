@@ -12,7 +12,9 @@
 //! Models and matrices are immutable and shared read-only between threads;
 //! the Python layer swaps whole objects rather than mutating them. The one
 //! exception, `OnlineModel`, updates in place under a mutex it never waits
-//! for: access during an update fails fast rather than deadlock.
+//! for: access during an update fails fast rather than deadlock. Native
+//! work runs on the extension's own rayon pool (`pool`), which a forked
+//! child rebuilds.
 
 mod booster;
 mod codec;
@@ -28,6 +30,7 @@ mod gpu;
 mod inference;
 mod online;
 mod params;
+mod pool;
 mod target_stats;
 mod train;
 

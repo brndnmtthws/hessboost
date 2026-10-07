@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, Protocol, TypeAlias, cast
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol, TypeAlias, cast, overload
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -13,9 +14,23 @@ from hessboost import _hessboost
 from hessboost._booster import Booster
 from hessboost._exceptions import HessboostError
 from hessboost._matrix import DMatrix, _check_schema
-from hessboost.target_stats import Column, OrderedTargetEncoder, _column_indices
+from hessboost.target_stats import (
+    Column,
+    FittedTargetEncoder,
+    OrderedTargetEncoder,
+    _column_indices,
+    _encoded,
+)
 
-__all__ = ["CustomMetric", "Objective", "TrainingCallback", "cv", "train", "train_with_budget"]
+__all__ = [
+    "CustomMetric",
+    "CvRefit",
+    "Objective",
+    "TrainingCallback",
+    "cv",
+    "train",
+    "train_with_budget",
+]
 
 Objective: TypeAlias = Callable[[NDArray[np.float32], DMatrix], tuple[ArrayLike, ArrayLike]]
 """A custom objective, as XGBoost's ``obj``: ``obj(margins, dtrain)``
@@ -288,21 +303,26 @@ def train(
     core, best_score = _hessboost.train(request)
     if unprinted is not None:
         print(unprinted, flush=True)
-    if init is None:
-        booster = Booster._wrap(
-            core, dtrain._feature_names, dtrain._feature_types, dict(dtrain._categories)
-        )
-    else:
-        # What dtrain does not record (numpy codes) is still the earlier
-        # model's, and prediction keeps re-coding frames to it.
-        booster = Booster._wrap(
-            core,
-            dtrain._feature_names if dtrain._feature_names is not None else init._feature_names,
-            dtrain._feature_types if dtrain._feature_types is not None else init._feature_types,
-            {**init._categories, **dtrain._categories},
-        )
+    booster = _trained(core, dtrain, init)
     booster.best_score = best_score
     return booster
+
+
+def _trained(core: _hessboost.Booster, dtrain: DMatrix, init: Booster | None) -> Booster:
+    """The booster of ``core``, trained on ``dtrain`` (continuing ``init``),
+    with their feature schema."""
+    if init is None:
+        return Booster._wrap(
+            core, dtrain._feature_names, dtrain._feature_types, dict(dtrain._categories)
+        )
+    # What dtrain does not record (numpy codes) is still the earlier model's,
+    # and prediction keeps re-coding frames to it.
+    return Booster._wrap(
+        core,
+        dtrain._feature_names if dtrain._feature_names is not None else init._feature_names,
+        dtrain._feature_types if dtrain._feature_types is not None else init._feature_types,
+        {**init._categories, **dtrain._categories},
+    )
 
 
 def train_with_budget(
@@ -362,6 +382,42 @@ def train_with_budget(
     )
 
 
+CvHistory: TypeAlias = dict[str, NDArray[np.float64]]
+"""``{"test-<metric>-mean": ..., "test-<metric>-std": ...}``: what :func:`cv`
+returns, one value per round."""
+
+
+@dataclass(frozen=True)
+class CvRefit:
+    """What ``cv(..., refit=True)`` returns: the cross-validation history
+    and the booster retrained on every row at the chosen round count."""
+
+    history: CvHistory
+    """The history :func:`cv` returns without ``refit``."""
+    booster: Booster
+    """Trained on every row of ``dtrain`` for :attr:`num_boost_round`
+    rounds (continuing ``xgb_model`` when given), as :func:`train` would
+    train it, without eval sets. With ``target_stats`` it was trained on
+    ``dtrain`` encoded by :attr:`target_encoder`, so its encoded columns are
+    numerical."""
+    num_boost_round: int
+    """The chosen round count: the best round's under early stopping, else
+    every round the folds ran (the length of every history array)."""
+    target_encoder: FittedTargetEncoder | None
+    """With ``target_stats``, the encoder fitted on every row of ``dtrain``:
+    encode new data with its ``transform`` before predicting with
+    :attr:`booster`. ``None`` otherwise."""
+
+
+def _history(results: list[tuple[str, list[float], list[float]]]) -> CvHistory:
+    out: CvHistory = {}
+    for metric, mean, std in results:
+        out[f"test-{metric}-mean"] = np.asarray(mean, dtype=np.float64)
+        out[f"test-{metric}-std"] = np.asarray(std, dtype=np.float64)
+    return out
+
+
+@overload
 def cv(
     params: Mapping[str, Any],
     dtrain: DMatrix,
@@ -373,7 +429,57 @@ def cv(
     early_stopping_rounds: int | None = None,
     target_stats: Sequence[Column] | None = None,
     target_encoder: OrderedTargetEncoder | None = None,
-) -> dict[str, NDArray[np.float64]]:
+    target_stats_label: ArrayLike | None = None,
+    xgb_model: str | os.PathLike[str] | Booster | None = None,
+    refit: Literal[False] = False,
+) -> CvHistory: ...
+@overload
+def cv(
+    params: Mapping[str, Any],
+    dtrain: DMatrix,
+    num_boost_round: int = 10,
+    *,
+    nfold: int = 3,
+    folds: _Splitter | Iterable[tuple[ArrayLike, ArrayLike]] | None = None,
+    seed: int = 0,
+    early_stopping_rounds: int | None = None,
+    target_stats: Sequence[Column] | None = None,
+    target_encoder: OrderedTargetEncoder | None = None,
+    target_stats_label: ArrayLike | None = None,
+    xgb_model: str | os.PathLike[str] | Booster | None = None,
+    refit: Literal[True],
+) -> CvRefit: ...
+@overload
+def cv(
+    params: Mapping[str, Any],
+    dtrain: DMatrix,
+    num_boost_round: int = 10,
+    *,
+    nfold: int = 3,
+    folds: _Splitter | Iterable[tuple[ArrayLike, ArrayLike]] | None = None,
+    seed: int = 0,
+    early_stopping_rounds: int | None = None,
+    target_stats: Sequence[Column] | None = None,
+    target_encoder: OrderedTargetEncoder | None = None,
+    target_stats_label: ArrayLike | None = None,
+    xgb_model: str | os.PathLike[str] | Booster | None = None,
+    refit: bool,
+) -> CvHistory | CvRefit: ...
+def cv(
+    params: Mapping[str, Any],
+    dtrain: DMatrix,
+    num_boost_round: int = 10,
+    *,
+    nfold: int = 3,
+    folds: _Splitter | Iterable[tuple[ArrayLike, ArrayLike]] | None = None,
+    seed: int = 0,
+    early_stopping_rounds: int | None = None,
+    target_stats: Sequence[Column] | None = None,
+    target_encoder: OrderedTargetEncoder | None = None,
+    target_stats_label: ArrayLike | None = None,
+    xgb_model: str | os.PathLike[str] | Booster | None = None,
+    refit: bool = False,
+) -> CvHistory | CvRefit:
     """Cross-validates ``params`` on ``dtrain``, as XGBoost's ``xgboost.cv``.
 
     Every fold trains ``num_boost_round`` rounds on its training rows and is
@@ -398,11 +504,30 @@ def cv(
             encoding (see :mod:`hessboost.target_stats`).
         target_encoder: The encoder ``target_stats`` uses (default:
             ``OrderedTargetEncoder()``).
+        target_stats_label: The per-row target the ``target_stats`` encoder
+            averages instead of ``dtrain``'s labels (which stay the training
+            target): one finite value per row, split with the folds, such
+            as one column of a multi-target matrix or a class's 0/1
+            indicator.
+        xgb_model: A booster (or model file) every fold, and the refit,
+            continue, as :func:`train` continues ``xgb_model`` (with the
+            same checks of ``dtrain`` against it). The history counts this
+            run's rounds from 0. Not with ``target_stats``: the model was
+            trained on its own encoding of those columns.
+        refit: Also retrain on every row of ``dtrain`` for the chosen round
+            count and return a :class:`CvRefit`.
 
     Returns:
         ``{"test-<metric>-mean": ..., "test-<metric>-std": ...}`` per
         metric, one value per round (pass it to ``pandas.DataFrame`` for a
-        table). Training-set metrics are not computed.
+        table); training-set metrics are not computed. With ``refit``, a
+        :class:`CvRefit` holding that history and the retrained booster.
+
+    Raises:
+        HessboostError: The parameters, folds or data are refused,
+            ``target_stats_label`` is given without ``target_stats`` or with
+            the wrong length, or ``xgb_model`` is given with
+            ``target_stats``.
     """
     if not isinstance(dtrain, DMatrix):
         raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
@@ -417,6 +542,16 @@ def cv(
         encoding = (encoder._core, _column_indices(target_stats, dtrain._feature_names))
     elif target_encoder is not None:
         raise HessboostError("target_encoder needs target_stats, the columns to encode")
+    labels = None
+    if target_stats_label is not None:
+        labels = np.ascontiguousarray(target_stats_label, dtype=np.float32)
+        if labels.ndim != 1:
+            raise HessboostError(
+                f"target_stats_label must be one value per row, got shape {labels.shape}"
+            )
+    init = _init_model(xgb_model)
+    if init is not None:
+        _check_schema(init, dtrain, "dtrain", "xgb_model's")
     rows = dtrain.num_row()
     if folds is None:
         pairs = [
@@ -432,11 +567,26 @@ def cv(
             (np.asarray(train).reshape(-1).tolist(), np.asarray(test).reshape(-1).tolist())
             for train, test in chosen
         ]
-    results = _hessboost.cv(
-        native, dtrain._core, int(num_boost_round), pairs, early_stopping_rounds, encoding
+    request: dict[str, object] = {
+        "params": native,
+        "dtrain": dtrain._core,
+        "num_boost_round": int(num_boost_round),
+        "folds": pairs,
+        "early_stopping_rounds": early_stopping_rounds,
+        "target_stats": encoding,
+        "target_stats_label": labels,
+        "init_model": None if init is None else init._model,
+    }
+    if not refit:
+        return _history(_hessboost.cv(request))
+    results, core, rounds, fitted = _hessboost.cv_refit(request)
+    if encoding is None or fitted is None:
+        return CvRefit(_history(results), _trained(core, dtrain, init), rounds, None)
+    # The refit trained on dtrain encoded by `fitted`, its columns numerical.
+    encoded = _encoded(dtrain, dtrain._core, encoding[1])
+    return CvRefit(
+        _history(results),
+        _trained(core, encoded, None),
+        rounds,
+        FittedTargetEncoder._wrap(fitted, dtrain),
     )
-    out: dict[str, NDArray[np.float64]] = {}
-    for metric, mean, std in results:
-        out[f"test-{metric}-mean"] = np.asarray(mean, dtype=np.float64)
-        out[f"test-{metric}-std"] = np.asarray(std, dtype=np.float64)
-    return out

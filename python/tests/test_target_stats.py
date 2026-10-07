@@ -173,6 +173,72 @@ def test_cv_fits_the_encoder_on_each_folds_training_rows() -> None:
         hessboost.cv({}, dtrain, 2, target_encoder=encoder)
 
 
+def test_cv_target_stats_label_splits_with_the_folds() -> None:
+    x, y = categorical_data()
+    multi = matrix(x, np.column_stack([y, -y]))
+    encoder = OrderedTargetEncoder(seed=6)
+    folds = hessboost.folds.k_fold(300, 3, seed=2)
+    result = hessboost.cv(
+        {"max_depth": 3},
+        multi,
+        5,
+        folds=folds,
+        target_stats=["city"],
+        target_encoder=encoder,
+        target_stats_label=-y,
+    )
+    scores = []
+    for train_rows, test_rows in folds:
+        encoded, stats = encoder.fit_transform(
+            multi.slice(train_rows), ["city"], label=-y[train_rows]
+        )
+        history: hessboost.EvalsResult = {}
+        hessboost.train(
+            {"max_depth": 3},
+            encoded,
+            5,
+            evals=[(stats.transform(multi.slice(test_rows)), "test")],
+            evals_result=history,
+            verbose_eval=False,
+        )
+        scores.append(history["test"]["rmse"])
+    np.testing.assert_allclose(result["test-rmse-mean"], np.mean(scores, axis=0), rtol=1e-12)
+    with pytest.raises(HessboostError, match="target_stats_label"):
+        hessboost.cv({}, multi, 2, target_stats_label=-y)
+    with pytest.raises(HessboostError):
+        hessboost.cv({}, multi, 2, target_stats=["city"], target_stats_label=y[:10])
+
+
+def test_cv_refit_returns_the_encoder_fitted_on_every_row() -> None:
+    x, y = categorical_data()
+    dtrain = matrix(x, y)
+    encoder = OrderedTargetEncoder(seed=2)
+    refit = hessboost.cv(
+        {"max_depth": 3},
+        dtrain,
+        30,
+        early_stopping_rounds=2,
+        target_stats=["city"],
+        target_encoder=encoder,
+        refit=True,
+    )
+    stats = refit.target_encoder
+    assert isinstance(stats, FittedTargetEncoder)
+    assert stats.columns == [0]
+    booster = refit.booster
+    assert booster.feature_types == ["q", "q"]
+    assert booster.feature_names == ["city", "noise"]
+    encoded, by_hand = encoder.fit_transform(dtrain, ["city"])
+    trained = hessboost.train({"max_depth": 3}, encoded, refit.num_boost_round)
+    np.testing.assert_array_equal(
+        booster.predict(stats.transform(x)), trained.predict(by_hand.transform(x))
+    )
+    # A continued model was trained on its own encoding of the columns.
+    init = hessboost.train({}, dtrain, 2)
+    with pytest.raises(HessboostError, match="target_stats"):
+        hessboost.cv({}, dtrain, 2, target_stats=["city"], xgb_model=init)
+
+
 def frame_encoder() -> tuple[FittedTargetEncoder, pd.DataFrame, NDArray[np.float64]]:
     """An encoder fitted on a frame, a frame of its and unseen categories
     in another order, and numpy data."""

@@ -78,7 +78,7 @@ impl OrderedTargetEncoder {
 /// Fitted ordered target statistics over a whole training matrix.
 #[pyclass(frozen, module = "hessboost._hessboost")]
 pub struct FittedTargetEncoder {
-    inner: target_stats::FittedTargetEncoder,
+    pub(crate) inner: target_stats::FittedTargetEncoder,
 }
 
 #[pymethods]

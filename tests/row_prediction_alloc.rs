@@ -41,7 +41,17 @@ fn allocations(f: impl FnOnce()) -> usize {
     ALLOCATIONS.with(Cell::get) - before
 }
 
-fn model(params: &[(&str, Value)], n_cols: usize, classes: usize) -> (BoostedModel, Vec<f32>) {
+/// One model kind: its parameters, feature count, and class count (`0` for
+/// a continuous label).
+struct Kind {
+    name: &'static str,
+    params: Vec<(&'static str, Value)>,
+    n_cols: usize,
+    classes: usize,
+}
+
+fn model(kind: &Kind) -> (BoostedModel, Vec<f32>) {
+    let (n_cols, classes) = (kind.n_cols, kind.classes);
     let n = 300;
     let x: Vec<f32> = (0..n * n_cols)
         .map(|i| {
@@ -67,16 +77,22 @@ fn model(params: &[(&str, Value)], n_cols: usize, classes: usize) -> (BoostedMod
         .unwrap()
         .with_labels(&y)
         .unwrap();
-    let params = TrainingParams::from_xgboost(params.iter().cloned()).unwrap();
+    let params = TrainingParams::from_xgboost(kind.params.iter().cloned()).unwrap();
     (train(&params, &dtrain, 20).unwrap(), x)
 }
 
 #[test]
 fn row_predictions_allocate_nothing() {
-    let kinds: [(&str, Vec<(&str, Value)>, usize, usize); 7] = [
-        ("squared error", vec![], 8, 0),
-        ("wide rows", vec![("max_depth", json!(3))], 400, 0),
-        (
+    let kind = |name, params, n_cols, classes| Kind {
+        name,
+        params,
+        n_cols,
+        classes,
+    };
+    let kinds = [
+        kind("squared error", vec![], 8, 0),
+        kind("wide rows", vec![("max_depth", json!(3))], 400, 0),
+        kind(
             "softmax, 70 classes",
             vec![
                 ("objective", json!("multi:softmax")),
@@ -86,7 +102,7 @@ fn row_predictions_allocate_nothing() {
             8,
             70,
         ),
-        (
+        kind(
             "softprob, vector leaves",
             vec![
                 ("objective", json!("multi:softprob")),
@@ -96,7 +112,7 @@ fn row_predictions_allocate_nothing() {
             8,
             3,
         ),
-        (
+        kind(
             "quantiles",
             vec![
                 ("objective", json!("reg:quantileerror")),
@@ -105,11 +121,17 @@ fn row_predictions_allocate_nothing() {
             8,
             0,
         ),
-        ("linear leaves", vec![("linear_tree", json!(true))], 8, 0),
-        ("model shrinkage", vec![("model_shrink_rate", json!(0.1))], 8, 0),
+        kind("linear leaves", vec![("linear_tree", json!(true))], 8, 0),
+        kind(
+            "model shrinkage",
+            vec![("model_shrink_rate", json!(0.1))],
+            8,
+            0,
+        ),
     ];
-    for (name, params, n_cols, classes) in kinds {
-        let (model, x) = model(&params, n_cols, classes);
+    for kind in &kinds {
+        let (model, x) = model(kind);
+        let (name, n_cols) = (kind.name, kind.n_cols);
         let row = &x[n_cols..2 * n_cols];
         let mut margins = vec![0.0; model.n_outputs()];
         let mut values = vec![0.0; model.prediction_width()];

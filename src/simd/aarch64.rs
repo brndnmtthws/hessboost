@@ -678,8 +678,7 @@ pub(super) unsafe fn short_softmax_gradient<const K: usize>(
         let mut row = 0;
         while row + 4 <= labels.len() {
             let base = row * K;
-            if let Some(probabilities) = short_softmax_batch::<K>(&preds[base..base + 4 * K])
-            {
+            if let Some(probabilities) = short_softmax_batch::<K>(&preds[base..base + 4 * K]) {
                 // Saturating conversion matches Rust's float-to-usize cast
                 // when comparing with class IDs 0..K, including NaN/negatives.
                 let target = vcvtq_u32_f32(vld1q_f32(labels.as_ptr().add(row)));

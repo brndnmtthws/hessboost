@@ -310,7 +310,6 @@ version = "0.2.4"
 dependencies = [
  "hessboost",
  "numpy",
- "once_cell",
  "pyo3",
  "rayon",
  "self_cell",

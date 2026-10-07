@@ -943,7 +943,11 @@ impl CompactForest {
     /// `group` (every tree [`TreeMeta::lockstep_ok`] and width-checked), with
     /// `key_of(node)` the row's key for a numeric node's feature and sign.
     #[inline(always)]
-    fn lockstep_leaves(&self, group: &[TreeMeta], key_of: impl Fn(&CNode) -> u32) -> [usize; LANES] {
+    fn lockstep_leaves(
+        &self,
+        group: &[TreeMeta],
+        key_of: impl Fn(&CNode) -> u32,
+    ) -> [usize; LANES] {
         let nodes = &self.nodes[..];
         let mut nid = [0usize; LANES];
         let mut depth = 0u32;

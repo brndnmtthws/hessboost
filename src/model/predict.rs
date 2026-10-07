@@ -267,7 +267,7 @@ impl BoostedModel {
     /// [`HessboostError::IncompatibleModel`] (`outputs`) for a model with
     /// several outputs; use [`Self::transform_margins_into`].
     pub fn transform_margin(&self, margin: f32) -> Result<f32> {
-        self.single_output(self.n_outputs, "transform_margins_into")?;
+        one_value_per_row(self.n_outputs, "transform_margins_into")?;
         let mut value = [margin];
         self.transform().apply(&mut value, 1);
         Ok(value[0])
@@ -295,22 +295,13 @@ impl BoostedModel {
         }
         let transform = self.transform();
         let rows = margins.len() / k;
-        check_len("transformed predictions", out.len(), rows * transform.width(k))?;
+        check_len(
+            "transformed predictions",
+            out.len(),
+            rows * transform.width(k),
+        )?;
         transform.apply_into(margins, out, k);
         Ok(())
-    }
-
-    /// Refuse a model with other than one value per row of what a scalar
-    /// method returns (`width`: its outputs, or its prediction width),
-    /// naming the `_into` method that serves it.
-    fn single_output(&self, width: usize, instead: &str) -> Result<()> {
-        if width == 1 {
-            return Ok(());
-        }
-        Err(HessboostError::incompatible_model(
-            "outputs",
-            format!("the model gives {width} values per row; use `{instead}`"),
-        ))
     }
 
     /// The margin of one row of feature values, for a single-output model:
@@ -320,8 +311,12 @@ impl BoostedModel {
     ///
     /// [`HessboostError::IncompatibleModel`] (`outputs`) for a model with
     /// several outputs, plus the errors of [`Self::predict_margin_row_into`].
-    pub fn predict_margin_row(&self, row: &[f32], iterations: impl Into<Iterations>) -> Result<f32> {
-        self.single_output(self.n_outputs, "predict_margin_row_into")?;
+    pub fn predict_margin_row(
+        &self,
+        row: &[f32],
+        iterations: impl Into<Iterations>,
+    ) -> Result<f32> {
+        one_value_per_row(self.n_outputs, "predict_margin_row_into")?;
         let mut out = [0.0];
         self.predict_margin_row_into(row, iterations, &mut out)?;
         Ok(out[0])
@@ -363,7 +358,7 @@ impl BoostedModel {
     /// [`Self::prediction_width`] is not 1, plus the errors of
     /// [`Self::predict_row_into`].
     pub fn predict_row(&self, row: &[f32], iterations: impl Into<Iterations>) -> Result<f32> {
-        self.single_output(self.prediction_width(), "predict_row_into")?;
+        one_value_per_row(self.prediction_width(), "predict_row_into")?;
         let mut out = [0.0];
         self.predict_row_into(row, iterations, &mut out)?;
         Ok(out[0])
@@ -411,7 +406,11 @@ impl BoostedModel {
     ) -> Result<()> {
         let iterations = self.row_request(row, iterations.into())?;
         let transform = self.transform();
-        check_len("row predictions", out.len(), transform.width(self.n_outputs))?;
+        check_len(
+            "row predictions",
+            out.len(),
+            transform.width(self.n_outputs),
+        )?;
         if let Transform::ClassIndex = transform {
             out[0] = self.row_class(row, iterations) as f32;
         } else {
@@ -473,7 +472,11 @@ impl BoostedModel {
         let k = self.n_outputs;
         if let Some(linear) = &self.linear {
             let base = &self.base_score[outputs.clone()];
-            for ((m, &b), &bias) in out.iter_mut().zip(base).zip(&linear.bias()[outputs.clone()]) {
+            for ((m, &b), &bias) in out
+                .iter_mut()
+                .zip(base)
+                .zip(&linear.bias()[outputs.clone()])
+            {
                 *m = b + bias;
             }
             for (f, &x) in row.iter().enumerate() {
@@ -880,6 +883,19 @@ pub(crate) fn initial_margins(base_score: &[f32], data: &DMatrix) -> Vec<f32> {
             out
         }
     }
+}
+
+/// Refuse a model with other than one value per row of what a scalar method
+/// returns (`width`: its outputs, or its prediction width), naming the
+/// `_into` method that serves it.
+fn one_value_per_row(width: usize, instead: &str) -> Result<()> {
+    if width == 1 {
+        return Ok(());
+    }
+    Err(HessboostError::incompatible_model(
+        "outputs",
+        format!("the model gives {width} values per row; use `{instead}`"),
+    ))
 }
 
 /// Rows per prediction block: the block's feature rows stay in cache while

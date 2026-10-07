@@ -120,11 +120,7 @@ fn cases() -> Vec<Case> {
             ],
             count,
         ),
-        case(
-            "gamma",
-            vec![("objective", json!("reg:gamma"))],
-            positive,
-        ),
+        case("gamma", vec![("objective", json!("reg:gamma"))], positive),
         case(
             "softprob, vector leaves",
             vec![
@@ -176,26 +172,14 @@ fn cases() -> Vec<Case> {
             vec![("objective", json!("dist:normal"))],
             signal,
         ),
-        case(
-            "hinge",
-            vec![("objective", json!("binary:hinge"))],
-            binary,
-        ),
-        case(
-            "linear leaves",
-            vec![("linear_tree", json!(true))],
-            signal,
-        ),
+        case("hinge", vec![("objective", json!("binary:hinge"))], binary),
+        case("linear leaves", vec![("linear_tree", json!(true))], signal),
         case(
             "model shrinkage",
             vec![("model_shrink_rate", json!(0.05))],
             signal,
         ),
-        case(
-            "gblinear",
-            vec![("booster", json!("gblinear"))],
-            signal,
-        ),
+        case("gblinear", vec![("booster", json!("gblinear"))], signal),
         Case {
             targets: 2,
             ..case("label matrix", vec![], signal)
@@ -277,7 +261,11 @@ fn rows_predict_what_every_batch_predicts() {
             model
                 .transform_margins_into(margins.as_slice(), &mut transformed)
                 .unwrap();
-            assert_eq!(bits(&transformed), bits(batch.as_slice()), "{name}: transform");
+            assert_eq!(
+                bits(&transformed),
+                bits(batch.as_slice()),
+                "{name}: transform"
+            );
 
             let (mut row_margins, mut row_values) = (vec![0.0; k], vec![0.0; width]);
             for (r, row) in x.chunks(n_cols).enumerate() {
@@ -293,7 +281,11 @@ fn rows_predict_what_every_batch_predicts() {
                     .predict_margin_row_into(row, iterations, &mut row_margins)
                     .unwrap();
                 let margin = &margins.as_slice()[r * k..(r + 1) * k];
-                assert_eq!(bits(&row_margins), bits(margin), "{name}: margins of row {r}");
+                assert_eq!(
+                    bits(&row_margins),
+                    bits(margin),
+                    "{name}: margins of row {r}"
+                );
 
                 if width == 1 {
                     let value = model.predict_row(row, iterations).unwrap();
@@ -301,7 +293,11 @@ fn rows_predict_what_every_batch_predicts() {
                 }
                 if k == 1 {
                     let m = model.predict_margin_row(row, iterations).unwrap();
-                    assert_eq!(m.to_bits(), margin[0].to_bits(), "{name}: margin of row {r}");
+                    assert_eq!(
+                        m.to_bits(),
+                        margin[0].to_bits(),
+                        "{name}: margin of row {r}"
+                    );
                     let value = model.transform_margin(m).unwrap();
                     assert_eq!(value.to_bits(), want[0].to_bits(), "{name}: row {r}");
                 }
@@ -353,7 +349,10 @@ fn malformed_rows_and_outputs_are_refused() {
         ("row", None)
     );
     // Three probabilities per row: the scalar methods name the `_into` ones.
-    assert_eq!(incompatible_model(model.predict_row(row, Iterations::Best)), "outputs");
+    assert_eq!(
+        incompatible_model(model.predict_row(row, Iterations::Best)),
+        "outputs"
+    );
     assert_eq!(
         incompatible_model(model.predict_margin_row(row, Iterations::Best)),
         "outputs"

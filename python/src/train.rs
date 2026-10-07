@@ -242,11 +242,11 @@ impl CommitGate {
 }
 
 /// Runs `work` on a worker thread, inside the extension's rayon pool, while
-/// the caller, detached, wakes every [`SIGNAL_POLL`] to run the interpreter's signal handlers (only the main
-/// thread's do anything), passing a raised exception (`KeyboardInterrupt`)
-/// to `on_signal`, and answers `gate` with `may_commit` after a signal
-/// check. `work` sees the interruption through its round hook and stops at
-/// the end of the round.
+/// the caller, detached, wakes every [`SIGNAL_POLL`] to run the
+/// interpreter's signal handlers (only the main thread's do anything),
+/// passing a raised exception (`KeyboardInterrupt`) to `on_signal`, and
+/// answers `gate` with `may_commit` after a signal check. `work` sees the
+/// interruption through its round hook and stops at the end of the round.
 fn interruptible<T: Send>(
     py: Python<'_>,
     work: impl FnOnce() -> T + Send,
@@ -274,7 +274,7 @@ fn interruptible<T: Send>(
         }
         worker
             .join()
-            .map_err(|_| PanicException::new_err("the training thread panicked"))
+            .map_err(|_| PanicException::new_err("the training thread panicked"))?
     })
 }
 

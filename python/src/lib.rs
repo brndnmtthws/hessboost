@@ -8,13 +8,12 @@
 //! converts arguments and results and releases the GIL around the work.
 //!
 //! The module declares free-threading support (`gil_used = false`): it has no
-//! `unsafe` code and no global mutable state, and every class is `frozen`.
+//! `unsafe` code, and every class is `frozen`. Its only global state is the
+//! rayon pool native work runs on (`pool`), which a forked child rebuilds.
 //! Models and matrices are immutable and shared read-only between threads;
 //! the Python layer swaps whole objects rather than mutating them. The one
 //! exception, `OnlineModel`, updates in place under a mutex it never waits
-//! for: access during an update fails fast rather than deadlock. Native
-//! work runs on the extension's own rayon pool (`pool`), which a forked
-//! child rebuilds.
+//! for: access during an update fails fast rather than deadlock.
 
 mod booster;
 mod codec;
@@ -35,9 +34,17 @@ mod target_stats;
 mod train;
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 #[pymodule(gil_used = false)]
 fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // A forked child moves to a thread pool of its own (POSIX only).
+    let os = m.py().import("os")?;
+    if os.hasattr("register_at_fork")? {
+        let hooks = PyDict::new(m.py());
+        hooks.set_item("after_in_child", wrap_pyfunction!(pool::after_fork, m)?)?;
+        os.call_method("register_at_fork", (), Some(&hooks))?;
+    }
     m.add_class::<data::DMatrix>()?;
     m.add_class::<params::Params>()?;
     m.add_class::<booster::Booster>()?;

@@ -8,8 +8,7 @@ use crate::error::{HessboostError, Result};
 use crate::objective::AftDistribution;
 use crate::objective::distributional::special::erf_glibc as erf;
 use crate::objective::{
-    GradPair, Loss, MIN_HESS_F64, OutputDomain, check_base_score_domain, inverse_log_link,
-    log_link,
+    GradPair, Loss, MIN_HESS_F64, OutputDomain, check_base_score_domain, inverse_log_link, log_link,
 };
 
 /// Accelerated failure time model (`survival:aft`) on interval-censored

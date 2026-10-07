@@ -60,6 +60,6 @@ impl DetachExt for Python<'_> {
         self,
         f: impl FnOnce() -> Result<T, RustError> + Send + pyo3::marker::Ungil,
     ) -> PyResult<T> {
-        self.detach(|| pool::install(f)).or_raise()
+        self.detach(|| pool::install(f))?.or_raise()
     }
 }

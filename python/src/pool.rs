@@ -2,60 +2,99 @@
 //!
 //! Crate code parallelizes on the current rayon pool. Rayon's global pool
 //! does not survive `os.fork()`: the child has none of its threads, so its
-//! first parallel job waits forever. Every native entry point that may run
-//! rayon work therefore runs inside [`install`] (through
+//! first parallel job would wait forever. Every native entry point that may
+//! run rayon work therefore runs inside [`install`] (through
 //! [`DetachExt::detached`](crate::errors::DetachExt::detached), or directly
-//! in the training worker), on a pool owned by the process that built it:
-//! a process whose id differs from the builder's (a forked child) builds
-//! its own. Stale pools are leaked, never dropped (their threads do not
-//! exist in the child and their internal locks may be held). Pools are
-//! sized like rayon's global pool: `RAYON_NUM_THREADS`, else the CPU count.
+//! in the training worker), on a pool of the current process.
 //!
-//! The pools form a lock-free list of [`OnceBox`] slots (`once_cell`'s
-//! racing cells: a losing initializer drops its value), so no thread can
-//! hold a lock on them at fork time, as one initializing a `std`
-//! `OnceLock`/`LazyLock` would. Installing from a thread outside the
-//! pool hands the closure to a pool thread; work that never touches rayon
-//! detaches with plain `Python::detach` instead.
+//! Every process of a fork lineage keeps its pool in the slot of its fork
+//! generation. Python's fork hook ([`after_fork`], which the module
+//! registers with `os.register_at_fork`) advances the generation in every
+//! forked child, and a process that finds its slot claimed by another
+//! process (one that forked it without Python's hooks) advances it itself.
+//! A process thus only ever initializes a slot it claimed, which no ancestor
+//! touched, so no slot holds a lock or a half-built pool of a thread the fork
+//! left behind; inherited pools are never dropped. Pools are sized like
+//! rayon's global pool: `RAYON_NUM_THREADS`, else the CPU count.
+//!
+//! Installing from a thread outside the pool hands the closure to a pool
+//! thread; work that never touches rayon detaches with plain
+//! `Python::detach` instead.
 
-use once_cell::race::OnceBox;
+use crate::errors::refuse;
+use pyo3::exceptions::PyOSError;
+use pyo3::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-/// One process's pool, followed by the slot of the next process's (a
-/// forked descendant's).
-struct Node {
-    pid: u32,
-    threads: ThreadPool,
-    next: OnceBox<Node>,
+/// Fork generations of one lineage, with a pool slot each.
+const GENERATIONS: usize = 64;
+
+/// One generation's pool and the process that claimed the slot (`0`:
+/// unclaimed; no process has id 0).
+struct Slot {
+    owner: AtomicU32,
+    threads: OnceLock<ThreadPool>,
 }
 
-/// The first pool built in this process or the ancestors it was forked from.
-static POOLS: OnceBox<Node> = OnceBox::new();
+static SLOTS: [Slot; GENERATIONS] = [const {
+    Slot {
+        owner: AtomicU32::new(0),
+        threads: OnceLock::new(),
+    }
+}; GENERATIONS];
 
-/// This process's pool, built on first use. The list's last pool is the
-/// newest; any other was inherited from an ancestor (even one whose
-/// process id this process reuses).
-fn current() -> &'static ThreadPool {
+/// This process's fork generation: the slot of its pool.
+static GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// `os.register_at_fork`'s `after_in_child` hook: a forked child moves to
+/// a slot of its own.
+#[pyfunction]
+pub(crate) fn after_fork() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// This process's pool, built on first use.
+fn current() -> PyResult<&'static ThreadPool> {
     let pid = std::process::id();
-    let mut slot = &POOLS;
     loop {
-        let pool = slot.get_or_init(|| {
-            Box::new(Node {
-                pid,
-                threads: ThreadPoolBuilder::new()
-                    .build()
-                    .expect("failed to start the hessboost thread pool"),
-                next: OnceBox::new(),
-            })
-        });
-        if pool.pid == pid && pool.next.get().is_none() {
-            return &pool.threads;
+        let generation = GENERATION.load(Ordering::Acquire);
+        let slot = SLOTS.get(generation).ok_or_else(|| {
+            refuse(format!(
+                "cannot start a thread pool after {GENERATIONS} nested forks"
+            ))
+        })?;
+        match slot
+            .owner
+            .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {}
+            Err(owner) if owner == pid => {}
+            // Claimed by the process this one was forked from.
+            Err(_) => {
+                let _ = GENERATION.compare_exchange(
+                    generation,
+                    generation + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                continue;
+            }
         }
-        slot = &pool.next;
+        if let Some(threads) = slot.threads.get() {
+            return Ok(threads);
+        }
+        let built = ThreadPoolBuilder::new()
+            .build()
+            .map_err(|error| PyOSError::new_err(format!("cannot start a thread pool: {error}")))?;
+        // A racing thread of this process may initialize the slot first;
+        // its pool serves both, and this one is dropped.
+        return Ok(slot.threads.get_or_init(move || built));
     }
 }
 
 /// Runs `f` inside this process's pool, so its rayon work runs there.
-pub(crate) fn install<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    current().install(f)
+pub(crate) fn install<T: Send>(f: impl FnOnce() -> T + Send) -> PyResult<T> {
+    Ok(current()?.install(f))
 }

@@ -151,7 +151,7 @@ Fix findings rather than suppress them.
 |---|---|
 |`lib.rs`|crate docs ("What's here", "Not implemented"), `prelude`, hidden `internals`|
 |`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams (`stream_key`, `keyed_normal`)|
-|`data/`|`dmatrix` (`DMatrix`; `select_rows` keeps dense storage dense and whole query groups, refusing a selection that splits one; `selected_group_sizes` is that check, also run by `CrossValidation` on every fold), `loaders`, `meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`) over `sort` (float sort keys, radix sort), `ghist` (`GHistIndex`), `target_stats` (public, opt-in; `fit_transform_with_labels` for a separate per-row target)|
+|`data/`|`dmatrix` (`DMatrix`; feature arrays behind `Arc`, shared by clones, copied on write by `dense_values_mut`; `select_rows` keeps dense storage dense and whole query groups, refusing a selection that splits one; `selected_group_sizes` is that check, also run by `CrossValidation` on every fold), `loaders`, `meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`) over `sort` (float sort keys, radix sort), `ghist` (`GHistIndex`), `target_stats` (public, opt-in; `fit_transform_with_labels` for a separate per-row target)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, `loss` (the loss a configuration trains with), parameter enums|
 |`config/groups.rs`|option groups a switch owns: `Dart` (`BoosterKind::Dart`), `Boulevard` (`BoosterKind::Boulevard`), `Ebm` (`BoosterKind::Ebm`), `Refresh` (`ProcessType::Update`), `QuantizedGrad`, `ExtraTrees`, `LinearTree`, `BalancedBagging`, `QueryBagging`, `Langevin`, `ModelShrink` (`Option` fields); each validates when built|
 |`config/mod.rs`|re-exports; the `setter!` macro both builders' plain setters use|

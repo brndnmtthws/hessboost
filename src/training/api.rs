@@ -192,7 +192,8 @@ pub struct TrainResult {
     /// Evaluation history (empty when no eval sets were supplied). Its
     /// iterations are the model's absolute iteration indices, which after
     /// continued training start at the initial model's
-    /// [`num_boost_rounds`](BoostedModel::num_boost_rounds).
+    /// [`num_boost_rounds`](BoostedModel::num_boost_rounds); for
+    /// `booster = ebm` they are EBM rounds ([`Trainer::on_round`]).
     pub history: EvalHistory,
     /// With [`early_stopping_rounds`](Trainer::early_stopping_rounds), the
     /// watched metric's value at the model's
@@ -274,7 +275,8 @@ impl<'a> Trainer<'a> {
 
     /// Evaluate the metrics on `data` after every round, reporting them
     /// under `name` in [`TrainResult::history`]. Call once per eval set; the
-    /// order is kept.
+    /// order is kept. For `booster = ebm` every EBM round of both stages is
+    /// scored (see [`crate::ebm`]).
     #[must_use]
     pub fn eval(mut self, data: &'a DMatrix, name: &'a str) -> Self {
         self.evals.push(EvalSet { data, name });
@@ -299,6 +301,15 @@ impl<'a> Trainer<'a> {
     /// CatBoost's `use_best_model` does: every later iteration rescaled the
     /// earlier ones, so the returned model is the one the run held after the
     /// best iteration, and its `best_iteration` is its last.
+    ///
+    /// A classic `booster = ebm` model is cut back the same way: its rounds
+    /// (counted as [`on_round`](Self::on_round) does, across both stages)
+    /// grow one tree per term each, so the returned model is the one
+    /// training held after the best round (with no pair terms when that is
+    /// a main-effect round), [`TrainResult::best_score`] is its metric, and
+    /// its `best_iteration` is its last tree. It refuses this together with
+    /// per-bag [`Ebm::early_stopping`](crate::config::Ebm::early_stopping),
+    /// and a Boulevard EBM refuses it.
     ///
     /// After [`init_model`](Self::init_model) the early-stopping state starts
     /// fresh; `best_iteration` and the history's iterations are absolute
@@ -386,7 +397,9 @@ impl<'a> Trainer<'a> {
     /// through the main-effect stage and on through the pair stage (up to
     /// `num_boost_round` each, fewer once every bag has early-stopped); a
     /// `Break` keeps the completed rounds (each bag's best ones under
-    /// `ebm_early_stopping_rounds`), a stopped main-effect stage gets no
+    /// `ebm_early_stopping_rounds`; under
+    /// [`early_stopping_rounds`](Self::early_stopping_rounds) the best
+    /// round's model), a stopped main-effect stage gets no
     /// pair terms, and with interactions the result is then not a shorter
     /// run's model.
     ///

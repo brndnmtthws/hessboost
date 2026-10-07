@@ -220,7 +220,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   never by thread. EBM rounds draw from `Rng` keyed by seed, bag, stage,
   and round (bags' rows from SplitMix64 keyed by bag); bags and a Boulevard
   round's per-term trees may grow in parallel and are combined in bag and
-  term order.
+  term order (a classic EBM's trees round by round, a round's bag by bag).
   Quantized histograms sum integers. `rand` stays a dev-dependency.
   `Trainer::on_round` only observes: a hook that always continues leaves
   the model byte-identical, and a `Break` after round `k` gives the
@@ -484,8 +484,11 @@ leaves carry the final `1/B` scale, so exports and SHAP see a plain gbtree
 ensemble, and slices drop the `BoulevardInfo`. `booster = ebm` counts every
 tree as an iteration (`num_boost_round` counts EBM rounds, one tree per term
 each, and caps each stage under `ebm_early_stopping_rounds`, which stops
-every bag on its held-out rows), needs one output, refuses eval sets,
-`Trainer::early_stopping_rounds`, continuation, online updates, column sampling,
+every bag on its held-out rows), needs one output, scores eval sets after
+every EBM round (classic: bit for bit the model through that round),
+early-stops classic EBMs by cutting back to the best round's model
+(`best_iteration` its last tree; refused with `ebm_early_stopping_rounds`),
+refuses continuation, online updates, column sampling,
 interaction constraints, forests, feature weights, and base margins, draws
 each classic tree's rows from its outer bag (by class under balanced
 bagging, by query under query bagging), and calls `on_round` after every round of both stages; `ebm_boulevard` adds

@@ -124,8 +124,9 @@
 //! bagging, since they need a `binary:*` or `rank:*` objective);
 //! residualization with fewer than 80 rows; and non-positive or non-finite
 //! process parameters. `booster = boulevard` and `booster = ebm` train one
-//! label column without early stopping, so their training refuses vector
-//! labels and the early-stopping presets (set `early_stopping` to `None`).
+//! label column, so their training refuses vector labels; Boulevard
+//! averaging (`booster = boulevard`, `ebm_boulevard`) also refuses the
+//! early-stopping presets (set `early_stopping` to `None`).
 //! Sampling refuses a matrix whose feature count differs from the training
 //! data's, or one with base margins.
 //!

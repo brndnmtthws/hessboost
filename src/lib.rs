@@ -207,7 +207,7 @@
 //!     exact integer sums, `f64` chains in the CPU's order outside them),
 //!     with the tree's rows, and for the common objectives the margins and
 //!     gradients, kept on the GPU; the driver and NVRTC load at run time.
-//!     Not yet run on a real GPU ([`backend::cuda`]).
+//!     CPU bit-parity tests pass on an NVIDIA L40S ([`backend::cuda`]).
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,

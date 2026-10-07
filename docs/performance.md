@@ -818,12 +818,21 @@ resident. Other objectives upload gradients per tree; categorical search
 and loss-guided growth read histograms back to the host. CUDA prediction
 is not implemented.
 
-**GPU execution and performance are not yet verified on an L40S.**
-Compiling kernels with NVRTC without a device checks compilation, not
-memory safety, numerical parity, occupancy, or throughput. The 512-thread
-histogram blocks and shared-memory budget are starting configurations,
-not measured optima. Pinned uploads retain completion events before
-reuse or destruction; row readbacks use separate cacheable staging.
+**Required CUDA tests passed on an NVIDIA L40S**, compute capability 8.9,
+driver 595.91.07, on 2026-10-06: 3 lifecycle/fallback regressions and all
+10 CUDA integration tests, with `HESSBOOST_REQUIRE_CUDA=1`. Source and
+kernel checksums matched revision `3c6e5b8`. This verifies the exercised
+CPU bit-parity and determinism cases, not throughput or optimal occupancy.
+The three regressions and resident numeric split/gradient parity scenario
+also passed Compute Sanitizer `memcheck`, `racecheck`, `synccheck`, and
+`initcheck`: zero reported errors, hazards, or warnings in these scenarios.
+Full CUDA integration-suite `memcheck` also passed (10/10, zero errors),
+and histogram construction across all strategies passed `racecheck`
+with zero hazards or warnings.
+Compiling with NVRTC alone does not establish those runtime properties.
+The 512-thread histogram blocks and shared-memory budget remain starting
+configurations, not measured optima. Pinned uploads retain completion
+events before reuse or destruction; row readbacks use separate cacheable staging.
 Partial-histogram waves are capped by currently available device memory.
 
 The local-bin representation keeps both a padded row-major copy and a

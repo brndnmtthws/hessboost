@@ -192,7 +192,7 @@ pub enum Device {
     /// [`backend::cuda`](crate::backend::cuda)): the tree's rows stay on
     /// the GPU, which partitions them and builds the histograms, and for
     /// `reg:squarederror` and the logistic objectives keeps the margins and
-    /// computes the gradients too. Not yet run on a real GPU.
+    /// computes the gradients too. CPU bit-parity tests pass on an L40S.
     Cuda {
         /// The CUDA device ordinal (XGBoost `cuda:<ordinal>`; `0` for
         /// plain `cuda`).

@@ -175,7 +175,7 @@ See [`python/README.md`](python/README.md).
   - [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/): Training controlled by one budget value, based on PerpetualBooster.
   - [Metal GPU](https://docs.rs/hessboost/latest/hessboost/backend/metal/): Apple Silicon GPU prediction and training (`--features metal`).
   - [wgpu GPU](https://docs.rs/hessboost/latest/hessboost/backend/wgpu/): Vulkan, Metal, and DirectX 12 GPU prediction and training through wgpu (`--features wgpu`), bit-identical to the CPU and testable on a software adapter; unmeasured on real GPUs so far.
-  - [CUDA GPU](https://docs.rs/hessboost/latest/hessboost/backend/cuda/): NVIDIA GPU training on Linux (`--features cuda`) with the rows, and for common objectives the margins and gradients, resident on the GPU; bit-identical to the CPU; not yet run on a real GPU.
+  - [CUDA GPU](https://docs.rs/hessboost/latest/hessboost/backend/cuda/): NVIDIA GPU training on Linux (`--features cuda`) with the rows, and for common objectives the margins and gradients, resident on the GPU; CPU bit-parity tests pass on an L40S (see [verification](docs/performance.md#cuda-gpu-linux)).
 
 ## Caveats
 

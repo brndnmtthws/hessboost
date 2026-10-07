@@ -15,6 +15,33 @@
 //! element, or as one flat slice via [`as_slice`](Predictions::as_slice) /
 //! [`into_vec`](Predictions::into_vec).
 //!
+//! A row of feature values predicts without a matrix:
+//! [`predict_row`](BoostedModel::predict_row) /
+//! [`predict_margin_row`](BoostedModel::predict_margin_row) return a
+//! single-output model's value, and
+//! [`predict_row_into`](BoostedModel::predict_row_into) /
+//! [`predict_margin_row_into`](BoostedModel::predict_margin_row_into) write a
+//! row of [`prediction_width`](BoostedModel::prediction_width) (or
+//! [`n_outputs`](BoostedModel::n_outputs)) values into a caller's buffer,
+//! allocating nothing; [`predict_rows`](BoostedModel::predict_rows) /
+//! [`predict_margin_rows`](BoostedModel::predict_margin_rows) read many rows
+//! in place. Every path gives the same bits as [`BoostedModel::predict`] of
+//! any matrix holding the rows: the trees add up in the same order, and the
+//! objective's transform applies to each value (each row, for softmax and
+//! the sorted quantiles) on its own, with XGBoost's scalar `expf`, sigmoid,
+//! and softmax. [`transform_margin`](BoostedModel::transform_margin) and
+//! [`transform_margins_into`](BoostedModel::transform_margins_into) apply that
+//! transform to margins: `predict` is exactly the transform of
+//! `predict_margin`.
+//!
+//! Read-only accessors describe a model without its file formats: its
+//! [`trees`](BoostedModel::trees) (nodes, category sets, leaf vectors and
+//! linear leaves), their [`tree_weights`](BoostedModel::tree_weights), its
+//! [`num_class`](BoostedModel::num_class), a `gblinear` model's
+//! [`linear`](BoostedModel::linear) weights, and the
+//! [`shrinkage`](BoostedModel::shrinkage) record of a model trained with
+//! model shrinkage.
+//!
 //! Every prediction method takes the boosting iterations it uses
 //! ([`Iterations`], XGBoost's `iteration_range`): [`Iterations::Best`] for
 //! the effective iterations (through `best_iteration` after early stopping,

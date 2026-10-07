@@ -83,6 +83,20 @@
 //!   ([`BoostedModel::slice`](model::BoostedModel::slice)), `iteration_range`
 //!   prediction as Rust ranges (every prediction method's
 //!   [`Iterations`](model::Iterations) argument).
+//! - **Prediction:** of a [`DMatrix`], of borrowed dense rows without
+//!   copying them ([`predict_rows`](model::BoostedModel::predict_rows)), and
+//!   of one row without allocating
+//!   ([`predict_row`](model::BoostedModel::predict_row),
+//!   [`predict_row_into`](model::BoostedModel::predict_row_into)), bit for bit
+//!   alike in every batch: each value (each row for softmax and the sorted
+//!   quantiles) is transformed on its own, with XGBoost's scalar `expf`,
+//!   sigmoid, and softmax
+//!   ([`transform_margins_into`](model::BoostedModel::transform_margins_into)).
+//!   Read-only model metadata: tree weights, nodes, and category sets,
+//!   `gblinear` weights, and the model-shrinkage record
+//!   ([`tree_weights`](model::BoostedModel::tree_weights),
+//!   [`RegTree`](tree::RegTree), [`linear`](model::BoostedModel::linear),
+//!   [`shrinkage`](model::BoostedModel::shrinkage)).
 //! - **Tree methods:** `exact`, `hist`, `approx`; `depthwise`/`lossguide`
 //!   growth; uniform or `gradient_based` row sampling; column sampling with
 //!   optional per-feature weights

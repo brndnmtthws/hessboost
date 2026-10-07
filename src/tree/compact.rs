@@ -268,7 +268,7 @@ impl BreadthFirst {
 }
 
 /// Keys (two per feature) [`CompactForest::walk_row`] keeps on the stack;
-/// wider rows key into a heap buffer.
+/// a wider row is keyed value by value as the walk reads it.
 const INLINE_KEYS: usize = 256;
 
 /// A block of dense rows as the batch kernels consume it: the full

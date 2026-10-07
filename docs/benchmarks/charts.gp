@@ -93,21 +93,21 @@ set ytics 25
 
 # --- Pointwise kernels ---------------------------------------------------------
 
-# Three 960px charts, one per kernel kind, so the cluster labels stay
+# Two 960px charts, one per kernel kind, so the cluster labels stay
 # readable when the SVG is scaled down to the page width (renderers scale
 # to the container and never upscale). Cluster titles under the x axis
-# mark the dense rows and the softmax rows (blocks 2 and 3) or the
-# multiclass rows (block 4) of optimization.dat.
+# mark the dense rows and the softmax rows (block 2) or the multiclass
+# rows (block 3) of optimization.dat.
 set bmargin 6
 unset key
-array kname[3]  = ["gradient", "transform", "metric"]
-array ktitle[3] = ["Objective gradient", "Prediction transform", "Metric"]
-array g1text[3] = ["dense", "dense", "dense"]
-array g1x[3]    = [2.0, 0.5, 3.0]
-array g2text[3] = ["softmax, by class count", "softmax, by class count", "multiclass, 32 classes"]
-array g2x[3]    = [7.5, 4.5, 7.5]
+array kname[2]  = ["gradient", "metric"]
+array ktitle[2] = ["Objective gradient", "Metric"]
+array g1text[2] = ["dense", "dense"]
+array g1x[2]    = [2.0, 3.0]
+array g2text[2] = ["softmax, by class count", "multiclass, 32 classes"]
+array g2x[2]    = [7.5, 7.5]
 
-do for [k=1:3] {
+do for [k=1:2] {
     set output sprintf("docs/benchmarks/%s-optimization.svg", kname[k])
     set title sprintf("%s time cut vs scalar baseline\n{/*0.8 one million outputs, single thread, mean of two Criterion run medians}", ktitle[k])
     set label 1 g1text[k] at g1x[k], graph -0.14 center front

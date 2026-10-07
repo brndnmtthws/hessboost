@@ -163,6 +163,9 @@ See [`python/README.md`](python/README.md).
   whole-query ranking folds, per-fold target statistics, continuing a model, and refitting on all
   rows at the chosen round count), early stopping, feature importance,
   SHAP values and interactions, model slicing, and iteration ranges.
+- **Prediction & inspection:** Batch, in-place (borrowed rows), and allocation-free single-row
+  prediction, bit-identical in every batch; read-only model metadata (tree weights and nodes,
+  `gblinear` weights, model-shrinkage records).
 - **Interchange:** Native binary and JSON formats, XGBoost JSON/UBJSON import/export, LightGBM model import, and models embedded in the binary at compile time.
 - **Modern modeling (opt-in):**
   - [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/): Finite-sample coverage guarantees.

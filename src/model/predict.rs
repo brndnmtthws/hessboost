@@ -209,10 +209,10 @@ impl BoostedModel {
     /// encoded as `f32` (the first of equal largest margins, as XGBoost).
     ///
     /// They are the margins of [`Self::predict_margin`] through
-    /// [`Self::transform_margins_into`], which transforms every value (every
-    /// row, for softmax and the sorted quantiles) on its own: a row's
-    /// predictions are bit for bit the same in every batch, including
-    /// [`Self::predict_row`]'s single row.
+    /// [`Self::transform_margins_into`], which transforms each value (each
+    /// row, for softmax and the sorted quantiles) on its own, so a row's
+    /// predictions have the same bits in every batch, the single row of
+    /// [`Self::predict_row`] included.
     ///
     /// # Errors
     ///
@@ -323,12 +323,13 @@ impl BoostedModel {
 
     /// Write the margins of one row of feature values into `out` (one per
     /// output, [`Self::n_outputs`]): `row` holds one value per feature, `NaN`
-    /// for a missing one, as in a matrix from [`DMatrix::from_dense`]. Bit for
-    /// bit that row's [`Self::predict_margin`] in any batch (tree weights,
-    /// model shrinkage, missing-value routing, linear leaves and
-    /// [`Iterations::Best`] included), without building a matrix and without
-    /// allocating once the model's first prediction has laid out its trees.
-    /// The intercepts are the model's: a row has no `base_margin`.
+    /// for a missing one, as in a matrix from [`DMatrix::from_dense`]. The
+    /// margins are that row's [`Self::predict_margin`] in any batch, bit for
+    /// bit (tree weights, model shrinkage, missing-value routing, linear
+    /// leaves, and [`Iterations::Best`] included), computed without building
+    /// a matrix and, once the model's first prediction has laid out its
+    /// trees, without allocating. The intercepts are the model's: a row has
+    /// no `base_margin`.
     ///
     /// # Errors
     ///

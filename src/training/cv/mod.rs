@@ -210,8 +210,8 @@ impl<'a> CrossValidation<'a> {
     /// training a fold fails. An EBM that stops its bags early
     /// ([`Ebm::early_stopping`](crate::config::Ebm::early_stopping)) is refused
     /// ([`HessboostError::InvalidParameter`] `ebm_early_stopping_rounds`):
-    /// each fold would end its stages at a round of its own, so the folds'
-    /// rounds would not line up;
+    /// each fold would end its stages at a different round, so the folds'
+    /// rounds would not line up.
     /// [`early_stopping_rounds`](Self::early_stopping_rounds) stops on the
     /// fold means instead.
     pub fn run(self) -> Result<Vec<CvResult>> {
@@ -220,21 +220,21 @@ impl<'a> CrossValidation<'a> {
 
     /// Cross-validate as [`run`](Self::run) does, then retrain on every row
     /// of `data` for the chosen round count
-    /// ([`CvRefit::num_boost_round`]: the best round's under
+    /// ([`CvRefit::num_boost_round`]: through the best round under
     /// [`early_stopping_rounds`](Self::early_stopping_rounds), else every
     /// round the folds ran). The retraining continues
     /// [`init_model`](Self::init_model) when set and has no eval sets. With
-    /// [`target_stats`](Self::target_stats) it trains on `data` encoded by
+    /// [`target_stats`](Self::target_stats), it trains on `data` encoded by
     /// the encoder fitted on every row (over
-    /// [`target_stats_label`](Self::target_stats_label) when set), returned
-    /// as [`CvRefit::target_encoder`].
+    /// [`target_stats_label`](Self::target_stats_label) when set), which is
+    /// returned as [`CvRefit::target_encoder`].
     ///
-    /// The retraining runs `num_boost_round` rounds stopped through
-    /// [`Trainer::on_round`] after the chosen count, so it is the model of
-    /// training `data` for that many rounds. For `booster = ebm` the count
-    /// is of EBM rounds through both stages (`num_boost_round` still caps
-    /// each stage), so the model is the one after that many rounds of the
-    /// full run.
+    /// The retraining is configured for all `num_boost_round` rounds and
+    /// stopped through [`Trainer::on_round`] after the chosen count, so its
+    /// model equals one trained on `data` for that many rounds. For
+    /// `booster = ebm` the count is of EBM rounds across both stages
+    /// (`num_boost_round` still caps each stage), so the model is the one
+    /// after that many rounds of the full run.
     ///
     /// Fails as `run` does, or when encoding or retraining on `data` fails.
     ///
@@ -307,9 +307,9 @@ impl<'a> CrossValidation<'a> {
         {
             return Err(HessboostError::invalid_param(
                 "ebm_early_stopping_rounds",
-                "cross-validation averages the folds round by round, and stopping each \
-                 fold's bags on its own held-out rows ends its stages at a round of its own; \
-                 stop on the fold means with early_stopping_rounds instead",
+                "cross-validation averages the folds round by round, but stopping each \
+                 fold's bags on its own held-out rows ends the folds' stages at different \
+                 rounds; stop on the fold means with early_stopping_rounds instead",
             ));
         }
         if let Some(labels) = self.target_stats_label {

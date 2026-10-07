@@ -302,14 +302,14 @@ impl<'a> Trainer<'a> {
     /// earlier ones, so the returned model is the one the run held after the
     /// best iteration, and its `best_iteration` is its last.
     ///
-    /// A classic `booster = ebm` model is cut back the same way: its rounds
-    /// (counted as [`on_round`](Self::on_round) does, across both stages)
-    /// grow one tree per term each, so the returned model is the one
-    /// training held after the best round (with no pair terms when that is
-    /// a main-effect round), [`TrainResult::best_score`] is its metric, and
-    /// its `best_iteration` is its last tree. It refuses this together with
-    /// per-bag [`Ebm::early_stopping`](crate::config::Ebm::early_stopping),
-    /// and a Boulevard EBM refuses it.
+    /// A classic `booster = ebm` model is cut back the same way. Each of its
+    /// rounds (counted as [`on_round`](Self::on_round) counts them, across
+    /// both stages) grows one tree per term; the returned model is the one
+    /// the run held after the best round (without pair terms when that is a
+    /// main-effect round), [`TrainResult::best_score`] is its metric, and its
+    /// `best_iteration` is its last tree. An EBM with per-bag
+    /// [`Ebm::early_stopping`](crate::config::Ebm::early_stopping) refuses
+    /// this option, and so does a Boulevard EBM.
     ///
     /// After [`init_model`](Self::init_model) the early-stopping state starts
     /// fresh; `best_iteration` and the history's iterations are absolute

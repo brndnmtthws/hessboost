@@ -168,11 +168,11 @@ class LinearLeavesInfo:
 @dataclass(frozen=True)
 class TreeInfo:
     """One tree of :attr:`ModelInfo.trees` as node-indexed arrays; node 0
-    is the root. A row at internal node ``n`` goes to ``left[n]`` when its
-    value of ``feature[n]`` is missing and ``default_left[n]``, or is
-    present and below ``threshold[n]`` (numerical splits) or one of
-    ``categories[n]`` (categorical splits, comparing its integer code),
-    and to ``right[n]`` otherwise, until a leaf (``left[n] == -1``)."""
+    is the root. At internal node ``n``, a row branches to ``left[n]`` if its
+    value of ``feature[n]`` is missing and ``default_left[n]`` is true, or if
+    it is present and either below ``threshold[n]`` (numerical splits) or
+    contained in ``categories[n]`` (categorical splits by integer code).
+    Otherwise, the row branches to ``right[n]``. Leaves have ``left[n] == -1``."""
 
     left: NDArray[np.int32]
     """Left child of every node, ``-1`` for leaves."""
@@ -513,8 +513,8 @@ class Booster(_SchemaState):
         missing: float = np.nan,
         out: NDArray[np.float32] | None = None,
     ) -> NDArray[np.float32]:
-        """Predicts one row without building a :class:`DMatrix`: bit for
-        bit ``predict(row[None, :], ...)[0]``, for low-latency serving.
+        """Predicts one row for low-latency serving, without building a
+        :class:`DMatrix`: bit for bit ``predict(row[None, :], ...)[0]``.
 
         Args:
             row: One value per feature (``(num_features(),)``, converted to
@@ -524,9 +524,8 @@ class Booster(_SchemaState):
                 predictions.
             iteration_range: As for :meth:`predict` (``None``: through
                 :attr:`best_iteration`).
-            missing: The missing-value marker (default NaN); with another
-                marker, a NaN in ``row`` is refused, as :class:`DMatrix`
-                refuses it.
+            missing: The missing-value marker (default NaN). If set to another
+                value, NaN in ``row`` is rejected as invalid data.
             out: A C-contiguous 1-D ``float32`` array of exactly the result's
                 length, written in place and returned, so no result array is
                 allocated.
@@ -579,10 +578,10 @@ class Booster(_SchemaState):
     def transform_margins(
         self, margins: ArrayLike, *, out: NDArray[np.float32] | None = None
     ) -> NDArray[np.float32]:
-        """The predictions of rows of margins (as
-        ``predict(output_margin=True)`` returns them) by the objective's
-        transform: ``transform_margins(predict(d, output_margin=True))`` is
-        bit for bit ``predict(d)``.
+        """Applies the objective's prediction transform to rows of margins,
+        such as those ``predict(output_margin=True)`` returns:
+        ``transform_margins(predict(d, output_margin=True))`` is bit for bit
+        ``predict(d)``.
 
         Args:
             margins: ``(rows,)`` margins of a single-output model, or
@@ -622,13 +621,13 @@ class Booster(_SchemaState):
         every tree's nodes (see :class:`ModelInfo`), for inspection and
         custom inference without parsing a model file.
 
-        A tree model's margin for output ``k`` is ``base_margins[k]`` plus
-        ``tree_weights[t] * leaf value`` over the trees ``t`` of the
-        iterations used that feed ``k`` (:attr:`ModelInfo.tree_outputs`;
-        every output of a vector-leaf tree), summed in ``float32`` in tree
-        order, a ``linear_tree`` leaf predicting its linear model. A model
-        with :attr:`ModelInfo.shrinkage` instead repeats training's
-        recurrence (see :class:`ShrinkageInfo`).
+        For a tree model, the margin for output ``k`` is ``base_margins[k]``
+        plus ``tree_weights[t] * leaf value`` over the trees ``t`` of the
+        iterations used that feed ``k`` (:attr:`ModelInfo.tree_outputs`; a
+        vector-leaf tree feeds every output), summed in ``float32`` in tree
+        order; a ``linear_tree`` leaf predicts its linear model. A model with
+        :attr:`ModelInfo.shrinkage` instead repeats training's recurrence
+        (see :class:`ShrinkageInfo`).
         """
         fields = self._model.model_info()
         gblinear, shrinkage = fields.pop("gblinear"), fields.pop("shrinkage")

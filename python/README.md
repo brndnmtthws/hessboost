@@ -93,12 +93,12 @@ probability = booster.transform_margin(float(out[0]))
 probabilities = booster.transform_margins(margins)  # == booster.predict(X[800:])
 ```
 
-`booster.model_info()` returns the model's structure as numpy arrays
-(`ModelInfo`: layout, base margins, per-tree weights and outputs, `gblinear`
-and model-shrinkage records, and per tree `TreeInfo` node arrays: children,
-split features, thresholds, categories, leaf values, covers, gains, linear
-leaves), enough to walk the trees and recompute the margins without parsing
-a model file.
+`booster.model_info()` returns the model's structure as numpy arrays, enough
+to walk the trees and recompute the margins without parsing a model file: a
+`ModelInfo` with the layout, base margins, per-tree weights and outputs, and
+the `gblinear` and model-shrinkage records, and per tree a `TreeInfo` of node
+arrays (children, split features, thresholds, categories, leaf values, covers,
+gains, linear leaves).
 
 ### Input data
 
@@ -387,8 +387,8 @@ supports confidence bands on its shapes via
 EBMs take eval sets like any booster: `train(..., evals=[(dvalid, "valid")],
 early_stopping_rounds=5)` records the history and `best_score` (classic
 EBMs stop early on it), and `cv` (with `refit=True` too) cross-validates
-them. `cv` refuses `ebm_early_stopping_rounds`, which would end each fold's
-stages at a round of its own; its `early_stopping_rounds` stops on the fold
+them. `cv` refuses `ebm_early_stopping_rounds`, which would stop each fold's
+stages at different rounds; its `early_stopping_rounds` stops on the fold
 means instead.
 
 ### Boulevard inference

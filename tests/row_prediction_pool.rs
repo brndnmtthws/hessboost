@@ -1,7 +1,7 @@
-//! The row methods run on the calling thread: they never enter rayon, so a
+//! The row methods run on the calling thread and never enter rayon, so a
 //! forked process, whose copy of rayon's global pool has no threads, still
-//! predicts rows outside any pool (as the Python bindings call them). Its
-//! own test binary, since it checks that the process never built rayon's
+//! predicts rows outside any pool, as the Python bindings call them. The test
+//! has its own binary because it checks that the process never built rayon's
 //! global pool.
 
 use hessboost::objective::{Multiclass, Objective};

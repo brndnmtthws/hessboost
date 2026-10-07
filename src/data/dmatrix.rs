@@ -233,10 +233,10 @@ impl DMatrix {
         Self::from_dense_with_missing(data, n_rows, n_cols, f32::NAN)
     }
 
-    /// [`DMatrix::from_dense`] taking ownership of `data` instead of copying
-    /// it: the same validation (a non-empty shape matching `data.len()`,
-    /// every value finite or NaN) and the same matrix, with NaN marking
-    /// missing values.
+    /// Builds the matrix [`DMatrix::from_dense`] builds, taking ownership of
+    /// `data` instead of copying it, after the same checks (a non-empty shape
+    /// matching `data.len()`, every value finite or NaN). NaN marks a missing
+    /// value.
     pub fn from_dense_vec(data: Vec<f32>, n_rows: usize, n_cols: usize) -> Result<Self> {
         check_dense(&data, n_rows, n_cols, f32::NAN)?;
         Ok(Self::new(

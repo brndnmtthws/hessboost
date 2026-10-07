@@ -395,14 +395,14 @@ class CvRefit:
     history: CvHistory
     """The history :func:`cv` returns without ``refit``."""
     booster: Booster
-    """Trained on every row of ``dtrain`` for :attr:`num_boost_round`
-    rounds (continuing ``xgb_model`` when given), as :func:`train` would
-    train it, without eval sets. With ``target_stats`` it was trained on
-    ``dtrain`` encoded by :attr:`target_encoder`, so its encoded columns are
-    numerical."""
+    """The booster trained on every row of ``dtrain`` for
+    :attr:`num_boost_round` rounds (continuing ``xgb_model`` when given), as
+    :func:`train` would train it without eval sets. With ``target_stats``,
+    it was trained on ``dtrain`` encoded by :attr:`target_encoder`, so its
+    encoded columns are numerical."""
     num_boost_round: int
-    """The chosen round count: the best round's under early stopping, else
-    every round the folds ran (the length of every history array)."""
+    """The chosen round count: through the best round under early stopping,
+    else every round the folds ran (the length of each history array)."""
     target_encoder: FittedTargetEncoder | None
     """With ``target_stats``, the encoder fitted on every row of ``dtrain``:
     encode new data with its ``transform`` before predicting with
@@ -524,11 +524,11 @@ def cv(
         :class:`CvRefit` holding that history and the retrained booster.
 
     Raises:
-        HessboostError: The parameters, folds or data are refused,
+        HessboostError: The parameters, folds, or data are refused,
             ``target_stats_label`` is given without ``target_stats`` or with
             the wrong length, ``xgb_model`` is given with ``target_stats``,
             or an EBM stops its bags early (``ebm_early_stopping_rounds``:
-            each fold would end its stages at a round of its own).
+            the folds would end their stages at different rounds).
     """
     if not isinstance(dtrain, DMatrix):
         raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")

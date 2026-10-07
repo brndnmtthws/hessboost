@@ -34,9 +34,10 @@
 //! transform to margins: `predict` is exactly the transform of
 //! `predict_margin`.
 //!
-//! Read-only accessors describe a model without its file formats: its
-//! [`trees`](BoostedModel::trees) (nodes, category sets, leaf vectors and
-//! linear leaves), their [`tree_weights`](BoostedModel::tree_weights), its
+//! Read-only accessors describe the model in memory, so callers never parse
+//! a model file: its [`trees`](BoostedModel::trees) (nodes, category sets,
+//! leaf vectors, and linear leaves), their
+//! [`tree_weights`](BoostedModel::tree_weights), its
 //! [`num_class`](BoostedModel::num_class), a `gblinear` model's
 //! [`linear`](BoostedModel::linear) weights, and the
 //! [`shrinkage`](BoostedModel::shrinkage) record of a model trained with
@@ -882,10 +883,11 @@ impl BoostedModel {
         self.max_delta_step
     }
 
-    /// Number of raw outputs per instance: `num_class` for multiclass, the
-    /// objective's output count otherwise (`1` for every built-in scalar
-    /// objective, [`BoostedModel::n_targets`] for a multi-target model; custom
-    /// objectives may declare more).
+    /// Number of raw outputs (margins) per row: `num_class` for multiclass,
+    /// one per alpha for a `reg:quantileerror` or `reg:expectileerror` alpha
+    /// list, one per natural parameter for `dist:*`,
+    /// [`BoostedModel::n_targets`] for a label matrix, `1` for every other
+    /// built-in objective, and what a custom objective declares.
     #[inline]
     pub fn n_outputs(&self) -> usize {
         self.n_outputs

@@ -224,12 +224,12 @@ Prediction transforms have no vector kernels: each value (each row for
 softmax) goes through XGBoost's scalar `expf`, sigmoid, and softmax, so a
 prediction never depends on the rows predicted with it, and `predict` is bit
 for bit the transform of `predict_margin`. The NEON transforms this replaced
-took 60–77% less time on these cases, but rounded by position in the batch:
-on Neoverse V3, a row predicted alone and inside a batch of 64 differed by one
-ULP in 8 of 64 logistic rows, 37 Poisson rows, and 55 Tweedie rows, and by up
-to two in 62 softprob rows. There, scalar `expf` takes about 2.0 ns per value
-against the kernel's 0.77 ns, next to about 1.3 µs per row for the tree walk
-of 100 depth-six trees (below).
+took 60–77% less time on these cases, but a value's rounding depended on its
+position in the batch: on Neoverse V3, a row predicted alone and inside a
+batch of 64 differed by one ULP in 8 of 64 logistic rows, 37 Poisson rows,
+and 55 Tweedie rows, and by up to two in 62 softprob rows. On that machine,
+scalar `expf` takes about 2.0 ns per value against 0.77 ns for the vector
+kernel, while walking 100 depth-six trees takes about 1.3 µs per row (below).
 
 ### Quantized-gradient training (opt-in)
 
@@ -530,8 +530,9 @@ A `DMatrix` shares its feature values behind an `Arc`, so a clone (Python's
 input is checked 256 values at a time without a branch, and from 2^22 values
 on, checked and copied in parallel 2^18-value blocks. `predict_rows` reads
 borrowed rows without building a matrix; `predict_row` writes one row's
-values without allocating. `select_rows` still copies: 0.15% of a
-cross-validation fold and 0.003% of EBM training, so no row views.
+values without allocating. `select_rows` still copies rows: the copies take
+0.15% of a cross-validation fold's time and 0.003% of EBM training's, too
+little for row views to pay off.
 
 192-core **AWS Neoverse-V3** (Rust 1.99.0, release), 2026-10-07 UTC, busy
 host (load 40–560), best of 7–15 runs; every 97th value `NaN`. Prediction:

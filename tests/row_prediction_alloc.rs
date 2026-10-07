@@ -1,7 +1,7 @@
-//! Row predictions allocate nothing: once a model has laid out its trees
-//! (its first prediction), predicting a row through every row method of
-//! every model kind, and transforming its margins, allocates no memory.
-//! Its own test binary, since it installs a counting global allocator.
+//! Row predictions allocate no heap memory: once a model's first prediction
+//! has laid out its trees, predicting a row through every row method of
+//! every model kind, and transforming its margins, allocates nothing. The
+//! test has its own binary because it installs a counting global allocator.
 
 use hessboost::prelude::*;
 use serde_json::{Value, json};

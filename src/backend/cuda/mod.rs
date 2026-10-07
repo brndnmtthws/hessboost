@@ -100,8 +100,8 @@ use crate::tree::hist::{
     RowEngine, RowRule, RowSplit, ScanRequest, Segment, SumOrder, sum_order, zeroed,
 };
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
-    DriverError, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits, sys,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
+    DeviceRepr, DriverError, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits, sys,
 };
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -111,9 +111,9 @@ use std::sync::{Arc, Mutex};
 const THREADS: u32 = 256;
 /// Grid-stride kernels launch at most this many blocks per SM.
 const BLOCKS_PER_SM: u32 = 8;
-/// Threads per histogram block (`HIST_THREADS` in `kernels.cu`). Smaller
-/// blocks than XGBoost's 1024 keep several resident per SM, so one block's
-/// shared-memory flush overlaps another's gathers (measured on an L40S).
+/// Threads per histogram block (`HIST_THREADS` in `kernels.cu`). A starting
+/// point for occupancy tuning; actual residency also depends on registers
+/// and shared memory and must be measured on the target GPU.
 const HIST_THREADS: u32 = 512;
 /// Rows per partition tile (`PART_TILE` in `kernels.cu`).
 const PART_TILE: usize = 4096;
@@ -135,18 +135,22 @@ const MIN_DRIVER: i32 = 12_080;
 /// Most nodes one reduction launch covers (a grid's `y` limit).
 const MAX_GRID_Y: usize = 65_535;
 
-/// Whether CUDA device 0 is available: the driver and NVRTC load, the
-/// device exists, and the kernels compile for it.
+/// Whether CUDA device 0 is available and has not suffered a runtime error.
 #[must_use]
 pub fn available() -> bool {
-    device(0).is_ok()
+    unavailable_reason().is_none()
 }
 
-/// Why CUDA device 0 is unavailable (no driver, no NVRTC, no device, or a
-/// kernel compile failure), for diagnostics; `None` when it is available.
+/// Why CUDA device 0 is unavailable, including a sticky runtime failure.
 #[must_use]
 pub fn unavailable_reason() -> Option<String> {
-    device(0).err()
+    match device(0) {
+        Ok(opened) if opened.failed.load(Ordering::Acquire) => {
+            Some("CUDA device 0 disabled after a runtime error".into())
+        }
+        Ok(_) => None,
+        Err(reason) => Some(reason),
+    }
 }
 
 /// The name of CUDA device 0, if it is available (for diagnostics and
@@ -586,6 +590,7 @@ struct State {
     pin_grad: Option<Pinned<f32>>,
     pin_out: Option<Pinned<f64>>,
     pin_rows: Option<Pinned<u32>>,
+    pin_row_upload: Option<Pinned<u32>>,
     /// Resident growth: the histogram slots (two `f64`s per bin per slot)
     /// and how many it holds.
     pool: CudaSlice<f64>,
@@ -604,7 +609,10 @@ struct State {
 struct Pinned<T> {
     ptr: std::ptr::NonNull<T>,
     len: usize,
-    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    completion: CudaEvent,
+    pending: bool,
+    write_combined: bool,
 }
 
 // SAFETY: plain host memory owned by this value, accessed through `&self`
@@ -613,18 +621,22 @@ unsafe impl<T: Send> Send for Pinned<T> {}
 // SAFETY: as above.
 unsafe impl<T: Sync> Sync for Pinned<T> {}
 
-impl<T: Copy> Pinned<T> {
-    /// `len` zeroed elements (`T` must be valid all-zero, as the plain
-    /// numbers used here are). `write_combined` suits buffers the host only
-    /// writes and the device only reads.
+impl<T: Copy + ValidAsZeroBits> Pinned<T> {
+    /// `len` zeroed elements. Write-combined memory is for uploads only;
+    /// readbacks use cacheable memory.
     fn new(
-        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
         len: usize,
         write_combined: bool,
     ) -> std::result::Result<Self, DriverError> {
+        let ctx = stream.context();
         ctx.bind_to_thread()?;
+        let completion = ctx.new_event(None)?;
         let len = len.max(1);
-        let bytes = len * std::mem::size_of::<T>();
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .filter(|&bytes| isize::try_from(bytes).is_ok())
+            .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
         let flags = if write_combined {
             sys::CU_MEMHOSTALLOC_WRITECOMBINED
         } else {
@@ -641,8 +653,20 @@ impl<T: Copy> Pinned<T> {
         Ok(Pinned {
             ptr,
             len,
-            ctx: ctx.clone(),
+            stream: stream.clone(),
+            completion,
+            pending: false,
+            write_combined,
         })
+    }
+
+    /// Wait only for this buffer's last upload before host reuse.
+    fn wait(&mut self) -> std::result::Result<(), DriverError> {
+        if self.pending {
+            self.completion.synchronize()?;
+            self.pending = false;
+        }
+        Ok(())
     }
 
     fn as_slice(&self) -> &[T] {
@@ -658,25 +682,30 @@ impl<T: Copy> Pinned<T> {
 
 impl<T> Drop for Pinned<T> {
     fn drop(&mut self) {
-        // Every copy touching the buffer was synchronized before its call
-        // returned, so nothing reads or writes it any more.
-        let _ = self.ctx.bind_to_thread();
-        // SAFETY: allocated by `malloc_host`, freed once.
-        let _ = unsafe { cudarc::driver::result::free_host(self.ptr.as_ptr().cast()) };
+        // Drain even on an error exit before an upload's event was recorded.
+        // If CUDA cannot establish completion, leak rather than free memory
+        // that the DMA engine may still access.
+        if self.stream.synchronize().is_ok() {
+            // SAFETY: allocated by `malloc_host`, freed once after all DMA.
+            let _ = unsafe { cudarc::driver::result::free_host(self.ptr.as_ptr().cast()) };
+        }
     }
 }
 
 /// A pinned buffer of at least `len` elements in `slot`.
-fn pinned<'a, T: Copy>(
+fn pinned<'a, T: Copy + ValidAsZeroBits>(
     stream: &Arc<CudaStream>,
     slot: &'a mut Option<Pinned<T>>,
     len: usize,
     write_combined: bool,
 ) -> std::result::Result<&'a mut Pinned<T>, DriverError> {
-    if slot.as_ref().is_none_or(|p| p.len < len) {
+    if slot
+        .as_ref()
+        .is_none_or(|p| p.len < len || p.write_combined != write_combined)
+    {
         *slot = None;
         *slot = Some(Pinned::new(
-            stream.context(),
+            stream,
             len.next_power_of_two(),
             write_combined,
         )?);
@@ -685,10 +714,9 @@ fn pinned<'a, T: Copy>(
 }
 
 /// Copy `src` into `dst`'s front through the pinned buffer `staging`, in
-/// pieces: the host fills piece `k + 1` (in parallel) while the DMA engine
-/// moves piece `k`. Asynchronous: the caller synchronizes before `staging`
-/// is reused.
-fn upload_pinned<T: Copy + Send + Sync + DeviceRepr>(
+/// pieces: the host fills piece `k + 1` while DMA moves piece `k`. Record
+/// completion on the owner before returning; host reuse waits on that event.
+fn upload_pinned<T: Copy + Send + Sync + DeviceRepr + ValidAsZeroBits>(
     stream: &Arc<CudaStream>,
     staging: &mut Pinned<T>,
     src: &[T],
@@ -696,29 +724,44 @@ fn upload_pinned<T: Copy + Send + Sync + DeviceRepr>(
 ) -> std::result::Result<(), DriverError> {
     /// Bytes per DMA piece.
     const PIECE_BYTES: usize = 8 << 20;
+    stream.context().bind_to_thread()?;
+    staging.wait()?;
     assert!(src.len() <= staging.len && src.len() <= dst.len());
     let piece = (PIECE_BYTES / std::mem::size_of::<T>()).max(1);
     let (base, _record) = dst.device_ptr_mut(stream);
-    let host = &mut staging.as_mut_slice()[..src.len()];
-    for (k, (h, s)) in host.chunks_mut(piece).zip(src.chunks(piece)).enumerate() {
-        h.par_chunks_mut(1 << 16)
-            .zip(s.par_chunks(1 << 16))
-            .for_each(|(a, b)| a.copy_from_slice(b));
-        let offset = (k * piece * std::mem::size_of::<T>()) as u64;
-        // SAFETY: `h` is pinned host memory that stays untouched until the
-        // caller synchronizes; the destination range lies within `dst`.
-        unsafe { cudarc::driver::result::memcpy_htod_async(base + offset, h, stream.cu_stream()) }?;
+    let copied = (|| {
+        let host = &mut staging.as_mut_slice()[..src.len()];
+        for (k, (h, s)) in host.chunks_mut(piece).zip(src.chunks(piece)).enumerate() {
+            h.par_chunks_mut(1 << 16)
+                .zip(s.par_chunks(1 << 16))
+                .for_each(|(a, b)| a.copy_from_slice(b));
+            let offset = (k * piece * std::mem::size_of::<T>()) as u64;
+            // SAFETY: disjoint pinned pieces remain owned and untouched until
+            // completion; the destination range lies within `dst`.
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(base + offset, h, stream.cu_stream())
+            }?;
+        }
+        staging.completion.record(stream)
+    })();
+    if copied.is_ok() {
+        staging.pending = true;
+    } else {
+        // Earlier pieces may still be in flight even if a later enqueue fails.
+        let _ = stream.synchronize();
     }
-    Ok(())
+    copied
 }
 
 /// Copy `len` elements from `src`'s front into `staging` and wait for them.
-fn download_pinned<'a, T: Copy + DeviceRepr>(
+fn download_pinned<'a, T: Copy + DeviceRepr + ValidAsZeroBits>(
     stream: &Arc<CudaStream>,
     staging: &'a mut Pinned<T>,
     src: &CudaSlice<T>,
     len: usize,
 ) -> std::result::Result<&'a [T], DriverError> {
+    stream.context().bind_to_thread()?;
+    staging.wait()?;
     assert!(len <= staging.len && len <= src.len());
     if len > 0 {
         let (ptr, _record) = src.device_ptr(stream);
@@ -741,13 +784,13 @@ fn download_pinned<'a, T: Copy + DeviceRepr>(
 /// [`device = cuda`](crate::config::TrainingParams::device); constructing it
 /// directly serves custom training loops against a [`GHistIndex`]. Its
 /// histograms equal the CPU backend's bit for bit. `build` must receive the
-/// index the backend was built from, and the gradient slice must not change
-/// between `prepare` and the tree's last `build`; inputs that do not fit
-/// the backend's buffers (another index shape, a gradient slice of another
-/// length, row indices past the index) never reach the GPU and take the
-/// CPU path, which checks them.
+/// index the backend was built from (or a clone), and the gradient slice
+/// must not change between `prepare` and the tree's last `build`. A different
+/// index, a gradient slice of another length, or row indices past the index
+/// never reach the GPU and take the CPU path, which checks them.
 pub struct CudaHistBackend {
     device: Arc<Device>,
+    index_identity: u32,
     n_rows: usize,
     n_cols: usize,
     total_bins: usize,
@@ -920,6 +963,7 @@ impl CudaHistBackend {
         }
         let state = Self::upload(&device, index).map_err(gpu_error)?;
         Ok(CudaHistBackend {
+            index_identity: index.identity(),
             n_rows,
             n_cols,
             total_bins,
@@ -1062,6 +1106,7 @@ impl CudaHistBackend {
             pin_grad: None,
             pin_out: None,
             pin_rows: None,
+            pin_row_upload: None,
             pool: stream.alloc_zeros(2)?,
             pool_slots: 0,
             scan_tasks: alloc_u32(4)?,
@@ -1072,12 +1117,9 @@ impl CudaHistBackend {
         })
     }
 
-    /// Whether `ghist` is the index the backend was built from (by shape).
+    /// The uploaded index's immutable identity (also valid after moves/clones).
     fn fits(&self, ghist: &GHistIndex) -> bool {
-        ghist.n_rows() == self.n_rows
-            && ghist.n_cols() == self.n_cols
-            && ghist.total_bins() == self.total_bins
-            && ghist.dense_stride().is_some() == self.dense
+        ghist.identity() == self.index_identity
     }
 
     /// Lock the device state, unless the device has failed.
@@ -1260,6 +1302,31 @@ impl CudaHistBackend {
         Ok(())
     }
 
+    /// Reserve only the partials this batch needs, capped by a quarter of
+    /// currently free memory. Smaller waves keep the same reduction order.
+    fn partial_wave(
+        &self,
+        state: &mut State,
+        chunks: usize,
+    ) -> std::result::Result<usize, DriverError> {
+        let words = self.total_bins * 2;
+        let requested = chunks.min(state.wave_slots).max(1);
+        if state.partials.len() / words >= requested {
+            return Ok(requested);
+        }
+        let stream = &self.device.stream;
+        stream.context().bind_to_thread()?;
+        let (free, _) = cudarc::driver::result::mem_get_info()?;
+        let held = state.partials.len() / words;
+        let budget = (free / 4 / (words * 8)).max(held).max(1);
+        let wave = requested.min(budget);
+        if held < wave {
+            // Exact capacity: power-of-two growth could exceed the budget.
+            state.partials = stream.alloc_zeros(wave * words)?;
+        }
+        Ok(wave)
+    }
+
     /// The histograms of `nodes` (`(rows of source, contiguous)`), reading
     /// rows from `source` (an upload's host copy feeds CPU-built nodes).
     /// With `targets`, node
@@ -1382,14 +1449,12 @@ impl CudaHistBackend {
                 })
             })
             .collect();
-        if !chunk_list.is_empty() {
-            fit(
-                stream,
-                &mut state.partials,
-                state.wave_slots.min(chunk_list.len()) * bins * 2,
-            )?;
-        }
-        for wave in chunk_list.chunks(state.wave_slots) {
+        let wave_slots = if chunk_list.is_empty() {
+            1
+        } else {
+            self.partial_wave(state, chunk_list.len())?
+        };
+        for wave in chunk_list.chunks(wave_slots) {
             let tiles: Vec<u64> = wave
                 .iter()
                 .enumerate()
@@ -1434,12 +1499,7 @@ impl CudaHistBackend {
         // Strategy 3: `f64` chains, one thread per (chunk, feature).
         for &(_, seg, seg_rows, slot) in &chains {
             let segs = seg.len.div_ceil(seg_rows);
-            let wave_chunks = state.wave_slots;
-            fit(
-                stream,
-                &mut state.partials,
-                wave_chunks.min(segs) * bins * 2,
-            )?;
+            let wave_chunks = self.partial_wave(state, segs)?;
             for (w, first) in (0..segs).step_by(wave_chunks).enumerate() {
                 let wave = wave_chunks.min(segs - first);
                 let begin = seg.offset + first * seg_rows;
@@ -1511,6 +1571,7 @@ impl CudaHistBackend {
                     &state.tree_rows.slice(seg.offset..seg.offset + seg.len),
                     &mut rows,
                 )?;
+                stream.synchronize()?;
                 rows
             };
             let mut hist = zeroed(bins);
@@ -1808,11 +1869,8 @@ impl RowEngine for CudaHistBackend {
             }
             _ => {
                 let state = &mut *state;
-                pinned(stream, &mut state.pin_rows, rows.len(), true).and_then(|staging| {
-                    upload_pinned(stream, staging, rows, &mut state.tree_rows)?;
-                    // The staging buffer is reused by the leaf-row download.
-                    stream.synchronize()
-                })
+                pinned(stream, &mut state.pin_row_upload, rows.len(), true)
+                    .and_then(|staging| upload_pinned(stream, staging, rows, &mut state.tree_rows))
             }
         };
         self.ok(placed)?;
@@ -1968,6 +2026,10 @@ impl RowEngine for CudaHistBackend {
         let stream = &self.device.stream;
         let loaded = stream.clone_htod(margins);
         state.margins = Some(self.ok(loaded)?);
+        // A fresh margin run may reuse the same host allocation with new
+        // labels or weights; addresses are only stable within a run.
+        state.labels = None;
+        state.weights = None;
         Some(())
     }
 
@@ -2340,5 +2402,137 @@ impl RowEngine for CudaHistBackend {
                 .map(|&[grad, hess]| GradStats::new(grad, hess))
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::DMatrix;
+    use crate::data::quantile::HistCuts;
+
+    fn backend() -> Option<(GHistIndex, CudaHistBackend)> {
+        if let Some(reason) = unavailable_reason() {
+            assert!(
+                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
+                "CUDA required: {reason}"
+            );
+            eprintln!("skipping CUDA regression: {reason}");
+            return None;
+        }
+        let values: Vec<f32> = (0..20_000).map(|r| (r % 5) as f32).collect();
+        let data = DMatrix::from_dense(&values, values.len(), 1).unwrap();
+        let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256));
+        let backend = CudaHistBackend::new(&index, 0).unwrap();
+        Some((index, backend))
+    }
+
+    fn bits(hist: &[GradStats]) -> Vec<[u64; 2]> {
+        hist.iter()
+            .map(|p| [p.grad.to_bits(), p.hess.to_bits()])
+            .collect()
+    }
+
+    #[test]
+    fn repeated_prepare_and_cross_thread_use_keep_latest_gradients() {
+        let Some((index, backend)) = backend() else {
+            return;
+        };
+        let first = vec![GradPair::new(1.0, 1.0); index.n_rows()];
+        let second: Vec<_> = (0..index.n_rows())
+            .map(|r| GradPair::new((r % 7) as f32 - 3.0, 2.0))
+            .collect();
+        backend.prepare(&index, &first);
+        backend.prepare(&index, &second);
+        let rows: Vec<u32> = (0..index.n_rows() as u32).collect();
+        let mut expected = zeroed(index.total_bins());
+        CpuBackend.build(&index, &rows, &second, &mut expected);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    backend.prepare(&index, &first);
+                    backend.prepare(&index, &second);
+                    let mut actual = zeroed(index.total_bins());
+                    backend.build(&index, &rows, &second, &mut actual);
+                    assert_eq!(bits(&actual), bits(&expected));
+                    assert_eq!(backend.node_counts().cpu_nodes, 0);
+                })
+                .join()
+                .unwrap();
+        });
+        // Drop with the last pinned upload still in flight.
+        backend.prepare(&index, &first);
+        drop(backend);
+        assert!(available(), "{:?}", unavailable_reason());
+    }
+
+    #[test]
+    fn resident_nonfinite_fallback_waits_for_downloaded_rows() {
+        let Some((index, backend)) = backend() else {
+            return;
+        };
+        let mut pairs: Vec<_> = (0..index.n_rows())
+            .map(|r| GradPair::new((r % 7) as f32 - 3.0, 1.0))
+            .collect();
+        pairs[0].grad = f32::NAN;
+        let rows: Vec<u32> = (1..index.n_rows() as u32).step_by(2).collect();
+        backend.prepare(&index, &pairs);
+        let root = backend.begin_tree(&index, &rows).unwrap();
+        let split = RowSplit {
+            seg: root,
+            feature: 0,
+            rule: RowRule::Below(2),
+            default_left: false,
+        };
+        let children = backend.partition(&index, &[split]).unwrap()[0];
+        let segments = [root, children.left, children.right];
+        let hists = backend.histograms(&index, Some(&pairs), &segments).unwrap();
+        let actual_rows = backend.rows(&segments).unwrap();
+        let (fs, fe) = index.cuts().feature_bins(0);
+        let wanted_left: Vec<u32> = rows
+            .iter()
+            .copied()
+            .filter(|&r| index.feature_bin(r as usize, fs, fe).unwrap() < 2)
+            .collect();
+        let wanted_right: Vec<u32> = rows
+            .iter()
+            .copied()
+            .filter(|&r| index.feature_bin(r as usize, fs, fe).unwrap() >= 2)
+            .collect();
+        assert_eq!(actual_rows[1], wanted_left);
+        assert_eq!(actual_rows[2], wanted_right);
+        for (hist, rows) in hists.iter().zip(&actual_rows) {
+            let mut expected = zeroed(index.total_bins());
+            CpuBackend.build(&index, rows, &pairs, &mut expected);
+            assert_eq!(bits(hist), bits(&expected));
+        }
+        assert!(available(), "{:?}", unavailable_reason());
+    }
+
+    #[test]
+    fn fresh_margin_run_refreshes_labels_and_weights_in_place() {
+        let Some((index, backend)) = backend() else {
+            return;
+        };
+        let margins = vec![0.0; index.n_rows()];
+        let mut labels = vec![1.0; index.n_rows()];
+        let mut weights = vec![1.0; index.n_rows()];
+        let loss = DeviceLoss::SquaredError {
+            scale_pos_weight: 1.0,
+        };
+        backend.load_margins(&margins).unwrap();
+        assert_eq!(backend.gradients(loss, &labels, Some(&weights)), Some(true));
+        labels.fill(3.0);
+        weights.fill(2.0);
+        backend.load_margins(&margins).unwrap();
+        assert_eq!(backend.gradients(loss, &labels, Some(&weights)), Some(true));
+        let rows: Vec<u32> = (0..index.n_rows() as u32).collect();
+        let root = backend.begin_tree(&index, &rows).unwrap();
+        let total = backend.root_total(root).unwrap();
+        assert_eq!(
+            total,
+            GradStats::new(-6.0 * index.n_rows() as f64, 2.0 * index.n_rows() as f64)
+        );
+        assert!(available(), "{:?}", unavailable_reason());
     }
 }

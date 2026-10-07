@@ -167,13 +167,14 @@ pub trait RowEngine: Sync {
     /// The row ids of each segment.
     fn rows(&self, segs: &[Segment]) -> Option<Vec<Vec<u32>>>;
 
-    /// Keep `margins` (one per row) on the device for device-side rounds.
+    /// Start a margin run, invalidating any cached labels and weights.
     fn load_margins(&self, margins: &[f32]) -> Option<()>;
 
     /// Stage `loss`'s gradients of the device margins for the next tree,
     /// exactly as the host computes them: whether they are all finite (a
     /// tree with non-finite gradients, or rows the device cannot reproduce,
-    /// must grow on the host).
+    /// must grow on the host). Labels and weights must stay immutable
+    /// until the next [`Self::load_margins`] call.
     fn gradients(&self, loss: DeviceLoss, labels: &[f32], weights: Option<&[f32]>) -> Option<bool>;
 
     /// Add each leaf's value to the device margins of its rows.

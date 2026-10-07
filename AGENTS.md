@@ -270,6 +270,11 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   only the gradients whose host kernel they reproduce operation for
   operation. Non-finite gradients, inputs that do not fit, and every tree
   after a CUDA error run on the CPU.
+  Pinned uploads retain a completion event through reuse and destruction;
+  upload and readback staging have separate cache modes. The uploaded
+  binned index is matched by immutable identity (moves and clones retain
+  it), not aggregate shape. A fresh margin run invalidates cached labels
+  and weights. GPU parity tests reject sticky runtime fallback.
 - **CPU summation order:** `tree::hist::sum_order` depends on a node's row
   count alone (a chain below 8,192 rows, else `len / 4096` blocks reduced
   in block order), for every index layout, the feature sweeps, and the

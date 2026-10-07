@@ -363,6 +363,15 @@ fn mismatched_inputs_match_the_cpu_backend() {
     };
     assert!(refused(&CpuBackend));
     assert!(refused(&backend));
+    // Same dimensions and cut count, but different bin contents: the
+    // uploaded index must not be reused, even though its shape matches.
+    let other_data: Vec<f32> = (0..n).map(|r| ((r + 1) % 5) as f32).collect();
+    let other = DMatrix::from_dense(&other_data, n, 1).unwrap();
+    let other = GHistIndex::from_dmatrix(&other, HistCuts::from_dmatrix(&other, 256));
+    let expected = histogram(&CpuBackend, &other, &rows, gpair);
+    assert_ne!(expected, histogram(&CpuBackend, &index, &rows, gpair));
+    assert_eq!(histogram(&backend, &other, &rows, gpair), expected);
+    assert!(cuda::available(), "{:?}", cuda::unavailable_reason());
 }
 
 /// `device = cuda` training reproduces single-threaded CPU training bit for
@@ -520,6 +529,11 @@ fn device_cuda_training_matches_single_threaded_cpu() {
                 .unwrap()
         };
         assert_eq!(train_one(&cpu), train_one(&gpu), "{name}");
+        assert!(
+            cuda::available(),
+            "{name}: {:?}",
+            cuda::unavailable_reason()
+        );
     }
 }
 
@@ -600,6 +614,11 @@ fn device_cuda_resident_search_matches_single_threaded_cpu() {
                 .unwrap()
         };
         assert_eq!(train_one(&cpu), train_one(&gpu), "{name}");
+        assert!(
+            cuda::available(),
+            "{name}: {:?}",
+            cuda::unavailable_reason()
+        );
     }
 }
 
@@ -651,6 +670,11 @@ fn device_cuda_training_matches_cpu_at_scale() {
                 .unwrap()
         };
         assert_eq!(bytes(&cpu), bytes(&gpu), "{name}");
+        assert!(
+            cuda::available(),
+            "{name}: {:?}",
+            cuda::unavailable_reason()
+        );
     }
 }
 
@@ -681,6 +705,7 @@ fn device_cuda_training_is_deterministic() {
     };
     assert_eq!(run(1), run(1));
     assert_eq!(run(1), run(4));
+    assert!(cuda::available(), "{:?}", cuda::unavailable_reason());
 }
 
 /// Training on a device ordinal that does not exist fails with a GPU error

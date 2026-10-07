@@ -5,7 +5,7 @@ use super::dart::{dart_new_tree_weight, finish_dart, round_gradients, round_rng,
 use super::margins::{MarginCaches, TreeOutput};
 use super::prepare::{Prepared, TrainContext, TreeSample, approx_index};
 use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
-use crate::config::{BoosterKind, Device, Refresh, SamplingMethod, TrainingParams};
+use crate::config::{BoosterKind, Device, GrowPolicy, Refresh, SamplingMethod, TrainingParams};
 use crate::data::ghist::GHistIndex;
 use crate::error::Result;
 use crate::model::BoostedModel;
@@ -64,6 +64,10 @@ fn device_round_applies(run: &TrainContext, state: &RoundState) -> Option<Device
         && dtrain.n_targets() == 1
         && params.num_parallel_tree == 1
         && params.booster == BoosterKind::GbTree
+        && matches!(
+            params.grow_policy,
+            GrowPolicy::DepthWise | GrowPolicy::LossGuide
+        )
         && params.sampling_method == SamplingMethod::Uniform
         && params.subsample >= 1.0
         && params.balanced_bagging.is_none()

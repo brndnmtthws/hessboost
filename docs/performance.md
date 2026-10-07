@@ -809,6 +809,48 @@ cargo bench --features wgpu --bench training -- wgpu
 cargo run --release --features wgpu --example wgpu
 ```
 
+## CUDA GPU (Linux)
+
+The `cuda` feature keeps rows on the device and batches depthwise
+histogram construction and numeric split search by level. Squared-error
+and eligible logistic rounds also keep training margins and gradients
+resident. Other objectives upload gradients per tree; categorical search
+and loss-guided growth read histograms back to the host. CUDA prediction
+is not implemented.
+
+**GPU execution and performance are not yet verified on an L40S.**
+Compiling kernels with NVRTC without a device checks compilation, not
+memory safety, numerical parity, occupancy, or throughput. The 512-thread
+histogram blocks and shared-memory budget are starting configurations,
+not measured optima. Pinned uploads retain completion events before
+reuse or destruction; row readbacks use separate cacheable staging.
+Partial-histogram waves are capped by currently available device memory.
+
+The local-bin representation keeps both a padded row-major copy and a
+feature-major copy. Sparse CSR input is expanded into these dense copies:
+size GPU and host memory for `rows * features`, not just nonzero entries.
+Resident split scans return per-feature winners, not just one winner per
+node, and partitioning needs a left-count readback before child work can
+be scheduled. Profile these transfers and host synchronization in Nsight
+Systems before assuming one synchronization per level. Host evaluation
+sets and logistic scalar tails can add more synchronization.
+
+On the target instance, require the device tests so missing CUDA cannot
+pass vacuously:
+
+```sh
+HESSBOOST_REQUIRE_CUDA=1 cargo test --release --features cuda --lib backend::cuda::tests -- --test-threads=1
+HESSBOOST_REQUIRE_CUDA=1 cargo test --release --features cuda --test cuda -- --test-threads=1
+cargo bench --features cuda --bench training -- cuda
+```
+
+Run the test binaries under Compute Sanitizer's `memcheck` and `racecheck`
+before publishing speedups. Compare end-to-end training against the CPU
+and XGBoost CUDA on the same instance, including dataset preparation and
+transfers; report kernel timing separately. CUDA runtime errors disable
+the device and preserve CPU fallback, but the parity tests explicitly
+reject this fallback as evidence of successful CUDA execution.
+
 ## Reproduce the measurements
 
 Benchmarks live in [`benches/training.rs`](../benches/training.rs). Run the

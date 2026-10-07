@@ -14,6 +14,9 @@ use crate::data::quantile::{BinSearch, HistCuts};
 use rayon::prelude::*;
 use std::ops::Range;
 
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+static NEXT_IDENTITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 /// Backing storage for bin indices, in the narrowest width that fits.
 #[derive(Debug, Clone)]
 enum BinStore {
@@ -96,6 +99,9 @@ pub enum Bins<'a> {
 /// checks. `from_dmatrix` is the only constructor and verifies this.
 #[derive(Debug, Clone)]
 pub struct GHistIndex {
+    /// Immutable content identity, retained by clones and across moves.
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    identity: u32,
     n_rows: usize,
     n_cols: usize,
     row_ptr: Vec<usize>,
@@ -210,6 +216,14 @@ impl GHistIndex {
         };
 
         GHistIndex {
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            identity: NEXT_IDENTITY
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |id| id.checked_add(1),
+                )
+                .expect("binned index identity exhausted"),
             n_rows,
             n_cols,
             row_ptr,
@@ -218,6 +232,11 @@ impl GHistIndex {
             cuts,
             dense,
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    pub(crate) fn identity(&self) -> u32 {
+        self.identity
     }
 
     /// Number of rows.

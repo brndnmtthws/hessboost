@@ -2,7 +2,7 @@
 //! per-bag early stopping on held-out rows.
 
 use super::fast::fast_pairs;
-use super::{EBM_BAG_SALT, EBM_SALT, Grown, Hook, Term, gradients, grow, parallel};
+use super::{EBM_BAG_SALT, EBM_SALT, Grown, GrownTree, Hook, Term, gradients, grow, parallel};
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -11,7 +11,6 @@ use crate::rng::{GOLDEN, Rng, splitmix64};
 use crate::training::boulevard::tree_rows;
 use crate::training::prepare::{Prepared, TrainContext};
 use crate::training::row_sampling::bernoulli_rows;
-use crate::tree::RegTree;
 use crate::tree::builder::all_rows;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -126,17 +125,28 @@ struct Scorer<'m> {
     sign: f64,
 }
 
+/// Where a round of [`Bag::cycle`] falls: its stage and its index in the
+/// stage (which key the round's RNG), and its index among the reported
+/// rounds ([`Hook`]).
+#[derive(Clone, Copy)]
+struct RoundAt {
+    stage: u64,
+    round: u64,
+    reported: usize,
+}
+
 /// One outer bag of the classic EBM: its rows (with query bagging, each
 /// row's query index and the query count), its margins over every training
-/// row, its trees (learning rate applied, not yet `1/B`), and with early
-/// stopping its held-out rows and the current stage's stopper.
+/// row, its trees of both stages (final leaf values: learning rate, then
+/// `1/B`), and with early stopping its held-out rows and the current
+/// stage's stopper.
 struct Bag {
     index: u64,
     rows: Vec<u32>,
     row_queries: Vec<u32>,
     queries: usize,
     margins: Vec<f32>,
-    trees: Vec<(u32, RegTree)>,
+    trees: Vec<GrownTree>,
     holdout: Option<Holdout>,
     stopper: Option<Stopper>,
     /// Trees this bag has grown over both stages: each tree's gradient
@@ -281,7 +291,7 @@ impl Bag {
         self.stopper.as_ref().is_some_and(|s| s.done)
     }
 
-    /// Round `round` of cyclic boosting over `terms`: each tree fits the
+    /// Round `at` of cyclic boosting over `terms`: each tree fits the
     /// gradients of everything before it; with early stopping each tree is
     /// scored, and the round ends where the bag stops.
     fn cycle(
@@ -289,12 +299,17 @@ impl Bag {
         run: &TrainContext,
         prepared: &Prepared,
         terms: &[Term],
-        round: (u64, u64),
+        at: RoundAt,
         scorer: Option<&Scorer>,
     ) {
-        let (stage, round) = round;
+        let RoundAt {
+            stage,
+            round,
+            reported,
+        } = at;
         let params = run.params;
         let eta = params.eta as f32;
+        let n_bags = params.ebm_settings().outer_bags();
         let key = params.seed
             ^ EBM_SALT
             ^ stage.wrapping_mul(GOLDEN)
@@ -315,7 +330,16 @@ impl Bag {
             for (m, p) in self.margins.iter_mut().zip(tree_rows(&tree, run.dtrain)) {
                 *m += p;
             }
-            self.trees.push((term, tree));
+            // The bag's own margins take the tree whole; the model its
+            // `1/B` share.
+            if n_bags > 1 {
+                tree.scale_leaves(1.0 / n_bags as f32);
+            }
+            self.trees.push(GrownTree {
+                round: reported,
+                term,
+                tree,
+            });
             if let Some(scorer) = scorer {
                 let score = self.score(run, scorer);
                 if let Some(stopper) = &mut self.stopper {
@@ -326,10 +350,18 @@ impl Bag {
     }
 }
 
+/// Every bag's trees in model order: round by round and, within a round,
+/// bag by bag in bag order, each bag's in term order (the sort is stable).
+fn model_order(bags: &[Bag]) -> Vec<&GrownTree> {
+    let mut trees: Vec<&GrownTree> = bags.iter().flat_map(|bag| &bag.trees).collect();
+    trees.sort_by_key(|t| t.round);
+    trees
+}
+
 /// Run up to `rounds` rounds of `terms` in every bag (the bags of a round
-/// in parallel when allowed), reporting each round to `hook`, until the
-/// hook stops or every bag has stopped early; then each bag keeps its best
-/// trees.
+/// in parallel when allowed), adding each round's trees to the eval margins
+/// in model order and reporting the round to `hook`, until the hook stops
+/// or every bag has stopped early; then each bag keeps its best trees.
 fn cycle_bags(
     run: &TrainContext,
     prepared: &Prepared,
@@ -344,11 +376,22 @@ fn cycle_bags(
         bag.start_stage(run, scorer, terms.len());
     }
     for round in 0..rounds as u64 {
-        let f = |bag: &mut Bag| bag.cycle(run, prepared, terms, (stage, round), scorer);
+        let at = RoundAt {
+            stage,
+            round,
+            reported: hook.done,
+        };
+        let f = |bag: &mut Bag| bag.cycle(run, prepared, terms, at, scorer);
         if parallel(run.params) && bags.len() > 1 {
             bags.par_iter_mut().for_each(f);
         } else {
             bags.iter_mut().for_each(f);
+        }
+        for bag in bags.iter() {
+            let start = bag.trees.partition_point(|t| t.round < at.reported);
+            for grown in &bag.trees[start..] {
+                hook.add_tree(&grown.tree);
+            }
         }
         if !hook.next() || bags.iter().all(Bag::stopped) {
             break;
@@ -360,7 +403,8 @@ fn cycle_bags(
 }
 
 /// The classic EBM: cyclic main effects per bag, FAST on the bag-averaged
-/// main effects, then cyclic pairs per bag; every tree scaled by `1/B`.
+/// main effects, then cyclic pairs per bag; every tree scaled by `1/B` and
+/// the trees laid out round by round ([`model_order`]).
 pub(super) fn classic(
     run: &TrainContext,
     prepared: &Prepared,
@@ -381,6 +425,11 @@ pub(super) fn classic(
         metric,
         sign: if metric.maximize() { -1.0 } else { 1.0 },
     });
+    // An early-stopped bag drops its trees past its best score when the
+    // stage ends, so the pair stage boosts (and its eval margins restart)
+    // from the kept main effects.
+    let restart = (scorer.is_some() && params.ebm_settings().interactions() > 0)
+        .then(|| hook.margins.evals.clone());
     let main_terms: Vec<Term> = mains
         .iter()
         .enumerate()
@@ -395,12 +444,15 @@ pub(super) fn classic(
         scorer.as_ref(),
         hook,
     );
-    let mut main_trees: Vec<(u32, RegTree)> = Vec::new();
-    for bag in &mut bags {
-        main_trees.append(&mut bag.trees);
-    }
+    let main_rounds = hook.done;
     let mut pairs = Vec::new();
     if params.ebm_settings().interactions() > 0 && !hook.stopped {
+        if let Some(initial) = restart {
+            hook.margins.evals = initial;
+            for grown in model_order(&bags) {
+                hook.add_tree(&grown.tree);
+            }
+        }
         let inv = 1.0 / n_bags as f64;
         let averaged: Vec<f32> = (0..n)
             .map(|i| {
@@ -429,17 +481,14 @@ pub(super) fn classic(
             hook,
         );
     }
-    let mut trees = main_trees;
-    for bag in &mut bags {
-        trees.append(&mut bag.trees);
-    }
-    if n_bags > 1 {
-        let inv = 1.0 / n_bags as f32;
-        for (_, tree) in &mut trees {
-            tree.scale_leaves(inv);
-        }
-    }
-    Ok(Grown { trees, pairs })
+    let mut trees: Vec<GrownTree> = bags.into_iter().flat_map(|bag| bag.trees).collect();
+    // Model order ([`model_order`]); the sort is stable.
+    trees.sort_by_key(|t| t.round);
+    Ok(Grown {
+        trees,
+        pairs,
+        main_rounds,
+    })
 }
 
 #[cfg(test)]

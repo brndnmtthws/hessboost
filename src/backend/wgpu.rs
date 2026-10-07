@@ -16,10 +16,7 @@
 //!
 //! The backend is the portable sibling of [`backend::metal`](crate::backend::metal)
 //! and shares its design: the same exactness domain, the same scatter
-//! kernel, the same CPU fallbacks. It is a correctness and portability path
-//! so far, not a speedup: nothing has been measured on a real GPU, and on a
-//! software adapter it is slower than the CPU. Use it to run and test the
-//! GPU paths on machines without one, and measure before relying on it.
+//! kernel, the same CPU fallbacks.
 //!
 //! # Adapter
 //!
@@ -172,8 +169,8 @@ pub fn device_name() -> Option<String> {
 }
 
 /// Whether the adapter is a software renderer (Mesa's lavapipe, WARP,
-/// SwiftShader), which runs the GPU paths on the CPU: correct, useful for
-/// testing, and slower than the CPU backend. `None` without an adapter.
+/// SwiftShader), which runs the GPU paths on the CPU: correct, but slower
+/// than the CPU backend. `None` without an adapter.
 #[must_use]
 pub fn is_software_adapter() -> Option<bool> {
     Context::shared().map(|ctx| ctx.software)

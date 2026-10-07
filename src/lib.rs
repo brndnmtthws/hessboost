@@ -196,12 +196,12 @@
 //!     sums, CPU fallback outside their exact domain). Documented only in
 //!     macOS builds with the feature (`cargo doc --features metal`);
 //!     elsewhere [`backend::metal`] is a stub.
-//!   - portable GPU acceleration through wgpu (`wgpu` feature; Vulkan,
+//!   - portable GPU support through wgpu (`wgpu` feature; Vulkan,
 //!     Metal, DirectX 12): the same bit-identical prediction
 //!     ([`to_wgpu`](model::BoostedModel::to_wgpu)) and histograms
 //!     ([`device`](config::TrainingParams::device) = `wgpu`), runnable
-//!     without a GPU on a software adapter such as Mesa's lavapipe;
-//!     unmeasured on real GPUs so far ([`backend::wgpu`]).
+//!     without a GPU on a software adapter such as Mesa's lavapipe
+//!     ([`backend::wgpu`]).
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,

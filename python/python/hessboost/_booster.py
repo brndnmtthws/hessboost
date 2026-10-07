@@ -325,10 +325,7 @@ class Booster(_SchemaState):
         Args:
             device: ``"metal"`` (macOS; faster than the CPU from roughly a
                 few thousand row-trees upward) or ``"wgpu"`` (Vulkan, Metal,
-                or DirectX 12; unmeasured on real GPUs so far, and slower
-                than the CPU on a software adapter such as Mesa's lavapipe,
-                which it picks only when there is no other). ``None``: Metal
-                on macOS, wgpu elsewhere.
+                or DirectX 12). ``None``: Metal on macOS, wgpu elsewhere.
 
         Raises:
             HessboostError: ``device`` is unknown or cannot predict here

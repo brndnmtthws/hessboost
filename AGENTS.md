@@ -151,7 +151,7 @@ Fix findings rather than suppress them.
 |---|---|
 |`lib.rs`|crate docs ("What's here", "Not implemented"), `prelude`, hidden `internals`|
 |`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams (`stream_key`, `keyed_normal`)|
-|`data/`|`dmatrix` (`DMatrix`; feature arrays behind `Arc`, shared by clones, copied on write by `dense_values_mut`; `select_rows` keeps dense storage dense and whole query groups, refusing a selection that splits one; `selected_group_sizes` is that check, also run by `CrossValidation` on every fold; `rejects_dense_values`, the branch-free scan dense input and borrowed prediction rows share), `rows` (`Rows`: a matrix's rows or borrowed dense `NaN`-missing rows, what the prediction internals read), `loaders`, `meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`) over `sort` (float sort keys, radix sort), `ghist` (`GHistIndex`), `target_stats` (public, opt-in; `fit_transform_with_labels` for a separate per-row target)|
+|`data/`|`dmatrix` (`DMatrix`; feature arrays behind `Arc`, shared by clones, copied on write by `dense_values_mut`; `select_rows` keeps dense storage dense and whole query groups, refusing a selection that splits one; `selected_group_sizes` is that check, also run by `CrossValidation` on every fold; `rejects_dense_values`, the branch-free scan dense input and borrowed prediction rows share, parallel for large inputs, and `rejects_dense`, the same scan on the calling thread, for single prediction rows), `rows` (`Rows`: a matrix's rows or borrowed dense `NaN`-missing rows, what the prediction internals read), `loaders`, `meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`) over `sort` (float sort keys, radix sort), `ghist` (`GHistIndex`), `target_stats` (public, opt-in; `fit_transform_with_labels` for a separate per-row target)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, `loss` (the loss a configuration trains with), parameter enums|
 |`config/groups.rs`|option groups a switch owns: `Dart` (`BoosterKind::Dart`), `Boulevard` (`BoosterKind::Boulevard`), `Ebm` (`BoosterKind::Ebm`), `Refresh` (`ProcessType::Update`), `QuantizedGrad`, `ExtraTrees`, `LinearTree`, `BalancedBagging`, `QueryBagging`, `Langevin`, `ModelShrink` (`Option` fields); each validates when built|
 |`config/mod.rs`|re-exports; the `setter!` macro both builders' plain setters use|
@@ -371,7 +371,9 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `predict_rows` read dense `NaN`-missing rows in place (`data::Rows`), give
   bit for bit what `predict` gives for a matrix of the same rows, and the
   row methods allocate nothing once the model's lazily built
-  `CompactForest` and `Transform` exist.
+  `CompactForest` and `Transform` exist. The row methods (and
+  `transform_margin`) also never enter rayon, which the Python bindings'
+  plain `detach` relies on in a forked child (`tests/row_prediction_pool.rs`).
 - **Loss/metric hooks:** training and evaluation read data only via
   `MetaInfo` hooks (`Loss::gradient_info`, `base_margins_info`,
   `eval_transform`, `validate_info`, `requires_labels`;
@@ -500,7 +502,8 @@ each, and caps each stage under `ebm_early_stopping_rounds`, which stops
 every bag on its held-out rows), needs one output, scores eval sets after
 every EBM round (classic: bit for bit the model through that round),
 early-stops classic EBMs by cutting back to the best round's model
-(`best_iteration` its last tree; refused with `ebm_early_stopping_rounds`),
+(`best_iteration` its last tree; refused with `ebm_early_stopping_rounds`,
+which cross-validation refuses too: each fold would stop at its own round),
 refuses continuation, online updates, column sampling,
 interaction constraints, forests, feature weights, and base margins, draws
 each classic tree's rows from its outer bag (by class under balanced

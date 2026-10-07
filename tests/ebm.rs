@@ -1081,14 +1081,16 @@ fn eval_histories_are_identical_across_thread_counts() {
     assert_eq!(with_threads(1, run), with_threads(4, run));
 }
 
-/// Cross-validation scores every fold on an eval set, which EBMs take.
+/// Cross-validation scores every fold on an eval set, which EBMs take, and
+/// stops on the fold means; bag early stopping, which would end every
+/// fold's stages at a round of its own, is refused.
 #[test]
 fn cross_validation_early_stops_an_ebm() {
     use hessboost::training::{CrossValidation, Fold};
     let (_, data) = data(300, 36);
     let params = two_bags();
-    let folds = Fold::k_fold(300, 3, 1).unwrap();
-    let results = CrossValidation::new(&params, &data, 6, folds)
+    let folds = || Fold::k_fold(300, 3, 1).unwrap();
+    let results = CrossValidation::new(&params, &data, 6, folds())
         .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
         .run()
         .unwrap();
@@ -1096,4 +1098,11 @@ fn cross_validation_early_stops_an_ebm() {
     assert_eq!(rmse.metric, "rmse");
     assert!((1..=12).contains(&rmse.rounds.len()));
     assert!(rmse.rounds.iter().all(|round| round.mean.is_finite()));
+
+    let bag_stopping = classic_with(classic_ebm().outer_bags(2).early_stopping(stopping(2)))
+        .build()
+        .unwrap();
+    let cv = || CrossValidation::new(&bag_stopping, &data, 6, folds());
+    assert_eq!(invalid_param(cv().run()), "ebm_early_stopping_rounds");
+    assert_eq!(invalid_param(cv().refit()), "ebm_early_stopping_rounds");
 }

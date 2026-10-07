@@ -1,5 +1,5 @@
 use super::{BoostedModel, Predictions, Shrinkage, Transform, shrink_margins};
-use crate::data::{DMatrix, Rows, check_len, rejects_dense_values};
+use crate::data::{DMatrix, Rows, check_len, rejects_dense, rejects_dense_values};
 use crate::error::{HessboostError, Result};
 use crate::objective::Objective;
 use crate::objective::distributional::Dist;
@@ -421,10 +421,11 @@ impl BoostedModel {
 
     /// Check one row of features (one finite or `NaN` value per feature, as
     /// a dense matrix requires) and resolve `iterations` for it as
-    /// [`Self::predict_margin`] does.
+    /// [`Self::predict_margin`] does. The scan runs on the calling thread,
+    /// as everything the row methods do: they never enter rayon.
     fn row_request(&self, row: &[f32], iterations: Iterations) -> Result<Range<usize>> {
         check_len("prediction feature count", row.len(), self.n_features)?;
-        if rejects_dense_values(row, f32::NAN) {
+        if rejects_dense(row, f32::NAN) {
             return Err(HessboostError::invalid_data(
                 "row",
                 "non-missing feature values must be finite",

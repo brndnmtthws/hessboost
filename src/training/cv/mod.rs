@@ -16,7 +16,7 @@ mod fold;
 
 pub use fold::Fold;
 
-use crate::config::TrainingParams;
+use crate::config::{BoosterKind, TrainingParams};
 use crate::data::DMatrix;
 use crate::data::target_stats::{FittedTargetEncoder, OrderedTargetEncoder};
 use crate::error::{HessboostError, Result};
@@ -207,7 +207,13 @@ impl<'a> CrossValidation<'a> {
     /// empty, out of bounds, or (on ranking data) not whole query groups,
     /// when [`target_stats_label`](Self::target_stats_label) or
     /// [`init_model`](Self::init_model) is refused, or when encoding or
-    /// training a fold fails.
+    /// training a fold fails. An EBM that stops its bags early
+    /// ([`Ebm::early_stopping`](crate::config::Ebm::early_stopping)) is refused
+    /// ([`HessboostError::InvalidParameter`] `ebm_early_stopping_rounds`):
+    /// each fold would end its stages at a round of its own, so the folds'
+    /// rounds would not line up;
+    /// [`early_stopping_rounds`](Self::early_stopping_rounds) stops on the
+    /// fold means instead.
     pub fn run(self) -> Result<Vec<CvResult>> {
         self.results()
     }
@@ -295,6 +301,16 @@ impl<'a> CrossValidation<'a> {
     fn results(&self) -> Result<Vec<CvResult>> {
         if self.folds.is_empty() {
             return Err(HessboostError::invalid_param("folds", "no folds"));
+        }
+        if let BoosterKind::Ebm(ebm) = &self.params.booster
+            && ebm.early_stopping().is_some()
+        {
+            return Err(HessboostError::invalid_param(
+                "ebm_early_stopping_rounds",
+                "cross-validation averages the folds round by round, and stopping each \
+                 fold's bags on its own held-out rows ends its stages at a round of its own; \
+                 stop on the fold means with early_stopping_rounds instead",
+            ));
         }
         if let Some(labels) = self.target_stats_label {
             if self.target_stats.is_none() {

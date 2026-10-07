@@ -387,7 +387,9 @@ supports confidence bands on its shapes via
 EBMs take eval sets like any booster: `train(..., evals=[(dvalid, "valid")],
 early_stopping_rounds=5)` records the history and `best_score` (classic
 EBMs stop early on it), and `cv` (with `refit=True` too) cross-validates
-them.
+them. `cv` refuses `ebm_early_stopping_rounds`, which would end each fold's
+stages at a round of its own; its `early_stopping_rounds` stops on the fold
+means instead.
 
 ### Boulevard inference
 

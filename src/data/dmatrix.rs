@@ -127,10 +127,12 @@ pub(crate) fn rejects_dense_values(values: &[f32], missing: f32) -> bool {
     }
 }
 
-/// Whether `values` holds a non-missing value that is not finite. With the
-/// NaN sentinel the only refused values are infinities; other sentinels
-/// need the general test. Each [`SCAN_BLOCK`] is reduced branch-free.
-fn rejects_dense(values: &[f32], missing: f32) -> bool {
+/// [`rejects_dense_values`] on the calling thread, whatever the length: what
+/// a single prediction row is checked with, since the row methods never
+/// enter rayon. With the NaN sentinel the only refused values are
+/// infinities; other sentinels need the general test. Each [`SCAN_BLOCK`] is
+/// reduced branch-free.
+pub(crate) fn rejects_dense(values: &[f32], missing: f32) -> bool {
     if missing.is_nan() {
         values
             .chunks(SCAN_BLOCK)

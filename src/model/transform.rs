@@ -73,15 +73,21 @@ impl Transform {
     /// Transform the `n_outputs`-wide margin rows `values` in place and
     /// return the prediction width: the first `values.len() / n_outputs *
     /// width` values then hold the predictions (for a class index, row `r`'s
-    /// class lands at index `r` and the rest are left over). Large inputs
-    /// are transformed in parallel, by whole rows.
+    /// class lands at index `r` and the rest are left over). Inputs of more
+    /// than one [`CHUNK_ROWS`] chunk and at least [`PARALLEL_VALUES`] values
+    /// are transformed in parallel, by whole chunks; anything smaller, a
+    /// single row included, on the calling thread.
     pub(crate) fn apply(&self, values: &mut [f32], n_outputs: usize) -> usize {
         match self {
             Transform::Margins => {}
             Transform::Loss(loss) => {
-                if values.len() >= PARALLEL_VALUES && rayon::current_num_threads() > 1 {
+                let chunk = CHUNK_ROWS * n_outputs;
+                if values.len() >= PARALLEL_VALUES
+                    && values.len() > chunk
+                    && rayon::current_num_threads() > 1
+                {
                     values
-                        .par_chunks_mut(CHUNK_ROWS * n_outputs)
+                        .par_chunks_mut(chunk)
                         .for_each(|rows| loss.pred_transform(rows));
                 } else {
                     loss.pred_transform(values);

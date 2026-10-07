@@ -526,8 +526,9 @@ def cv(
     Raises:
         HessboostError: The parameters, folds or data are refused,
             ``target_stats_label`` is given without ``target_stats`` or with
-            the wrong length, or ``xgb_model`` is given with
-            ``target_stats``.
+            the wrong length, ``xgb_model`` is given with ``target_stats``,
+            or an EBM stops its bags early (``ebm_early_stopping_rounds``:
+            each fold would end its stages at a round of its own).
     """
     if not isinstance(dtrain, DMatrix):
         raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")

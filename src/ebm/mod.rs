@@ -100,6 +100,8 @@
 //! `Trainer::early_stopping_rounds` together with
 //! [`Ebm::early_stopping`](crate::config::Ebm::early_stopping) (flat
 //! `ebm_early_stopping_rounds`; the two rules would pick different models),
+//! as does [`CrossValidation`](crate::training::CrossValidation) (each fold
+//! would end its stages at a round of its own),
 //! `num_parallel_tree > 1`, column sampling, interaction
 //! constraints (the terms fix every tree's features), linear leaves, the
 //! reuse penalties, `process_type = update`, feature weights, and a

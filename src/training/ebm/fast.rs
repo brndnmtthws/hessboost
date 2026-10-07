@@ -126,10 +126,8 @@ fn hess_total(gpair: &[GradPair]) -> Option<f64> {
     })
 }
 
-/// FAST's score of one pair. `grid`, a worker's buffer reused across
-/// pairs, gets `ma + 1` rows of `mb + 1` cells of `[gradient, Hessian]`
-/// sums: the pair's bin histogram below a zero row and right of a zero
-/// column, then its 2D prefix sums.
+/// FAST's score of one pair, scored in `grid`, a worker's buffer reused
+/// across pairs.
 fn pair_gain(
     bins: &PairBins,
     gpair: &[GradPair],
@@ -137,6 +135,19 @@ fn pair_gain(
     hess_total: Option<f64>,
     grid: &mut Vec<[f64; 2]>,
 ) -> f64 {
+    pair_grid(bins, gpair, grid);
+    let (ma, mb) = (bins.ma, bins.mb);
+    if denominators_positive(lambda, hess_total, grid.len()) {
+        best_cut::<false>(grid, ma, mb, lambda)
+    } else {
+        best_cut::<true>(grid, ma, mb, lambda)
+    }
+}
+
+/// Fill `grid` with `ma + 1` rows of `mb + 1` cells of `[gradient,
+/// Hessian]` sums: the pair's bin histogram below a zero row and right of
+/// a zero column, then its 2D prefix sums.
+fn pair_grid(bins: &PairBins, gpair: &[GradPair], grid: &mut Vec<[f64; 2]>) {
     let PairBins {
         a: bins_a,
         b: bins_b,
@@ -155,18 +166,17 @@ fn pair_gain(
         cell[1] += f64::from(gp.hess);
     }
     prefix_sums(grid, s);
-    // A quadrant's computed Hessian sum, its rows' at least 0, can fall
-    // short by the rounding of its cells in `prefix_sums` (five roundings
-    // a cell, each at most the Hessian total) and of the scan's three
-    // differences. Past 32 roundings a cell `H + λ` is positive in every
-    // quadrant, so the guard in `best_cut` would always pass.
-    let positive =
-        hess_total.is_some_and(|total| lambda > 16.0 * f64::EPSILON * grid.len() as f64 * total);
-    if positive {
-        best_cut::<false>(grid, ma, mb, lambda)
-    } else {
-        best_cut::<true>(grid, ma, mb, lambda)
-    }
+}
+
+/// Whether every quadrant's `H + λ` in a grid of `cells` prefix sums over
+/// Hessians totalling `hess_total` is positive, so the guard in
+/// [`best_cut`] would always pass. A quadrant's computed Hessian sum, its
+/// rows' at least 0, can fall short by the rounding of its cells in
+/// [`prefix_sums`] (five roundings a cell, each at most the total) and of
+/// the scan's three differences: past 32 roundings a cell it cannot reach
+/// `−λ`.
+fn denominators_positive(lambda: f64, hess_total: Option<f64>, cells: usize) -> bool {
+    hess_total.is_some_and(|total| lambda > 16.0 * f64::EPSILON * cells as f64 * total)
 }
 
 /// Turn the histogram in `grid` (rows of `s` cells, the first row and
@@ -355,5 +365,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The smallest computed `H + λ` over every quadrant of every cut and
+    /// the unsplit node, each formed as [`best_cut`] forms it.
+    fn smallest_denominator(grid: &[[f64; 2]], ma: usize, mb: usize, lambda: f64) -> f64 {
+        let s = mb + 1;
+        let last = &grid[ma * s..];
+        let ht = last[mb][1];
+        let mut smallest = ht + lambda;
+        for row in grid[s..ma * s].chunks_exact(s) {
+            let h0 = row[mb][1];
+            let hr = ht - h0;
+            for (&[_, h00], &[_, h1]) in row[1..mb].iter().zip(&last[1..mb]) {
+                for h in [h00, h0 - h00, h1 - h00, hr - h1 + h00] {
+                    smallest = smallest.min(h + lambda);
+                }
+            }
+        }
+        smallest
+    }
+
+    /// Hessians spread over 80 binades round in every prefix sum, and rows
+    /// in every seventh bin leave most quadrants empty, so their computed
+    /// Hessian sums are rounding alone, some of them negative. Once
+    /// `lambda` passes the gate, even by one ulp, every `H + λ` is still
+    /// positive and the guard-free scan returns the guarded scan's bits;
+    /// up to the gate `pair_gain` keeps the guard.
+    #[test]
+    fn the_guard_free_gate_covers_prefix_rounding() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        let (mut grid, mut scratch) = (Vec::new(), Vec::new());
+        let mut negative = false;
+        for (ma, mb) in [(3, 9), (64, 64), (256, 200)] {
+            let n = 4000;
+            let mut column =
+                |m: usize| -> Vec<u32> { (0..n).map(|_| next(m as u64) as u32 / 7 * 7).collect() };
+            let (a, b) = (column(ma), column(mb));
+            let mut spread = |center: f32, binades: u64| {
+                let mantissa = next(1 << 24) as f32 / (1 << 24) as f32 + center;
+                mantissa * 2f32.powi(next(2 * binades + 1) as i32 - binades as i32)
+            };
+            let gpair: Vec<GradPair> = (0..n)
+                .map(|_| GradPair::new(spread(-0.5, 20), spread(0.5, 40)))
+                .collect();
+            let bins = PairBins {
+                a: &a,
+                b: &b,
+                ma,
+                mb,
+            };
+            let total = hess_total(&gpair).expect("finite, non-negative Hessians");
+            pair_grid(&bins, &gpair, &mut grid);
+            negative |= smallest_denominator(&grid, ma, mb, 0.0) < 0.0;
+            // The largest `lambda` the gate refuses, by bisecting the bit
+            // patterns of positive floats (ordered as their values).
+            let refused = |lambda: f64| !denominators_positive(lambda, Some(total), grid.len());
+            let (mut below, mut above) = (0u64, f64::MAX.to_bits());
+            while above - below > 1 {
+                let mid = below + (above - below) / 2;
+                if refused(f64::from_bits(mid)) {
+                    below = mid;
+                } else {
+                    above = mid;
+                }
+            }
+            let above = f64::from_bits(above);
+            for lambda in [f64::from_bits(below), above, 4.0 * above] {
+                let guarded = best_cut::<true>(&grid, ma, mb, lambda);
+                if !refused(lambda) {
+                    let smallest = smallest_denominator(&grid, ma, mb, lambda);
+                    assert!(smallest > 0.0, "{ma} x {mb}, lambda {lambda}: {smallest}");
+                    let unguarded = best_cut::<false>(&grid, ma, mb, lambda);
+                    assert_eq!(unguarded.to_bits(), guarded.to_bits(), "{ma} x {mb}");
+                }
+                let gain = pair_gain(&bins, &gpair, lambda, Some(total), &mut scratch);
+                assert_eq!(
+                    gain.to_bits(),
+                    guarded.to_bits(),
+                    "{ma} x {mb}, lambda {lambda}"
+                );
+            }
+        }
+        assert!(negative, "some quadrant's Hessian sum must round below 0");
     }
 }

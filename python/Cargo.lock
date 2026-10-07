@@ -311,6 +311,7 @@ dependencies = [
  "hessboost",
  "numpy",
  "pyo3",
+ "rayon",
  "self_cell",
  "serde",
  "serde_json",

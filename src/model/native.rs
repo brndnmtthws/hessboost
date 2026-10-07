@@ -327,7 +327,7 @@ pub(super) fn write_shrinkage(w: &mut Writer, shrinkage: &Shrinkage) {
     );
     w.array(
         SHRINKAGE_SECTIONS[1],
-        shrinkage.base_score().iter().copied(),
+        shrinkage.base_scores().iter().copied(),
         f32::to_le_bytes,
     );
 }
@@ -574,6 +574,7 @@ fn read_model(s: &Sections) -> Result<BoostedModel> {
         ebm: read_ebm(s)?,
         shrinkage: read_shrinkage(s)?,
         compact: OnceLock::new(),
+        transform: OnceLock::new(),
     })
 }
 
@@ -1115,6 +1116,7 @@ mod tests {
             boulevard: None,
             ebm: None,
             compact: OnceLock::new(),
+            transform: OnceLock::new(),
         })
         .unwrap()
     }

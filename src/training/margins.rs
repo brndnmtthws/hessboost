@@ -61,10 +61,10 @@ impl<'a> MarginCaches<'a> {
             dtrain,
             eval_sets,
             n_out: model.n_outputs(),
-            train: model.margin_from_trees(dtrain, trees.clone()),
+            train: model.margin_from_trees(dtrain.into(), trees.clone()),
             evals: eval_sets
                 .iter()
-                .map(|set| model.margin_from_trees(set.data, trees.clone()))
+                .map(|set| model.margin_from_trees(set.data.into(), trees.clone()))
                 .collect(),
         }
     }
@@ -103,9 +103,9 @@ impl<'a> MarginCaches<'a> {
     /// Recompute every cache from `model` (after a DART rescaling, which
     /// makes them non-additive).
     pub(super) fn recompute(&mut self, model: &BoostedModel) {
-        self.train = model.margin_from_trees(self.dtrain, 0..model.num_trees());
+        self.train = model.margin_from_trees(self.dtrain.into(), 0..model.num_trees());
         for (margins, set) in self.evals.iter_mut().zip(self.eval_sets) {
-            *margins = model.margin_from_trees(set.data, 0..model.num_trees());
+            *margins = model.margin_from_trees(set.data.into(), 0..model.num_trees());
         }
     }
 

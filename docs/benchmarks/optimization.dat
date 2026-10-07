@@ -7,10 +7,10 @@
 #
 # Block 0: full training, one row per workload. Block 1: single
 # histogram tree, one row per case. Both hold baseline/optimized medians
-# at 1 and 4 threads. Blocks 2-4: pointwise kernels at one thread, one
-# row per case, split by kind (gradients, transforms, metrics) so each
-# kind renders as its own 960px chart. Rows follow the order of the
-# tables in the doc. Two blank lines start a new gnuplot index block.
+# at 1 and 4 threads. Blocks 2-3: pointwise kernels at one thread, one
+# row per case, split by kind (gradients, metrics) so each kind renders
+# as its own 960px chart. Rows follow the order of the tables in the doc.
+# Two blank lines start a new gnuplot index block.
 #
 # Block 0/1: label        base_t1   opt_t1   base_t4   opt_t4
 "256 bins"        398.027   110.772   381.738    54.300
@@ -42,18 +42,7 @@
 "128"            2.188     0.948
 
 
-# Block 3: dense and softmax prediction transforms. Two blank lines start a new gnuplot index block.
-"sigmoid"        1.448     0.573
-"exp"            1.280     0.473
-"2"              2.339     0.564
-"3"              2.378     0.543
-"4"              1.997     0.581
-"8"              1.896     0.712
-"32"             1.877     0.581
-"128"            1.927     0.589
-
-
-# Block 4: dense and multiclass metrics. Two blank lines start a new gnuplot index block.
+# Block 3: dense and multiclass metrics. Two blank lines start a new gnuplot index block.
 "rmse"           0.776     0.268
 "mae"            0.768     0.268
 "error"          1.338     0.204

@@ -131,6 +131,7 @@ impl TryFrom<UncheckedBoostedModel> for BoostedModel {
             boulevard: m.boulevard,
             ebm: m.ebm,
             compact: OnceLock::new(),
+            transform: OnceLock::new(),
         };
         model.validate_structure()?;
         Ok(model)

@@ -184,7 +184,7 @@ pub(crate) fn plan_margins(
     let trees = model.iteration_trees(model.resolve_iterations(iterations, "iterations")?);
     let n = data.n_rows();
     let n_cols = data.n_cols();
-    let margins = initial_margins(model.base_scores(), data);
+    let margins = initial_margins(model.base_scores(), data.into());
     if trees.is_empty() || n == 0 {
         return Ok(MarginPlan::Done(Predictions::new(
             margins,

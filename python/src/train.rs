@@ -5,11 +5,11 @@ use crate::booster::Booster;
 use crate::data::{DMatrix, row_major, to_numpy};
 use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::Params;
-use crate::target_stats::OrderedTargetEncoder;
+use crate::target_stats::{FittedTargetEncoder, OrderedTargetEncoder};
 use hessboost::metric::CustomMetric;
 use hessboost::objective::{CustomLoss, GradPair, Objective};
 use hessboost::training::budget::{self, BudgetConfig};
-use hessboost::training::{CrossValidation, Fold, RoundEval, Trainer};
+use hessboost::training::{CrossValidation, CvResult, Fold, RoundEval, Trainer};
 use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArrayDyn, PyReadonlyArray1, ToPyArray};
 use pyo3::panic::PanicException;
@@ -241,12 +241,12 @@ impl CommitGate {
     }
 }
 
-/// Runs `work` on a worker thread while the caller, detached, wakes every
-/// [`SIGNAL_POLL`] to run the interpreter's signal handlers (only the main
-/// thread's do anything), passing a raised exception (`KeyboardInterrupt`)
-/// to `on_signal`, and answers `gate` with `may_commit` after a signal
-/// check. `work` sees the interruption through its round hook and stops at
-/// the end of the round.
+/// Runs `work` on a worker thread, inside the extension's rayon pool, while
+/// the caller, detached, wakes every [`SIGNAL_POLL`] to run the
+/// interpreter's signal handlers (only the main thread's do anything),
+/// passing a raised exception (`KeyboardInterrupt`) to `on_signal`, and
+/// answers `gate` with `may_commit` after a signal check. `work` sees the
+/// interruption through its round hook and stops at the end of the round.
 fn interruptible<T: Send>(
     py: Python<'_>,
     work: impl FnOnce() -> T + Send,
@@ -257,7 +257,7 @@ fn interruptible<T: Send>(
     let caller = std::thread::current();
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || {
-            let out = work();
+            let out = crate::pool::install(work);
             caller.unpark();
             out
         });
@@ -274,7 +274,7 @@ fn interruptible<T: Send>(
         }
         worker
             .join()
-            .map_err(|_| PanicException::new_err("the training thread panicked"))
+            .map_err(|_| PanicException::new_err("the training thread panicked"))?
     })
 }
 
@@ -449,39 +449,66 @@ pub(crate) fn train_with_budget(
 /// `(metric, per-round test means, per-round test standard deviations)`.
 type CvHistory = Vec<(String, Vec<f64>, Vec<f64>)>;
 
-/// Cross-validates over explicit `(train rows, test rows)` folds, with
-/// `target_stats = (encoder, columns)` fitted inside each fold.
-#[pyfunction]
-#[pyo3(signature = (
-    params, data, num_boost_round, folds, early_stopping_rounds=None, target_stats=None
-))]
-pub(crate) fn cv(
-    py: Python<'_>,
-    params: &Params,
-    data: &DMatrix,
+/// One cross-validation run, passed from Python as a `dict`: explicit
+/// `(train rows, test rows)` folds, with `target_stats = (encoder, columns)`
+/// fitted inside each fold (over `target_stats_label` when given) and an
+/// `init_model` every fold continues.
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+pub(crate) struct CvRequest<'py> {
+    params: Py<Params>,
+    dtrain: Py<DMatrix>,
     num_boost_round: usize,
     folds: Vec<(Vec<usize>, Vec<usize>)>,
+    #[pyo3(default)]
     early_stopping_rounds: Option<usize>,
+    #[pyo3(default)]
     target_stats: Option<(Py<OrderedTargetEncoder>, Vec<usize>)>,
-) -> PyResult<CvHistory> {
-    let early_stopping_rounds = patience(early_stopping_rounds)?;
-    let folds = folds
-        .into_iter()
-        .map(|(train, test)| Fold::new(train, test))
-        .collect();
-    let target_stats =
-        target_stats.map(|(encoder, columns)| (encoder.get().inner.clone(), columns));
-    let results = py.detached(|| {
-        let mut cv = CrossValidation::new(&params.inner, &data.inner, num_boost_round, folds);
+    #[pyo3(default)]
+    target_stats_label: Option<PyReadonlyArray1<'py, f32>>,
+    #[pyo3(default)]
+    init_model: Option<Py<Booster>>,
+}
+
+impl CvRequest<'_> {
+    /// The configured run (a cheap builder; the work is its `run` or
+    /// `refit`), borrowing the request's matrix, labels and model.
+    fn configured(&mut self) -> PyResult<CrossValidation<'_>> {
+        let early_stopping_rounds = patience(self.early_stopping_rounds)?;
+        let folds = std::mem::take(&mut self.folds)
+            .into_iter()
+            .map(|(train, test)| Fold::new(train, test))
+            .collect();
+        let target_stats = self
+            .target_stats
+            .take()
+            .map(|(encoder, columns)| (encoder.get().inner.clone(), columns));
+        let request = &*self;
+        let mut cv = CrossValidation::new(
+            &request.params.get().inner,
+            &request.dtrain.get().inner,
+            request.num_boost_round,
+            folds,
+        );
         if let Some(rounds) = early_stopping_rounds {
             cv = cv.early_stopping_rounds(rounds);
         }
         if let Some((encoder, columns)) = target_stats {
             cv = cv.target_stats(encoder, columns);
         }
-        cv.run()
-    })?;
-    Ok(results
+        if let Some(labels) = &request.target_stats_label {
+            cv = cv.target_stats_label(row_major(labels, "target_stats_label")?);
+        }
+        if let Some(booster) = &request.init_model {
+            cv = cv.init_model(&booster.get().model);
+        }
+        Ok(cv)
+    }
+}
+
+/// The Python form of `results`: one [`CvHistory`] entry per metric.
+fn history(results: Vec<CvResult>) -> CvHistory {
+    results
         .into_iter()
         .map(|result| {
             let (means, stds) = result
@@ -491,7 +518,34 @@ pub(crate) fn cv(
                 .unzip();
             (result.metric, means, stds)
         })
-        .collect())
+        .collect()
+}
+
+/// Cross-validates as `request` describes; returns the history.
+#[pyfunction]
+pub(crate) fn cv(py: Python<'_>, mut request: CvRequest<'_>) -> PyResult<CvHistory> {
+    let cv = request.configured()?;
+    py.detached(move || cv.run()).map(history)
+}
+
+/// Cross-validates as `request` describes, then retrains on every row for
+/// the chosen round count: `(history, booster, rounds, the encoder fitted
+/// on every row with target_stats)`.
+#[pyfunction]
+pub(crate) fn cv_refit(
+    py: Python<'_>,
+    mut request: CvRequest<'_>,
+) -> PyResult<(CvHistory, Booster, usize, Option<FittedTargetEncoder>)> {
+    let cv = request.configured()?;
+    let refit = py.detached(move || cv.refit())?;
+    Ok((
+        history(refit.results),
+        Booster::new(refit.model),
+        refit.num_boost_round,
+        refit
+            .target_encoder
+            .map(|inner| FittedTargetEncoder { inner }),
+    ))
 }
 
 type FoldArrays<'py> = Vec<(Bound<'py, PyArrayDyn<i64>>, Bound<'py, PyArrayDyn<i64>>)>;

@@ -171,26 +171,42 @@ fn train_boulevard<'a>(
 }
 
 /// `booster = ebm`: `validate` refuses `process_type = update` and
-/// continued training for it, and `validate_request` eval sets and early
-/// stopping.
+/// continued training for it. Every EBM round is scored on the eval sets;
+/// under early stopping the model is cut back to the one training held
+/// after the best round, whose trees are all its iterations, so its
+/// `best_iteration` is its last.
 fn train_ebm<'a>(
     mut run: Run<'a>,
     mut model: BoostedModel,
     mut report: RoundReporter<'a>,
 ) -> Result<TrainResult> {
     let prepared = run.prepare()?;
+    let dtrain = run.ctx.dtrain;
+    let mut margins = MarginCaches::new(&model, dtrain, run.evals);
     let eval_plan = run.eval_plan()?;
-    super::ebm::boost(
+    // The per-bag early-stopping metric: `Trainer::custom_metric`'s, else
+    // the last configured one.
+    let metric = eval_plan.metrics.last().cloned();
+    report.watch(eval_plan, run.early_stopping_rounds, 0);
+    let boosted = super::ebm::boost(
         &run.ctx,
         &prepared,
-        &mut model,
+        &model,
         run.num_boost_round,
-        // The early-stopping metric: `Trainer::custom_metric`'s, else the
-        // last configured one.
-        eval_plan.metrics.last().map(AsRef::as_ref),
-        &mut |iteration| report.finish_round(iteration, None),
+        metric.as_deref(),
+        &mut margins,
+        &mut |round, margins| report.finish_round(round, Some(margins)),
     )?;
-    Ok(report.into_result(model))
+    let best = report.best();
+    boosted.into_model(&mut model, dtrain, best.map(|(round, _)| round));
+    if best.is_some() {
+        model.set_best_iteration(model.num_boost_rounds().checked_sub(1));
+    }
+    Ok(TrainResult {
+        model,
+        history: report.into_history(),
+        best_score: best.map(|(_, score)| score),
+    })
 }
 
 /// gbtree, DART, and forests (and `process_type=update`'s refresh): grow or
@@ -243,7 +259,7 @@ fn train_trees<'a>(
     {
         prepared.resume_approx_cache(
             &run.ctx,
-            &state.model.margin_from_trees(dtrain, 0..0),
+            &state.model.margin_from_trees(dtrain.into(), 0..0),
             &mut state.gpair,
             &mut state.gpair_k,
             n_out,
@@ -330,7 +346,7 @@ fn train_linear(
         params,
         dtrain,
         num_boost_round,
-        model.margin_from_trees(dtrain, 0..0),
+        model.margin_from_trees(dtrain.into(), 0..0),
         objective,
         model.linear(),
         &mut |iteration| report.finish_round(iteration, None),

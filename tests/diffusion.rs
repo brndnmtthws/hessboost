@@ -365,9 +365,9 @@ fn row_bagging_regressor_params_are_refused() {
 #[test]
 fn single_label_boosters_train_on_one_label_column() {
     // `booster = boulevard` (one averaged squared-error regressor) and
-    // `booster = ebm` (additive terms) score a scalar target without early
-    // stopping; their own refusals (early stopping, a label matrix) come
-    // back as errors from `fit`, not panics.
+    // `booster = ebm` (additive terms) score a scalar target; their own
+    // refusals (Boulevard's early stopping, a label matrix) come back as
+    // errors from `fit`, not panics.
     let boosters = [
         BoosterKind::Boulevard(Boulevard::default()),
         BoosterKind::Ebm(Ebm::default()),
@@ -387,10 +387,12 @@ fn single_label_boosters_train_on_one_label_column() {
             .eta(0.8)
             .build()
             .unwrap();
-        assert_eq!(
-            invalid_param(DiffusionModel::fit(&params, &data)),
-            "early_stopping_rounds"
-        );
+        let stopped = DiffusionModel::fit(&params, &data);
+        if matches!(booster, BoosterKind::Boulevard(_)) {
+            assert_eq!(invalid_param(stopped), "early_stopping_rounds");
+        } else {
+            assert!(stopped.is_ok());
+        }
         params.early_stopping = None;
         let model = DiffusionModel::fit(&params, &data).unwrap();
         let samples = model.sample(&probe, 50, &SampleOptions::seeded(1)).unwrap();

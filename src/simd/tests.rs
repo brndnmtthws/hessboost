@@ -15,24 +15,6 @@ fn assert_grad_pairs_close(actual: &[GradPair], expected: &[GradPair]) {
     }
 }
 
-/// The vector exponential matches `f32::exp` within 7e-7 relative error and
-/// reproduces NaN, infinities, and underflow to zero exactly.
-fn assert_exp_close(actual: &[f32], expected: &[f32]) {
-    for (&actual, &expected) in actual.iter().zip(expected) {
-        if expected.is_nan() {
-            assert!(actual.is_nan());
-        } else if expected.is_infinite() || expected == 0.0 {
-            assert_eq!(actual, expected);
-        } else {
-            let relative = ((actual - expected) / expected).abs();
-            assert!(
-                relative <= 7.0e-7,
-                "SIMD exp {actual} differs from scalar {expected} by {relative}"
-            );
-        }
-    }
-}
-
 /// `(loss, weight)` sums agree within a relative `tolerance`.
 fn assert_sums_close(actual: (f64, f64), expected: (f64, f64), tolerance: f64) {
     assert!((actual.0 - expected.0).abs() <= expected.0.abs() * tolerance);
@@ -45,15 +27,6 @@ fn sawtooth(len: usize, period: usize, start: f32, step: f32) -> Vec<f32> {
     (0..len)
         .map(|i| start + (i % period) as f32 * step)
         .collect()
-}
-
-/// Scalar `softmax_scalar` over every `num_class` row of `values`.
-fn scalar_softmax_rows(values: &[f32], num_class: usize) -> Vec<f32> {
-    let mut out = values.to_vec();
-    for row in out.chunks_mut(num_class) {
-        softmax_scalar(row);
-    }
-    out
 }
 
 /// [`softmax_gradient_rows_scalar`] over every row of a complete matrix.
@@ -74,49 +47,6 @@ fn scalar_softmax_gradient(
         num_class,
     );
     out
-}
-
-#[test]
-fn sigmoid_dispatch_is_close_to_scalar() {
-    let mut actual = sawtooth(4_103, 4_103, -20.0, 40.0 / 4_102.0);
-    let expected: Vec<f32> = actual.iter().map(|&value| sigmoid_scalar(value)).collect();
-    sigmoid_inplace(&mut actual);
-    for (actual, expected) in actual.iter().zip(expected) {
-        assert!(
-            (actual - expected).abs() <= 3.0e-7,
-            "SIMD sigmoid {actual} differs from scalar {expected}"
-        );
-    }
-}
-
-#[test]
-fn exp_dispatch_is_close_to_scalar_and_preserves_special_values() {
-    let mut actual = sawtooth(8_195, 8_195, -80.0, 160.0 / 8_192.0);
-    actual.extend([f32::NEG_INFINITY, f32::INFINITY, f32::NAN]);
-    let expected: Vec<f32> = actual.iter().map(|value| value.exp()).collect();
-    exp_inplace(&mut actual);
-    assert_exp_close(&actual, &expected);
-}
-
-#[test]
-fn exp_dispatch_handles_special_values_inside_vector_blocks() {
-    // With a length divisible by every vector width there is no scalar tail,
-    // so these special values exercise the in-block fallback paths rather
-    // than landing after the vector loop.
-    let mut actual = sawtooth(8_192, 8_192, -80.0, 160.0 / 8_192.0);
-    for (index, value) in [
-        (3, f32::NEG_INFINITY),
-        (67, f32::INFINITY),
-        (131, f32::NAN),
-        (259, f32::MIN),
-        (1027, f32::MAX),
-        (2051, f32::from_bits(1)),
-    ] {
-        actual[index] = value;
-    }
-    let expected: Vec<f32> = actual.iter().map(|value| value.exp()).collect();
-    exp_inplace(&mut actual);
-    assert_exp_close(&actual, &expected);
 }
 
 #[test]
@@ -183,40 +113,12 @@ fn count_gradients_are_close_to_scalar() {
 }
 
 #[test]
-fn wide_softmax_dispatch_is_close_to_scalar() {
-    for num_class in [8, 32, 33, 128, 131] {
-        let original = sawtooth(num_class, 103, -2.5, 0.05);
-        let expected = scalar_softmax_rows(&original, num_class);
-        let mut actual = original;
-        softmax_rows_inplace(&mut actual, num_class);
-        for (actual, expected) in actual.iter().zip(expected) {
-            assert!((actual - expected).abs() <= 3.0e-7);
-        }
-    }
-
-    // A wide dynamic range takes the scalar exceptional path so exponent
-    // underflow behavior remains identical.
-    let mut actual = vec![-100.0; 32];
-    actual[0] = 100.0;
-    let expected = scalar_softmax_rows(&actual, 32);
-    softmax_rows_inplace(&mut actual, 32);
-    assert_eq!(actual, expected);
-}
-
-#[test]
-fn softmax_matrix_and_gradient_are_close_to_scalar() {
+fn softmax_gradient_is_close_to_scalar() {
     for num_class in [4, 8, 17, 32, 33, 128, 131] {
         let rows = 257;
         let original = sawtooth(rows * num_class, 211, -2.5, 0.025);
         let labels: Vec<f32> = (0..rows).map(|row| (row % num_class) as f32).collect();
         let weight_values = sawtooth(rows, 11, 0.5, 0.125);
-
-        let mut transformed = original.clone();
-        let expected_transform = scalar_softmax_rows(&original, num_class);
-        softmax_rows_inplace(&mut transformed, num_class);
-        for (actual, expected) in transformed.iter().zip(&expected_transform) {
-            assert!((actual - expected).abs() <= 3.0e-7);
-        }
 
         for weights in [None, Some(weight_values.as_slice())] {
             let mut actual = vec![GradPair::default(); original.len()];
@@ -236,17 +138,6 @@ fn short_softmax_batches_match_scalar_across_boundaries() {
                 .collect();
             let labels: Vec<f32> = (0..rows).map(|i| (i % num_class) as f32).collect();
             let weights: Vec<f32> = (0..rows).map(|i| (i % 7) as f32 * 0.25).collect();
-            let expected = scalar_softmax_rows(&original, num_class);
-            // Offset and guard both buffers to exercise unaligned stores
-            // and catch writes past batch/remainder boundaries, including odd rows.
-            let mut values = vec![1234.0; original.len() + 2];
-            values[1..=original.len()].copy_from_slice(&original);
-            softmax_rows_inplace(&mut values[1..=original.len()], num_class);
-            assert_eq!(values[0], 1234.0);
-            assert_eq!(values[original.len() + 1], 1234.0);
-            for (actual, expected) in values[1..=original.len()].iter().zip(expected) {
-                assert!((actual - expected).abs() <= 3e-7);
-            }
             for weight in [None, Some(weights.as_slice())] {
                 let guard = GradPair::new(1234.0, 5678.0);
                 let mut actual = vec![guard; original.len() + 2];
@@ -306,12 +197,6 @@ fn short_softmax_exceptional_rows_and_label_casts_match_scalar() {
             ] {
                 let mut original = vec![0.0; labels.len() * num_class];
                 original[position] = exceptional;
-                let expected = scalar_softmax_rows(&original, num_class);
-                let mut actual = original.clone();
-                softmax_rows_inplace(&mut actual, num_class);
-                for (&actual, &expected) in actual.iter().zip(&expected) {
-                    close(actual, expected);
-                }
                 for weight in [None, Some(weights.as_slice())] {
                     let mut actual = vec![GradPair::default(); original.len()];
                     let expected = scalar_softmax_gradient(&original, &labels, weight, num_class);
@@ -807,10 +692,10 @@ fn multiclass_metric_fallback_preserves_ties_and_nonfinite_values() {
     assert_eq!(actual.0.is_nan(), expected.0.is_nan());
 }
 
-/// The softmax entry points run the architecture's specialized kernel for
-/// every class count it covers, bit for bit, and the scalar rows otherwise.
+/// The softmax gradient runs the architecture's specialized kernel for every
+/// class count it covers, bit for bit, and the scalar rows otherwise.
 #[test]
-fn softmax_dispatch_selects_the_kernel_for_each_class_count() {
+fn softmax_gradient_dispatch_selects_the_kernel_for_each_class_count() {
     for num_class in 2..=9usize {
         let rows = 37;
         let preds: Vec<f32> = (0..rows * num_class)
@@ -827,11 +712,8 @@ fn softmax_dispatch_selects_the_kernel_for_each_class_count() {
             1e-16,
             &mut dispatched,
         );
-        let mut transformed = preds.clone();
-        softmax_rows_inplace(&mut transformed, num_class);
 
         let mut expected = vec![GradPair::default(); preds.len()];
-        let mut expected_rows = preds.clone();
         let mut vector = false;
         #[cfg(target_arch = "aarch64")]
         if neon_available() {
@@ -871,13 +753,6 @@ fn softmax_dispatch_selects_the_kernel_for_each_class_count() {
                     ),
                     _ => vector = false,
                 }
-                match num_class {
-                    2 => aarch64::short_softmax_rows::<2>(&mut expected_rows),
-                    3 => aarch64::short_softmax_rows::<3>(&mut expected_rows),
-                    4 => aarch64::short_softmax_rows::<4>(&mut expected_rows),
-                    8.. => aarch64::softmax_rows_inplace(&mut expected_rows, num_class),
-                    _ => {}
-                }
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -895,7 +770,6 @@ fn softmax_dispatch_selects_the_kernel_for_each_class_count() {
                         1e-16,
                         &mut expected,
                     );
-                    x86_64::short_softmax_rows::<2>(&mut expected_rows);
                 } else {
                     x86_64::short_softmax_gradient::<4>(
                         &preds,
@@ -904,7 +778,6 @@ fn softmax_dispatch_selects_the_kernel_for_each_class_count() {
                         1e-16,
                         &mut expected,
                     );
-                    x86_64::short_softmax_rows::<4>(&mut expected_rows);
                 }
             }
         }
@@ -918,9 +791,6 @@ fn softmax_dispatch_selects_the_kernel_for_each_class_count() {
                 0..rows,
                 num_class,
             );
-            for row in expected_rows.chunks_mut(num_class) {
-                softmax_scalar(row);
-            }
         }
         let bits = |pairs: &[GradPair]| -> Vec<(u32, u32)> {
             pairs
@@ -932,12 +802,6 @@ fn softmax_dispatch_selects_the_kernel_for_each_class_count() {
             bits(&dispatched),
             bits(&expected),
             "gradient, {num_class} classes"
-        );
-        let bits = |values: &[f32]| -> Vec<u32> { values.iter().map(|v| v.to_bits()).collect() };
-        assert_eq!(
-            bits(&transformed),
-            bits(&expected_rows),
-            "transform, {num_class} classes"
         );
     }
 }

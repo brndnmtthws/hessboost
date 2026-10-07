@@ -3,13 +3,12 @@
 
 use rayon::prelude::*;
 
-use super::exp_transform;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use crate::objective::AftDistribution;
 use crate::objective::distributional::special::erf_glibc as erf;
 use crate::objective::{
-    GradPair, Loss, MIN_HESS_F64, OutputDomain, check_base_score_domain, log_link,
+    GradPair, Loss, MIN_HESS_F64, OutputDomain, check_base_score_domain, inverse_log_link, log_link,
 };
 
 /// Accelerated failure time model (`survival:aft`) on interval-censored
@@ -135,7 +134,7 @@ impl Loss for AftLoss {
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
-        exp_transform(preds);
+        inverse_log_link(preds);
     }
 
     /// Identity: the AFT metrics consume the raw log-time margins.

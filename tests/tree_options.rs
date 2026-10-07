@@ -5,6 +5,7 @@ use hessboost::config::{
     BoosterKind, ExtraTrees, LinearTree, Monotone, MultiStrategy, TrainingParamsBuilder,
 };
 use hessboost::data::FeatureType;
+use hessboost::objective::Quantiles;
 use hessboost::prelude::*;
 
 mod common;
@@ -171,6 +172,111 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
     );
 }
 
+/// [`piecewise_linear`] with every tenth label shifted by +20: outliers a
+/// robust objective must ignore.
+fn with_outliers(n: usize, seed: u64) -> DMatrix {
+    let data = piecewise_linear(n, seed);
+    let mut y = data.labels().unwrap().to_vec();
+    for v in y.iter_mut().step_by(10) {
+        *v += 20.0;
+    }
+    // `piecewise_linear`'s features.
+    labeled_dense(&uniform(2 * n, seed), 2, &y)
+}
+
+/// Mean pinball loss over `alphas` (`alpha = 0.5` is half the MAE), row-major
+/// predictions `[row][alpha]` against one label per row.
+fn pinball(model: &BoostedModel, data: &DMatrix, alphas: &[f32]) -> f64 {
+    let preds = model.predict(data, Iterations::Best).unwrap();
+    let labels = data.labels().unwrap();
+    let k = alphas.len();
+    assert_eq!(preds.as_slice().len(), labels.len() * k);
+    let loss: f64 = preds
+        .as_slice()
+        .chunks_exact(k)
+        .zip(labels)
+        .flat_map(|(row, &y)| {
+            row.iter().zip(alphas).map(move |(&p, &a)| {
+                let r = f64::from(y - p);
+                if r >= 0.0 {
+                    f64::from(a) * r
+                } else {
+                    f64::from(a - 1.0) * r
+                }
+            })
+        })
+        .sum();
+    loss / (labels.len() * k) as f64
+}
+
+/// The surrogate-trained L1 and pinball objectives fit their linear leaves
+/// by the surrogates' Newton steps: better held-out loss than constant
+/// leaves, linear leaves after the first tree, thread-count independent, and
+/// lossless native round trips.
+#[test]
+fn linear_leaves_fit_absolute_and_quantile_objectives() {
+    let train_set = with_outliers(3000, 21);
+    let test_set = piecewise_linear(1500, 22);
+    for (objective, alphas) in [
+        (Objective::AbsoluteError, vec![0.5]),
+        (
+            Objective::Quantile(Quantiles::new([0.3]).unwrap()),
+            vec![0.3],
+        ),
+        (
+            Objective::Quantile(Quantiles::new([0.25, 0.5, 0.75]).unwrap()),
+            vec![0.25, 0.5, 0.75],
+        ),
+    ] {
+        let params = |linear: bool, threads: usize| {
+            let mut builder = base()
+                .max_depth(2)
+                .eta(0.5)
+                .objective(objective.clone())
+                .nthread(threads);
+            if linear {
+                builder = builder.linear_tree(LinearTree::default());
+            }
+            builder.build().unwrap()
+        };
+        let constant = train(&params(false, 4), &train_set, 8).unwrap();
+        let linear = train(&params(true, 4), &train_set, 8).unwrap();
+        let (lc, ll) = (
+            pinball(&constant, &test_set, &alphas),
+            pinball(&linear, &test_set, &alphas),
+        );
+        assert!(
+            ll < 0.75 * lc,
+            "{objective:?}: linear {ll} vs constant {lc}"
+        );
+        assert!(linear.trees()[0].linear_leaves().is_none());
+        let per_round = alphas.len();
+        assert!(
+            linear.trees()[per_round..]
+                .iter()
+                .all(|t| t.linear_leaves().is_some())
+        );
+
+        let encoded = linear.encode(ModelFormat::Binary).unwrap();
+        let serial = train(&params(true, 1), &train_set, 8).unwrap();
+        assert_eq!(serial.encode(ModelFormat::Binary).unwrap(), encoded);
+
+        let before = linear.predict(&test_set, Iterations::Best).unwrap();
+        let from_bytes = BoostedModel::decode(encoded, ModelFormat::Binary).unwrap();
+        assert_eq!(
+            from_bytes.predict(&test_set, Iterations::Best).unwrap(),
+            before
+        );
+        let from_json =
+            BoostedModel::decode(linear.encode(ModelFormat::Json).unwrap(), ModelFormat::Json)
+                .unwrap();
+        assert_eq!(
+            from_json.predict(&test_set, Iterations::Best).unwrap(),
+            before
+        );
+    }
+}
+
 #[test]
 fn incompatible_configurations_are_rejected() {
     let invalid =
@@ -191,12 +297,6 @@ fn incompatible_configurations_are_rejected() {
         base()
             .linear_tree(LinearTree::default())
             .multi_strategy(MultiStrategy::MultiOutputTree),
-        "linear_tree",
-    );
-    invalid(
-        base()
-            .linear_tree(LinearTree::default())
-            .objective(Objective::AbsoluteError),
         "linear_tree",
     );
     // The histogram-based `approx` builder accepts every option.

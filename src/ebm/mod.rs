@@ -35,7 +35,8 @@
 //!   `= B`): each bag boosts every term on its own row sample
 //!   ([`Ebm::bag_fraction`](crate::config::Ebm::bag_fraction))
 //!   and the model averages the bags (each bag's trees carry `1/B`). The
-//!   bags train in parallel and are combined in bag order. Each tree
+//!   bags train in parallel; the model lays their trees out round by
+//!   round, a round's bag by bag in bag order (each in term order). Each tree
 //!   subsamples its bag's rows (`subsample`, by class under
 //!   [`BalancedBagging`](crate::config::BalancedBagging), or by query under
 //!   [`QueryBagging`](crate::config::QueryBagging)).
@@ -45,7 +46,19 @@
 //!   after every tree, stops a stage once the last `rounds × terms` trees
 //!   failed to beat its best earlier score by
 //!   its tolerance (relative), and keeps its trees up to its best score, so the bags
-//!   stop at different rounds and `num_boost_round` only caps them.
+//!   stop at different rounds and `num_boost_round` only caps them. Eval
+//!   sets ([`Trainer::eval`](crate::training::Trainer::eval)) still score
+//!   each round's model as trained (a bag's trees past its best score
+//!   included until its stage ends), not the returned model.
+//! - **Eval sets and early stopping**: every EBM round of both stages is
+//!   scored on the eval sets. For a classic EBM the scores are those of the
+//!   model formed by the trees through that round, bit for bit, and
+//!   [`Trainer::early_stopping_rounds`](crate::training::Trainer::early_stopping_rounds)
+//!   (XGBoost's rule over the rounds of both stages) returns the model
+//!   training held after the best round: the later trees are dropped, a
+//!   best round in the main-effect stage leaves no pair terms, and
+//!   `best_iteration` is the model's last. A Boulevard EBM reports the
+//!   stage average of the rounds run, as `booster = boulevard` does.
 //! - **Interactions** ([`Ebm::interactions`](crate::config::Ebm::interactions)
 //!   `= k`): after the main effects, FAST (Lou, Caruana, Gehrke & Hooker,
 //!   *Accurate intelligible models with pairwise interactions*, KDD 2013)
@@ -83,17 +96,22 @@
 //!
 //! # Refusals
 //!
-//! `booster = ebm` needs one output and no `init_model`, eval sets, or
-//! `Trainer::early_stopping_rounds` (the terms of one run are fixed; stop
-//! each bag with [`Ebm::early_stopping`](crate::config::Ebm::early_stopping),
-//! flat `ebm_early_stopping_rounds`, instead); it refuses `num_parallel_tree > 1`, column sampling, interaction
-//! constraints (the terms fix every tree's features), linear leaves, the
-//! reuse penalties, `process_type = update`, feature weights, and base
-//! margins (the shapes and their centering assume the intercept alone).
-//! With `ebm_boulevard` also everything Boulevard inference refuses
-//! (non-squared-error objectives, row weights, L1 or clipped
-//! leaves, quantized gradients, smoothed leaves, gradient-based sampling),
-//! outer bags, early stopping, and `base_score`. See
+//! `booster = ebm` needs one output and no `init_model`. It refuses
+//! `num_parallel_tree > 1`, column sampling, interaction constraints (the
+//! terms fix every tree's features), linear leaves, the reuse penalties,
+//! `process_type = update`, feature weights, and a training `base_margin`
+//! (the shapes and their centering assume the intercept alone; an eval set's
+//! replaces the intercept, as in prediction). Per-bag
+//! [`Ebm::early_stopping`](crate::config::Ebm::early_stopping) (flat
+//! `ebm_early_stopping_rounds`) is refused together with
+//! [`Trainer::early_stopping_rounds`](crate::training::Trainer::early_stopping_rounds),
+//! since the two rules would select different models, and by
+//! [`CrossValidation`](crate::training::CrossValidation), since each fold
+//! would end its stages at a different round. With `ebm_boulevard` it also
+//! refuses everything Boulevard inference refuses (non-squared-error
+//! objectives, row weights, L1 or clipped leaves, quantized gradients,
+//! smoothed leaves, gradient-based sampling), outer bags, early stopping, and
+//! `base_score`. See
 //! [`TrainingParams::validate`](crate::config::TrainingParams::validate).
 //!
 //! # Deviations from InterpretML

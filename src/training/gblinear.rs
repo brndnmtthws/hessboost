@@ -91,7 +91,7 @@ pub(crate) fn train_gblinear(
         })
         .collect();
     for row in 0..n {
-        for_each_present_value(dtrain, row, |f, x| {
+        for_each_present_value(dtrain.into(), row, |f, x| {
             if x != 0.0 {
                 let col = &mut cols[f];
                 col.rows.push(row as u32);

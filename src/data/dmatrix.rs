@@ -4,10 +4,20 @@ use crate::data::meta::{FeatureType, GroupInfo, LabelBounds, Labels, MetaInfo};
 use crate::error::{HessboostError, Result};
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 /// Dense inputs with at least this many values are validated and copied in
-/// parallel.
-const PARALLEL_COPY_VALUES: usize = 1 << 20;
+/// parallel: below it the serial scan and copy are faster than rayon's
+/// dispatch (measured on a 192-core aarch64 host).
+const PARALLEL_COPY_VALUES: usize = 1 << 22;
+
+/// Values per parallel task of the dense validation scan and copy.
+const PARALLEL_BLOCK: usize = 1 << 18;
+
+/// Values per branch-free block of the dense validation scan: each block is
+/// OR-reduced without early exit (which vectorizes), and the scan stops at
+/// the first block holding a refused value.
+const SCAN_BLOCK: usize = 256;
 
 /// Returns `true` if `v` should be treated as missing given the sentinel
 /// `missing`. NaN sentinels match any NaN. Otherwise an exact bit-compatible
@@ -79,7 +89,7 @@ fn check_weights(
 
 /// Validate a row-major dense matrix: a non-empty shape matching
 /// `data.len()`, every non-missing value finite. Returns whether `data` is
-/// large enough to be checked (and copied) in parallel.
+/// large enough to be copied in parallel.
 fn check_dense(data: &[f32], n_rows: usize, n_cols: usize, missing: f32) -> Result<bool> {
     if n_rows == 0 || n_cols == 0 {
         return Err(HessboostError::EmptyDataset(
@@ -90,41 +100,79 @@ fn check_dense(data: &[f32], n_rows: usize, n_cols: usize, missing: f32) -> Resu
         .checked_mul(n_cols)
         .ok_or_else(|| HessboostError::invalid_data("data", "n_rows * n_cols overflows usize"))?;
     check_len("dense data length", data.len(), expected)?;
-    // With the NaN sentinel the only rejected values are infinities, a
-    // branch-free check the compiler vectorizes; other sentinels need the
-    // general test. Large inputs are checked in parallel.
-    let parallel = data.len() >= PARALLEL_COPY_VALUES && rayon::current_num_threads() > 1;
-    let rejects = |chunk: &[f32]| {
-        if missing.is_nan() {
-            chunk.iter().any(|v| v.is_infinite())
-        } else {
-            chunk.iter().any(|&v| v != missing && !v.is_finite())
-        }
-    };
-    let invalid = if parallel {
-        data.par_chunks(PARALLEL_COPY_VALUES / 16).any(rejects)
-    } else {
-        rejects(data)
-    };
-    if invalid {
+    if rejects_dense_values(data, missing) {
         return Err(HessboostError::invalid_data(
             "data",
             "non-missing feature values must be finite",
         ));
     }
-    Ok(parallel)
+    Ok(parallel_values(data.len()))
 }
 
-/// Backing storage for the feature matrix.
+/// Whether `len` dense values are scanned and copied in parallel.
+fn parallel_values(len: usize) -> bool {
+    len >= PARALLEL_COPY_VALUES && rayon::current_num_threads() > 1
+}
+
+/// Whether dense `values` hold what a dense matrix with the `missing`
+/// sentinel refuses (a non-missing value that is not finite), in parallel
+/// blocks for large inputs. Shared with the predictions of borrowed rows.
+pub(crate) fn rejects_dense_values(values: &[f32], missing: f32) -> bool {
+    if parallel_values(values.len()) {
+        values
+            .par_chunks(PARALLEL_BLOCK)
+            .any(|chunk| rejects_dense(chunk, missing))
+    } else {
+        rejects_dense(values, missing)
+    }
+}
+
+/// [`rejects_dense_values`] on the calling thread, whatever the length: what
+/// a single prediction row is checked with, since the row methods never
+/// enter rayon. With the NaN sentinel the only refused values are
+/// infinities; other sentinels need the general test. Each [`SCAN_BLOCK`] is
+/// reduced branch-free.
+pub(crate) fn rejects_dense(values: &[f32], missing: f32) -> bool {
+    if missing.is_nan() {
+        values
+            .chunks(SCAN_BLOCK)
+            .any(|block| block.iter().fold(false, |bad, v| bad | v.is_infinite()))
+    } else {
+        values.chunks(SCAN_BLOCK).any(|block| {
+            block
+                .iter()
+                .fold(false, |bad, &v| bad | ((v != missing) & !v.is_finite()))
+        })
+    }
+}
+
+/// Copy of `data`, in parallel [`PARALLEL_BLOCK`]s when `parallel`.
+fn copy_dense(data: &[f32], parallel: bool) -> Vec<f32> {
+    if !parallel {
+        return data.to_vec();
+    }
+    let mut values = vec![0.0; data.len()];
+    values
+        .par_chunks_mut(PARALLEL_BLOCK)
+        .zip(data.par_chunks(PARALLEL_BLOCK))
+        .for_each(|(dst, src)| dst.copy_from_slice(src));
+    values
+}
+
+/// Backing storage for the feature matrix, shared between clones: cloning
+/// a [`DMatrix`] copies only its metadata, and a mutation of shared values
+/// copies them first ([`Arc::make_mut`]), so a clone never changes its
+/// source. Each array is its own `Arc<Vec<_>>`, so wrapping an owned `Vec`
+/// copies nothing and a value-only rewrite keeps sharing the CSR structure.
 #[derive(Debug, Clone)]
 enum Storage {
     /// Row-major dense matrix of length `n_rows * n_cols`.
-    Dense(Vec<f32>),
+    Dense(Arc<Vec<f32>>),
     /// Compressed sparse row: `indptr` has `n_rows + 1` entries.
     Csr {
-        indptr: Vec<usize>,
-        indices: Vec<u32>,
-        values: Vec<f32>,
+        indptr: Arc<Vec<usize>>,
+        indices: Arc<Vec<u32>>,
+        values: Arc<Vec<f32>>,
     },
 }
 
@@ -137,6 +185,10 @@ enum Storage {
 /// sparse storage absent columns are missing. Split finding learns a default
 /// direction for absent values, matching
 /// XGBoost's sparsity-aware algorithm.
+///
+/// Clones share the feature values: `clone` copies only the metadata
+/// (labels, weights, and the rest), and no operation on a clone changes the
+/// matrix it was cloned from.
 #[derive(Debug, Clone)]
 pub struct DMatrix {
     n_rows: usize,
@@ -174,10 +226,25 @@ impl DMatrix {
         }
     }
 
-    /// Build a dense matrix from a row-major slice of length `n_rows * n_cols`.
-    /// The missing sentinel defaults to NaN.
+    /// Build a dense matrix from a row-major slice of length `n_rows * n_cols`,
+    /// copying it. The missing sentinel defaults to NaN.
+    /// [`DMatrix::from_dense_vec`] takes an owned `Vec` without copying.
     pub fn from_dense(data: &[f32], n_rows: usize, n_cols: usize) -> Result<Self> {
         Self::from_dense_with_missing(data, n_rows, n_cols, f32::NAN)
+    }
+
+    /// Builds the matrix [`DMatrix::from_dense`] builds, taking ownership of
+    /// `data` instead of copying it, after the same checks (a non-empty shape
+    /// matching `data.len()`, every value finite or NaN). NaN marks a missing
+    /// value.
+    pub fn from_dense_vec(data: Vec<f32>, n_rows: usize, n_cols: usize) -> Result<Self> {
+        check_dense(&data, n_rows, n_cols, f32::NAN)?;
+        Ok(Self::new(
+            n_rows,
+            n_cols,
+            Storage::Dense(Arc::new(data)),
+            f32::NAN,
+        ))
     }
 
     /// Build a dense matrix with an explicit missing-value sentinel.
@@ -188,19 +255,13 @@ impl DMatrix {
         missing: f32,
     ) -> Result<Self> {
         let parallel = check_dense(data, n_rows, n_cols, missing)?;
-        let values = if parallel {
-            data.par_iter().copied().collect()
-        } else {
-            data.to_vec()
-        };
-        Ok(Self::new(n_rows, n_cols, Storage::Dense(values), missing))
-    }
-
-    /// [`DMatrix::from_dense`] taking ownership of `data` instead of copying
-    /// it (the missing sentinel is NaN).
-    pub(crate) fn from_dense_vec(data: Vec<f32>, n_rows: usize, n_cols: usize) -> Result<Self> {
-        check_dense(&data, n_rows, n_cols, f32::NAN)?;
-        Ok(Self::new(n_rows, n_cols, Storage::Dense(data), f32::NAN))
+        let values = copy_dense(data, parallel);
+        Ok(Self::new(
+            n_rows,
+            n_cols,
+            Storage::Dense(Arc::new(values)),
+            missing,
+        ))
     }
 
     /// Build a matrix from compressed-sparse-row arrays.
@@ -254,9 +315,9 @@ impl DMatrix {
             n_rows,
             n_cols,
             Storage::Csr {
-                indptr,
-                indices,
-                values,
+                indptr: Arc::new(indptr),
+                indices: Arc::new(indices),
+                values: Arc::new(values),
             },
             f32::NAN,
         ))
@@ -572,7 +633,7 @@ impl DMatrix {
     #[inline]
     pub(crate) fn dense_values(&self) -> Option<&[f32]> {
         match &self.storage {
-            Storage::Dense(data) => Some(data),
+            Storage::Dense(data) => Some(data.as_slice()),
             Storage::Csr { .. } => None,
         }
     }
@@ -588,17 +649,18 @@ impl DMatrix {
                 indptr,
                 indices,
                 values,
-            } => Some((indptr, indices, values)),
+            } => Some((indptr.as_slice(), indices.as_slice(), values.as_slice())),
         }
     }
 
     /// Mutable row-major storage of a dense matrix, or `None` for sparse
-    /// storage. Callers keep the constructors' invariant: every value is
-    /// finite or the missing sentinel.
+    /// storage. Values shared with a clone are copied first, so the clone
+    /// keeps its own. Callers keep the constructors' invariant: every value
+    /// is finite or the missing sentinel.
     #[inline]
     pub(crate) fn dense_values_mut(&mut self) -> Option<&mut [f32]> {
         match &mut self.storage {
-            Storage::Dense(data) => Some(data),
+            Storage::Dense(data) => Some(Arc::make_mut(data).as_mut_slice()),
             Storage::Csr { .. } => None,
         }
     }
@@ -606,35 +668,50 @@ impl DMatrix {
     /// Copy of this matrix, metadata included, with every non-missing stored
     /// value replaced by `f(row, col, value)`. Missing dense entries become NaN
     /// and the result's sentinel is NaN, so a mapped value can never collide
-    /// with a non-NaN sentinel. Feature types are copied unchanged.
+    /// with a non-NaN sentinel. Feature types are copied unchanged. The values
+    /// are written to new storage (a CSR result shares this matrix's
+    /// `indptr` and `indices`); this matrix is unchanged.
     pub(crate) fn map_values(&self, mut f: impl FnMut(usize, usize, f32) -> f32) -> Self {
-        let mut out = self.clone();
-        match &mut out.storage {
+        let storage = match &self.storage {
             Storage::Dense(data) => {
-                for (row, values) in data.chunks_exact_mut(self.n_cols).enumerate() {
-                    for (col, v) in values.iter_mut().enumerate() {
-                        *v = if is_missing(*v, self.missing) {
+                let mut mapped = Vec::with_capacity(data.len());
+                for (row, values) in data.chunks_exact(self.n_cols).enumerate() {
+                    mapped.extend(values.iter().enumerate().map(|(col, &v)| {
+                        if is_missing(v, self.missing) {
                             f32::NAN
                         } else {
-                            f(row, col, *v)
-                        };
-                    }
+                            f(row, col, v)
+                        }
+                    }));
                 }
+                Storage::Dense(Arc::new(mapped))
             }
             Storage::Csr {
                 indptr,
                 indices,
                 values,
             } => {
+                let mut mapped = Vec::with_capacity(values.len());
                 for row in 0..self.n_rows {
-                    for k in indptr[row]..indptr[row + 1] {
-                        if !is_missing(values[k], self.missing) {
-                            values[k] = f(row, indices[k] as usize, values[k]);
+                    let (start, end) = (indptr[row], indptr[row + 1]);
+                    mapped.extend((start..end).map(|k| {
+                        let v = values[k];
+                        if is_missing(v, self.missing) {
+                            v
+                        } else {
+                            f(row, indices[k] as usize, v)
                         }
-                    }
+                    }));
+                }
+                Storage::Csr {
+                    indptr: Arc::clone(indptr),
+                    indices: Arc::clone(indices),
+                    values: Arc::new(mapped),
                 }
             }
-        }
+        };
+        let mut out = self.clone();
+        out.storage = storage;
         out.missing = f32::NAN;
         out
     }
@@ -743,7 +820,12 @@ impl DMatrix {
                     }
                 }
                 // The source's values are already validated.
-                Self::new(rows.len(), n_cols, Storage::Dense(selected), f32::NAN)
+                Self::new(
+                    rows.len(),
+                    n_cols,
+                    Storage::Dense(Arc::new(selected)),
+                    f32::NAN,
+                )
             }
             Storage::Csr { .. } => {
                 let mut indptr = Vec::with_capacity(rows.len() + 1);

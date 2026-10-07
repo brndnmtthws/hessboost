@@ -24,14 +24,15 @@ test row's label into its own encoding.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal, TypeAlias
+from typing import Literal, Self, TypeAlias
 
 import numpy as np
 from numpy.typing import ArrayLike
 
-from hessboost import _data, _hessboost
+from hessboost import _hessboost
 from hessboost._exceptions import HessboostError
 from hessboost._matrix import DMatrix, _matrix_for
+from hessboost._model_io import PathLike, _SchemaState, read_bytes, write_bytes
 
 __all__ = ["Column", "FittedTargetEncoder", "OrderedTargetEncoder", "TargetKind"]
 
@@ -168,29 +169,85 @@ class OrderedTargetEncoder:
         return self._repr
 
 
-class FittedTargetEncoder:
+class FittedTargetEncoder(_SchemaState):
     """Ordered target statistics fitted on a training matrix: each encoded
     column's smoothed target mean per category over every training row.
-    Build with :meth:`OrderedTargetEncoder.fit_transform`."""
+    Build with :meth:`OrderedTargetEncoder.fit_transform`; store with
+    :meth:`to_bytes`/:meth:`save` or pickle (which also keeps the training
+    matrix's feature names, types and frame categories)."""
 
     __module__ = "hessboost.target_stats"
 
     _core: _hessboost.FittedTargetEncoder
-    _feature_names: list[str] | None
-    _feature_types: list[str] | None
-    _categories: _data.Categories
 
     def __init__(self) -> None:
         raise TypeError("use OrderedTargetEncoder.fit_transform(...)")
 
     @classmethod
-    def _wrap(cls, core: _hessboost.FittedTargetEncoder, dtrain: DMatrix) -> FittedTargetEncoder:
+    def _wrap(cls, core: _hessboost.FittedTargetEncoder, dtrain: DMatrix | None) -> Self:
         self = object.__new__(cls)
         self._core = core
-        self._feature_names = dtrain._feature_names
-        self._feature_types = dtrain._feature_types
-        self._categories = dict(dtrain._categories)
+        if dtrain is None:
+            self._set_schema(None, None, {})
+        else:
+            self._set_schema(dtrain._feature_names, dtrain._feature_types, dict(dtrain._categories))
         return self
+
+    def to_bytes(self) -> bytes:
+        """The statistics as UTF-8 JSON: the Rust crate's serde encoding of
+        ``hessboost::data::target_stats::FittedTargetEncoder``, which Rust
+        reads back with ``serde_json``.
+
+        The bytes hold column indices and integer category codes only, not
+        the training matrix's feature names, feature types or frame
+        categories; pickle the encoder to keep them."""
+        return self._core.encode()
+
+    @classmethod
+    def from_bytes(cls, data: bytes | bytearray | memoryview) -> Self:
+        """Reads statistics written by :meth:`to_bytes` (or serialized by the
+        Rust crate).
+
+        The encoder has no feature schema, so :meth:`transform` cannot
+        supply or check one: it accepts data of any feature names, refuses
+        data whose encoded columns are not categorical (a numpy array needs
+        a :class:`~hessboost.DMatrix` with ``feature_types``), and encodes a
+        DataFrame's categorical column by that frame's own category codes
+        (positions in its categories), not re-coded to the training frame's,
+        so a frame whose categories differ from training's in content or
+        order silently gets other categories' encodings. :meth:`encode`
+        takes column indices only. Pickle the original encoder to keep the
+        schema.
+
+        Raises:
+            ModelFormatError: The bytes are not valid JSON statistics.
+        """
+        return cls._wrap(_hessboost.FittedTargetEncoder.decode(bytes(data)), None)
+
+    def save(self, path: PathLike) -> None:
+        """Writes :meth:`to_bytes` to ``path``.
+
+        Raises:
+            OSError: The file cannot be written.
+        """
+        write_bytes(path, self.to_bytes())
+
+    @classmethod
+    def load(cls, path: PathLike) -> Self:
+        """Reads a file written by :meth:`save`, as :meth:`from_bytes` reads
+        bytes (with the same schema caveat).
+
+        Raises:
+            ModelFormatError: The file is not valid JSON statistics.
+            OSError: The file cannot be read.
+        """
+        return cls.from_bytes(read_bytes(path))
+
+    def _model_state(self) -> bytes:
+        return self._core.encode()
+
+    def _restore_model(self, model: bytes) -> None:
+        self._core = _hessboost.FittedTargetEncoder.decode(model)
 
     def transform(self, data: object, *, missing: float = np.nan) -> DMatrix:
         """``data`` (a :class:`~hessboost.DMatrix`, or anything it accepts,
@@ -226,7 +283,7 @@ class FittedTargetEncoder:
             HessboostError: ``column`` is not encoded.
         """
         index = _column_index(column, self._feature_names)
-        value = self._core.encode(index, int(code))
+        value = self._core.encoding(index, int(code))
         if value is None:
             raise HessboostError(f"feature {column!r} is not target-encoded")
         return value

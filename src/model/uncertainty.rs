@@ -89,7 +89,7 @@
 //! # }
 //! ```
 
-use super::{BoostedModel, ModelObjective, Predictions, transform_margins_in_place};
+use super::{BoostedModel, ModelObjective, Predictions};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::objective::Objective;
@@ -338,28 +338,14 @@ impl BoostedModel {
         let margins = self.prefix_margins(data, &iterations)?;
         let (n_rows, k) = (data.n_rows(), self.n_outputs);
         // `predict`'s layout: one class index per row for `multi:softmax`.
-        let width = if self
-            .objective
-            .built_in()
-            .is_some_and(Objective::predicts_class_index)
-        {
-            1
-        } else {
-            k
-        };
+        let transform = self.transform();
+        let width = transform.width(k);
         let mut predictions = Vec::with_capacity(iterations.len() * n_rows * width);
         let len = n_rows * k;
         for m in 0..iterations.len() {
             let start = predictions.len();
             predictions.extend_from_slice(&margins[m * len..(m + 1) * len]);
-            let values = &mut predictions[start..];
-            transform_margins_in_place(
-                &self.objective,
-                self.max_delta_step,
-                self.n_targets,
-                values,
-                k,
-            );
+            transform.apply(&mut predictions[start..], k);
             predictions.truncate(start + n_rows * width);
         }
         Ok(VirtualEnsembles {

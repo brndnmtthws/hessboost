@@ -1,11 +1,12 @@
 # Performance
 
 hessboost trains on parallel histograms with runtime-detected SIMD kernels:
-NEON on AArch64; AVX2+FMA (gradients, exp/sigmoid/softmax) and SSE2 (bin
-search) on x86-64. Split search stays scalar; prediction walks monotone
-integer keys branch-free. Everything else falls back to scalar Rust. Split
-choices, histogram sums, and predictions match the scalar path exactly;
-transcendental kernels stay within a few f32 ULPs of the scalar functions.
+NEON on AArch64; AVX2+FMA (gradients with their exp/sigmoid/softmax) and SSE2
+(bin search) on x86-64. Split search and prediction transforms stay scalar;
+prediction walks monotone integer keys branch-free. Everything else falls
+back to scalar Rust. Split choices, histogram sums, and predictions match the
+scalar path exactly; gradient transcendentals stay within a few f32 ULPs of
+the scalar functions.
 Below: CPU training against XGBoost, then the optimizations inside hessboost.
 
 ## XGBoost comparison
@@ -186,13 +187,10 @@ loss-guide caps at 64 leaves.
 ### Numerical kernels
 
 Pointwise cases run one million predictions (multiclass: `1M / classes`
-rows, ~1M outputs). Transforms include the copy into the reusable output
-buffer; metrics include final normalization. Prepared inputs, single
-thread, no tree training.
+rows, ~1M outputs). Metrics include final normalization. Prepared inputs,
+single thread, no tree training.
 
 ![Objective gradient time cut vs scalar baseline](benchmarks/gradient-optimization.svg)
-
-![Prediction transform time cut vs scalar baseline](benchmarks/transform-optimization.svg)
 
 ![Metric time cut vs scalar baseline](benchmarks/metric-optimization.svg)
 
@@ -209,14 +207,6 @@ thread, no tree training.
 | Softmax gradient, 8 classes | 1 | 2.675 | 1.309 | 51.1% |
 | Softmax gradient, 32 classes | 1 | 2.176 | 1.012 | 53.5% |
 | Softmax gradient, 128 classes | 1 | 2.188 | 0.948 | 56.6% |
-| Sigmoid transform | 1 | 1.448 | 0.573 | 60.4% |
-| Exponential transform | 1 | 1.280 | 0.473 | 63.1% |
-| Softmax transform, 2 classes | 1 | 2.339 | 0.564 | 75.9% |
-| Softmax transform, 3 classes | 1 | 2.378 | 0.543 | 77.2% |
-| Softmax transform, 4 classes | 1 | 1.997 | 0.581 | 70.9% |
-| Softmax transform, 8 classes | 1 | 1.896 | 0.712 | 62.4% |
-| Softmax transform, 32 classes | 1 | 1.877 | 0.581 | 69.1% |
-| Softmax transform, 128 classes | 1 | 1.927 | 0.589 | 69.4% |
 | RMSE, weighted | 1 | 0.776 | 0.268 | 65.4% |
 | MAE, weighted | 1 | 0.768 | 0.268 | 65.1% |
 | Binary error, weighted | 1 | 1.338 | 0.204 | 84.8% |
@@ -229,6 +219,17 @@ thread, no tree training.
 
 The suite also covers unweighted metrics, more class counts, and
 histogram-accumulation controls (scalar loop and scheduling).
+
+Prediction transforms have no vector kernels: each value (each row for
+softmax) goes through XGBoost's scalar `expf`, sigmoid, and softmax, so a
+prediction never depends on the rows predicted with it, and `predict` is bit
+for bit the transform of `predict_margin`. The NEON transforms this replaced
+took 60–77% less time on these cases, but a value's rounding depended on its
+position in the batch: on Neoverse V3, a row predicted alone and inside a
+batch of 64 differed by one ULP in 8 of 64 logistic rows, 37 Poisson rows,
+and 55 Tweedie rows, and by up to two in 62 softprob rows. On that machine,
+scalar `expf` takes about 2.0 ns per value against 0.77 ns for the vector
+kernel, while walking 100 depth-six trees takes about 1.3 µs per row (below).
 
 ### Quantized-gradient training (opt-in)
 
@@ -522,6 +523,30 @@ builds of the old code differing only in unrelated training code measured
 140.0 vs 132.8 ms). A shared block-tail walk for generic and symmetric
 kernels was dropped (+4.6% quantile, +2.2% symmetric).
 
+### Matrix storage and borrowed rows
+
+A `DMatrix` shares its feature values behind an `Arc`, so a clone (Python's
+`set_info`, the per-fold and per-sample matrices) copies only metadata. Dense
+input is checked 256 values at a time without a branch, and from 2^22 values
+on, checked and copied in parallel 2^18-value blocks. `predict_rows` reads
+borrowed rows without building a matrix; `predict_row` writes one row's
+values without allocating. `select_rows` still copies rows: the copies take
+0.15% of a cross-validation fold's time and 0.003% of EBM training's, too
+little for row views to pay off.
+
+192-core **AWS Neoverse-V3** (Rust 1.99.0, release), 2026-10-07 UTC, busy
+host (load 40–560), best of 7–15 runs; every 97th value `NaN`. Prediction:
+100 depth-six `binary:logistic` trees.
+
+| Case | Threads | Before (ms) | After (ms) |
+|---|---:|---:|---:|
+| `from_dense`, 1M × 100 | 1 | 57.3 | 30.3 |
+| `from_dense`, 1M × 100 | 192 | 9.2 | 4.2 |
+| `clone` and new labels, 1M × 100 | 1 | 20.7 | 0.43 |
+| `from_dense` + `predict` → `predict_rows`, 1M × 100 | 1 | 407.5 | 396.3 |
+| `from_dense` + `predict` → `predict_rows`, 1M × 100 | 192 | 22.5 | 11.7 |
+| One-row `from_dense` + `predict` → `predict_row`, 100 features | 1 | 0.00108 | 0.00097 |
+
 ### Categorical and sparse partitions
 
 Categorical splits and sub-half-full indexes used to partition serially
@@ -623,19 +648,17 @@ blocks. Scalar formulas serve fallbacks, exceptional blocks, and tails.
 | Operation | NEON path |
 |---|---|
 | Logistic, Poisson, Gamma, Tweedie gradients | Four `f32` predictions per block, with weighted and unweighted inputs |
-| Sigmoid and exponential transforms | Four `f32` predictions per block |
-| Softmax gradients and transforms, 2–4 classes | Four rows at a time using interleaved loads and stores |
-| Softmax gradients and transforms, 8+ classes | Vector blocks within each row |
+| Softmax gradients, 2–4 classes | Four rows at a time using interleaved loads and stores |
+| Softmax gradients, 8+ classes | Vector blocks within each row |
 | RMSE, MAE, binary error, log loss, count metrics | `f64` reductions with optional weights |
 | Multiclass log loss | Gathered label probabilities with `f64` logarithms |
 | Multiclass error, 8+ classes | Vector row maxima |
 
 Minimum 16 elements for most kernels; 5–7-class softmax stays scalar. The
-`f32` exp is range reduction plus a degree-seven polynomial on finite
-`[-80, 80]`, `f32::exp` elsewhere; softmax subtracts the row max and bails
-on nonfinite rows or margin spread above 80. Estrin evaluation for
-gradients and narrow softmax, Horner for wide in-place softmax. Metric logs
-and Tweedie exps stay `f64`.
+`f32` exp is range reduction plus a degree-seven polynomial (Estrin pairs)
+on finite `[-80, 80]`, `f32::exp` elsewhere; softmax subtracts the row max
+and bails on nonfinite rows or margin spread above 80. Metric logs and
+Tweedie exps stay `f64`.
 
 Depthwise growth expands nodes and draws child feature samples in traversal
 order, then partitions, histograms, and evaluates independent nodes in
@@ -689,7 +712,10 @@ missing stores the next-lower threshold; right-missing mirrors children and
 stores a negated threshold plus sign mask; leaves self-loop). One step: node
 load, feature load, XOR, compare, add — no data-dependent branch. Sixteen
 rows walk in lockstep for the tree depth; batches under sixteen rows walk
-sixteen trees in lockstep instead. 256-row blocks run in parallel, each
+sixteen trees in lockstep instead. So does one row (`predict_row`,
+`predict_row_into`), keyed once on the stack up to 128 features and per step
+beyond, so it never allocates; borrowed rows (`predict_rows`) fill the same
+blocks a dense matrix does. 256-row blocks run in parallel, each
 block's sixteen-row groups stored feature-major (`[group][feature][lane]`);
 trees sum in order, bit-identical to sequential. Non-`NaN` sentinels scatter
 straight in; >4,096 sparse columns use per-lookup access. Categorical

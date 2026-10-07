@@ -38,6 +38,8 @@ doctest = false
 hessboost = { path = "..", features = ["wgpu"] }
 numpy = "0.29"
 pyo3 = { version = "0.29", features = ["abi3-py311"] }
+# The extension's own pool, which a forked child rebuilds (`src/pool.rs`).
+rayon = "1.12"
 # Method configurations cross the boundary as their serde JSON.
 serde = "1.0"
 # Parameter mappings deserialize into `TrainingParams` through serde;

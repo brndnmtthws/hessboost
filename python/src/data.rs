@@ -291,7 +291,8 @@ impl DMatrix {
         Ok(Self { inner })
     }
 
-    /// A copy with the fields present in `info` replaced.
+    /// A copy with the fields present in `info` replaced, sharing this
+    /// matrix's feature values (so only the metadata is copied).
     fn with_info(&self, py: Python<'_>, info: Info<'_>) -> PyResult<Self> {
         let info = info.slices()?;
         let inner = py.detached(|| info.apply(self.inner.clone()))?;

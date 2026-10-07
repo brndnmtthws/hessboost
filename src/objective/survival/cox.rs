@@ -1,9 +1,11 @@
 //! Cox proportional hazards (`survival:cox`, XGBoost
 //! `objective/regression_obj.cu`).
 
-use super::{abs_label_order, exp_transform};
+use super::abs_label_order;
 use crate::error::Result;
-use crate::objective::{GradPair, Loss, OutputDomain, check_base_score_domain, log_link};
+use crate::objective::{
+    GradPair, Loss, OutputDomain, check_base_score_domain, inverse_log_link, log_link,
+};
 
 /// Cox proportional-hazards regression (`survival:cox`) on right-censored
 /// survival times.
@@ -68,7 +70,7 @@ impl Loss for Cox {
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
-        exp_transform(preds);
+        inverse_log_link(preds);
     }
 
     fn probs_to_margins(&self, scores: &mut [f32]) {

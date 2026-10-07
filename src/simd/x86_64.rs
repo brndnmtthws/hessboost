@@ -1,7 +1,7 @@
 //! AVX2/FMA kernels for x86-64. The transcendental kernels mirror the NEON
 //! formulas and stay within a few f32 ULPs of the scalar library functions.
 
-use super::{MAX_FAST_EXP_INPUT, scalar, sigmoid_scalar};
+use super::{MAX_FAST_EXP_INPUT, scalar};
 use crate::objective::GradPair;
 #[allow(
     clippy::wildcard_imports,
@@ -102,39 +102,6 @@ unsafe fn store_pairs(dest: *mut GradPair, grad: __m256, hess: __m256) {
     }
 }
 
-/// Vector-loop shell of a `&mut [f32]` unary inplace kernel: vector fast path
-/// for regular lanes, scalar per-lane fallback otherwise. The kernel and
-/// scalar formulas (intrinsics included) are passed in as expressions.
-macro_rules! unary_inplace_kernel {
-    ($name:ident, $kernel:expr, $scalar:expr) => {
-        #[target_feature(enable = "avx2,fma")]
-        pub(super) unsafe fn $name(values: &mut [f32]) {
-            // SAFETY: the caller guarantees AVX2/FMA support; every vector
-            // access is bounded by the loop condition.
-            unsafe {
-                let mut index = 0;
-                while index + WIDTH <= values.len() {
-                    let input = _mm256_loadu_ps(values.as_ptr().add(index));
-                    if regular_input(input) {
-                        _mm256_storeu_ps(values.as_mut_ptr().add(index), ($kernel)(input));
-                    } else {
-                        for value in &mut values[index..index + WIDTH] {
-                            *value = ($scalar)(*value);
-                        }
-                    }
-                    index += WIDTH;
-                }
-                for value in &mut values[index..] {
-                    *value = ($scalar)(*value);
-                }
-            }
-        }
-    };
-}
-
-unary_inplace_kernel!(exp_inplace, exp_f32, f32::exp);
-unary_inplace_kernel!(sigmoid_inplace, sigmoid_f32, sigmoid_scalar);
-
 #[target_feature(enable = "avx2,fma")]
 pub(super) unsafe fn logistic_gradient(
     preds: &[f32],
@@ -215,28 +182,24 @@ unsafe fn row_reduce<const K: usize>(
 }
 
 /// Softmax of the `WIDTH / K` rows held in one vector, or `None` when a row is
-/// non-finite or spans more than [`MAX_FAST_EXP_INPUT`].
-///
-/// `GRADIENT` selects the shift of `SoftmaxMultiClassObj::GetGradient`,
-/// `max(f32::MIN_POSITIVE, row...)`, instead of the plain row maximum of
-/// `common::Softmax`; rows whose maximum is at least `MIN_POSITIVE` are
-/// unaffected.
+/// non-finite or spans more than [`MAX_FAST_EXP_INPUT`]: the probabilities of
+/// `SoftmaxMultiClassObj::GetGradient`, which shifts by
+/// `max(f32::MIN_POSITIVE, row...)` (rows whose maximum is at least
+/// `MIN_POSITIVE` are shifted by it alone).
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn short_softmax_batch<const K: usize, const GRADIENT: bool>(
-    preds: *const f32,
-) -> Option<__m256> {
+unsafe fn short_softmax_batch<const K: usize>(preds: *const f32) -> Option<__m256> {
     // SAFETY: the caller guarantees AVX2/FMA support and `WIDTH` readable
     // values at `preds`.
     unsafe {
         let values = _mm256_loadu_ps(preds);
-        let mut maximum = row_reduce::<K>(values, _mm256_max_ps);
+        // `maxps` returns its second operand when either is NaN, so keep the
+        // row maximum second to preserve NaN lanes for the range guard.
+        let maximum = _mm256_max_ps(
+            _mm256_set1_ps(f32::MIN_POSITIVE),
+            row_reduce::<K>(values, _mm256_max_ps),
+        );
         let minimum = row_reduce::<K>(values, _mm256_min_ps);
-        if GRADIENT {
-            // `maxps` returns its second operand when either is NaN, so keep
-            // `maximum` second to preserve NaN lanes for the range guard.
-            maximum = _mm256_max_ps(_mm256_set1_ps(f32::MIN_POSITIVE), maximum);
-        }
         // NaNs propagate through min/max and infinities give a non-finite
         // range, so this ordered comparison fails for such rows.
         let regular = _mm256_cmp_ps::<_CMP_LE_OQ>(
@@ -249,28 +212,6 @@ unsafe fn short_softmax_batch<const K: usize, const GRADIENT: bool>(
         let exp = exp_f32(_mm256_sub_ps(values, maximum));
         let sum = row_reduce::<K>(exp, _mm256_add_ps);
         Some(_mm256_mul_ps(exp, _mm256_div_ps(_mm256_set1_ps(1.0), sum)))
-    }
-}
-
-#[target_feature(enable = "avx2,fma")]
-pub(super) unsafe fn short_softmax_rows<const K: usize>(values: &mut [f32]) {
-    // SAFETY: the caller guarantees AVX2/FMA support and K in {2, 4};
-    // `as_chunks_mut` bounds every vector access to complete rows.
-    unsafe {
-        let (batches, remainder) = values.as_chunks_mut::<WIDTH>();
-        for batch in batches {
-            match short_softmax_batch::<K, false>(batch.as_ptr()) {
-                Some(probabilities) => _mm256_storeu_ps(batch.as_mut_ptr(), probabilities),
-                None => {
-                    for row in batch.chunks_mut(K) {
-                        super::softmax_scalar(row);
-                    }
-                }
-            }
-        }
-        for row in remainder.chunks_mut(K) {
-            super::softmax_scalar(row);
-        }
     }
 }
 
@@ -347,7 +288,7 @@ pub(super) unsafe fn short_softmax_gradient<const K: usize>(
         let mut row = 0;
         while row + rows_per_batch <= labels.len() {
             let base = row * K;
-            match short_softmax_batch::<K, true>(preds.as_ptr().add(base)) {
+            match short_softmax_batch::<K>(preds.as_ptr().add(base)) {
                 Some(probability) => {
                     let label = broadcast_rows::<K>(labels.as_ptr().add(row));
                     let weight = match weights {

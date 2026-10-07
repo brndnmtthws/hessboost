@@ -2,8 +2,8 @@
 //! Poisson, Gamma, and Tweedie. All predict `exp(margin)`.
 
 use super::{
-    GradPair, Loss, OutputDomain, check_base_score_domain, check_label_domain, log_link,
-    newton_intercepts, weighted_label_mean,
+    GradPair, Loss, OutputDomain, check_base_score_domain, check_label_domain, inverse_log_link,
+    log_link, newton_intercepts, weighted_label_mean,
 };
 use crate::K_RT_EPS_F32;
 use crate::data::MetaInfo;
@@ -37,7 +37,7 @@ fn log_label_mean(info: &MetaInfo) -> Vec<f32> {
 macro_rules! log_link_objective {
     () => {
         fn pred_transform(&self, preds: &mut [f32]) {
-            crate::simd::exp_inplace(preds);
+            inverse_log_link(preds);
         }
 
         fn probs_to_margins(&self, scores: &mut [f32]) {

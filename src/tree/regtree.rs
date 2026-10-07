@@ -570,9 +570,21 @@ impl RegTree {
     /// Crate-internal: vector-leaf trees hold one weight per output, which
     /// callers read with [`RegTree::leaf_vector`].
     pub(crate) fn predict_row(&self, data: &DMatrix, row: usize) -> f32 {
+        self.predict_with(|f| data.get(row, f as usize))
+    }
+
+    /// [`Self::predict_row`] of one dense `row` (`NaN` = missing).
+    pub(crate) fn predict_dense(&self, row: &[f32]) -> f32 {
+        self.predict_with(|f| {
+            let v = row[f as usize];
+            (!v.is_nan()).then_some(v)
+        })
+    }
+
+    /// [`Self::predict_row`] of a row read through `get` (`None` = missing).
+    fn predict_with(&self, get: impl Fn(u32) -> Option<f32>) -> f32 {
         debug_assert!(!self.is_vector_leaf(), "predict_row on a vector-leaf tree");
-        let get = |f: u32| data.get(row, f as usize);
-        let leaf = self.leaf_id_with(get);
+        let leaf = self.leaf_id_with(&get);
         let constant = self.nodes[leaf].leaf_value;
         match &self.linear {
             Some(linear) => linear.predict(leaf, constant, get),

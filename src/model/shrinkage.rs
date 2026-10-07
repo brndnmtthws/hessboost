@@ -52,11 +52,14 @@ pub(crate) fn shrink_margins(margins: &mut [f32], factor: f64) {
     }
 }
 
-/// The per-iteration shrinkage record of a model: the coefficient `s_i`
-/// applied at the start of every iteration `i` (`s_0 = 1`) and the
-/// intercepts before shrinkage, in margin space.
+/// The per-iteration shrinkage record of a model trained with model
+/// shrinkage, read through [`BoostedModel::shrinkage`](super::BoostedModel::shrinkage):
+/// the coefficient `s_i` applied at the start of every iteration `i` (`s_0 =
+/// 1`) and the intercepts before shrinkage, in margin space.
+/// [`BoostedModel::predict_margin`](super::BoostedModel::predict_margin)
+/// explains how predictions use it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Shrinkage {
+pub struct Shrinkage {
     factors: Vec<f64>,
     base_score: Vec<f32>,
 }
@@ -71,13 +74,17 @@ impl Shrinkage {
         }
     }
 
-    /// The coefficient of every iteration.
-    pub(crate) fn factors(&self) -> &[f64] {
+    /// The coefficient of every iteration, in iteration order: iteration
+    /// `i` multiplies every margin by `factors()[i]` (in `f64`, rounded to
+    /// `f32` once per margin) before adding its trees. The first is `1`.
+    pub fn factors(&self) -> &[f64] {
         &self.factors
     }
 
-    /// The intercepts before shrinkage.
-    pub(crate) fn base_score(&self) -> &[f32] {
+    /// The per-output intercepts before shrinkage, which the recurrence
+    /// starts from (the model's [`base_scores`](super::BoostedModel::base_scores)
+    /// are their closed-form shrunk values).
+    pub fn base_scores(&self) -> &[f32] {
         &self.base_score
     }
 

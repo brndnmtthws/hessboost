@@ -1,6 +1,6 @@
 use super::{
     BINARY_LOG_LOSS_EPSILON, LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT, MIN_POSITIVE_PREDICTION,
-    RowWeights, scalar, sigmoid_scalar,
+    RowWeights, scalar,
 };
 use crate::objective::GradPair;
 #[allow(
@@ -100,10 +100,12 @@ unsafe fn store_grad_pairs(out: *mut GradPair, index: usize, grad: float32x4_t, 
 
 /// Exponential for finite f32 lanes in [-80, 80]. Range
 /// reduction keeps the polynomial input in [-ln(2)/2, ln(2)/2], where a
-/// seventh-order Taylor polynomial is within a few f32 ULPs.
+/// seventh-order Taylor polynomial (evaluated by Estrin pairs, which expose
+/// independent multiply-adds instead of a seven-deep chain) is within a few
+/// f32 ULPs.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn expq_f32<const ESTRIN: bool>(value: float32x4_t) -> float32x4_t {
+unsafe fn expq_f32(value: float32x4_t) -> float32x4_t {
     // SAFETY: the caller guarantees NEON support; all operations use registers.
     unsafe {
         let scaled = vmulq_n_f32(value, std::f32::consts::LOG2_E);
@@ -114,32 +116,19 @@ unsafe fn expq_f32<const ESTRIN: bool>(value: float32x4_t) -> float32x4_t {
         let mut reduced = vfmsq_n_f32(value, exponent_f32, 0.693_359_4);
         reduced = vfmaq_n_f32(reduced, exponent_f32, 2.121_944_4e-4);
 
-        let polynomial = if ESTRIN {
-            // Estrin evaluation exposes independent pairs instead of seven dependent FMAs.
-            let squared = vmulq_f32(reduced, reduced);
-            let fourth = vmulq_f32(squared, squared);
-            let pair_0 = vaddq_f32(vdupq_n_f32(1.0), reduced);
-            let pair_1 = vfmaq_f32(vdupq_n_f32(0.5), vdupq_n_f32(1.0 / 6.0), reduced);
-            let pair_2 = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), vdupq_n_f32(1.0 / 120.0), reduced);
-            let pair_3 = vfmaq_f32(
-                vdupq_n_f32(1.0 / 720.0),
-                vdupq_n_f32(1.0 / 5_040.0),
-                reduced,
-            );
-            let low = vfmaq_f32(pair_0, pair_1, squared);
-            let high = vfmaq_f32(pair_2, pair_3, squared);
-            vfmaq_f32(low, high, fourth)
-        } else {
-            // Wide in-place softmax favors Horner evaluation for throughput.
-            let mut polynomial = vdupq_n_f32(1.0 / 5_040.0);
-            polynomial = vfmaq_f32(vdupq_n_f32(1.0 / 720.0), polynomial, reduced);
-            polynomial = vfmaq_f32(vdupq_n_f32(1.0 / 120.0), polynomial, reduced);
-            polynomial = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), polynomial, reduced);
-            polynomial = vfmaq_f32(vdupq_n_f32(1.0 / 6.0), polynomial, reduced);
-            polynomial = vfmaq_f32(vdupq_n_f32(0.5), polynomial, reduced);
-            polynomial = vfmaq_f32(vdupq_n_f32(1.0), polynomial, reduced);
-            vfmaq_f32(vdupq_n_f32(1.0), polynomial, reduced)
-        };
+        let squared = vmulq_f32(reduced, reduced);
+        let fourth = vmulq_f32(squared, squared);
+        let pair_0 = vaddq_f32(vdupq_n_f32(1.0), reduced);
+        let pair_1 = vfmaq_f32(vdupq_n_f32(0.5), vdupq_n_f32(1.0 / 6.0), reduced);
+        let pair_2 = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), vdupq_n_f32(1.0 / 120.0), reduced);
+        let pair_3 = vfmaq_f32(
+            vdupq_n_f32(1.0 / 720.0),
+            vdupq_n_f32(1.0 / 5_040.0),
+            reduced,
+        );
+        let low = vfmaq_f32(pair_0, pair_1, squared);
+        let high = vfmaq_f32(pair_2, pair_3, squared);
+        let polynomial = vfmaq_f32(low, high, fourth);
 
         let exponent_bits = vshlq_n_s32(vaddq_s32(exponent, vdupq_n_s32(127)), 23);
         let multiply: unsafe fn(float32x4_t, float32x4_t) -> float32x4_t = vmulq_f32;
@@ -153,7 +142,7 @@ unsafe fn sigmoidq_f32(value: float32x4_t) -> float32x4_t {
     // SAFETY: the caller guarantees NEON support; all operations use registers.
     unsafe {
         let magnitude = vabsq_f32(value);
-        let exp = expq_f32::<true>(vnegq_f32(magnitude));
+        let exp = expq_f32(vnegq_f32(magnitude));
         let denominator = vaddq_f32(vdupq_n_f32(1.0), exp);
         let positive = vdivq_f32(vdupq_n_f32(1.0), denominator);
         let negative = vdivq_f32(exp, denominator);
@@ -398,41 +387,6 @@ pub(super) unsafe fn divided_basis_8(alpha: f32, c: &[f32; 8], u: &[f32; 8]) -> 
     }
 }
 
-/// Vector-loop shell of a `&mut [f32]` unary inplace kernel: vector fast path
-/// for regular lanes, scalar per-lane fallback otherwise. The kernel and
-/// scalar formulas (intrinsics included) are passed in as expressions.
-macro_rules! unary_inplace_kernel {
-    ($name:ident, $kernel:expr, $scalar:expr) => {
-        #[target_feature(enable = "neon")]
-        pub(super) unsafe fn $name(values: &mut [f32]) {
-            // SAFETY: the caller guarantees NEON support. Pointer bounds are
-            // documented at each memory access below.
-            unsafe {
-                let mut index = 0;
-                while index + VECTOR_WIDTH <= values.len() {
-                    // SAFETY: the loop condition leaves four readable and writable values.
-                    let input = vld1q_f32(values.as_ptr().add(index));
-                    if regular_input(input) {
-                        // SAFETY: the loop condition leaves four writable values.
-                        vst1q_f32(values.as_mut_ptr().add(index), ($kernel)(input));
-                    } else {
-                        for value in &mut values[index..index + VECTOR_WIDTH] {
-                            *value = ($scalar)(*value);
-                        }
-                    }
-                    index += VECTOR_WIDTH;
-                }
-                for value in &mut values[index..] {
-                    *value = ($scalar)(*value);
-                }
-            }
-        }
-    };
-}
-
-unary_inplace_kernel!(exp_inplace, expq_f32::<true>, f32::exp);
-unary_inplace_kernel!(sigmoid_inplace, sigmoidq_f32, sigmoid_scalar);
-
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn logistic_gradient(
     preds: &[f32],
@@ -528,8 +482,8 @@ pub(super) unsafe fn poisson_gradient(
                 Some(values) => vld1q_f32(values.as_ptr().add(index)),
                 None => vdupq_n_f32(1.0),
             };
-            let grad = vmulq_f32(vsubq_f32(expq_f32::<true>(pred), label), weight);
-            let hess = vmulq_f32(expq_f32::<true>(shifted), weight);
+            let grad = vmulq_f32(vsubq_f32(expq_f32(pred), label), weight);
+            let hess = vmulq_f32(expq_f32(shifted), weight);
             // SAFETY: the loop condition leaves room for four pairs; see `store_grad_pairs`.
             store_grad_pairs(out.as_mut_ptr(), index, grad, hess);
             index += VECTOR_WIDTH;
@@ -577,7 +531,7 @@ pub(super) unsafe fn gamma_gradient(
                 None => one,
             };
             weight = vmulq_f32(weight, vbslq_f32(vceqq_f32(label, one), scale, one));
-            let scaled = vmulq_f32(label, expq_f32::<true>(negative));
+            let scaled = vmulq_f32(label, expq_f32(negative));
             let grad = vmulq_f32(vsubq_f32(one, scaled), weight);
             let hess = vmulq_f32(scaled, weight);
             // SAFETY: the loop condition leaves room for four pairs; see `store_grad_pairs`.
@@ -624,8 +578,8 @@ pub(super) unsafe fn tweedie_gradient(
                 Some(values) => vld1q_f32(values.as_ptr().add(index)),
                 None => vdupq_n_f32(1.0),
             };
-            let exp_1 = expq_f32::<true>(input_1);
-            let exp_2 = expq_f32::<true>(input_2);
+            let exp_1 = expq_f32(input_1);
+            let exp_2 = expq_f32(input_2);
             let label_exp_1 = vmulq_f32(label, exp_1);
             let grad = vmulq_f32(vsubq_f32(exp_2, label_exp_1), weight);
             let hess = vmulq_f32(
@@ -643,70 +597,14 @@ pub(super) unsafe fn tweedie_gradient(
     }
 }
 
-#[target_feature(enable = "neon")]
-pub(super) unsafe fn softmax_inplace(values: &mut [f32]) {
-    // SAFETY: the caller guarantees NEON support. Pointer bounds are
-    // documented at each memory access below.
-    unsafe {
-        let Some((min, max)) = finite_min_max(values) else {
-            super::softmax_scalar(values);
-            return;
-        };
-        if max - min > MAX_FAST_EXP_INPUT {
-            super::softmax_scalar(values);
-            return;
-        }
-
-        let max_vector = vdupq_n_f32(max);
-        let mut sum_vector = vdupq_n_f32(0.0);
-        let mut index = 0;
-        while index + VECTOR_WIDTH <= values.len() {
-            // SAFETY: the loop condition leaves four readable and writable values.
-            let input = vld1q_f32(values.as_ptr().add(index));
-            let exp = expq_f32::<false>(vsubq_f32(input, max_vector));
-            sum_vector = vaddq_f32(sum_vector, exp);
-            // SAFETY: the loop condition leaves four writable values.
-            vst1q_f32(values.as_mut_ptr().add(index), exp);
-            index += VECTOR_WIDTH;
-        }
-        let mut sum = vaddvq_f32(sum_vector);
-        for value in &mut values[index..] {
-            *value = (*value - max).exp();
-            sum += *value;
-        }
-
-        let inverse = 1.0 / sum;
-        let inverse_vector = vdupq_n_f32(inverse);
-        index = 0;
-        while index + VECTOR_WIDTH <= values.len() {
-            // SAFETY: the loop condition leaves four readable and writable values.
-
-            let probability = vld1q_f32(values.as_ptr().add(index));
-            vst1q_f32(
-                values.as_mut_ptr().add(index),
-                vmulq_f32(probability, inverse_vector),
-            );
-
-            index += VECTOR_WIDTH;
-        }
-        for value in &mut values[index..] {
-            *value *= inverse;
-        }
-    }
-}
-
 /// Process four independent rows in the lanes, so short rows need neither a
-/// horizontal reduction nor a scratch pass through the output matrix.
-///
-/// `GRADIENT` selects the shift of `SoftmaxMultiClassObj::GetGradient`,
-/// `max(f32::MIN_POSITIVE, row...)`, instead of the plain row maximum of
-/// `common::Softmax`; rows whose maximum is at least `MIN_POSITIVE` are
-/// unaffected.
+/// horizontal reduction nor a scratch pass through the output matrix: the
+/// probabilities of `SoftmaxMultiClassObj::GetGradient`, which shifts by
+/// `max(f32::MIN_POSITIVE, row...)` (rows whose maximum is at least
+/// `MIN_POSITIVE` are shifted by it alone).
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn short_softmax_batch<const K: usize, const GRADIENT: bool>(
-    preds: &[f32],
-) -> Option<[float32x4_t; K]> {
+unsafe fn short_softmax_batch<const K: usize>(preds: &[f32]) -> Option<[float32x4_t; K]> {
     // SAFETY: callers provide four complete rows, K is 2, 3, or 4, and NEON
     // is available. Interleaved loads transpose row-major inputs into classes.
     unsafe {
@@ -738,11 +636,9 @@ unsafe fn short_softmax_batch<const K: usize, const GRADIENT: bool>(
             minimum = vminq_f32(minimum, value);
             maximum = vmaxq_f32(maximum, value);
         }
-        if GRADIENT {
-            // `vmaxq_f32` propagates NaN, so the range guard below still
-            // rejects non-finite rows.
-            maximum = vmaxq_f32(maximum, vdupq_n_f32(f32::MIN_POSITIVE));
-        }
+        // `vmaxq_f32` propagates NaN, so the range guard below still rejects
+        // non-finite rows.
+        maximum = vmaxq_f32(maximum, vdupq_n_f32(f32::MIN_POSITIVE));
         // NaNs propagate through min/max; infinities produce a non-finite
         // range. Either makes this ordered comparison fail for that row.
         if vminvq_u32(vcleq_f32(
@@ -754,7 +650,7 @@ unsafe fn short_softmax_batch<const K: usize, const GRADIENT: bool>(
         }
         let mut sum = vdupq_n_f32(0.0);
         for value in &mut values {
-            *value = expq_f32::<true>(vsubq_f32(*value, maximum));
+            *value = expq_f32(vsubq_f32(*value, maximum));
             sum = vaddq_f32(sum, *value);
         }
         let inverse = vdivq_f32(vdupq_n_f32(1.0), sum);
@@ -762,36 +658,6 @@ unsafe fn short_softmax_batch<const K: usize, const GRADIENT: bool>(
             *value = vmulq_f32(*value, inverse);
         }
         Some(values)
-    }
-}
-
-#[target_feature(enable = "neon")]
-pub(super) unsafe fn short_softmax_rows<const K: usize>(values: &mut [f32]) {
-    // SAFETY: NEON is available, K is 2, 3, or 4, and chunks bound each
-    // interleaved load/store to four complete rows. Remaining rows are scalar.
-    unsafe {
-        #[allow(
-            clippy::chunks_exact_to_as_chunks,
-            reason = "`as_chunks_mut::<{ 4 * K }>` needs generic_const_exprs"
-        )]
-        let mut batches = values.chunks_exact_mut(4 * K);
-        for batch in &mut batches {
-            if let Some(p) = short_softmax_batch::<K, false>(batch) {
-                match K {
-                    2 => vst2q_f32(batch.as_mut_ptr(), float32x4x2_t(p[0], p[1])),
-                    3 => vst3q_f32(batch.as_mut_ptr(), float32x4x3_t(p[0], p[1], p[2])),
-                    4 => vst4q_f32(batch.as_mut_ptr(), float32x4x4_t(p[0], p[1], p[2], p[3])),
-                    _ => unreachable!(),
-                }
-            } else {
-                for row in batch.chunks_mut(K) {
-                    super::softmax_scalar(row);
-                }
-            }
-        }
-        for row in batches.into_remainder().chunks_mut(K) {
-            super::softmax_scalar(row);
-        }
     }
 }
 
@@ -812,7 +678,7 @@ pub(super) unsafe fn short_softmax_gradient<const K: usize>(
         let mut row = 0;
         while row + 4 <= labels.len() {
             let base = row * K;
-            if let Some(probabilities) = short_softmax_batch::<K, true>(&preds[base..base + 4 * K])
+            if let Some(probabilities) = short_softmax_batch::<K>(&preds[base..base + 4 * K])
             {
                 // Saturating conversion matches Rust's float-to-usize cast
                 // when comparing with class IDs 0..K, including NaN/negatives.
@@ -897,19 +763,6 @@ pub(super) unsafe fn short_softmax_gradient<const K: usize>(
 }
 
 #[target_feature(enable = "neon")]
-pub(super) unsafe fn softmax_rows_inplace(values: &mut [f32], num_class: usize) {
-    // SAFETY: the caller guarantees NEON support. Pointer bounds are
-    // documented at each memory access below.
-    unsafe {
-        for row in values.chunks_mut(num_class) {
-            // SAFETY: this function may only be entered after NEON detection and
-            // `chunks_mut` bounds every class row.
-            softmax_inplace(row);
-        }
-    }
-}
-
-#[target_feature(enable = "neon")]
 pub(super) unsafe fn softmax_gradient(
     preds: &[f32],
     labels: &[f32],
@@ -971,7 +824,7 @@ unsafe fn softmax_gradient_row(
         while index + VECTOR_WIDTH <= preds.len() {
             // SAFETY: the loop condition leaves four inputs and four output pairs.
             let input = vld1q_f32(preds.as_ptr().add(index));
-            let exp = expq_f32::<true>(vsubq_f32(input, max_vector));
+            let exp = expq_f32(vsubq_f32(input, max_vector));
             sum_vector = vaddq_f32(sum_vector, exp);
             // Store the exponent in the gradient field as scratch space. The second
             // pass overwrites both fields with their final values.

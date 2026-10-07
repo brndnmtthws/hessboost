@@ -1,7 +1,6 @@
-use super::{
-    BoostedModel, ModelObjective, Predictions, Shrinkage, rebuild_objective, shrink_margins,
-};
+use super::{BoostedModel, Predictions, Shrinkage, Transform, shrink_margins};
 use crate::data::DMatrix;
+use crate::data::check_len;
 use crate::error::{HessboostError, Result};
 use crate::objective::Objective;
 use crate::objective::distributional::Dist;
@@ -9,6 +8,10 @@ use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, LaneBlock, fill_
 use crate::tree::scalar_tree_output;
 use rayon::prelude::*;
 use std::ops::{Bound, Range, RangeBounds};
+
+/// Classes whose margins [`BoostedModel::predict_row_into`] forms at once,
+/// on the stack, for a `multi:softmax` row (more are formed chunk by chunk).
+const CLASS_CHUNK: usize = 64;
 
 /// The boosting iterations a prediction uses (XGBoost's `iteration_range`).
 ///
@@ -204,7 +207,13 @@ impl BoostedModel {
     /// `iterations` ([`Iterations`]; [`Iterations::Best`] for the effective
     /// ones). `multi:softprob` returns an `n_rows × num_class` probability
     /// matrix while `multi:softmax` returns one class index per row,
-    /// encoded as `f32`.
+    /// encoded as `f32` (the first of equal largest margins, as XGBoost).
+    ///
+    /// They are the margins of [`Self::predict_margin`] through
+    /// [`Self::transform_margins_into`], which transforms every value (every
+    /// row, for softmax and the sorted quantiles) on its own: a row's
+    /// predictions are bit for bit the same in every batch, including
+    /// [`Self::predict_row`]'s single row.
     ///
     /// # Errors
     ///
@@ -238,7 +247,312 @@ impl BoostedModel {
     /// The predictions of [`Self::predict`] from the margins of
     /// [`Self::predict_margin`] (shared with the GPU predictors).
     pub(crate) fn transform_margins(&self, margin: Predictions) -> Predictions {
-        transform_model_margins(&self.objective, self.max_delta_step, self.n_targets, margin)
+        self.transform().predictions(margin)
+    }
+
+    /// Values per row of [`Self::predict`] (and of
+    /// [`Self::predict_row_into`]'s output): [`Self::n_outputs`], except `1`
+    /// for `multi:softmax`, which predicts one class index per row.
+    pub fn prediction_width(&self) -> usize {
+        self.transform().width(self.n_outputs)
+    }
+
+    /// The prediction of one margin of a single-output model, by the
+    /// objective's transform (the sigmoid of `binary:logistic`, the `exp` of
+    /// the log-link objectives, the identity for squared error, ...): bit
+    /// for bit what [`Self::predict`] reports for a row with that margin.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::IncompatibleModel`] (`outputs`) for a model with
+    /// several outputs; use [`Self::transform_margins_into`].
+    pub fn transform_margin(&self, margin: f32) -> Result<f32> {
+        self.single_output(self.n_outputs, "transform_margins_into")?;
+        let mut value = [margin];
+        self.transform().apply(&mut value, 1);
+        Ok(value[0])
+    }
+
+    /// Write the predictions of rows of margins into `out`: `margins` holds
+    /// whole rows of [`Self::n_outputs`] margins (`[row][output]`, as
+    /// [`Self::predict_margin`] lays them out) and `out` the same rows of
+    /// [`Self::prediction_width`] values. The transform of
+    /// [`Self::predict`], without allocating: `predict` of any batch is bit
+    /// for bit this transform of its `predict_margin`.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] when `margins` is not whole rows
+    /// or `out` does not hold one prediction row per margin row.
+    pub fn transform_margins_into(&self, margins: &[f32], out: &mut [f32]) -> Result<()> {
+        let k = self.n_outputs;
+        if !margins.len().is_multiple_of(k) {
+            return Err(HessboostError::dimension_mismatch(
+                "margins (whole rows of the model's outputs)",
+                margins.len().next_multiple_of(k),
+                margins.len(),
+            ));
+        }
+        let transform = self.transform();
+        let rows = margins.len() / k;
+        check_len("transformed predictions", out.len(), rows * transform.width(k))?;
+        transform.apply_into(margins, out, k);
+        Ok(())
+    }
+
+    /// Refuse a model with other than one value per row of what a scalar
+    /// method returns (`width`: its outputs, or its prediction width),
+    /// naming the `_into` method that serves it.
+    fn single_output(&self, width: usize, instead: &str) -> Result<()> {
+        if width == 1 {
+            return Ok(());
+        }
+        Err(HessboostError::incompatible_model(
+            "outputs",
+            format!("the model gives {width} values per row; use `{instead}`"),
+        ))
+    }
+
+    /// The margin of one row of feature values, for a single-output model:
+    /// [`Self::predict_margin_row_into`] into one value.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::IncompatibleModel`] (`outputs`) for a model with
+    /// several outputs, plus the errors of [`Self::predict_margin_row_into`].
+    pub fn predict_margin_row(&self, row: &[f32], iterations: impl Into<Iterations>) -> Result<f32> {
+        self.single_output(self.n_outputs, "predict_margin_row_into")?;
+        let mut out = [0.0];
+        self.predict_margin_row_into(row, iterations, &mut out)?;
+        Ok(out[0])
+    }
+
+    /// Write the margins of one row of feature values into `out` (one per
+    /// output, [`Self::n_outputs`]): `row` holds one value per feature, `NaN`
+    /// for a missing one, as in a matrix from [`DMatrix::from_dense`]. Bit for
+    /// bit that row's [`Self::predict_margin`] in any batch (tree weights,
+    /// model shrinkage, missing-value routing, linear leaves and
+    /// [`Iterations::Best`] included), without building a matrix and without
+    /// allocating once the model's first prediction has laid out its trees.
+    /// The intercepts are the model's: a row has no `base_margin`.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] when `row` does not hold one
+    /// value per feature or `out` one per output,
+    /// [`HessboostError::InvalidData`] (`row`) for an infinite value, plus the
+    /// errors of [`Self::predict_margin`] for `iterations`.
+    pub fn predict_margin_row_into(
+        &self,
+        row: &[f32],
+        iterations: impl Into<Iterations>,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let iterations = self.row_request(row, iterations.into())?;
+        check_len("row margins", out.len(), self.n_outputs)?;
+        self.margin_row(row, iterations, 0..self.n_outputs, out);
+        Ok(())
+    }
+
+    /// The prediction of one row of feature values, for a model that
+    /// predicts one value per row: [`Self::predict_row_into`] into one value.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::IncompatibleModel`] (`outputs`) for a model whose
+    /// [`Self::prediction_width`] is not 1, plus the errors of
+    /// [`Self::predict_row_into`].
+    pub fn predict_row(&self, row: &[f32], iterations: impl Into<Iterations>) -> Result<f32> {
+        self.single_output(self.prediction_width(), "predict_row_into")?;
+        let mut out = [0.0];
+        self.predict_row_into(row, iterations, &mut out)?;
+        Ok(out[0])
+    }
+
+    /// Write the predictions of one row of feature values into `out`
+    /// ([`Self::prediction_width`] values: one per output, a `dist:*` model's
+    /// natural parameters, a `multi:softprob` row's probabilities, or
+    /// `multi:softmax`'s class index): [`Self::predict_margin_row_into`]'s
+    /// margins through [`Self::transform_margins_into`], so bit for bit that
+    /// row's [`Self::predict`] in any batch, without allocating.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] when `row` does not hold one
+    /// value per feature or `out` one per predicted value,
+    /// [`HessboostError::InvalidData`] (`row`) for an infinite value, plus the
+    /// errors of [`Self::predict_margin`] for `iterations`.
+    ///
+    /// ```
+    /// use hessboost::objective::{Multiclass, Objective};
+    /// use hessboost::prelude::*;
+    ///
+    /// # fn main() -> Result<()> {
+    /// let x: Vec<f32> = (0..60).map(|i| (i % 30) as f32).collect();
+    /// let y: Vec<f32> = (0..30).map(|i| (i % 3) as f32).collect();
+    /// let dtrain = DMatrix::from_dense(&x, 30, 2)?.with_labels(&y)?;
+    /// let params = TrainingParams::builder()
+    ///     .objective(Objective::Softprob(Multiclass::new(3)?))
+    ///     .build()?;
+    /// let model = train(&params, &dtrain, 5)?;
+    ///
+    /// let mut probabilities = [0.0; 3];
+    /// model.predict_row_into(&[4.0, f32::NAN], Iterations::Best, &mut probabilities)?;
+    /// let batch = model.predict(&DMatrix::from_dense(&[4.0, f32::NAN], 1, 2)?, Iterations::Best)?;
+    /// assert_eq!(probabilities, batch.as_slice());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn predict_row_into(
+        &self,
+        row: &[f32],
+        iterations: impl Into<Iterations>,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let iterations = self.row_request(row, iterations.into())?;
+        let transform = self.transform();
+        check_len("row predictions", out.len(), transform.width(self.n_outputs))?;
+        if let Transform::ClassIndex = transform {
+            out[0] = self.row_class(row, iterations) as f32;
+        } else {
+            self.margin_row(row, iterations, 0..self.n_outputs, out);
+            transform.apply(out, self.n_outputs);
+        }
+        Ok(())
+    }
+
+    /// Check one row of features (one finite or `NaN` value per feature, as
+    /// a dense matrix requires) and resolve `iterations` for it as
+    /// [`Self::predict_margin`] does.
+    fn row_request(&self, row: &[f32], iterations: Iterations) -> Result<Range<usize>> {
+        check_len("prediction feature count", row.len(), self.n_features)?;
+        if row.iter().any(|v| v.is_infinite()) {
+            return Err(HessboostError::invalid_data(
+                "row",
+                "non-missing feature values must be finite",
+            ));
+        }
+        self.margin_iterations(iterations)
+    }
+
+    /// `multi:softmax`'s class of one row from the resolved `iterations`:
+    /// XGBoost's `FindMaxIndex` over its margins (the first of equal maxima,
+    /// as [`Transform::ClassIndex`] picks it), whose margins are formed
+    /// [`CLASS_CHUNK`] classes at a time on the stack.
+    fn row_class(&self, row: &[f32], iterations: Range<usize>) -> usize {
+        let k = self.n_outputs;
+        let mut chunk = [0.0f32; CLASS_CHUNK];
+        let (mut best, mut best_margin) = (0, f32::NAN);
+        for start in (0..k).step_by(CLASS_CHUNK) {
+            let end = (start + CLASS_CHUNK).min(k);
+            let margins = &mut chunk[..end - start];
+            self.margin_row(row, iterations.clone(), start..end, margins);
+            for (class, &margin) in (start..end).zip(margins.iter()) {
+                if class == 0 || margin > best_margin {
+                    (best, best_margin) = (class, margin);
+                }
+            }
+        }
+        best
+    }
+
+    /// The margins of outputs `outputs` of one dense `row` (`NaN` = missing)
+    /// from the resolved `iterations`, into `out` (one per output), with the
+    /// batch paths' arithmetic cell by cell: the intercept, then gblinear's
+    /// bias and its feature terms in feature order, or every tree's weighted
+    /// value in tree order (for a shrunk model, each iteration's shrink
+    /// before its trees).
+    fn margin_row(
+        &self,
+        row: &[f32],
+        iterations: Range<usize>,
+        outputs: Range<usize>,
+        out: &mut [f32],
+    ) {
+        debug_assert_eq!(out.len(), outputs.len());
+        let k = self.n_outputs;
+        if let Some(linear) = &self.linear {
+            let base = &self.base_score[outputs.clone()];
+            for ((m, &b), &bias) in out.iter_mut().zip(base).zip(&linear.bias()[outputs.clone()]) {
+                *m = b + bias;
+            }
+            for (f, &x) in row.iter().enumerate() {
+                if x.is_nan() {
+                    continue;
+                }
+                let weights = &linear.weights()[f * k..(f + 1) * k][outputs.clone()];
+                for (m, &w) in out.iter_mut().zip(weights) {
+                    *m += (f64::from(w) * f64::from(x)) as f32;
+                }
+            }
+            return;
+        }
+        let per = self.trees_per_iteration();
+        if let Some(shrinkage) = &self.shrinkage {
+            out.copy_from_slice(&shrinkage.base_scores()[outputs.clone()]);
+            for i in iterations {
+                shrink_margins(out, shrinkage.factors()[i]);
+                self.add_row_trees(row, i * per..(i + 1) * per, &outputs, |_| 1.0, out);
+            }
+            return;
+        }
+        out.copy_from_slice(&self.base_score[outputs.clone()]);
+        let weight = |t| self.tree_weight(t);
+        let trees = self.iteration_trees(iterations);
+        if outputs.len() == k {
+            self.add_row_trees(row, trees, &outputs, weight, out);
+        } else {
+            for i in trees.start / per..trees.end / per {
+                self.add_row_trees(row, i * per..(i + 1) * per, &outputs, weight, out);
+            }
+        }
+    }
+
+    /// `out[o - outputs.start] += weight(t) * tree_t(row)[o]` for the outputs
+    /// `o` in `outputs` and the trees `t` of `trees` (whole iterations, or
+    /// one iteration when `outputs` is not every output) feeding them, in
+    /// tree order per output.
+    fn add_row_trees(
+        &self,
+        row: &[f32],
+        trees: Range<usize>,
+        outputs: &Range<usize>,
+        weight: impl Fn(usize) -> f32,
+        out: &mut [f32],
+    ) {
+        let forest = self.compact_forest();
+        let k = self.n_outputs;
+        if self.has_vector_leaves() {
+            forest.walk_row(row, trees, |t, leaf| {
+                let w = weight(t);
+                let values = &forest.leaf_vector(leaf, k)[outputs.clone()];
+                for (o, &v) in out.iter_mut().zip(values) {
+                    *o += w * v;
+                }
+            });
+            return;
+        }
+        // A scalar tree feeds one output; within an iteration the trees of
+        // the outputs `outputs` are contiguous.
+        let parallel = self.num_parallel_tree;
+        let trees = if outputs.len() == k {
+            trees
+        } else {
+            trees.start + outputs.start * parallel..trees.start + outputs.end * parallel
+        };
+        let slot = |t: usize| scalar_tree_output(t, parallel, k) - outputs.start;
+        if self.trees[trees.clone()]
+            .iter()
+            .any(|tree| tree.linear_leaves().is_some())
+        {
+            for t in trees {
+                out[slot(t)] += weight(t) * self.trees[t].predict_dense(row);
+            }
+        } else {
+            forest.walk_row(row, trees, |t, leaf| {
+                out[slot(t)] += weight(t) * forest.leaf_value(leaf);
+            });
+        }
     }
 
     /// The class decisions of [`Self::predict_class`] from the
@@ -341,25 +655,31 @@ impl BoostedModel {
         iterations: impl Into<Iterations>,
     ) -> Result<Predictions> {
         self.validate_prediction_data(data)?;
-        let iterations = self.resolve_iterations(iterations.into(), "iterations")?;
-        if let Some(shrinkage) = &self.shrinkage {
-            // Every later iteration rescaled the earlier ones, so the
-            // iterations `a..b` alone are no model.
-            if iterations.start != 0 {
-                return Err(HessboostError::incompatible_model(
-                    "iterations",
-                    format!(
-                        "a model trained with model shrinkage rescales its earlier iterations \
-                         every iteration, so {}..{} has no meaning; use a range starting at 0",
-                        iterations.start, iterations.end
-                    ),
-                ));
-            }
-            let values = self.shrunk_margins(shrinkage, data, iterations.end);
-            return Ok(Predictions::new(values, data.n_rows(), self.n_outputs()));
-        }
-        let values = self.margin_from_trees(data, self.iteration_trees(iterations));
+        let iterations = self.margin_iterations(iterations.into())?;
+        let values = match &self.shrinkage {
+            Some(shrinkage) => self.shrunk_margins(shrinkage, data, iterations.end),
+            None => self.margin_from_trees(data, self.iteration_trees(iterations)),
+        };
         Ok(Predictions::new(values, data.n_rows(), self.n_outputs()))
+    }
+
+    /// The iterations of a margin prediction ([`Self::resolve_iterations`]),
+    /// refusing a shrunk model's ranges that start after iteration 0: every
+    /// later iteration rescaled the earlier ones, so `a..b` alone is no
+    /// model.
+    fn margin_iterations(&self, iterations: Iterations) -> Result<Range<usize>> {
+        let iterations = self.resolve_iterations(iterations, "iterations")?;
+        if self.shrinkage.is_some() && iterations.start != 0 {
+            return Err(HessboostError::incompatible_model(
+                "iterations",
+                format!(
+                    "a model trained with model shrinkage rescales its earlier iterations \
+                     every iteration, so {}..{} has no meaning; use a range starting at 0",
+                    iterations.start, iterations.end
+                ),
+            ));
+        }
+        Ok(iterations)
     }
 
     /// The margins of a shrunk model after its first `k` iterations, with
@@ -560,58 +880,6 @@ pub(crate) fn initial_margins(base_score: &[f32], data: &DMatrix) -> Vec<f32> {
             out
         }
     }
-}
-
-/// Turn raw margins (`[row][output]`) of a model with the given objective
-/// into predictions in the objective's reported space: the objective's
-/// transform (identity for an objective the crate does not implement, e.g. a
-/// custom loss, mirroring how XGBoost returns margins then), and for
-/// `multi:softmax` the per-row argmax class index encoded as `f32` (width 1).
-pub(crate) fn transform_model_margins(
-    objective: &ModelObjective,
-    max_delta_step: f64,
-    n_targets: usize,
-    margin: Predictions,
-) -> Predictions {
-    let (n_rows, n_outputs) = (margin.n_rows(), margin.width());
-    let mut values = margin.into_vec();
-    let width =
-        transform_margins_in_place(objective, max_delta_step, n_targets, &mut values, n_outputs);
-    values.truncate(n_rows * width);
-    Predictions::new(values, n_rows, width)
-}
-
-/// [`transform_model_margins`] in place: turns the margins `values`
-/// (`[row][output]`, `n_outputs` wide) into predictions and returns their
-/// width. For `multi:softmax` (width 1) the class indices fill the first
-/// `n_rows` values and the rest are left over.
-pub(crate) fn transform_margins_in_place(
-    objective: &ModelObjective,
-    max_delta_step: f64,
-    n_targets: usize,
-    values: &mut [f32],
-    n_outputs: usize,
-) -> usize {
-    if let Some(Ok(loss)) = rebuild_objective(objective, max_delta_step, n_targets) {
-        loss.pred_transform(values);
-    }
-    if objective
-        .built_in()
-        .is_some_and(Objective::predicts_class_index)
-    {
-        // Row `r`'s class lands at index `r`, at or before the row's own
-        // values, so every row is read before it is overwritten.
-        for r in 0..values.len() / n_outputs {
-            let class = values[r * n_outputs..(r + 1) * n_outputs]
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                .map_or(0.0, |(i, _)| i as f32);
-            values[r] = class;
-        }
-        return 1;
-    }
-    n_outputs
 }
 
 /// Rows per prediction block: the block's feature rows stay in cache while

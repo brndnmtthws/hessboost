@@ -877,36 +877,29 @@ impl CompactForest {
     /// Walk one dense `row` through trees `trees` and call `sink(t, leaf)`
     /// with each tree's arena leaf id, in tree order. Trees are walked
     /// [`LANES`] at a time in lockstep, so a single instance still overlaps its
-    /// dependent load chains (the batch kernel overlaps rows instead). The row
-    /// is keyed once, `[feature][sign]`, so a node's slot maps to its key by a
-    /// shift.
+    /// dependent load chains (the batch kernel overlaps rows instead). A row
+    /// of up to `INLINE_KEYS / 2` features is keyed once on the stack,
+    /// `[feature][sign]`, so a node's slot maps to its key by a shift; a wider
+    /// row keys each value a step reads, so the walk never allocates.
     #[inline(always)]
-    fn walk_row(
+    pub(crate) fn walk_row(
         &self,
         row: &[f32],
         trees: std::ops::Range<usize>,
         mut sink: impl FnMut(usize, u32),
     ) {
         assert!(trees.end <= self.trees.len());
-        let nodes = &self.nodes[..];
         let begin = trees.start;
         let groups = trees.len() / LANES;
         let full = begin + groups * LANES;
-        // The row's keys, filled when the first lockstep group needs them:
-        // on the stack for rows of up to `INLINE_KEYS / 2` features.
+        // The row's keys, filled when the first lockstep group needs them.
         let mut inline = [0u32; INLINE_KEYS];
-        let mut heap: Vec<u32> = Vec::new();
+        let len = 2 * row.len();
         let mut keyed = false;
         for g in 0..groups {
             let first = begin + g * LANES;
             let group = &self.trees[first..first + LANES];
-            let mut depth = 0u32;
-            let mut ok = true;
-            for meta in group {
-                ok &= meta.lockstep_ok();
-                depth = depth.max(meta.depth);
-            }
-            if !ok {
+            if !group.iter().all(TreeMeta::lockstep_ok) {
                 for j in 0..LANES {
                     sink(first + j, self.leaf_id(first + j, row));
                 }
@@ -915,49 +908,62 @@ impl CompactForest {
             for meta in group {
                 meta.check_width(row.len());
             }
-            let len = 2 * row.len();
-            if !keyed {
-                let buf: &mut [u32] = if len <= INLINE_KEYS {
-                    &mut inline[..len]
-                } else {
-                    heap.resize(len, 0);
-                    &mut heap
-                };
-                for (pair, &v) in buf.as_chunks_mut::<2>().0.iter_mut().zip(row) {
-                    *pair = [key(v), key(-v)];
+            let leaves = if len <= INLINE_KEYS {
+                let keys = &mut inline[..len];
+                if !keyed {
+                    for (pair, &v) in keys.as_chunks_mut::<2>().0.iter_mut().zip(row) {
+                        *pair = [key(v), key(-v)];
+                    }
+                    keyed = true;
                 }
-                keyed = true;
-            }
-            let keys: &[u32] = if len <= INLINE_KEYS {
-                &inline[..len]
+                let keys = &*keys;
+                // SAFETY: `check_width` ran for every tree in the group, and
+                // `keys` holds two keys per feature, indexed by `slot / LANES`.
+                self.lockstep_leaves(group, |node| unsafe {
+                    *keys.get_unchecked(node.slot as usize / LANES)
+                })
             } else {
-                &heap
+                // SAFETY: `check_width` ran for every tree in the group, so
+                // every split feature indexes `row`. The sign flip is `-v`.
+                self.lockstep_leaves(group, |node| unsafe {
+                    let v = *row.get_unchecked(node.feature());
+                    key(f32::from_bits(v.to_bits() ^ node.negate_mask()))
+                })
             };
-            let mut nid = [0usize; LANES];
-            for (n, meta) in nid.iter_mut().zip(group) {
-                *n = meta.root as usize;
-            }
-            for _ in 0..depth {
-                macro_rules! lane {
-                    ($($j:literal)*) => {$(
-                        // SAFETY: as in `walk_block`; `check_width` ran for
-                        // every tree in the group and `keys` holds two keys
-                        // per feature, indexed by `slot / LANES`.
-                        let node = unsafe { nodes.get_unchecked(nid[$j]) };
-                        // SAFETY: see above.
-                        let k = unsafe { *keys.get_unchecked(node.slot as usize / LANES) };
-                        nid[$j] = Self::next_numeric(node, k);
-                    )*};
-                }
-                lane!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
-            }
-            for (j, &id) in nid.iter().enumerate() {
+            for (j, &id) in leaves.iter().enumerate() {
                 sink(first + j, id as u32);
             }
         }
         for t in full..trees.end {
             sink(t, self.leaf_id(t, row));
         }
+    }
+
+    /// The arena leaves one row reaches in the [`LANES`] lockstep trees
+    /// `group` (every tree [`TreeMeta::lockstep_ok`] and width-checked), with
+    /// `key_of(node)` the row's key for a numeric node's feature and sign.
+    #[inline(always)]
+    fn lockstep_leaves(&self, group: &[TreeMeta], key_of: impl Fn(&CNode) -> u32) -> [usize; LANES] {
+        let nodes = &self.nodes[..];
+        let mut nid = [0usize; LANES];
+        let mut depth = 0u32;
+        for (n, meta) in nid.iter_mut().zip(group) {
+            *n = meta.root as usize;
+            depth = depth.max(meta.depth);
+        }
+        for _ in 0..depth {
+            macro_rules! lane {
+                ($($j:literal)*) => {$(
+                    // SAFETY: as in `walk_block`: `nid[j]` is always an arena
+                    // node id (the root, then children `next_numeric`
+                    // produced).
+                    let node = unsafe { nodes.get_unchecked(nid[$j]) };
+                    nid[$j] = Self::next_numeric(node, key_of(node));
+                )*};
+            }
+            lane!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
+        }
+        nid
     }
 
     /// Original leaf ids of one dense `row` in trees `0..out.len()`, written

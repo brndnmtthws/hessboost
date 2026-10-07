@@ -422,7 +422,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 - **One objective:** `TrainingParams::objective` is the only source of
   the trained loss (`TrainingParams::loss`); a custom loss is
   `Objective::Custom`, so every property (base-score domain, default
-  metric, default `max_delta_step`, adaptive leaves, output count) comes
+  metric, default `max_delta_step`, output count) comes
   from the loss being trained. A custom loss may not take a built-in
   objective's name: the model records it by name (`ModelObjective::name`,
   no `built_in` objective).

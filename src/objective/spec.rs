@@ -47,11 +47,11 @@ pub enum Objective {
     SquaredLogError,
     /// `reg:pseudohubererror`: the pseudo-Huber loss.
     PseudoHuber(PseudoHuber),
-    /// `reg:absoluteerror`: absolute error, leaves re-estimated after
-    /// growth.
+    /// `reg:absoluteerror`: absolute error, trained on a smooth pseudo-Huber
+    /// surrogate with ordinary Newton leaves.
     AbsoluteError,
-    /// `reg:quantileerror`: one output per quantile, leaves re-estimated
-    /// after growth.
+    /// `reg:quantileerror`: one output per quantile, trained on a smooth
+    /// pinball surrogate with ordinary Newton leaves.
     Quantile(Quantiles),
     /// `reg:expectileerror`: one output per expectile.
     Expectile(Expectiles),
@@ -393,13 +393,6 @@ impl Objective {
         } else {
             0.0
         }
-    }
-
-    /// Whether the objective re-estimates its leaves after growth
-    /// (XGBoost's adaptive leaves: `reg:absoluteerror`,
-    /// `reg:quantileerror`).
-    pub(crate) fn has_adaptive_leaves(&self) -> bool {
-        matches!(self, Objective::AbsoluteError | Objective::Quantile(_))
     }
 
     /// Whether the objective is `reg:squarederror` without reweighting

@@ -22,8 +22,8 @@
 //! plain `Python::detach` instead. A thread of the pool itself (installed
 //! work, or a Python callback that work runs) must not hand work to the
 //! pool from another thread and wait: every pool thread may be waiting on
-//! it, so the work would never start. [`on_pool_thread`] tells it to run
-//! the work itself.
+//! the caller, so the work would never start. [`on_pool_thread`] identifies
+//! pool threads so callers can run such work inline.
 
 use crate::errors::refuse;
 use pyo3::exceptions::PyOSError;
@@ -105,8 +105,8 @@ pub(crate) fn install<T: Send>(f: impl FnOnce() -> T + Send) -> PyResult<T> {
 
 /// Whether the current thread is one of this process's pool threads,
 /// running installed work or a Python callback of it. Such a thread runs
-/// nested work inline: it is in the pool already, and queueing the work for
-/// the pool could wait on itself.
+/// nested work inline: it is already in the pool, and work it queued there
+/// could wait for this very thread.
 pub(crate) fn on_pool_thread() -> bool {
     SLOTS
         .get(GENERATION.load(Ordering::Acquire))

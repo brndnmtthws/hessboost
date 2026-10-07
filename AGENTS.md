@@ -451,9 +451,10 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   rayon runs on the extension's process-local pool (`pool`: `detached`
   and the training worker install it), which a forked child rebuilds.
   A hooked call (`train`, an online update) from a Python callback on that
-  pool runs inline there (`pool::on_pool_thread`, `interruptible`) instead
-  of waiting for a pool thread the callback holds; `tests/test_training.py`
-  and `tests/test_online.py` check it on a one-thread pool. Parameter mappings go
+  pool runs inline on the callback thread (`pool::on_pool_thread`,
+  `interruptible`) instead of waiting for a pool thread the callback holds;
+  `tests/test_training.py` and `tests/test_online.py` check it on a
+  one-thread pool. Parameter mappings go
   through `TrainingParams::from_xgboost`, the crate's one XGBoost
   boundary (also used by `tests/parity.rs` and the `train` fuzz target),
   so unknown keys are refused. `train(obj=...)` trains

@@ -174,7 +174,7 @@ fn round_hook(
     }
 }
 
-/// Where a [`CommitGate::Caller`] question is.
+/// State of a [`CommitGate::Caller`] question.
 enum Phase {
     Working,
     Asking,
@@ -197,7 +197,7 @@ pub(crate) enum CommitGate<'a> {
     Inline(&'a (dyn Fn() -> bool + Sync)),
 }
 
-/// A [`CommitGate::Caller`] question and the caller to wake for it.
+/// State of a [`CommitGate::Caller`] question and the caller thread to wake.
 pub(crate) struct GateState {
     phase: Mutex<Phase>,
     answered: Condvar,
@@ -205,8 +205,8 @@ pub(crate) struct GateState {
 }
 
 impl CommitGate<'_> {
-    /// Worker side: the answer, from the waiting caller (woken for it) or
-    /// the inline verdict.
+    /// Worker side: returns the answer from the waiting caller (woken for it)
+    /// or from the inline verdict.
     pub(crate) fn confirm(&self) -> ControlFlow<()> {
         let state = match self {
             Self::Caller(state) => state,
@@ -269,10 +269,10 @@ impl GateState {
 /// [`CommitGate`] with `may_commit` after a signal check; `work` sees the
 /// interruption through its round hook and stops at the end of the round.
 ///
-/// On a pool thread (a Python callback of an outer call), `work` runs right
-/// there instead: handed to the pool from another thread, it could wait
-/// forever for a pool thread while every pool thread waits on it, this one
-/// included. Its gate then answers with `may_commit` on the spot
+/// On a pool thread (a Python callback of an outer call), `work` runs
+/// inline instead: handed to the pool from another thread, it could wait
+/// indefinitely for a pool thread while every pool thread waits on it,
+/// this one included. Its gate then answers with `may_commit` on the spot
 /// ([`CommitGate::Inline`]).
 fn interruptible<T: Send>(
     py: Python<'_>,

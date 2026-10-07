@@ -211,7 +211,7 @@ print("ok")
 def test_access_from_the_update_callback_fails_fast(mode: OnlineMode) -> None:
     """Reading the model or data, or updating again, from an update's own
     callback raises instead of deadlocking; the row count and mode stay
-    readable. Run in a subprocess on a one-thread pool, where the callback
+    readable. Runs in a subprocess on a one-thread pool, where the callback
     holds the only pool thread, so a deadlock fails the test by timeout."""
     import os
     import subprocess

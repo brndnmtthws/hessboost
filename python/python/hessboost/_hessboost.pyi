@@ -27,6 +27,7 @@ __all__ = [
     "SplitConformal",
     "TermShape",
     "cv",
+    "cv_refit",
     "forward_chaining",
     "honest_refit",
     "k_fold",
@@ -135,6 +136,29 @@ class Booster:
     def predict(
         self, data: DMatrix, kind: _PredictKind, iteration_range: tuple[int, int] | None = None
     ) -> NDArray[np.float32]: ...
+    def predict_rows(
+        self,
+        rows: NDArray[np.float32],
+        margin: bool,
+        iteration_range: tuple[int, int] | None = None,
+    ) -> NDArray[np.float32]: ...
+    def predict_row_into(
+        self,
+        row: NDArray[np.float32],
+        margin: bool,
+        out: NDArray[np.float32],
+        iteration_range: tuple[int, int] | None = None,
+    ) -> None: ...
+    def transform_margin(self, margin: float) -> float:
+        """The prediction of one margin of a single-output model, by the
+        objective's transform: bit for bit what ``predict`` reports for a row
+        with that margin."""
+    def transform_margins_into(
+        self, margins: NDArray[np.float32], out: NDArray[np.float32]
+    ) -> None:
+        """Writes the predictions of whole rows of ``num_outputs`` margins
+        (row-major, C-contiguous) into ``out``, the same rows of
+        ``prediction_width`` values: ``predict``'s transform of its margins."""
     def predict_leaf(
         self, data: DMatrix, iteration_range: tuple[int, int] | None = None
     ) -> NDArray[np.int32]: ...
@@ -173,6 +197,8 @@ class Booster:
     @property
     def base_margins(self) -> list[float]: ...
     @property
+    def prediction_width(self) -> int: ...
+    @property
     def vector_leaves(self) -> bool: ...
     @property
     def boulevard(self) -> dict[str, Any] | None: ...
@@ -181,6 +207,7 @@ class Booster:
     def to_gpu(self, device: _GpuDevice | None) -> GpuModel: ...
     def to_compact(self) -> CompactModel: ...
     def size_report(self) -> dict[str, int]: ...
+    def model_info(self) -> dict[str, Any]: ...
 
 @final
 class CompactModel:
@@ -437,14 +464,13 @@ def train_with_budget(
     iteration_limit: int | None = None,
     stopping_rounds: int | None = None,
 ) -> Booster: ...
-def cv(
-    params: Params,
-    data: DMatrix,
-    num_boost_round: int,
-    folds: list[tuple[list[int], list[int]]],
-    early_stopping_rounds: int | None = None,
-    target_stats: tuple[OrderedTargetEncoder, list[int]] | None = None,
-) -> list[tuple[str, list[float], list[float]]]: ...
+
+_CvHistory: TypeAlias = list[tuple[str, list[float], list[float]]]
+
+def cv(request: Mapping[str, object]) -> _CvHistory: ...
+def cv_refit(
+    request: Mapping[str, object],
+) -> tuple[_CvHistory, Booster, int, FittedTargetEncoder | None]: ...
 def k_fold(
     n_rows: int, nfold: int, seed: int
 ) -> list[tuple[NDArray[np.int64], NDArray[np.int64]]]: ...

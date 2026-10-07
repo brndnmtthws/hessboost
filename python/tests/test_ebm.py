@@ -161,6 +161,43 @@ def test_early_stopping_rounds_zero_is_off() -> None:
     hessboost.train({**stopped, "ebm_early_stopping_tolerance": 0.01}, dtrain, 5)
 
 
+def test_eval_sets_and_early_stopping() -> None:
+    x, y = additive(600, 4, features=3, noise=0.3)
+    dtrain = hessboost.DMatrix(x[:400], label=y[:400])
+    dvalid = hessboost.DMatrix(x[400:], label=y[400:])
+    log: hessboost.EvalsResult = {}
+    booster = hessboost.train(
+        {**CLASSIC, "eta": 0.5},
+        dtrain,
+        200,
+        evals=[(dvalid, "valid")],
+        early_stopping_rounds=5,
+        evals_result=log,
+        verbose_eval=False,
+    )
+    history = log["valid"]["rmse"]
+    assert 5 < len(history) < 200
+    assert booster.best_iteration is not None
+    assert booster.best_score == min(history)
+    # Prediction stops at the best iteration, whose score early stopping kept.
+    residual = booster.predict(dvalid) - y[400:].astype(np.float32)
+    assert float(np.sqrt(np.mean(residual.astype(np.float64) ** 2))) == pytest.approx(
+        booster.best_score, rel=1e-6
+    )
+
+
+def test_cross_validation_and_refit() -> None:
+    x, y = additive(400, 5, features=3, noise=0.2)
+    dtrain = hessboost.DMatrix(x, label=y)
+    result = hessboost.cv(CLASSIC, dtrain, 10)
+    assert result["test-rmse-mean"].shape == (10,)
+    assert result["test-rmse-mean"][-1] < result["test-rmse-mean"][0]
+    refit = hessboost.cv(CLASSIC, dtrain, 10, early_stopping_rounds=3, refit=True)
+    assert refit.booster.ebm is not None
+    trained = hessboost.train(CLASSIC, dtrain, refit.num_boost_round)
+    np.testing.assert_array_equal(refit.booster.predict(x), trained.predict(x))
+
+
 def test_axis_tags_decode_exhaustively() -> None:
     numeric = _axis("numeric", [0.5, 1.5])
     assert isinstance(numeric, NumericAxis)

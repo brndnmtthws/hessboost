@@ -563,6 +563,66 @@ def test_ranking_cv_keeps_whole_query_groups() -> None:
         hessboost.cv({"objective": "rank:ndcg"}, dtrain, 5)
 
 
+@pytest.mark.parametrize("early_stopping_rounds", [None, 3])
+def test_cv_refit_trains_every_row_for_the_chosen_rounds(
+    early_stopping_rounds: int | None,
+) -> None:
+    x, y = regression()
+    dtrain = DMatrix(x, y, feature_names=[f"x{i}" for i in range(5)])
+    params = {"eta": 0.8, "max_depth": 3}
+    refit = hessboost.cv(
+        params, dtrain, 40, early_stopping_rounds=early_stopping_rounds, refit=True
+    )
+    assert isinstance(refit, hessboost.CvRefit)
+    plain = hessboost.cv(params, dtrain, 40, early_stopping_rounds=early_stopping_rounds)
+    assert refit.history.keys() == plain.keys()
+    for name, values in plain.items():
+        np.testing.assert_array_equal(refit.history[name], values)
+    assert refit.num_boost_round == len(plain["test-rmse-mean"])
+    if early_stopping_rounds is None:
+        assert refit.num_boost_round == 40
+    else:
+        assert refit.num_boost_round < 40
+    assert refit.target_encoder is None
+    booster = refit.booster
+    assert booster.num_boosted_rounds() == refit.num_boost_round
+    assert booster.feature_names == dtrain.feature_names
+    trained = hessboost.train(params, dtrain, refit.num_boost_round)
+    np.testing.assert_array_equal(booster.predict(x), trained.predict(x))
+
+
+def test_cv_continues_xgb_model_in_every_fold() -> None:
+    x, y = regression()
+    dtrain = DMatrix(x, y)
+    params = {"max_depth": 3}
+    init = hessboost.train(params, dtrain, 4)
+    folds = hessboost.folds.k_fold(400, 3, seed=1)
+    result = hessboost.cv(params, dtrain, 5, folds=folds, xgb_model=init, refit=True)
+    scores = []
+    for train_rows, test_rows in folds:
+        history: hessboost.EvalsResult = {}
+        hessboost.train(
+            params,
+            dtrain.slice(train_rows),
+            5,
+            evals=[(dtrain.slice(test_rows), "test")],
+            evals_result=history,
+            verbose_eval=False,
+            xgb_model=init,
+        )
+        scores.append(history["test"]["rmse"])
+    np.testing.assert_allclose(
+        result.history["test-rmse-mean"], np.mean(scores, axis=0), rtol=1e-12
+    )
+    np.testing.assert_allclose(result.history["test-rmse-std"], np.std(scores, axis=0), rtol=1e-9)
+    assert result.booster.num_boosted_rounds() == 4 + result.num_boost_round
+    continued = hessboost.train(params, dtrain, 5, xgb_model=init)
+    np.testing.assert_array_equal(result.booster.predict(x), continued.predict(x))
+    # The model must take dtrain's features.
+    with pytest.raises(HessboostError):
+        hessboost.cv(params, DMatrix(x[:, :4], y), 2, xgb_model=init)
+
+
 def test_train_with_budget_fits_and_refuses_tuned_parameters() -> None:
     x, y = regression()
     dtrain = DMatrix(x[:300], y[:300], feature_names=[f"f{i}" for i in range(x.shape[1])])

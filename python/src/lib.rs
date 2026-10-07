@@ -27,6 +27,7 @@ mod errors;
 mod forest;
 mod gpu;
 mod inference;
+mod info;
 mod online;
 mod params;
 mod pool;
@@ -69,6 +70,7 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(train::train, m)?)?;
     m.add_function(wrap_pyfunction!(train::train_with_budget, m)?)?;
     m.add_function(wrap_pyfunction!(train::cv, m)?)?;
+    m.add_function(wrap_pyfunction!(train::cv_refit, m)?)?;
     m.add_function(wrap_pyfunction!(train::k_fold, m)?)?;
     m.add_function(wrap_pyfunction!(train::forward_chaining, m)?)?;
     m.add_function(wrap_pyfunction!(train::purged_forward, m)?)?;

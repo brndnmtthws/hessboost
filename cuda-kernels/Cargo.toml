@@ -25,3 +25,28 @@ predict = []
 # Keep this crate out of hessboost's build: it needs cuda-oxide's nightly.
 [workspace]
 members = ["."]
+
+# The root crate's lint policy (`../Cargo.toml`), checked by CI with
+# `cargo clippy --features train` and `--features predict` from this
+# directory (a host-target check: cuda-oxide's codegen is not involved).
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+# Numeric kernels convert between f32/f64/usize/u32 on purpose; value ranges
+# are bounded by the data model (bins, feature ids, row counts).
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# Exact comparisons are intentional: sentinels, split thresholds, test oracles.
+float_cmp = "allow"
+# Math code uses the conventional short names (g, h, w, x, y, lo, hi).
+many_single_char_names = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+# Every fallible API returns HessboostError; per-function sections are boilerplate.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Hot prediction/histogram/SIMD helpers; forced inlining is measured.
+inline_always = "allow"

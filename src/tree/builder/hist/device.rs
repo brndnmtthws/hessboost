@@ -884,6 +884,58 @@ mod tests {
         }
     }
 
+    /// A tree whose gradients sum exactly over all of its rows forms its
+    /// scans' prefixes with warp scans; one whose gradients span too many
+    /// binades keeps the CPU's ordered chains. Both grow the CPU's tree.
+    #[test]
+    fn exact_and_ordered_scans_grow_the_cpu_tree() {
+        if !has_device() {
+            return;
+        }
+        let (index, exact) = fixture(64);
+        let wide: Vec<GradPair> = exact
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let scale = 10f32.powi((i % 23) as i32 - 11);
+                GradPair::new(p.grad * scale * 1.1, 1.0 + (i % 5) as f32 * 0.3)
+            })
+            .collect();
+        let rows: Vec<u32> = (0..index.n_rows() as u32).collect();
+        for (gradients, certified) in [(&exact, true), (&wide, false)] {
+            for policy in [GrowPolicy::DepthWise, GrowPolicy::LossGuide] {
+                let params = TrainingParams::builder()
+                    .grow_policy(policy)
+                    .max_depth(5)
+                    .max_leaves(13)
+                    .min_child_weight(0.0)
+                    .build()
+                    .unwrap();
+                let mut sampler = ColumnSampler::all(3);
+                let expected =
+                    HistTreeBuilder::new(&params).build(&index, gradients, &rows, &mut sampler);
+                let backend = CudaHistBackend::new(&index, 0).unwrap();
+                let actual = HistTreeBuilder::new(&params).with_backend(&backend).build(
+                    &index,
+                    gradients,
+                    &rows,
+                    &mut ColumnSampler::all(3),
+                );
+                assert_eq!(
+                    serde_json::to_vec(&actual).unwrap(),
+                    serde_json::to_vec(&expected).unwrap(),
+                    "certified {certified}, {policy:?}"
+                );
+                let counts = backend.scan_diagnostics();
+                assert!(counts.device_nodes > 1, "must scan on the device");
+                let all_exact = counts.exact_nodes == counts.device_nodes;
+                assert_eq!((all_exact, counts.exact_nodes > 0), (certified, certified));
+                assert_eq!(backend.node_counts().cpu_nodes, 0);
+            }
+        }
+        assert!(available(), "{:?}", unavailable_reason());
+    }
+
     #[test]
     fn nan_category_order_and_score_request_explicit_host_replay() {
         if !has_device() {

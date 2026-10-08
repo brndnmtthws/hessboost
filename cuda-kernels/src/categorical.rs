@@ -7,8 +7,9 @@
 //! `(slot, direction)`, its result index, and the first bin of its sorting
 //! workspace.
 
-use crate::train::ScanReg;
-use crate::{F64x2, FULL, SCAN_WARPS, grid_index, grid_threads, ld, st};
+use crate::train::{NumericResults, Regularization, ScanReg, shuffle_pair, warp_prefix};
+use crate::{F64x2, FULL, SCAN_WARPS, ld, st};
+use core::cmp::Ordering;
 use cuda_device::atomic::{AtomicOrdering::Relaxed, DeviceAtomicU32};
 use cuda_device::{SharedArray, kernel, launch_bounds, thread, warp};
 
@@ -31,31 +32,53 @@ unsafe fn request_feature(task: *const u64) -> (u64, u64) {
     (u64::from(word as u32), word >> 32)
 }
 
+/// The categorical tasks a sort pass covers: `tasks[4 t..]` for `t <
+/// n_tasks`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CategoryTasks {
+    pub tasks: *const u64,
+    pub n_tasks: u32,
+}
+
+/// The sort workspaces [`category_keys`] initializes: each category's key
+/// and the identity order.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SortWorkspace {
+    pub keys: *mut f32,
+    pub order: *mut u32,
+}
+
 /// Each category's sort key: its weight (`CalcWeightCat`), or 0 for a
 /// category whose Hessian is not positive or below `min_child_weight`;
 /// `order` starts as the identity. A non-finite key flags the task's result
 /// (`meta` status 3) for the host. Features below 4 categories search
-/// one-hot and need no keys.
+/// one-hot and need no keys. `meta` is a direct parameter: an atomic on a
+/// generic address would also need a local-memory path.
 ///
 /// # Safety
 ///
 /// `tasks` holds `n_tasks` tasks, `pool` every slot they name (`total_bins`
 /// bins each), `keys` and `order` every workspace, and `meta` every result.
 #[kernel]
-pub unsafe fn category_keys(
+pub unsafe extern "C" fn category_keys(
     pool: *const F64x2,
     feature_first: *const u32,
     total_bins: u64,
-    tasks: *const u64,
-    n_tasks: u32,
-    lambda: f64,
-    alpha: f64,
-    max_delta_step: f64,
-    min_child_weight: f64,
-    keys: *mut f32,
-    order: *mut u32,
+    work: CategoryTasks,
+    regularization: Regularization,
+    workspace: SortWorkspace,
     meta: *mut u32,
 ) {
+    let CategoryTasks { tasks, n_tasks } = work;
+    let SortWorkspace { keys, order } = workspace;
+    let Regularization {
+        lambda,
+        alpha,
+        max_delta_step,
+        min_child_weight,
+    } = regularization;
     // SAFETY: the caller's; one block per task, one thread per category.
     unsafe {
         let mut t = thread::blockIdx_x();
@@ -74,8 +97,14 @@ pub unsafe fn category_keys(
                     let mut key = 0.0f32;
                     // CalcWeightCat checks min_child_weight before
                     // CalcWeight's non-positive-Hessian case, and does not
-                    // apply node bounds.
-                    if !(s.y < min_child_weight) && !(s.y <= 0.0) {
+                    // apply node bounds. A NaN Hessian passes both (and
+                    // flags the task below).
+                    if s.y.partial_cmp(&min_child_weight) != Some(Ordering::Less)
+                        && !matches!(
+                            s.y.partial_cmp(&0.0),
+                            Some(Ordering::Less | Ordering::Equal)
+                        )
+                    {
                         let threshold = if s.x > alpha {
                             s.x - alpha
                         } else if s.x < -alpha {
@@ -112,16 +141,16 @@ pub unsafe fn category_keys(
 ///
 /// As [`category_keys`], with `source` and `dest` holding every workspace.
 #[kernel]
-pub unsafe fn category_merge(
+pub unsafe extern "C" fn category_merge(
     feature_first: *const u32,
-    tasks: *const u64,
-    n_tasks: u32,
+    work: CategoryTasks,
+    meta: *const u32,
     width: u64,
     keys: *const f32,
     source: *const u32,
     dest: *mut u32,
-    meta: *const u32,
 ) {
+    let CategoryTasks { tasks, n_tasks } = work;
     // SAFETY: the caller's; one block per task, one thread per category,
     // each writing its own `dest` slot.
     unsafe {
@@ -163,14 +192,51 @@ pub unsafe fn category_merge(
     }
 }
 
-/// One warp per categorical feature: lane 0 forms the CPU's prefix and
-/// suffix chains over the categories in key order (or, one-hot below 4
-/// categories, the missing statistics), then all lanes score candidates
-/// with the numeric search's scorer. The reduction keeps the largest finite
-/// loss, then the earliest candidate. `meta[4 r..]` gets (status: 0 none, 1
-/// found, 4 NaN; categories selected; loss bits; default-left | backward
-/// << 1), `children[2 r..]` the right and left statistics (the tree's
-/// children are XGBoost's swapped), and `sets[63 r..]` the selected
+/// A categorical scan's tasks: `tasks[4 t..]` for `t < n_tasks`, each
+/// request's `totals` and `params` (root gain, lower, upper), and whether
+/// the tree's histograms are certified exact.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CategoricalTasks {
+    pub tasks: *const u64,
+    pub n_tasks: u64,
+    pub totals: *const F64x2,
+    pub params: *const f32,
+    pub exact: u32,
+}
+
+/// A categorical scan's results, per result index `r`: `meta[4 r..]`,
+/// `children[2 r..]` and `sets[63 r..]` ([`scan_categorical`] writes them,
+/// [`merge_scans`] reads them).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CategoricalResults {
+    pub meta: *mut u32,
+    pub children: *mut F64x2,
+    pub sets: *mut u32,
+}
+
+/// Warp `w`'s two chains of [`CAT_SET_BINS`] staged statistics in the
+/// block's shared memory, for [`scan_categorical`].
+#[inline(always)]
+fn chain_row(w: u32) -> *mut F64x2 {
+    const ROW: usize = 2 * CAT_SET_BINS as usize;
+    static mut CHAIN: SharedArray<F64x2, { SCAN_WARPS * ROW }> = SharedArray::UNINIT;
+    // SAFETY: an address within the array (`w < SCAN_WARPS`).
+    unsafe { SharedArray::as_raw_mut_ptr(&raw mut CHAIN).add(w as usize * ROW) }
+}
+
+/// One warp per categorical feature forms the prefix and suffix statistics
+/// over the categories in key order (or, one-hot below 4 categories, lane 0
+/// the missing statistics), then all lanes score candidates with the
+/// numeric search's scorer. Without `exact`, lane 0 chains them in the
+/// CPU's order; with `exact` (the tree's histograms certified exact, as for
+/// [`scan_splits`](crate::train::scan_splits)), the warp scans each 32
+/// categories at once ([`warp_prefix`]). The reduction keeps the largest
+/// finite loss, then the earliest candidate. `meta[4 r..]` gets (status: 0
+/// none, 1 found, 4 NaN; categories selected; loss bits; default-left |
+/// backward << 1), `children[2 r..]` the right and left statistics (the
+/// tree's children are XGBoost's swapped), and `sets[63 r..]` the selected
 /// categories.
 ///
 /// # Safety
@@ -179,34 +245,36 @@ pub unsafe fn category_merge(
 /// upper) every request, `order` the sorted workspaces, and `children` and
 /// `sets` every result.
 #[kernel]
-#[launch_bounds(128)]
-pub unsafe fn scan_categorical(
+#[launch_bounds(32)]
+pub unsafe extern "C" fn scan_categorical(
     pool: *const F64x2,
     feature_first: *const u32,
     total_bins: u64,
-    tasks: *const u64,
-    n_tasks: u64,
-    totals: *const F64x2,
-    params: *const f32,
-    lambda: f64,
-    alpha: f64,
-    max_delta_step: f64,
-    min_child_weight: f64,
+    work: CategoricalTasks,
+    regularization: Regularization,
     order: *const u32,
-    meta: *mut u32,
-    children: *mut F64x2,
-    sets: *mut u32,
+    out: CategoricalResults,
 ) {
-    static mut CHAIN: SharedArray<F64x2, { SCAN_WARPS * 2 * CAT_SET_BINS as usize }> =
-        SharedArray::UNINIT;
-    // SAFETY: the caller's; each warp owns its chain row, staged by its
-    // lanes, chained by lane 0 and read by the lanes, each step between
-    // warp barriers every lane reaches.
+    let CategoricalTasks {
+        tasks,
+        n_tasks,
+        totals,
+        params,
+        exact,
+    } = work;
+    let CategoricalResults {
+        meta,
+        children,
+        sets,
+    } = out;
+    // SAFETY: the caller's; each warp owns its chain row, staged (or
+    // scanned) by its lanes, chained by lane 0 and read by the lanes, each
+    // step between warp barriers every lane reaches; every lane reaches the
+    // shuffles.
     unsafe {
         let lane = thread::threadIdx_x() & 31;
         let warp_index = thread::threadIdx_x() >> 5;
-        let chain = SharedArray::as_raw_mut_ptr(&raw mut CHAIN)
-            .add(warp_index as usize * 2 * CAT_SET_BINS as usize);
+        let chain = chain_row(warp_index);
         let warps = u64::from(thread::gridDim_x()) * SCAN_WARPS as u64;
         let mut t = u64::from(thread::blockIdx_x()) * SCAN_WARPS as u64 + u64::from(warp_index);
         while t < n_tasks {
@@ -219,21 +287,47 @@ pub unsafe fn scan_categorical(
                 let slot = u64::from(ld(task, 1) as u32);
                 let bins = pool.add((slot * total_bins + u64::from(first)) as usize);
                 let total = ld(totals, request);
-                let reg = ScanReg {
-                    lambda,
-                    alpha,
-                    max_delta_step,
-                    min_child_weight,
-                    root_gain: ld(params, 3 * request),
-                    lower: ld(params, 3 * request + 1),
-                    upper: ld(params, 3 * request + 2),
-                    dir: (ld(task, 1) >> 32) as u32 as i32,
-                };
+                let reg = ScanReg::new(
+                    regularization,
+                    params,
+                    request,
+                    (ld(task, 1) >> 32) as u32 as i32,
+                );
                 let onehot = len < 4;
                 let depth = len.min(64);
                 let steps = if onehot { 0 } else { depth - 1 };
                 let (mut mg, mut mh) = (0.0f64, 0.0f64);
-                if !onehot {
+                if !onehot && exact != 0 {
+                    // Each chain (prefix, then suffix) a window of 32 steps
+                    // at a time: every lane loads its step's `order` entry
+                    // and bin, the warp scans them onto the previous
+                    // window's total, and each lane stores its prefix.
+                    let mut pass = 0;
+                    while pass < 2 {
+                        let mut carry = F64x2 { x: 0.0, y: 0.0 };
+                        let mut base = 0;
+                        while base < steps {
+                            let step = base + lane;
+                            let b = if step < steps {
+                                let k = if pass == 0 { step } else { len - 1 - step };
+                                ld(bins, u64::from(ld(order, workspace + u64::from(k))))
+                            } else {
+                                F64x2 { x: 0.0, y: 0.0 }
+                            };
+                            let s = warp_prefix(lane, b);
+                            let a = F64x2 {
+                                x: carry.x + s.x,
+                                y: carry.y + s.y,
+                            };
+                            if step < steps {
+                                st(chain, u64::from(pass * steps + step), a);
+                            }
+                            carry = shuffle_pair(a, (steps - base).min(32) - 1);
+                            base += 32;
+                        }
+                        pass += 1;
+                    }
+                } else if !onehot {
                     // The chains' bins in key order (prefix, then suffix),
                     // staged by every lane, each loading its `order` entry
                     // and bin in parallel; lane 0 then chains them in place,
@@ -253,13 +347,13 @@ pub unsafe fn scan_categorical(
                         let mut i = 0;
                         while i < len {
                             let b = ld(bins, u64::from(i));
-                            g = g + b.x;
-                            h = h + b.y;
+                            g += b.x;
+                            h += b.y;
                             i += 1;
                         }
                         mg = total.x - g;
                         mh = total.y - h;
-                    } else {
+                    } else if exact == 0 {
                         let mut pass = 0;
                         while pass < 2 {
                             let (mut g, mut h) = (0.0f64, 0.0f64);
@@ -267,8 +361,8 @@ pub unsafe fn scan_categorical(
                             while step < steps {
                                 let at = u64::from(pass * steps + step);
                                 let bin = ld(chain, at);
-                                g = g + bin.x;
-                                h = h + bin.y;
+                                g += bin.x;
+                                h += bin.y;
                                 st(chain, at, F64x2 { x: g, y: h });
                                 step += 1;
                             }
@@ -279,18 +373,14 @@ pub unsafe fn scan_categorical(
                 let mg = warp::shuffle_f64_sync(FULL, mg, 0);
                 let mh = warp::shuffle_f64_sync(FULL, mh, 0);
                 warp::sync_mask(FULL);
-                let mut best = 0.0f32;
-                let mut position = u32::MAX;
-                let (mut lg, mut lh, mut rg, mut rh) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-                let mut nan = false;
-                let count = if onehot { 2 * len } else { 2 * steps };
-                let mut candidate = lane;
-                while candidate < count {
-                    let (left, right) = if onehot {
+                // A candidate's (left, right) statistics, from the chains
+                // (or bins) that stay in place until the task ends.
+                let split_of = |candidate: u32| {
+                    if onehot {
                         let mut right = ld(bins, u64::from(candidate / 2));
                         if candidate & 1 != 0 {
-                            right.x = right.x + mg;
-                            right.y = right.y + mh;
+                            right.x += mg;
+                            right.y += mh;
                         }
                         let left = F64x2 {
                             x: total.x - right.x,
@@ -308,29 +398,34 @@ pub unsafe fn scan_categorical(
                         } else {
                             (acc, rest)
                         }
-                    };
+                    }
+                };
+                let mut best = 0.0f32;
+                let mut position = u32::MAX;
+                let mut nan = false;
+                let count = if onehot { 2 * len } else { 2 * steps };
+                let mut candidate = lane;
+                while candidate < count {
+                    let (left, right) = split_of(candidate);
                     let loss = reg.score(left.x, left.y, right.x, right.y);
                     if loss.is_nan() {
                         nan = true;
                     } else if loss.is_finite() && loss > best {
                         best = loss;
                         position = candidate;
-                        (lg, lh, rg, rh) = (left.x, left.y, right.x, right.y);
                     }
                     candidate += 32;
                 }
+                // Reduce the loss and position only: lane 0 then recomputes
+                // the winner's children, the same operations on the same
+                // statistics.
                 let mut delta = 16;
                 while delta > 0 {
                     let other_best = warp::shuffle_down_f32_sync(FULL, best, delta);
                     let other_position = warp::shuffle_down_sync(FULL, position, delta);
-                    let other_lg = warp::shuffle_down_f64_sync(FULL, lg, delta);
-                    let other_lh = warp::shuffle_down_f64_sync(FULL, lh, delta);
-                    let other_rg = warp::shuffle_down_f64_sync(FULL, rg, delta);
-                    let other_rh = warp::shuffle_down_f64_sync(FULL, rh, delta);
                     if other_best > best || (other_best == best && other_position < position) {
                         best = other_best;
                         position = other_position;
-                        (lg, lh, rg, rh) = (other_lg, other_lh, other_rg, other_rh);
                     }
                     delta >>= 1;
                 }
@@ -354,8 +449,14 @@ pub unsafe fn scan_categorical(
                         4 * result + 3,
                         u32::from(default_left) | u32::from(backward) << 1,
                     );
-                    st(children, 2 * result, F64x2 { x: rg, y: rh });
-                    st(children, 2 * result + 1, F64x2 { x: lg, y: lh });
+                    let zero = F64x2 { x: 0.0, y: 0.0 };
+                    let (left, right) = if found {
+                        split_of(position)
+                    } else {
+                        (zero, zero)
+                    };
+                    st(children, 2 * result, right);
+                    st(children, 2 * result + 1, left);
                 }
                 if found && !nan {
                     let mut i = lane;
@@ -381,12 +482,18 @@ pub unsafe fn scan_categorical(
 /// candidates are `refs[3 i..]` = (feature, kind: 0 numeric, 1 categorical,
 /// result index) for `i` in `[first[k], first[k + 1])`. A finite
 /// per-feature winner may be reduced; any NaN requires the host's
-/// sequential replay of the whole node (header word 0: 3 numeric NaN, 4
-/// non-finite category weight, 5 categorical NaN). Otherwise `out[out_at[k]
-/// ..]` gets the packed winner (`feature << 32 | kind + 1`, `default_left
-/// << 32 | bin` or the set size, loss bits, the left statistics' bits, and
-/// for a categorical winner the right ones and its category set), or 0 for
-/// none.
+/// sequential replay of the whole node (header word 0, from the first such
+/// candidate: 3 numeric NaN, 4 non-finite category weight, 5 categorical
+/// NaN). Otherwise `out[out_at[k] ..]` gets the packed winner (`feature <<
+/// 32 | kind + 1`, `default_left << 32 | bin` or the set size, loss bits,
+/// the left statistics' bits, and for a categorical winner the right ones
+/// and its category set), or 0 for none.
+///
+/// One warp per node (blocks of [`SCAN_WARPS`] warps, any grid): each lane
+/// folds every 32nd candidate in order with the host's `SplitEntry::update`
+/// rule from a zero loss, then the warp reduces the lanes' winners. A found
+/// result's loss is finite, so that rule is the order "greater loss, then
+/// lower feature, then earlier candidate", which any reduction tree keeps.
 ///
 /// # Safety
 ///
@@ -394,19 +501,28 @@ pub unsafe fn scan_categorical(
 /// candidate they name, the metadata, statistics and sets every result, and
 /// `out` room for each node's header and set.
 #[kernel]
-pub unsafe fn merge_scans(
+#[launch_bounds(32)]
+pub unsafe extern "C" fn merge_scans(
     refs: *const u32,
     first: *const u32,
     n_nodes: u64,
-    numeric_meta: *const u32,
-    numeric_acc: *const F64x2,
-    categorical_meta: *const u32,
-    categorical_children: *const F64x2,
-    categorical_sets: *const u32,
+    numeric: NumericResults,
+    categorical: CategoricalResults,
     out_at: *const u64,
     out: *mut u64,
 ) {
-    // SAFETY: the caller's; one thread per node writes its own output.
+    let NumericResults {
+        meta: numeric_meta,
+        acc: numeric_acc,
+    } = numeric;
+    let CategoricalResults {
+        meta: categorical_meta,
+        children: categorical_children,
+        sets: categorical_sets,
+    } = categorical;
+    // SAFETY: the caller's; one warp per node writes its own output (lane 0
+    // the header, the lanes distinct set entries after it), and every lane
+    // reaches the shuffles.
     unsafe {
         let meta_of = |kind: u32, index: u32| {
             let base = if kind != 0 {
@@ -414,26 +530,26 @@ pub unsafe fn merge_scans(
             } else {
                 numeric_meta
             };
-            base.add(4 * index as usize)
+            base.add(4 * index as usize).cast_const()
         };
-        let mut node = grid_index();
+        let lane = thread::threadIdx_x() & 31;
+        let warps = u64::from(thread::gridDim_x()) * SCAN_WARPS as u64;
+        let mut node = u64::from(thread::blockIdx_x()) * SCAN_WARPS as u64
+            + u64::from(thread::threadIdx_x() >> 5);
         while node < n_nodes {
             let mut best = 0.0f32;
             let mut best_feature = 0u32;
             let mut chosen = u32::MAX;
-            let mut fallback = 0u32;
-            let mut i = ld(first, node);
+            // The lane's first candidate requiring the host's replay.
+            let mut replay = u32::MAX;
+            let mut i = ld(first, node) + lane;
             while i < ld(first, node + 1) {
                 let candidate = refs.add(3 * i as usize);
                 let (feature, kind, index) = (ld(candidate, 0), ld(candidate, 1), ld(candidate, 2));
                 let meta = meta_of(kind, index);
                 let status = ld(meta, 0);
                 if (kind == 0 && status == 2) || (kind != 0 && status >= 3) {
-                    fallback = match (kind, status) {
-                        (0, _) => 3,
-                        (_, 3) => 4,
-                        _ => 5,
-                    };
+                    replay = i;
                     break;
                 }
                 if status == 1 {
@@ -442,7 +558,7 @@ pub unsafe fn merge_scans(
                         && if best_feature <= feature {
                             loss > best
                         } else {
-                            !(best > loss)
+                            best.partial_cmp(&loss) != Some(Ordering::Greater)
                         };
                     if replace {
                         best = loss;
@@ -450,50 +566,86 @@ pub unsafe fn merge_scans(
                         chosen = i;
                     }
                 }
-                i += 1;
+                i += 32;
             }
+            let mut delta = 16;
+            while delta > 0 {
+                let other_best = warp::shuffle_down_f32_sync(FULL, best, delta);
+                let other_feature = warp::shuffle_down_sync(FULL, best_feature, delta);
+                let other_chosen = warp::shuffle_down_sync(FULL, chosen, delta);
+                replay = replay.min(warp::shuffle_down_sync(FULL, replay, delta));
+                let better = other_best > best
+                    || (other_best == best
+                        && (other_feature < best_feature
+                            || (other_feature == best_feature && other_chosen < chosen)));
+                if other_chosen != u32::MAX && (chosen == u32::MAX || better) {
+                    best = other_best;
+                    best_feature = other_feature;
+                    chosen = other_chosen;
+                }
+                delta >>= 1;
+            }
+            let replay = warp::shuffle_sync(FULL, replay, 0);
+            let chosen = warp::shuffle_sync(FULL, chosen, 0);
             let header = out.add(ld(out_at, node) as usize);
-            if fallback != 0 || chosen == u32::MAX {
-                st(header, 0, u64::from(fallback));
+            if replay != u32::MAX || chosen == u32::MAX {
+                if lane == 0 {
+                    let fallback = if replay == u32::MAX {
+                        0
+                    } else {
+                        let candidate = refs.add(3 * replay as usize);
+                        let kind = ld(candidate, 1);
+                        match (kind, ld(meta_of(kind, ld(candidate, 2)), 0)) {
+                            (0, _) => 3,
+                            (_, 3) => 4,
+                            _ => 5,
+                        }
+                    };
+                    st(header, 0, fallback);
+                }
             } else {
                 let candidate = refs.add(3 * chosen as usize);
                 let (kind, index) = (ld(candidate, 1), ld(candidate, 2));
                 let meta = meta_of(kind, index);
-                st(
-                    header,
-                    0,
-                    u64::from(best_feature) << 32 | if kind != 0 { 2 } else { 1 },
-                );
-                st(
-                    header,
-                    1,
-                    u64::from(ld(meta, 3)) << 32 | u64::from(ld(meta, 1)),
-                );
-                st(header, 2, u64::from(ld(meta, 2)));
-                let a = if kind != 0 {
-                    ld(categorical_children, 2 * u64::from(index))
-                } else {
-                    ld(numeric_acc, u64::from(index))
-                };
-                st(header, 3, a.x.to_bits());
-                st(header, 4, a.y.to_bits());
+                if lane == 0 {
+                    st(
+                        header,
+                        0,
+                        u64::from(best_feature) << 32 | if kind != 0 { 2 } else { 1 },
+                    );
+                    st(
+                        header,
+                        1,
+                        u64::from(ld(meta, 3)) << 32 | u64::from(ld(meta, 1)),
+                    );
+                    st(header, 2, u64::from(ld(meta, 2)));
+                    let a = if kind != 0 {
+                        ld(categorical_children, 2 * u64::from(index))
+                    } else {
+                        ld(numeric_acc, u64::from(index))
+                    };
+                    st(header, 3, a.x.to_bits());
+                    st(header, 4, a.y.to_bits());
+                    if kind != 0 {
+                        let b = ld(categorical_children, 2 * u64::from(index) + 1);
+                        st(header, 5, b.x.to_bits());
+                        st(header, 6, b.y.to_bits());
+                    }
+                }
                 if kind != 0 {
-                    let b = ld(categorical_children, 2 * u64::from(index) + 1);
-                    st(header, 5, b.x.to_bits());
-                    st(header, 6, b.y.to_bits());
                     let selected = header.add(NODE_SCAN_WORDS as usize).cast::<u32>();
-                    let mut i = 0;
+                    let mut i = lane;
                     while i < ld(meta, 1) {
                         let category = ld(
                             categorical_sets,
                             CAT_SET_BINS * u64::from(index) + u64::from(i),
                         );
                         st(selected, u64::from(i), category);
-                        i += 1;
+                        i += 32;
                     }
                 }
             }
-            node += grid_threads();
+            node += warps;
         }
     }
 }

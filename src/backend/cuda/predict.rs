@@ -7,7 +7,7 @@
 //! categorical splits, multiclass and vector leaves. Leaf weighting happens
 //! once on the CPU in f32; the GPU adds in tree order without FMA or FTZ.
 
-use super::{Pinned, driver, kernels, upload_pinned};
+use super::{Pinned, Plain, abi, driver, kernels, upload_pinned};
 use crate::backend::shared::{ensure_forest_model, materialize_rows};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -149,12 +149,17 @@ struct Slot {
     pending: Option<(usize, usize)>,
 }
 
+/// Row blocks in flight per call: one being materialized, one uploading,
+/// one computing and one downloading, so a block's host copy waits only
+/// for the slot freed four blocks earlier.
+const SLOTS: usize = 4;
+
 struct Call {
     shape: Shape,
     upload: Arc<CudaStream>,
     compute: Arc<CudaStream>,
     download: Arc<CudaStream>,
-    slots: [Slot; 2],
+    slots: Vec<Slot>,
 }
 
 impl Call {
@@ -175,7 +180,9 @@ impl Call {
                 pending: None,
             })
         };
-        let slots = [make_slot()?, make_slot()?];
+        let slots = (0..SLOTS)
+            .map(|_| make_slot())
+            .collect::<std::result::Result<_, _>>()?;
         Ok(Self {
             shape,
             upload,
@@ -211,7 +218,7 @@ impl Call {
         let mut begin = 0;
         let mut batch = 0;
         while begin < data.n_rows() {
-            let slot = &mut self.slots[batch % 2];
+            let slot = &mut self.slots[batch % SLOTS];
             Self::finish(slot, margins, outputs)?;
             let rows = (data.n_rows() - begin).min(self.shape.rows);
             materialize_rows(
@@ -250,11 +257,8 @@ impl Call {
             }
             slot.uploaded.record(&self.upload)?;
             self.compute.wait(&slot.uploaded)?;
-            let n_rows = rows as u32;
-            let n_cols = cols as u32;
-            let k = outputs as u32;
-            let first = trees.start as u32;
-            let end = trees.end as u32;
+            let (n_rows, n_cols) = (rows as u32, cols as u32);
+            let (tree_begin, tree_end) = (trees.start as u32, trees.end as u32);
             let grid = LaunchConfig {
                 grid_dim: (n_rows.div_ceil(256), 1, 1),
                 block_dim: (256, 1, 1),
@@ -262,16 +266,19 @@ impl Call {
             };
             match &gpu.forest {
                 Forest::Narrow { nodes, roots } => {
+                    let batch = abi::Batch8 {
+                        n_rows,
+                        n_cols,
+                        tree_begin,
+                        tree_end,
+                    };
                     let mut launch = self.compute.launch_builder(&gpu.ctx.predict8);
                     launch
                         .arg(nodes)
                         .arg(roots)
                         .arg(&slot.rows)
                         .arg(&mut slot.out)
-                        .arg(&n_rows)
-                        .arg(&n_cols)
-                        .arg(&first)
-                        .arg(&end);
+                        .arg(&batch);
                     // SAFETY: validated model/data and block-local bounds;
                     // forest nodes and all slices live through completion.
                     unsafe { launch.launch(grid) }?;
@@ -282,6 +289,13 @@ impl Call {
                     vectors,
                     trees,
                 } => {
+                    let batch = abi::Batch16 {
+                        n_rows,
+                        n_cols,
+                        outputs: outputs as u32,
+                        tree_begin,
+                        tree_end,
+                    };
                     let mut launch = self.compute.launch_builder(&gpu.ctx.predict16);
                     launch
                         .arg(nodes)
@@ -290,11 +304,7 @@ impl Call {
                         .arg(trees)
                         .arg(&slot.rows)
                         .arg(&mut slot.out)
-                        .arg(&n_rows)
-                        .arg(&n_cols)
-                        .arg(&k)
-                        .arg(&first)
-                        .arg(&end);
+                        .arg(&batch);
                     // SAFETY: same as the narrow walk, with validated category
                     // and vector pools and per-tree output indices.
                     unsafe { launch.launch(grid) }?;
@@ -457,9 +467,7 @@ impl GpuModel {
 
 /// Upload through an owned pinned buffer and complete before source locals
 /// leave scope. The pinned owner also drains error paths before freeing DMA.
-fn upload_forest<
-    T: Copy + Send + Sync + cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
->(
+fn upload_forest<T: Plain>(
     stream: &Arc<CudaStream>,
     values: &[T],
 ) -> std::result::Result<CudaSlice<T>, DriverError> {
@@ -595,6 +603,7 @@ mod tests {
                 assert!(
                     [
                         "libcuda not found",
+                        "the NVIDIA driver supports CUDA",
                         "no CUDA device",
                         "has compute capability"
                     ]

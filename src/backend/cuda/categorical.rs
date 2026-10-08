@@ -3,8 +3,8 @@
 //! waves; histograms and unchosen feature results never cross the device.
 
 use super::{
-    CudaHistBackend, CudaSlice, CudaStream, DriverError, LaunchConfig, Pinned, SCAN_WARPS,
-    download_pinned, fit, pinned, upload,
+    CudaHistBackend, CudaSlice, CudaStream, DriverError, LaunchConfig, Pinned, SCAN_WARPS, abi,
+    bytes_of, download_pinned, fit, pinned,
 };
 use crate::data::ghist::GHistIndex;
 use crate::tree::gain::{GradStats, RegParams};
@@ -27,6 +27,10 @@ const HEADER_WORDS: usize = 7;
 pub struct ScanDiagnostics {
     /// Nodes whose feature results were merged on the device.
     pub device_nodes: u64,
+    /// Of those, nodes whose prefixes were formed by warp scans: their
+    /// tree's gradients sum exactly over all of its rows, so every
+    /// association of the additions gives the CPU's chain bits.
+    pub exact_nodes: u64,
     /// Numeric features scanned on the device.
     pub numeric_features: u64,
     /// Categorical features searched on the device.
@@ -42,11 +46,9 @@ pub struct ScanDiagnostics {
     pub categorical_score_replays: u64,
 }
 
-/// Reused descriptors, sorting scratch, device results and pinned output.
+/// Reused sorting scratch, device results and pinned output (descriptors
+/// travel in the backend's packed descriptor buffer).
 pub(super) struct ScanState {
-    numeric_tasks: CudaSlice<u32>,
-    totals: CudaSlice<f64>,
-    params: CudaSlice<f32>,
     numeric_meta: CudaSlice<u32>,
     numeric_acc: CudaSlice<f64>,
     categorical_tasks: CudaSlice<u64>,
@@ -55,21 +57,15 @@ pub(super) struct ScanState {
     categorical_meta: CudaSlice<u32>,
     categorical_children: CudaSlice<f64>,
     categorical_sets: CudaSlice<u32>,
-    refs: CudaSlice<u32>,
-    first: CudaSlice<u32>,
-    out_at: CudaSlice<u64>,
     out: CudaSlice<u64>,
     pin: Option<Pinned<u64>>,
     replays: [AtomicU64; 3],
-    work: [AtomicU64; 4],
+    work: [AtomicU64; 5],
 }
 
 impl ScanState {
     pub(super) fn new(stream: &Arc<CudaStream>) -> std::result::Result<Self, DriverError> {
         Ok(Self {
-            numeric_tasks: stream.alloc_zeros(4)?,
-            totals: stream.alloc_zeros(2)?,
-            params: stream.alloc_zeros(3)?,
             numeric_meta: stream.alloc_zeros(4)?,
             numeric_acc: stream.alloc_zeros(2)?,
             categorical_tasks: stream.alloc_zeros(4)?,
@@ -78,9 +74,6 @@ impl ScanState {
             categorical_meta: stream.alloc_zeros(4)?,
             categorical_children: stream.alloc_zeros(4)?,
             categorical_sets: stream.alloc_zeros(SET_BINS)?,
-            refs: stream.alloc_zeros(3)?,
-            first: stream.alloc_zeros(2)?,
-            out_at: stream.alloc_zeros(2)?,
             out: stream.alloc_zeros(HEADER_WORDS)?,
             pin: None,
             replays: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -91,6 +84,7 @@ impl ScanState {
     fn snapshot(&self) -> ScanDiagnostics {
         ScanDiagnostics {
             device_nodes: self.work[0].load(Ordering::Relaxed),
+            exact_nodes: self.work[4].load(Ordering::Relaxed),
             numeric_features: self.work[1].load(Ordering::Relaxed),
             categorical_features: self.work[2].load(Ordering::Relaxed),
             winner_readback_bytes: self.work[3].load(Ordering::Relaxed),
@@ -219,38 +213,62 @@ impl CudaHistBackend {
         let device = &*self.device;
         let stream = &device.stream;
         let state = &mut *state;
+        // The tree's gradients sum exactly over all of its rows, so every
+        // histogram and total of the tree is exact and the scans may form
+        // their prefixes in any association (the CPU's chain bits).
+        let exact = u32::from(state.staged.sums_exact(state.tree_len));
+        let regularization = abi::Regularization {
+            lambda: reg.lambda,
+            alpha: reg.alpha,
+            max_delta_step: reg.max_delta_step,
+            min_child_weight: reg.min_child_weight,
+        };
         let scanned = (|| {
             let scan = &mut state.scan;
-            upload(stream, &mut scan.totals, &totals)?;
-            upload(stream, &mut scan.params, &params)?;
-            upload(stream, &mut scan.refs, &refs)?;
-            upload(stream, &mut scan.first, &first)?;
-            upload(stream, &mut scan.out_at, &out_at)?;
+            let staging = &mut state.staging;
+            let pool = &device.pinned;
+            // One queued copy of the batch's requests and numeric tasks.
+            let [d_totals, d_params, d_refs, d_first, d_out_at, d_numeric] = staging.upload_parts(
+                pool,
+                stream,
+                &mut state.desc,
+                [
+                    bytes_of(&totals),
+                    bytes_of(&params),
+                    bytes_of(&refs),
+                    bytes_of(&first),
+                    bytes_of(&out_at),
+                    bytes_of(&numeric),
+                ],
+            )?;
             fit(stream, &mut scan.out, output_words)?;
             let total_bins = self.total_bins as u64;
             let n_numeric = numeric.len() / 4;
             if n_numeric > 0 {
-                upload(stream, &mut scan.numeric_tasks, &numeric)?;
                 fit(stream, &mut scan.numeric_meta, 4 * n_numeric)?;
                 fit(stream, &mut scan.numeric_acc, 2 * n_numeric)?;
-                let count = n_numeric as u64;
-                let dense = i32::from(self.dense);
+            }
+            let numeric_out = abi::NumericResults {
+                meta: abi::ptr_mut(&mut scan.numeric_meta, stream),
+                acc: abi::ptr_mut(&mut scan.numeric_acc, stream),
+            };
+            if n_numeric > 0 {
+                let work = abi::NumericTasks {
+                    tasks: d_numeric,
+                    n_tasks: n_numeric as u64,
+                    totals: d_totals,
+                    params: d_params,
+                    dense: i32::from(self.dense),
+                    exact,
+                };
                 let mut launch = stream.launch_builder(&device.kernels.scan_splits);
                 launch
                     .arg(&state.pool)
                     .arg(&state.feature_first)
                     .arg(&total_bins)
-                    .arg(&scan.numeric_tasks)
-                    .arg(&count)
-                    .arg(&scan.totals)
-                    .arg(&scan.params)
-                    .arg(&reg.lambda)
-                    .arg(&reg.alpha)
-                    .arg(&reg.max_delta_step)
-                    .arg(&reg.min_child_weight)
-                    .arg(&dense)
-                    .arg(&mut scan.numeric_meta)
-                    .arg(&mut scan.numeric_acc);
+                    .arg(&work)
+                    .arg(&regularization)
+                    .arg(&numeric_out);
                 // SAFETY: validated histogram slots and feature ids, four
                 // descriptor words per task, one whole warp per task.
                 unsafe { launch.launch(scan_config(n_numeric)) }?;
@@ -291,29 +309,32 @@ impl CudaHistBackend {
                         max_bins = max_bins.max(task.bins);
                         next += 1;
                     }
-                    upload(stream, &mut scan.categorical_tasks, &tasks)?;
+                    staging.upload(pool, stream, &mut scan.categorical_tasks, &tasks)?;
                     fit(stream, &mut scan.keys, workspace)?;
                     for order in &mut scan.order {
                         fit(stream, order, workspace)?;
                     }
                     let n_tasks = (next - begin) as u32;
+                    let wave = abi::CategoryTasks {
+                        tasks: abi::ptr(&scan.categorical_tasks, stream),
+                        n_tasks,
+                    };
                     let sort_config = LaunchConfig {
                         grid_dim: (n_tasks.min(device.sm_count.saturating_mul(8)).max(1), 1, 1),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     };
+                    let sort = abi::SortWorkspace {
+                        keys: abi::ptr_mut(&mut scan.keys, stream),
+                        order: abi::ptr_mut(&mut scan.order[0], stream),
+                    };
                     let mut keys = stream.launch_builder(&device.kernels.category_keys);
                     keys.arg(&state.pool)
                         .arg(&state.feature_first)
                         .arg(&total_bins)
-                        .arg(&scan.categorical_tasks)
-                        .arg(&n_tasks)
-                        .arg(&reg.lambda)
-                        .arg(&reg.alpha)
-                        .arg(&reg.max_delta_step)
-                        .arg(&reg.min_child_weight)
-                        .arg(&mut scan.keys)
-                        .arg(&mut scan.order[0])
+                        .arg(&wave)
+                        .arg(&regularization)
+                        .arg(&sort)
                         .arg(&mut scan.categorical_meta);
                     // SAFETY: each task's workspace range is disjoint and
                     // sized to its complete feature bin range.
@@ -330,64 +351,73 @@ impl CudaHistBackend {
                         let mut merge = stream.launch_builder(&device.kernels.category_merge);
                         merge
                             .arg(&state.feature_first)
-                            .arg(&scan.categorical_tasks)
-                            .arg(&n_tasks)
+                            .arg(&wave)
+                            .arg(&scan.categorical_meta)
                             .arg(&width)
                             .arg(&scan.keys)
                             .arg(&*input)
-                            .arg(output)
-                            .arg(&scan.categorical_meta);
+                            .arg(output);
                         // SAFETY: stable merge ranks are a permutation of
                         // each feature's workspace; source/dest do not alias.
                         unsafe { merge.launch(sort_config) }?;
                         source = 1 - source;
                         width *= 2;
                     }
-                    let count = u64::from(n_tasks);
+                    let work = abi::CategoricalTasks {
+                        tasks: abi::ptr(&scan.categorical_tasks, stream),
+                        n_tasks: u64::from(n_tasks),
+                        totals: d_totals,
+                        params: d_params,
+                        exact,
+                    };
+                    let out = abi::CategoricalResults {
+                        meta: abi::ptr_mut(&mut scan.categorical_meta, stream),
+                        children: abi::ptr_mut(&mut scan.categorical_children, stream),
+                        sets: abi::ptr_mut(&mut scan.categorical_sets, stream),
+                    };
                     let mut search = stream.launch_builder(&device.kernels.scan_categorical);
                     search
                         .arg(&state.pool)
                         .arg(&state.feature_first)
                         .arg(&total_bins)
-                        .arg(&scan.categorical_tasks)
-                        .arg(&count)
-                        .arg(&scan.totals)
-                        .arg(&scan.params)
-                        .arg(&reg.lambda)
-                        .arg(&reg.alpha)
-                        .arg(&reg.max_delta_step)
-                        .arg(&reg.min_child_weight)
+                        .arg(&work)
+                        .arg(&regularization)
                         .arg(&scan.order[source])
-                        .arg(&mut scan.categorical_meta)
-                        .arg(&mut scan.categorical_children)
-                        .arg(&mut scan.categorical_sets);
+                        .arg(&out);
                     // SAFETY: sorted indices cover each feature; one warp
                     // per task scores CPU-ordered prefix/suffix chains.
                     unsafe { search.launch(scan_config(n_tasks as usize)) }?;
                 }
             }
+            let categorical_out = abi::CategoricalResults {
+                meta: abi::ptr_mut(&mut scan.categorical_meta, stream),
+                children: abi::ptr_mut(&mut scan.categorical_children, stream),
+                sets: abi::ptr_mut(&mut scan.categorical_sets, stream),
+            };
             let count = requests.len() as u64;
             let mut merge = stream.launch_builder(&device.kernels.merge_scans);
             merge
-                .arg(&scan.refs)
-                .arg(&scan.first)
+                .arg(&d_refs)
+                .arg(&d_first)
                 .arg(&count)
-                .arg(&scan.numeric_meta)
-                .arg(&scan.numeric_acc)
-                .arg(&scan.categorical_meta)
-                .arg(&scan.categorical_children)
-                .arg(&scan.categorical_sets)
-                .arg(&scan.out_at)
+                .arg(&numeric_out)
+                .arg(&categorical_out)
+                .arg(&d_out_at)
                 .arg(&mut scan.out);
             // SAFETY: refs name completed results and node headers have
-            // disjoint spans large enough for their maximum chosen set.
-            unsafe { merge.launch(device.grid(requests.len())) }?;
-            let staging = pinned(stream, &mut scan.pin, output_words, false)?;
-            let packed = download_pinned(stream, staging, &scan.out, output_words)?;
+            // disjoint spans large enough for their maximum chosen set; one
+            // warp per node (the kernel strides over nodes).
+            unsafe { merge.launch(scan_config(requests.len())) }?;
+            let readback = pinned(pool, stream, &mut scan.pin, output_words, false)?;
+            let packed = download_pinned(stream, readback, &scan.out, output_words)?;
+            staging.synced();
             scan.work[0].fetch_add(requests.len() as u64, Ordering::Relaxed);
             scan.work[1].fetch_add(n_numeric as u64, Ordering::Relaxed);
             scan.work[2].fetch_add(categorical.len() as u64, Ordering::Relaxed);
             scan.work[3].fetch_add((output_words * 8) as u64, Ordering::Relaxed);
+            if exact != 0 {
+                scan.work[4].fetch_add(requests.len() as u64, Ordering::Relaxed);
+            }
             let mut results = Vec::with_capacity(requests.len());
             for &offset in &out_at[..requests.len()] {
                 let words = &packed[offset as usize..];

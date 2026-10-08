@@ -33,6 +33,7 @@ impl GpuBackend for Cuda {
         assert!(
             [
                 "libcuda not found",
+                "the NVIDIA driver supports CUDA",
                 "no CUDA device",
                 "has compute capability"
             ]
@@ -258,14 +259,17 @@ fn explicit_model_shrinkage_cpu_convention() {
         Iterations::Best,
         Iterations::from(0..0),
         Iterations::from(..3),
-        Iterations::from(2..5),
     ] {
-        let expected = model.predict_margin(&data, iterations);
-        let actual = gpu.predict_margin(&data, iterations);
-        match (expected, actual) {
-            (Ok(expected), Ok(actual)) => assert_bits(expected, actual),
-            (Err(expected), Err(actual)) => assert_eq!(expected.to_string(), actual.to_string()),
-            other => panic!("shrinkage paths disagree: {other:?}"),
-        }
+        assert_bits(
+            model.predict_margin(&data, iterations).unwrap(),
+            gpu.predict_margin(&data, iterations).unwrap(),
+        );
+    }
+    // Both refuse a shrunk model's range that starts after iteration 0.
+    for refused in [
+        model.predict_margin(&data, 2..5),
+        gpu.predict_margin(&data, 2..5),
+    ] {
+        assert_eq!(common::incompatible_model(refused), "iterations");
     }
 }

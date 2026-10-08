@@ -24,7 +24,7 @@ pub(super) enum Module {
 }
 
 impl Module {
-    fn ptx(self) -> &'static str {
+    pub(super) fn ptx(self) -> &'static str {
         match self {
             Module::Training => include_str!("training.ptx"),
             Module::Prediction => include_str!("prediction.ptx"),

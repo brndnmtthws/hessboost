@@ -10,7 +10,7 @@
 //! the PTX and fails when a committed file differs, so the PTX is always
 //! this source's. The build is byte-for-byte reproducible for a given host
 //! architecture (rustc's crate hashes, which name shared-memory symbols,
-//! depend on it): commit PTX built on x86_64 Linux, as CI is, or take the
+//! depend on it): commit PTX built on `x86_64` Linux, as CI is, or take the
 //! files CI uploads when the check fails.
 //!
 //! # Exactness
@@ -28,19 +28,27 @@
 //!   flush-to-zero). Nothing comes from libdevice, so the build needs no
 //!   CUDA toolkit.
 //! - No floating-point atomics: integer sums are order-free, and every `f64`
-//!   sum is one thread's chain in the CPU's order.
+//!   sum is one thread's chain in the CPU's order, except the split scans'
+//!   warp-parallel prefixes over histograms the host certified exact (every
+//!   partial sum an exact multiple of the grain below 2^53 grains, so every
+//!   association of the additions has the chain's bits).
 //!
 //! `build.sh` rejects PTX holding an approximate, flush-to-zero or
 //! contractible floating-point instruction.
 //!
 //! # ABI
 //!
-//! Kernels take raw pointers and scalars only, one PTX parameter each, in
-//! the order the host's launch builders push them
+//! Kernels are `extern "C"` and take raw pointers, scalars, and `#[repr(C)]`
+//! parameter structs by value (one PTX `.param .align N .b8` array each,
+//! read with `ld.param` at the fields' offsets), one PTX parameter per
+//! argument in the order the host's launch builders push them
 //! (`src/backend/cuda/{mod,categorical,predict}.rs`); their entry names are
-//! the function names. Record types are `#[repr(C)]` in the host's layouts.
-//! Each kernel is `unsafe`: the host guarantees that every buffer holds the
-//! elements the documented layout addresses for the launch's arguments.
+//! the function names. Record and parameter types are `#[repr(C)]` in the
+//! host's layouts. Pointers a kernel's inner loop dereferences stay direct
+//! parameters, which the backend lowers to global-space accesses; a
+//! struct's pointers are generic. Each kernel is `unsafe`: the host
+//! guarantees that every buffer holds the elements the documented layout
+//! addresses for the launch's arguments.
 //!
 //! Layouts (row ids `u32`, element offsets 64-bit):
 //! - bins: row-major ELLPACK, `n_cols` feature-local bins per row (`u8`,
@@ -74,8 +82,10 @@ use cuda_device::thread;
 const FULL: u32 = u32::MAX;
 
 /// Warps per split-scan block (`SCAN_WARPS` in `src/backend/cuda/mod.rs`);
-/// the scan kernels' `launch_bounds` are `32 * SCAN_WARPS`.
-const SCAN_WARPS: usize = 4;
+/// the scan kernels' `launch_bounds` are `32 * SCAN_WARPS`. One: a scan is
+/// latency-bound on its SM's `f64` units, so each feature's warp gets an SM
+/// of its own while a batch has fewer features than the device has SMs.
+const SCAN_WARPS: usize = 1;
 
 /// CUDA's `float2`: one gradient pair.
 #[repr(C, align(8))]

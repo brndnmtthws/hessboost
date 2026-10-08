@@ -41,16 +41,17 @@ fn device() -> bool {
 }
 
 /// The backend is either available or absent for a reason outside the
-/// crate (no driver, no device, a device older than the kernels' target). A
-/// module load failure is never an acceptable skip: without this guard,
-/// every device-dependent test would pass vacuously while the backend is
-/// broken.
+/// crate (no driver, a driver older than the backend needs, no device, a
+/// device older than the kernels' target). A module load failure is never
+/// an acceptable skip: without this guard, every device-dependent test
+/// would pass vacuously while the backend is broken.
 #[test]
 fn backend_available_or_no_device() {
     if let Some(reason) = cuda::unavailable_reason() {
         assert!(
             [
                 "libcuda not found",
+                "the NVIDIA driver supports CUDA",
                 "no CUDA device",
                 "CUDA device 0 has compute capability"
             ]

@@ -44,6 +44,18 @@ fn value_key(value: f32) -> u32 {
     }
 }
 
+/// [`predict16`]'s batch: rows `[0, n_rows)` of `n_cols` values, `outputs`
+/// margins each, trees `[tree_begin, tree_end)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Batch16 {
+    pub n_rows: u32,
+    pub n_cols: u32,
+    pub outputs: u32,
+    pub tree_begin: u32,
+    pub tree_end: u32,
+}
+
 /// Every row's margins (`outputs` per row) plus trees `[tree_begin,
 /// tree_end)` of the 16-byte layout, in tree order.
 ///
@@ -53,19 +65,22 @@ fn value_key(value: f32) -> u32 {
 /// `trees`, `nodes`, `categories` and `vectors` hold the forest the trees
 /// name.
 #[kernel]
-pub unsafe fn predict16(
+pub unsafe extern "C" fn predict16(
     nodes: *const Node16,
     categories: *const u32,
     vectors: *const f32,
     trees: *const Tree,
     rows: *const f32,
     margins: *mut f32,
-    n_rows: u32,
-    n_cols: u32,
-    outputs: u32,
-    tree_begin: u32,
-    tree_end: u32,
+    batch: Batch16,
 ) {
+    let Batch16 {
+        n_rows,
+        n_cols,
+        outputs,
+        tree_begin,
+        tree_end,
+    } = batch;
     // SAFETY: the caller's; one thread per row writes its own margins.
     unsafe {
         let mut row = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
@@ -120,6 +135,17 @@ pub unsafe fn predict16(
     }
 }
 
+/// [`predict8`]'s batch: rows `[0, n_rows)` of `n_cols` values, trees
+/// `[tree_begin, tree_end)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Batch8 {
+    pub n_rows: u32,
+    pub n_cols: u32,
+    pub tree_begin: u32,
+    pub tree_end: u32,
+}
+
 /// Every row's single margin plus trees `[tree_begin, tree_end)` of the
 /// 8-byte layout (numeric splits only): `nodes[i]` is (threshold or leaf
 /// bits, flags: bit 31 leaf, bit 30 negate, bits 15 to 29 feature, bits 0 to
@@ -131,16 +157,19 @@ pub unsafe fn predict16(
 /// `rows` holds `n_rows * n_cols` values and `margins` `n_rows`; `roots`
 /// and `nodes` hold the forest the trees name.
 #[kernel]
-pub unsafe fn predict8(
+pub unsafe extern "C" fn predict8(
     nodes: *const U32x2,
     roots: *const u32,
     rows: *const f32,
     margins: *mut f32,
-    n_rows: u32,
-    n_cols: u32,
-    tree_begin: u32,
-    tree_end: u32,
+    batch: Batch8,
 ) {
+    let Batch8 {
+        n_rows,
+        n_cols,
+        tree_begin,
+        tree_end,
+    } = batch;
     // SAFETY: the caller's; one thread per row writes its own margin.
     unsafe {
         let mut row = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
@@ -161,7 +190,7 @@ pub unsafe fn predict8(
                     let next = root + (node.y & 0x7fff) + u32::from(value > f32::from_bits(node.x));
                     node = ld(nodes, u64::from(next));
                 }
-                out = out + f32::from_bits(node.x);
+                out += f32::from_bits(node.x);
                 t += 1;
             }
             st(margins, u64::from(row), out);

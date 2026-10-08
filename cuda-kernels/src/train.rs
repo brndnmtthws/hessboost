@@ -4,6 +4,7 @@
 use crate::{
     Bin, F32x2, F64x2, FULL, I64x2, SCAN_WARPS, U32x2, U32x4, grid_index, grid_threads, ld, st,
 };
+use core::cmp::Ordering;
 use cuda_device::atomic::{
     AtomicOrdering::Relaxed, BlockAtomicU32, DeviceAtomicU32, DeviceAtomicU64,
 };
@@ -86,7 +87,7 @@ macro_rules! encode {
         /// `global` holds `n_rows * n_cols` cells, `first` `n_cols`
         /// entries, `rows` `n_rows * stride` and `cols` `n_rows * n_cols`.
         #[kernel]
-        pub unsafe fn $name(
+        pub unsafe extern "C" fn $name(
             global: *const $global,
             first: *const u32,
             n_rows: u64,
@@ -111,6 +112,16 @@ encode!(encode_u32_u8, u8, u32);
 encode!(encode_u32_u16, u16, u32);
 encode!(encode_u32_u32, u32, u32);
 
+/// [`bin_dense`]'s matrix: `cells` values, `n_cols` per row, and the value
+/// marking a missing one.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DenseCells {
+    pub cells: u64,
+    pub n_cols: u32,
+    pub missing: f32,
+}
+
 /// Raw dense binning against the CPU's cuts: an upper bound for a numeric
 /// value, an exact binary search (unseen: the feature's first bin) for a
 /// category; a missing value (as `DMatrix` defines it) is `u32::MAX`.
@@ -120,16 +131,19 @@ encode!(encode_u32_u32, u32, u32);
 /// `values` and `global` hold `cells` entries, `first` `n_cols + 1`,
 /// `categorical` `n_cols`, and `cuts` every bin `first` names.
 #[kernel]
-pub unsafe fn bin_dense(
+pub unsafe extern "C" fn bin_dense(
     values: *const f32,
-    cells: u64,
-    n_cols: u32,
-    missing: f32,
+    matrix: DenseCells,
     cuts: *const f32,
     first: *const u32,
     categorical: *const u8,
     global: *mut u32,
 ) {
+    let DenseCells {
+        cells,
+        n_cols,
+        missing,
+    } = matrix;
     // SAFETY: the caller's; one thread per cell.
     unsafe {
         let mut i = grid_index();
@@ -193,7 +207,7 @@ pub unsafe fn bin_dense(
 ///
 /// `gpair` and `units` hold `n` entries.
 #[kernel]
-pub unsafe fn stage_units(
+pub unsafe extern "C" fn stage_units(
     gpair: *const F32x2,
     units: *mut I64x2,
     n: u64,
@@ -221,7 +235,7 @@ pub unsafe fn stage_units(
 ///
 /// `rows` holds `n` entries.
 #[kernel]
-pub unsafe fn iota_rows(rows: *mut u32, n: u64, first: u32) {
+pub unsafe extern "C" fn iota_rows(rows: *mut u32, n: u64, first: u32) {
     // SAFETY: the caller's; one thread per row.
     unsafe {
         let mut i = grid_index();
@@ -241,7 +255,7 @@ pub unsafe fn iota_rows(rows: *mut u32, n: u64, first: u32) {
 /// `margins`, `labels` and `gpair` hold `n` entries, and `weights` too when
 /// `weighted` is nonzero.
 #[kernel]
-pub unsafe fn squared_error(
+pub unsafe extern "C" fn squared_error(
     margins: *const f32,
     labels: *const f32,
     weights: *const f32,
@@ -257,7 +271,7 @@ pub unsafe fn squared_error(
             let (p, y) = (ld(margins, i), ld(labels, i));
             let mut w = if weighted != 0 { ld(weights, i) } else { 1.0 };
             if y == 1.0 {
-                w = w * scale_pos_weight;
+                w *= scale_pos_weight;
             }
             st(
                 gpair,
@@ -316,6 +330,21 @@ fn exp_vector(v: f32) -> f32 {
     poly * f32::from_bits(((e + 127) << 23) as u32)
 }
 
+/// [`logistic`]'s objective and batch: whether rows are weighted, the
+/// positive-label weight scale, the Hessian floor, the largest margin
+/// magnitude the vector path takes, the host's vector width, and the row
+/// count.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LogisticParams {
+    pub weighted: i32,
+    pub scale_pos_weight: f32,
+    pub min_hess: f32,
+    pub max_input: f32,
+    pub lanes: u32,
+    pub n: u64,
+}
+
 /// The logistic objectives' gradients of the first `n` rows, the host's
 /// vector kernel (`simd::logistic_gradient`): `lanes` rows per vector; a
 /// vector holding a margin above `max_input` in magnitude (or a NaN) takes
@@ -327,18 +356,21 @@ fn exp_vector(v: f32) -> f32 {
 /// `margins`, `labels` and `gpair` hold `n` entries (a multiple of
 /// `lanes`), and `weights` too when `weighted` is nonzero.
 #[kernel]
-pub unsafe fn logistic(
+pub unsafe extern "C" fn logistic(
     margins: *const f32,
     labels: *const f32,
     weights: *const f32,
-    weighted: i32,
-    scale_pos_weight: f32,
-    min_hess: f32,
-    max_input: f32,
-    lanes: u32,
-    n: u64,
+    params: LogisticParams,
     gpair: *mut F32x2,
 ) {
+    let LogisticParams {
+        weighted,
+        scale_pos_weight,
+        min_hess,
+        max_input,
+        lanes,
+        n,
+    } = params;
     // SAFETY: the caller's; one thread per row, reading its vector's rows.
     unsafe {
         let mut i = grid_index();
@@ -445,7 +477,7 @@ impl Domain {
 ///
 /// `gpair` holds `n` entries and `domain` six.
 #[kernel]
-pub unsafe fn grad_domain(gpair: *const F32x2, n: u64, domain: *mut u32) {
+pub unsafe extern "C" fn grad_domain(gpair: *const F32x2, n: u64, domain: *mut u32) {
     let (mut grad, mut hess) = (Domain::EMPTY, Domain::EMPTY);
     // SAFETY: the caller's; every lane reaches the shuffles.
     unsafe {
@@ -462,7 +494,7 @@ pub unsafe fn grad_domain(gpair: *const F32x2, n: u64, domain: *mut u32) {
             hess.shuffle_down(delta);
             delta >>= 1;
         }
-        if thread::threadIdx_x() & 31 == 0 {
+        if thread::threadIdx_x().is_multiple_of(32) {
             grad.publish(domain);
             hess.publish(domain.add(3));
         }
@@ -501,7 +533,7 @@ unsafe fn part_tile(segs: *const u64, ptiles: *const u64) -> (u32, u64, u64, u64
 /// `ptiles` holds one code per block, `segs` and `values` every segment
 /// they name, `rows` every segment's rows, and `margins` every row.
 #[kernel]
-pub unsafe fn add_leaves(
+pub unsafe extern "C" fn add_leaves(
     segs: *const u64,
     values: *const f32,
     ptiles: *const u64,
@@ -531,7 +563,7 @@ pub unsafe fn add_leaves(
 /// `rows` holds `n` entries, `gpair` every row they name, and `totals` one
 /// entry per chunk (one for `n == 0`).
 #[kernel]
-pub unsafe fn chunk_chains(
+pub unsafe extern "C" fn chunk_chains(
     rows: *const u32,
     n: u64,
     grain: u64,
@@ -548,8 +580,8 @@ pub unsafe fn chunk_chains(
             let mut i = begin;
             while i < end {
                 let p = ld(gpair, u64::from(ld(rows, i)));
-                g = g + f64::from(p.x);
-                h = h + f64::from(p.y);
+                g += f64::from(p.x);
+                h += f64::from(p.y);
                 i += 1;
             }
             st(totals, c, F64x2 { x: g, y: h });
@@ -577,7 +609,7 @@ fn warp_sum_i64(mut v: i64) -> i64 {
 /// `rows` holds `n` entries, `units` every row they name, and `totals` two
 /// words per block.
 #[kernel]
-pub unsafe fn chunk_totals(
+pub unsafe extern "C" fn chunk_totals(
     rows: *const u32,
     n: u64,
     grain: u64,
@@ -604,7 +636,7 @@ pub unsafe fn chunk_totals(
             i += u64::from(thread::blockDim_x());
         }
         let (g, h) = (warp_sum_i64(g), warp_sum_i64(h));
-        if tid & 31 == 0 {
+        if tid.is_multiple_of(32) {
             st(warp_g, u64::from(tid >> 5), g);
             st(warp_h, u64::from(tid >> 5), h);
         }
@@ -627,24 +659,23 @@ pub unsafe fn chunk_totals(
 // Integer histograms
 
 /// A 64-bit add into shared memory as two 32-bit atomics with a carry (as
-/// XGBoost's `AtomicAdd64As32`): each add carries exactly when its own low
-/// add wrapped, so the words sum to the 64-bit total modulo 2^64.
+/// XGBoost's `AtomicAdd64As32`), on the word's low and high halves: each
+/// add carries exactly when its own low add wrapped, so the halves sum to
+/// the 64-bit total modulo 2^64.
 ///
 /// # Safety
 ///
-/// `dst` is a block-shared, 8-byte aligned word only updated atomically
-/// meanwhile.
+/// `lo` and `hi` are block-shared words only updated atomically meanwhile.
 #[inline(always)]
-unsafe fn add_shared(dst: *mut u64, v: i64) {
-    let p = dst.cast::<u32>();
-    let lo = v as u64 as u32;
-    let hi = ((v as u64) >> 32) as u32;
+unsafe fn add_shared(lo: *mut u32, hi: *mut u32, v: i64) {
+    let low = v as u64 as u32;
+    let high = ((v as u64) >> 32) as u32;
     // SAFETY: the caller's.
     unsafe {
-        let old = BlockAtomicU32::from_ptr(p).fetch_add(lo, Relaxed);
-        let add_hi = hi.wrapping_add(u32::from(old > u32::MAX - lo));
+        let old = BlockAtomicU32::from_ptr(lo).fetch_add(low, Relaxed);
+        let add_hi = high.wrapping_add(u32::from(old > u32::MAX - low));
         if add_hi != 0 {
-            BlockAtomicU32::from_ptr(p.add(1)).fetch_add(add_hi, Relaxed);
+            BlockAtomicU32::from_ptr(hi).fetch_add(add_hi, Relaxed);
         }
     }
 }
@@ -709,18 +740,24 @@ pub struct Group {
 const NONE: u32 = u32::MAX;
 
 /// One element's pair added to bin `bin` (unless [`NONE`]) of the block's
-/// shared histogram.
+/// shared histogram: four planes of `bins` words (gradient low and high
+/// halves, then the Hessian's), so a warp's bins fall in distinct banks.
 ///
 /// # Safety
 ///
-/// As [`add_shared`] for the bin's two words.
+/// As [`add_shared`] for the bin's four words.
 #[inline(always)]
-unsafe fn add_unit_shared(smem: *mut u64, bin: u32, unit: I64x2) {
+unsafe fn add_unit_shared(planes: *mut u32, bins: u32, bin: u32, unit: I64x2) {
     if bin != NONE {
+        let (bin, bins) = (bin as usize, bins as usize);
         // SAFETY: the caller's.
         unsafe {
-            add_shared(smem.add(2 * bin as usize), unit.x);
-            add_shared(smem.add(2 * bin as usize + 1), unit.y);
+            add_shared(planes.add(bin), planes.add(bins + bin), unit.x);
+            add_shared(
+                planes.add(2 * bins + bin),
+                planes.add(3 * bins + bin),
+                unit.y,
+            );
         }
     }
 }
@@ -743,15 +780,32 @@ unsafe fn add_unit_global(target: *mut u64, bin0: u32, bin: u32, unit: I64x2) {
     }
 }
 
+/// A dense histogram launch's work and layout: its tiles and feature
+/// groups (block `tile * n_groups + group`), the bins' row stride and
+/// missing sentinel, and the histograms' width.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TileWork {
+    pub tiles: *const Tile,
+    pub groups: *const Group,
+    pub total_bins: u64,
+    pub stride: u32,
+    pub sentinel: u32,
+    pub n_groups: u32,
+}
+
 /// One block per (tile, group): the tile's rows over the group's features,
 /// element `idx` = (row `idx / nf`, feature `idx % nf`), so a warp reads one
 /// row's bins contiguously and its gradient once. A tile's groups are
 /// consecutive blocks (`blockIdx.x = tile * n_groups + group`), which run
 /// together, so the tile's rows, bins and gradients come from L2 for all
-/// but the first group. `SHARED`: privatized in dynamic shared memory (`2 *
-/// bins` words), then flushed (64-bit atomics into an exact accumulator, or
-/// plain stores into the tile's own partial); otherwise straight into the
-/// target with 64-bit global atomics (a group too wide for shared memory).
+/// but the first group. `SHARED`: privatized in dynamic shared memory (16
+/// bytes per bin: [`add_unit_shared`]'s four word planes), then flushed
+/// (64-bit atomics into an exact accumulator, or plain stores into the
+/// tile's own partial); otherwise straight into the target with 64-bit
+/// global atomics (a group too wide for shared memory). The pointers the
+/// element loop reads are kernel parameters (global-space loads); `work`
+/// carries what each block reads once.
 ///
 /// # Safety
 ///
@@ -761,22 +815,26 @@ unsafe fn add_unit_global(target: *mut u64, bin0: u32, bin: u32, unit: I64x2) {
 #[inline(always)]
 unsafe fn hist_tile<B: Bin, const SHARED: bool>(
     bins: *const B,
-    stride: u32,
-    sentinel: u32,
     feature_first: *const u32,
     rows: *const u32,
-    tiles: *const Tile,
-    groups: *const Group,
     units: *const I64x2,
     acc: *mut u64,
     partials: *mut u64,
-    total_bins: u64,
-    n_groups: u32,
+    work: TileWork,
 ) {
+    let TileWork {
+        tiles,
+        groups,
+        total_bins,
+        stride,
+        sentinel,
+        n_groups,
+    } = work;
     // SAFETY: the caller's; shared words are zeroed and flushed between
     // barriers every thread reaches, and only updated atomically between.
     unsafe {
-        let smem = DynamicSharedArray::<u64>::get();
+        let words = DynamicSharedArray::<u64>::get();
+        let smem = words.cast::<u32>();
         let block = thread::blockIdx_x();
         let tile = ld(tiles, u64::from(block / n_groups));
         let g = ld(groups, u64::from(block % n_groups));
@@ -786,7 +844,7 @@ unsafe fn hist_tile<B: Bin, const SHARED: bool>(
         if SHARED {
             let mut i = tid;
             while i < 2 * g.bins {
-                st(smem, u64::from(i), 0);
+                st(words, u64::from(i), 0);
                 i += step;
             }
             thread::sync_threads();
@@ -799,14 +857,26 @@ unsafe fn hist_tile<B: Bin, const SHARED: bool>(
             thread::sync_threads();
         }
         let nf = g.f1 - g.f0;
-        let n = tile.count * nf;
         let tile_rows = rows.add(tile.begin as usize);
-        // Element `idx`'s row and group-relative bin (`NONE` past the tile
-        // or for a missing value).
-        let element = |idx: u32| {
-            if idx < n {
-                let i = idx / nf;
-                let f = g.f0 + (idx - i * nf);
+        // A thread's elements are `step` apart: track each one's (row,
+        // feature) incrementally instead of dividing (`nf` is positive
+        // whenever an element exists; past the tile the row reaches
+        // `tile.count`, the same bound as `idx < tile.count * nf`).
+        let nf_div = nf.max(1);
+        let (row_step, feature_step) = (step / nf_div, step % nf_div);
+        let next = |(i, f): (u32, u32)| {
+            let f = f + feature_step;
+            if f >= nf {
+                (i + row_step + 1, f - nf)
+            } else {
+                (i + row_step, f)
+            }
+        };
+        // Element (row `i`, feature `g.f0 + f`)'s row and group-relative
+        // bin (`NONE` past the tile or for a missing value).
+        let element = |(i, f): (u32, u32)| {
+            if i < tile.count {
+                let f = g.f0 + f;
                 let r = ld(tile_rows, u64::from(i));
                 let b = ld(bins, u64::from(r) * u64::from(stride) + u64::from(f)).get();
                 let bin = if b == sentinel {
@@ -830,31 +900,36 @@ unsafe fn hist_tile<B: Bin, const SHARED: bool>(
         // atomic, so each thread keeps several gathers in flight (in
         // registers: named, not an array the compiler may spill to local
         // memory).
-        let mut base = tid;
-        while base < n {
-            let e0 = element(base);
-            let e1 = element(base + step);
-            let e2 = element(base + 2 * step);
-            let e3 = element(base + 3 * step);
+        let mut c0 = (tid / nf_div, tid % nf_div);
+        while nf != 0 && c0.0 < tile.count {
+            let c1 = next(c0);
+            let c2 = next(c1);
+            let c3 = next(c2);
+            let (e0, e1, e2, e3) = (element(c0), element(c1), element(c2), element(c3));
             let (u0, u1, u2, u3) = (unit(e0), unit(e1), unit(e2), unit(e3));
             if SHARED {
-                add_unit_shared(smem, e0.1, u0);
-                add_unit_shared(smem, e1.1, u1);
-                add_unit_shared(smem, e2.1, u2);
-                add_unit_shared(smem, e3.1, u3);
+                add_unit_shared(smem, g.bins, e0.1, u0);
+                add_unit_shared(smem, g.bins, e1.1, u1);
+                add_unit_shared(smem, g.bins, e2.1, u2);
+                add_unit_shared(smem, g.bins, e3.1, u3);
             } else {
                 add_unit_global(target, g.bin0, e0.1, u0);
                 add_unit_global(target, g.bin0, e1.1, u1);
                 add_unit_global(target, g.bin0, e2.1, u2);
                 add_unit_global(target, g.bin0, e3.1, u3);
             }
-            base += 4 * step;
+            c0 = next(c3);
         }
         if SHARED {
             thread::sync_threads();
+            let (b0, b1, b2, b3) = (0, g.bins, 2 * g.bins, 3 * g.bins);
             let mut b = tid;
             while b < g.bins {
-                let (x, y) = (ld(smem, 2 * u64::from(b)), ld(smem, 2 * u64::from(b) + 1));
+                let word = |lo: u32, hi: u32| {
+                    u64::from(ld(smem, u64::from(lo + b)))
+                        | u64::from(ld(smem, u64::from(hi + b))) << 32
+                };
+                let (x, y) = (word(b0, b1), word(b2, b3));
                 let t = target.add(2 * (g.bin0 as usize + b as usize));
                 if partial {
                     *t = x;
@@ -873,6 +948,28 @@ unsafe fn hist_tile<B: Bin, const SHARED: bool>(
     }
 }
 
+/// A chain histogram launch's chunks: `segs` chunks of `seg_rows` of the
+/// `n` listed rows each, one `total_bins`-bin partial per chunk.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Chunks {
+    pub n: u64,
+    pub seg_rows: u64,
+    pub segs: u64,
+    pub total_bins: u64,
+}
+
+/// A dense chain histogram launch: its [`Chunks`], and the bins' row
+/// stride, feature count and missing sentinel.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ChainWork {
+    pub chunks: Chunks,
+    pub stride: u32,
+    pub n_cols: u32,
+    pub sentinel: u32,
+}
+
 /// Integer histograms of `segs` chunks of `seg_rows` rows each, as `f64`
 /// chains: one thread per (chunk, feature) adds the chunk's rows in order
 /// to its own feature's bins of the chunk's `f64` partial (zeroed), so every
@@ -886,18 +983,24 @@ unsafe fn hist_tile<B: Bin, const SHARED: bool>(
 #[inline(always)]
 unsafe fn hist_chain<B: Bin>(
     bins: *const B,
-    stride: u32,
-    n_cols: u32,
-    sentinel: u32,
     feature_first: *const u32,
     rows: *const u32,
-    n: u64,
-    seg_rows: u64,
-    segs: u64,
     gpair: *const F32x2,
     partials: *mut F64x2,
-    total_bins: u64,
+    work: ChainWork,
 ) {
+    let ChainWork {
+        chunks:
+            Chunks {
+                n,
+                seg_rows,
+                segs,
+                total_bins,
+            },
+        stride,
+        n_cols,
+        sentinel,
+    } = work;
     let t = grid_index();
     let n_cols = u64::from(n_cols);
     if t >= segs * n_cols {
@@ -917,13 +1020,22 @@ unsafe fn hist_chain<B: Bin>(
             if b != sentinel {
                 let p = ld(gpair, r);
                 let mut a = ld(h, u64::from(b));
-                a.x = a.x + f64::from(p.x);
-                a.y = a.y + f64::from(p.y);
+                a.x += f64::from(p.x);
+                a.y += f64::from(p.y);
                 st(h, u64::from(b), a);
             }
             i += 1;
         }
     }
+}
+
+/// A CSR histogram launch's tiles (one per block) and the histograms'
+/// width.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SparseTiles {
+    pub tiles: *const Tile,
+    pub total_bins: u64,
 }
 
 /// Integer CSR scatter: one warp per listed row, each stored entry visited
@@ -939,12 +1051,12 @@ unsafe fn hist_sparse<B: Bin>(
     bins: *const B,
     row_ptr: *const u64,
     rows: *const u32,
-    tiles: *const Tile,
     units: *const I64x2,
     acc: *mut u64,
     partials: *mut u64,
-    total_bins: u64,
+    work: SparseTiles,
 ) {
+    let SparseTiles { tiles, total_bins } = work;
     // SAFETY: the caller's; the updates are atomic.
     unsafe {
         let tile = ld(tiles, u64::from(thread::blockIdx_x()));
@@ -982,13 +1094,16 @@ unsafe fn hist_sparse_chain<B: Bin>(
     bins: *const B,
     row_ptr: *const u64,
     rows: *const u32,
-    n: u64,
-    seg_rows: u64,
-    segs: u64,
     gpair: *const F32x2,
     partials: *mut F64x2,
-    total_bins: u64,
+    chunks: Chunks,
 ) {
+    let Chunks {
+        n,
+        seg_rows,
+        segs,
+        total_bins,
+    } = chunks;
     // SAFETY: the caller's; one thread per chunk owns its partial.
     unsafe {
         let mut seg = grid_index();
@@ -1005,8 +1120,8 @@ unsafe fn hist_sparse_chain<B: Bin>(
                 while at < stop {
                     let b = u64::from(ld(bins, at).get());
                     let mut a = ld(h, b);
-                    a.x = a.x + f64::from(p.x);
-                    a.y = a.y + f64::from(p.y);
+                    a.x += f64::from(p.x);
+                    a.y += f64::from(p.y);
                     st(h, b, a);
                     at += 1;
                 }
@@ -1070,7 +1185,7 @@ unsafe fn block_sum_u32(mut count: u32) -> u32 {
     // thread 0 reads them after it.
     unsafe {
         let warp_sum = SharedArray::as_raw_mut_ptr(&raw mut WARP_SUM);
-        if tid & 31 == 0 {
+        if tid.is_multiple_of(32) {
             st(warp_sum, u64::from(tid >> 5), count);
         }
         thread::sync_threads();
@@ -1084,6 +1199,17 @@ unsafe fn block_sum_u32(mut count: u32) -> u32 {
         }
         total
     }
+}
+
+/// A routing launch's tiles: the splits' segments and rules, the tile
+/// codes (one per block), and each tile's left count (out).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PartTiles {
+    pub segs: *const u64,
+    pub ptiles: *const u64,
+    pub rules: *const Rule,
+    pub tile_left: *mut u32,
 }
 
 /// Each tile's rows' directions (`flags[off + i]`, 1 = left) from the
@@ -1101,18 +1227,15 @@ unsafe fn route_count<B: Bin>(
     cols: *const B,
     n_rows: u64,
     sentinel: u32,
-    segs: *const u64,
-    rules: *const Rule,
     table: *const u8,
-    ptiles: *const u64,
     rows: *const u32,
     flags: *mut u8,
-    tile_left: *mut u32,
+    tiles: PartTiles,
 ) {
     // SAFETY: the caller's; each thread routes its own rows.
     unsafe {
-        let (s, off, begin, end) = part_tile(segs, ptiles);
-        let rule = ld(rules, u64::from(s));
+        let (s, off, begin, end) = part_tile(tiles.segs, tiles.ptiles);
+        let rule = ld(tiles.rules, u64::from(s));
         let col = cols.add((u64::from(rule.feature) * n_rows) as usize);
         let mut count = 0;
         let mut i = begin + u64::from(thread::threadIdx_x());
@@ -1125,7 +1248,7 @@ unsafe fn route_count<B: Bin>(
         }
         let total = block_sum_u32(count);
         if thread::threadIdx_x() == 0 {
-            st(tile_left, u64::from(thread::blockIdx_x()), total);
+            st(tiles.tile_left, u64::from(thread::blockIdx_x()), total);
         }
     }
 }
@@ -1142,18 +1265,15 @@ unsafe fn route_sparse<B: Bin>(
     bins: *const B,
     row_ptr: *const u64,
     first: *const u32,
-    segs: *const u64,
-    rules: *const Rule,
     table: *const u8,
-    ptiles: *const u64,
     rows: *const u32,
     flags: *mut u8,
-    tile_left: *mut u32,
+    tiles: PartTiles,
 ) {
     // SAFETY: the caller's; each thread routes its own rows.
     unsafe {
-        let (s, off, begin, end) = part_tile(segs, ptiles);
-        let rule = ld(rules, u64::from(s));
+        let (s, off, begin, end) = part_tile(tiles.segs, tiles.ptiles);
+        let rule = ld(tiles.rules, u64::from(s));
         let (fs, fe) = (
             ld(first, u64::from(rule.feature)),
             ld(first, u64::from(rule.feature) + 1),
@@ -1180,7 +1300,7 @@ unsafe fn route_sparse<B: Bin>(
         }
         let total = block_sum_u32(count);
         if thread::threadIdx_x() == 0 {
-            st(tile_left, u64::from(thread::blockIdx_x()), total);
+            st(tiles.tile_left, u64::from(thread::blockIdx_x()), total);
         }
     }
 }
@@ -1193,7 +1313,7 @@ unsafe fn route_sparse<B: Bin>(
 /// `split_tiles` and `left_len` hold `n_splits` entries, and `tile_left`
 /// every tile they name.
 #[kernel]
-pub unsafe fn route_scan(
+pub unsafe extern "C" fn route_scan(
     split_tiles: *const U32x2,
     n_splits: u32,
     tile_left: *mut u32,
@@ -1226,7 +1346,7 @@ pub unsafe fn route_scan(
 /// As [`route_count`], with `tile_left` holding the exclusive prefixes and
 /// `left_len` every split's left total; `scratch` covers every segment.
 #[kernel]
-pub unsafe fn route_scatter(
+pub unsafe extern "C" fn route_scatter(
     segs: *const u64,
     ptiles: *const u64,
     rows: *const u32,
@@ -1316,7 +1436,7 @@ pub unsafe fn route_scatter(
 /// `ptiles` holds one code per block, `segs` every split they name, and
 /// `scratch` and `rows` every segment.
 #[kernel]
-pub unsafe fn route_copy(
+pub unsafe extern "C" fn route_copy(
     segs: *const u64,
     ptiles: *const u64,
     scratch: *const u32,
@@ -1352,7 +1472,7 @@ fn scaled(word: u64, grain: f64) -> f64 {
 /// `nodes` holds one entry per grid row, and `acc` and `out` the slots
 /// they name.
 #[kernel]
-pub unsafe fn finalize_exact(
+pub unsafe extern "C" fn finalize_exact(
     acc: *const u64,
     nodes: *const U32x2,
     total_bins: u64,
@@ -1376,6 +1496,56 @@ pub unsafe fn finalize_exact(
     }
 }
 
+/// [`finalize_exact`] fused with [`subtract_hists`]: node `k = blockIdx.y`
+/// is `nodes[3 k..]` = (accumulator slot, output slot, parent slot or
+/// `u32::MAX`). The accumulator becomes the output slot's `f64` bins, and
+/// a parent slot (the built child's parent, holding the parent's
+/// histogram) becomes its sibling's, `parent - child`: the same IEEE
+/// subtraction `subtract_hists` performs after a separate finalization, on
+/// the same child bits.
+///
+/// # Safety
+///
+/// `nodes` holds one entry per grid row, and `acc` and `out` the slots
+/// they name; no slot is the output or parent slot of two nodes, nor both.
+#[kernel]
+pub unsafe extern "C" fn finalize_exact_sub(
+    acc: *const u64,
+    nodes: *const u32,
+    total_bins: u64,
+    grad_value: f64,
+    hess_value: f64,
+    out: *mut F64x2,
+) {
+    // SAFETY: the caller's; one thread per output bin and its parent bin.
+    unsafe {
+        let k = 3 * u64::from(thread::blockIdx_y());
+        let (from, to, parent) = (ld(nodes, k), ld(nodes, k + 1), ld(nodes, k + 2));
+        let mut b = grid_index();
+        while b < total_bins {
+            let a = acc.add(((u64::from(from) * total_bins + b) * 2) as usize);
+            let child = F64x2 {
+                x: scaled(*a, grad_value),
+                y: scaled(*a.add(1), hess_value),
+            };
+            st(out, u64::from(to) * total_bins + b, child);
+            if parent != u32::MAX {
+                let at = u64::from(parent) * total_bins + b;
+                let p = ld(out, at);
+                st(
+                    out,
+                    at,
+                    F64x2 {
+                        x: p.x - child.x,
+                        y: p.y - child.y,
+                    },
+                );
+            }
+            b += grid_threads();
+        }
+    }
+}
+
 /// Integer chunk partials to `f64`, per bin in chunk order: node `k =
 /// blockIdx.y` reads partial slots `[x, x + y)` into output slot `z`,
 /// copying the first when `w` (its first chunk) and adding the rest, the
@@ -1386,7 +1556,7 @@ pub unsafe fn finalize_exact(
 /// `nodes` holds one entry per grid row, and `partials` and `out` the slots
 /// they name.
 #[kernel]
-pub unsafe fn reduce_chunks(
+pub unsafe extern "C" fn reduce_chunks(
     partials: *const u64,
     nodes: *const U32x4,
     total_bins: u64,
@@ -1408,8 +1578,8 @@ pub unsafe fn reduce_chunks(
             };
             while s < nd.y {
                 let p = partials.add(((u64::from(nd.x + s) * total_bins + b) * 2) as usize);
-                g = g + scaled(*p, grad_value);
-                h = h + scaled(*p.add(1), hess_value);
+                g += scaled(*p, grad_value);
+                h += scaled(*p.add(1), hess_value);
                 s += 1;
             }
             *o = F64x2 { x: g, y: h };
@@ -1425,7 +1595,7 @@ pub unsafe fn reduce_chunks(
 ///
 /// `partials` holds `segs * total_bins` bins and `out` `total_bins`.
 #[kernel]
-pub unsafe fn reduce_chains(
+pub unsafe extern "C" fn reduce_chains(
     partials: *const F64x2,
     segs: u64,
     total_bins: u64,
@@ -1443,8 +1613,8 @@ pub unsafe fn reduce_chains(
             };
             while s < segs {
                 let p = ld(partials, s * total_bins + b);
-                a.x = a.x + p.x;
-                a.y = a.y + p.y;
+                a.x += p.x;
+                a.y += p.y;
                 s += 1;
             }
             st(out, b, a);
@@ -1464,7 +1634,12 @@ pub unsafe fn reduce_chains(
 /// `pairs` holds `2 * n_pairs` slots, each in `pool` (`total_bins` bins
 /// per slot), no parent twice.
 #[kernel]
-pub unsafe fn subtract_hists(pool: *mut F64x2, pairs: *const u32, n_pairs: u64, total_bins: u64) {
+pub unsafe extern "C" fn subtract_hists(
+    pool: *mut F64x2,
+    pairs: *const u32,
+    n_pairs: u64,
+    total_bins: u64,
+) {
     // SAFETY: the caller's; one thread per parent bin.
     unsafe {
         let mut i = grid_index();
@@ -1486,6 +1661,16 @@ pub unsafe fn subtract_hists(pool: *mut F64x2, pairs: *const u32, n_pairs: u64, 
     }
 }
 
+/// The regularization a split search reads (the host's `RegParams`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Regularization {
+    pub lambda: f64,
+    pub alpha: f64,
+    pub max_delta_step: f64,
+    pub min_child_weight: f64,
+}
+
 /// The regularization a candidate's score reads (`SplitScorer`'s).
 #[derive(Clone, Copy)]
 pub(crate) struct ScanReg {
@@ -1500,6 +1685,34 @@ pub(crate) struct ScanReg {
 }
 
 impl ScanReg {
+    /// Request `request`'s scorer, in monotone direction `dir`.
+    ///
+    /// # Safety
+    ///
+    /// `params` holds the request's (root gain, lower, upper) at `3 *
+    /// request`.
+    #[inline(always)]
+    pub(crate) unsafe fn new(
+        reg: Regularization,
+        params: *const f32,
+        request: u64,
+        dir: i32,
+    ) -> Self {
+        // SAFETY: the caller's.
+        unsafe {
+            Self {
+                lambda: reg.lambda,
+                alpha: reg.alpha,
+                max_delta_step: reg.max_delta_step,
+                min_child_weight: reg.min_child_weight,
+                root_gain: ld(params, 3 * request),
+                lower: ld(params, 3 * request + 1),
+                upper: ld(params, 3 * request + 2),
+                dir,
+            }
+        }
+    }
+
     /// The scorer's child weight (`SplitScorer::score_run`'s `weight`): the
     /// soft-thresholded gradient over `H + lambda` in `f64`,
     /// `max_delta_step`, rounded to `f32`, then clamped to the node's bounds.
@@ -1543,12 +1756,10 @@ impl ScanReg {
             lh > 0.0 && rh > 0.0 && lh >= self.min_child_weight && rh >= self.min_child_weight;
         let wl = self.weight(lg, lh);
         let wr = self.weight(rg, rh);
-        let monotone = if self.dir > 0 {
-            wl <= wr
-        } else if self.dir < 0 {
-            wl >= wr
-        } else {
-            true
+        let monotone = match self.dir.cmp(&0) {
+            Ordering::Greater => wl <= wr,
+            Ordering::Less => wl >= wr,
+            Ordering::Equal => true,
         };
         let chg = (self.gain(lg, lh, wl) as f32 + self.gain(rg, rh, wr) as f32) - self.root_gain;
         if valid && monotone {
@@ -1559,14 +1770,91 @@ impl ScanReg {
     }
 }
 
+/// `v` from lane `src` of the warp, both components.
+#[inline(always)]
+pub(crate) fn shuffle_pair(v: F64x2, src: u32) -> F64x2 {
+    F64x2 {
+        x: warp::shuffle_f64_sync(FULL, v.x, src),
+        y: warp::shuffle_f64_sync(FULL, v.y, src),
+    }
+}
+
+/// The inclusive prefix sums of the lanes' `v` (lane `i` gets lanes `0..=i`)
+/// by shuffles up 1, 2, 4, 8 and 16; every lane of the warp calls it. Its
+/// association is not a sequential chain's, so it serves only sums the host
+/// certified exact (`exact` scans), where every association of the
+/// additions gives the chain's bits.
+#[inline(always)]
+pub(crate) fn warp_prefix(lane: u32, mut v: F64x2) -> F64x2 {
+    let mut delta = 1;
+    while delta < 32 {
+        let up_g = warp::shuffle_up_f64_sync(FULL, v.x, delta);
+        let up_h = warp::shuffle_up_f64_sync(FULL, v.y, delta);
+        if lane >= delta {
+            v = F64x2 {
+                x: up_g + v.x,
+                y: up_h + v.y,
+            };
+        }
+        delta <<= 1;
+    }
+    v
+}
+
+/// The lowest lane whose `mine` holds (lane 0 when none does): the lane
+/// holding a reduction's winning candidate, whose statistics the warp then
+/// fetches with one shuffle. Candidates are each one lane's, so only the
+/// score and position travel through the reduction.
+#[inline(always)]
+pub(crate) fn winner_lane(mine: bool) -> u32 {
+    warp::ballot_sync(FULL, mine).trailing_zeros() & 31
+}
+
+/// Warp `w`'s 32 staged statistics in the block's shared memory, for
+/// [`scan_splits`]'s sequential chains.
+#[inline(always)]
+fn chain_row(w: u32) -> *mut F64x2 {
+    static mut CHAIN: SharedArray<F64x2, { SCAN_WARPS * 32 }> = SharedArray::UNINIT;
+    // SAFETY: an address within the array (`w < SCAN_WARPS`).
+    unsafe { SharedArray::as_raw_mut_ptr(&raw mut CHAIN).add(w as usize * 32) }
+}
+
+/// A numeric scan's tasks: `tasks[4 t..]` for `t < n_tasks`, each request's
+/// `totals` and `params` (root gain, lower, upper), whether every feature
+/// is dense (no backward pass), and whether the tree's histograms are
+/// certified exact.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NumericTasks {
+    pub tasks: *const u32,
+    pub n_tasks: u64,
+    pub totals: *const F64x2,
+    pub params: *const f32,
+    pub dense: i32,
+    pub exact: u32,
+}
+
+/// A numeric scan's results, per task: `meta[4 t..]` and `acc[t]`
+/// ([`scan_splits`] writes them, `merge_scans` reads them).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NumericResults {
+    pub meta: *mut u32,
+    pub acc: *mut F64x2,
+}
+
 /// One warp per feature (`tasks[4 t..]`: request, feature, histogram slot,
-/// monotone direction). Lane 0 forms the CPU's sequential prefix (then
-/// suffix) chain 32 bins at a time, then all lanes score independent
-/// candidates. The reduction keeps the largest finite loss, then the
-/// earliest position (forward before backward). An arbitrary parallel
-/// floating-point scan would change the CPU's bits. `meta[4 t..]` gets
-/// (status: 0 none, 1 found, 2 NaN; bin; loss bits; backward), `acc[t]` the
-/// winner's accumulated statistics.
+/// monotone direction) forms the prefix (then suffix) statistics 32 bins at
+/// a time, and all lanes score independent candidates. Without `exact`,
+/// lane 0 chains each window in the CPU's order (an arbitrary parallel
+/// floating-point scan would change the CPU's bits); with `exact` (every
+/// histogram and total of the tree is certified exact in grains, so every
+/// association of the additions gives the chain's bits), each lane loads
+/// one bin and the warp scans it ([`warp_prefix`]) onto the previous
+/// window's total. The reduction keeps the largest finite loss, then the
+/// earliest position (forward before backward). `meta[4 t..]` gets (status:
+/// 0 none, 1 found, 2 NaN; bin; loss bits; backward), `acc[t]` the winner's
+/// accumulated statistics.
 ///
 /// # Safety
 ///
@@ -1574,55 +1862,48 @@ impl ScanReg {
 /// `params` (root gain, lower, upper) every request, and `pool` every slot
 /// (`total_bins` bins each).
 #[kernel]
-#[launch_bounds(128)]
-pub unsafe fn scan_splits(
+#[launch_bounds(32)]
+pub unsafe extern "C" fn scan_splits(
     pool: *const F64x2,
     feature_first: *const u32,
     total_bins: u64,
-    tasks: *const u32,
-    n_tasks: u64,
-    totals: *const F64x2,
-    params: *const f32,
-    lambda: f64,
-    alpha: f64,
-    max_delta_step: f64,
-    min_child_weight: f64,
-    dense: i32,
-    meta: *mut u32,
-    acc: *mut F64x2,
+    work: NumericTasks,
+    regularization: Regularization,
+    out: NumericResults,
 ) {
-    static mut CHAIN: SharedArray<F64x2, { SCAN_WARPS * 32 }> = SharedArray::UNINIT;
+    let NumericTasks {
+        tasks,
+        n_tasks,
+        totals,
+        params,
+        dense,
+        exact,
+    } = work;
+    let NumericResults { meta, acc } = out;
     // SAFETY: the caller's; each warp owns its chain row, staged by its
     // lanes, chained by lane 0 and read by the lanes, each step between
-    // warp barriers every lane reaches.
+    // warp barriers every lane reaches; every lane reaches the shuffles.
     unsafe {
         let lane = thread::threadIdx_x() & 31;
         let w = thread::threadIdx_x() >> 5;
-        let chain = SharedArray::as_raw_mut_ptr(&raw mut CHAIN).add(w as usize * 32);
+        let chain = chain_row(w);
         let warps = u64::from(thread::gridDim_x()) * SCAN_WARPS as u64;
         let mut t = u64::from(thread::blockIdx_x()) * SCAN_WARPS as u64 + u64::from(w);
         while t < n_tasks {
             let request = u64::from(ld(tasks, 4 * t));
             let f = u64::from(ld(tasks, 4 * t + 1));
             let slot = u64::from(ld(tasks, 4 * t + 2));
-            let reg = ScanReg {
-                lambda,
-                alpha,
-                max_delta_step,
-                min_child_weight,
-                root_gain: ld(params, 3 * request),
-                lower: ld(params, 3 * request + 1),
-                upper: ld(params, 3 * request + 2),
-                dir: ld(tasks, 4 * t + 3) as i32,
-            };
+            let reg = ScanReg::new(regularization, params, request, ld(tasks, 4 * t + 3) as i32);
             let total = ld(totals, request);
             let first = ld(feature_first, f);
             let len = u64::from(ld(feature_first, f + 1) - first);
             let bins = pool.add((slot * total_bins + u64::from(first)) as usize);
             let mut best = f32::NEG_INFINITY;
             let mut pos = u64::MAX;
-            let (mut best_g, mut best_h) = (0.0f64, 0.0f64);
+            let mut best_acc = F64x2 { x: 0.0, y: 0.0 };
             let mut nan = false;
+            // The statistics accumulated before the window: lane 0's chain,
+            // or (exact) every lane's copy of the scan's total.
             let (mut g, mut h) = (0.0f64, 0.0f64);
             let mut backward = false;
             loop {
@@ -1638,29 +1919,52 @@ pub unsafe fn scan_splits(
                 let mut base = 0;
                 while base < len {
                     let n = (len - base).min(32) as u32;
-                    // The window's bins, staged in shared memory by every
-                    // lane (one coalesced load each), then chained in order
-                    // in place by lane 0: its serial adds wait on no global
-                    // load.
-                    if lane < n {
-                        let at = base + u64::from(lane);
-                        let b = ld(bins, if backward { len - 1 - at } else { at });
-                        st(chain, u64::from(lane), b);
-                    }
-                    warp::sync_mask(FULL);
-                    if lane == 0 {
-                        let mut i = 0;
-                        while i < n {
-                            let b = ld(chain, u64::from(i));
-                            g = g + b.x;
-                            h = h + b.y;
-                            st(chain, u64::from(i), F64x2 { x: g, y: h });
-                            i += 1;
+                    let at = base + u64::from(lane);
+                    // This lane's bin of the window (`lane < n`).
+                    let bin = || ld(bins, if backward { len - 1 - at } else { at });
+                    let a = if exact != 0 {
+                        let b = if lane < n {
+                            bin()
+                        } else {
+                            F64x2 { x: 0.0, y: 0.0 }
+                        };
+                        let s = warp_prefix(lane, b);
+                        let a = F64x2 {
+                            x: g + s.x,
+                            y: h + s.y,
+                        };
+                        let carry = shuffle_pair(a, n - 1);
+                        (g, h) = (carry.x, carry.y);
+                        a
+                    } else {
+                        // The window's bins, staged in shared memory by
+                        // every lane (one coalesced load each), then chained
+                        // in order in place by lane 0: its serial adds wait
+                        // on no global load.
+                        if lane < n {
+                            st(chain, u64::from(lane), bin());
                         }
-                    }
-                    warp::sync_mask(FULL);
+                        warp::sync_mask(FULL);
+                        if lane == 0 {
+                            let mut i = 0;
+                            while i < n {
+                                let b = ld(chain, u64::from(i));
+                                g += b.x;
+                                h += b.y;
+                                st(chain, u64::from(i), F64x2 { x: g, y: h });
+                                i += 1;
+                            }
+                        }
+                        warp::sync_mask(FULL);
+                        let a = if lane < n {
+                            ld(chain, u64::from(lane))
+                        } else {
+                            F64x2 { x: 0.0, y: 0.0 }
+                        };
+                        warp::sync_mask(FULL);
+                        a
+                    };
                     if lane < n {
-                        let a = ld(chain, u64::from(lane));
                         let (rest_g, rest_h) = (total.x - a.x, total.y - a.y);
                         let l = if backward {
                             reg.score(rest_g, rest_h, a.x, a.y)
@@ -1671,12 +1975,10 @@ pub unsafe fn scan_splits(
                             nan = true;
                         } else if l > best && l.is_finite() {
                             best = l;
-                            pos = if backward { len } else { 0 } + base + u64::from(lane);
-                            best_g = a.x;
-                            best_h = a.y;
+                            pos = if backward { len } else { 0 } + at;
+                            best_acc = a;
                         }
                     }
-                    warp::sync_mask(FULL);
                     base += 32;
                 }
                 if backward {
@@ -1684,42 +1986,36 @@ pub unsafe fn scan_splits(
                 }
                 backward = true;
             }
+            // Positions are unique to their lanes: reduce the loss and
+            // position, then fetch the winner's statistics from its lane.
+            let (mut top, mut top_pos) = (best, pos);
             let mut delta = 16;
             while delta > 0 {
-                let other_best = warp::shuffle_down_f32_sync(FULL, best, delta);
-                let other_pos = warp::shuffle_down_u64_sync(FULL, pos, delta);
-                let other_g = warp::shuffle_down_f64_sync(FULL, best_g, delta);
-                let other_h = warp::shuffle_down_f64_sync(FULL, best_h, delta);
-                if other_best > best || (other_best == best && other_pos < pos) {
-                    best = other_best;
-                    pos = other_pos;
-                    best_g = other_g;
-                    best_h = other_h;
+                let other_best = warp::shuffle_down_f32_sync(FULL, top, delta);
+                let other_pos = warp::shuffle_down_u64_sync(FULL, top_pos, delta);
+                if other_best > top || (other_best == top && other_pos < top_pos) {
+                    top = other_best;
+                    top_pos = other_pos;
                 }
                 delta >>= 1;
             }
+            let top_pos = warp::shuffle_u64_sync(FULL, top_pos, 0);
+            let found = top_pos != u64::MAX;
+            let winner = shuffle_pair(best_acc, winner_lane(found && pos == top_pos));
             let nan = warp::any_sync(FULL, nan);
             if lane == 0 {
-                let found = pos != u64::MAX;
-                let backward = found && pos >= len;
+                let backward = found && top_pos >= len;
                 let status = if nan { 2 } else { u32::from(found) };
                 let bin = match (found, backward) {
                     (false, _) => 0,
-                    (true, true) => (2 * len - 1 - pos) as u32,
-                    (true, false) => pos as u32,
+                    (true, true) => (2 * len - 1 - top_pos) as u32,
+                    (true, false) => top_pos as u32,
                 };
                 st(meta, 4 * t, status);
                 st(meta, 4 * t + 1, bin);
-                st(meta, 4 * t + 2, best.to_bits());
+                st(meta, 4 * t + 2, top.to_bits());
                 st(meta, 4 * t + 3, u32::from(backward));
-                st(
-                    acc,
-                    t,
-                    F64x2 {
-                        x: best_g,
-                        y: best_h,
-                    },
-                );
+                st(acc, t, winner);
             }
             t += warps;
         }
@@ -1746,40 +2042,22 @@ macro_rules! per_width {
         ///
         /// # Safety
         ///
-        /// As [`hist_tile`], with `2 * bins` words of dynamic shared memory
-        /// for every group.
+        /// As [`hist_tile`], with 16 bytes of dynamic shared memory per bin
+        /// of every group.
         #[kernel]
         #[launch_bounds(512)]
-        pub unsafe fn $hist_shared(
+        pub unsafe extern "C" fn $hist_shared(
             bins: *const $bin,
-            stride: u32,
-            sentinel: u32,
             feature_first: *const u32,
             rows: *const u32,
-            tiles: *const Tile,
-            groups: *const Group,
             units: *const I64x2,
             acc: *mut u64,
             partials: *mut u64,
-            total_bins: u64,
-            n_groups: u32,
+            work: TileWork,
         ) {
             // SAFETY: the caller's.
             unsafe {
-                hist_tile::<$bin, true>(
-                    bins,
-                    stride,
-                    sentinel,
-                    feature_first,
-                    rows,
-                    tiles,
-                    groups,
-                    units,
-                    acc,
-                    partials,
-                    total_bins,
-                    n_groups,
-                )
+                hist_tile::<$bin, true>(bins, feature_first, rows, units, acc, partials, work)
             }
         }
 
@@ -1790,36 +2068,18 @@ macro_rules! per_width {
         /// As [`hist_tile`].
         #[kernel]
         #[launch_bounds(512)]
-        pub unsafe fn $hist_global(
+        pub unsafe extern "C" fn $hist_global(
             bins: *const $bin,
-            stride: u32,
-            sentinel: u32,
             feature_first: *const u32,
             rows: *const u32,
-            tiles: *const Tile,
-            groups: *const Group,
             units: *const I64x2,
             acc: *mut u64,
             partials: *mut u64,
-            total_bins: u64,
-            n_groups: u32,
+            work: TileWork,
         ) {
             // SAFETY: the caller's.
             unsafe {
-                hist_tile::<$bin, false>(
-                    bins,
-                    stride,
-                    sentinel,
-                    feature_first,
-                    rows,
-                    tiles,
-                    groups,
-                    units,
-                    acc,
-                    partials,
-                    total_bins,
-                    n_groups,
-                )
+                hist_tile::<$bin, false>(bins, feature_first, rows, units, acc, partials, work)
             }
         }
 
@@ -1829,37 +2089,16 @@ macro_rules! per_width {
         ///
         /// As [`hist_chain`].
         #[kernel]
-        pub unsafe fn $hist_chain(
+        pub unsafe extern "C" fn $hist_chain(
             bins: *const $bin,
-            stride: u32,
-            n_cols: u32,
-            sentinel: u32,
             feature_first: *const u32,
             rows: *const u32,
-            n: u64,
-            seg_rows: u64,
-            segs: u64,
             gpair: *const F32x2,
             partials: *mut F64x2,
-            total_bins: u64,
+            work: ChainWork,
         ) {
             // SAFETY: the caller's.
-            unsafe {
-                hist_chain(
-                    bins,
-                    stride,
-                    n_cols,
-                    sentinel,
-                    feature_first,
-                    rows,
-                    n,
-                    seg_rows,
-                    segs,
-                    gpair,
-                    partials,
-                    total_bins,
-                )
-            }
+            unsafe { hist_chain(bins, feature_first, rows, gpair, partials, work) }
         }
 
         /// [`route_count`] for this bin width.
@@ -1868,24 +2107,17 @@ macro_rules! per_width {
         ///
         /// As [`route_count`].
         #[kernel]
-        pub unsafe fn $route_count(
+        pub unsafe extern "C" fn $route_count(
             cols: *const $bin,
             n_rows: u64,
             sentinel: u32,
-            segs: *const u64,
-            rules: *const Rule,
             table: *const u8,
-            ptiles: *const u64,
             rows: *const u32,
             flags: *mut u8,
-            tile_left: *mut u32,
+            tiles: PartTiles,
         ) {
             // SAFETY: the caller's.
-            unsafe {
-                route_count(
-                    cols, n_rows, sentinel, segs, rules, table, ptiles, rows, flags, tile_left,
-                )
-            }
+            unsafe { route_count(cols, n_rows, sentinel, table, rows, flags, tiles) }
         }
 
         /// [`hist_sparse`] for this bin width.
@@ -1895,18 +2127,17 @@ macro_rules! per_width {
         /// As [`hist_sparse`].
         #[kernel]
         #[launch_bounds(512)]
-        pub unsafe fn $hist_sparse(
+        pub unsafe extern "C" fn $hist_sparse(
             bins: *const $bin,
             row_ptr: *const u64,
             rows: *const u32,
-            tiles: *const Tile,
             units: *const I64x2,
             acc: *mut u64,
             partials: *mut u64,
-            total_bins: u64,
+            work: SparseTiles,
         ) {
             // SAFETY: the caller's.
-            unsafe { hist_sparse(bins, row_ptr, rows, tiles, units, acc, partials, total_bins) }
+            unsafe { hist_sparse(bins, row_ptr, rows, units, acc, partials, work) }
         }
 
         /// [`hist_sparse_chain`] for this bin width.
@@ -1915,23 +2146,16 @@ macro_rules! per_width {
         ///
         /// As [`hist_sparse_chain`].
         #[kernel]
-        pub unsafe fn $hist_sparse_chain(
+        pub unsafe extern "C" fn $hist_sparse_chain(
             bins: *const $bin,
             row_ptr: *const u64,
             rows: *const u32,
-            n: u64,
-            seg_rows: u64,
-            segs: u64,
             gpair: *const F32x2,
             partials: *mut F64x2,
-            total_bins: u64,
+            chunks: Chunks,
         ) {
             // SAFETY: the caller's.
-            unsafe {
-                hist_sparse_chain(
-                    bins, row_ptr, rows, n, seg_rows, segs, gpair, partials, total_bins,
-                )
-            }
+            unsafe { hist_sparse_chain(bins, row_ptr, rows, gpair, partials, chunks) }
         }
 
         /// [`route_sparse`] for this bin width.
@@ -1940,24 +2164,17 @@ macro_rules! per_width {
         ///
         /// As [`route_sparse`].
         #[kernel]
-        pub unsafe fn $route_sparse(
+        pub unsafe extern "C" fn $route_sparse(
             bins: *const $bin,
             row_ptr: *const u64,
             first: *const u32,
-            segs: *const u64,
-            rules: *const Rule,
             table: *const u8,
-            ptiles: *const u64,
             rows: *const u32,
             flags: *mut u8,
-            tile_left: *mut u32,
+            tiles: PartTiles,
         ) {
             // SAFETY: the caller's.
-            unsafe {
-                route_sparse(
-                    bins, row_ptr, first, segs, rules, table, ptiles, rows, flags, tile_left,
-                )
-            }
+            unsafe { route_sparse(bins, row_ptr, first, table, rows, flags, tiles) }
         }
     };
 }

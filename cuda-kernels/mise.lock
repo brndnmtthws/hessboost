@@ -16,5 +16,5 @@ backend = "core:rust"
 specifiers = ["nightly-2026-08-28"]
 
 [tools.rust.options]
-components = "llvm-tools,rust-src,rustc-dev"
+components = "clippy,llvm-tools,rust-src,rustc-dev"
 profile = "minimal"

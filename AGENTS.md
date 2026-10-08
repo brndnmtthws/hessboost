@@ -69,13 +69,15 @@ JIT-compiles only its kernels), refusing PTX with a non-IEEE
 floating-point instruction or a libdevice call; run it after changing a
 kernel. The PTX is byte-for-byte reproducible per host architecture
 (rustc's crate hashes name its shared-memory symbols): commit an x86_64
-Linux build, as CI's `cuda-kernels` job rebuilds and compares (it uploads
-its build on a mismatch, then assembles the PTX for every supported
-architecture with ptxas from the pip `nvidia-cuda-nvcc` wheel).
+Linux build, as CI's `cuda-kernels` job lints the crate, rebuilds and
+compares (it uploads its build on a mismatch, then assembles the PTX for
+every supported architecture with ptxas from the pip `nvidia-cuda-nvcc`
+wheel).
 Device tests skip without a GPU unless `HESSBOOST_REQUIRE_CUDA` is set.
 
 ```sh
 cd cuda-kernels && mise exec -- ./build.sh   # after changing a kernel
+cd cuda-kernels && cargo clippy --features train -- -D warnings && cargo clippy --features predict -- -D warnings
 HESSBOOST_REQUIRE_CUDA=1 cargo nextest run --features cuda --test cuda --release
 cargo bench --features cuda --bench training -- cuda
 ```
@@ -196,7 +198,7 @@ Fix findings rather than suppress them.
 |`ebm/`|public: `EbmInfo` (terms, tree→term map, term means; crate-private `stages`, the Boulevard stage layout validation, inference, and refit share), `shape_functions`, `term_shape`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds and category sets, leaves as boxes, difference arrays)|
 |`model/`|`mod.rs` (`BoostedModel`, accessors incl. the public metadata `tree_weights`/`num_class`/`linear`/`shrinkage`, `TreeWeights`, the public `LinearModel`; XGBoost interchange docs), `io` (`ModelFormat`, its detection, the four codec verbs), `embed` (`EmbeddedModel`: `include_bytes!` in a `static`, decoded on first successful `get`), `serde` (native JSON mirror `UncheckedBoostedModel`), `validate` (`validate_structure`, prediction-data and objective-width checks), `predict` (`Iterations`, prediction dispatch, `accumulate_forest`, shrunk and multi-prefix margins, `RowBlock` traversal, borrowed-row `predict_rows`, the single-row methods and their output-range `margin_row`, which serves `multi:softmax`'s class 64 classes at a time on the stack), `transform` (`Transform`: the objective's prediction transform, built lazily per model, row-parallel for large batches, `multi:softmax`'s `FindMaxIndex`), `slice` (`slice`, `shrunk_prefix`), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `container` (`ContainerSpec`: the magic/version/checksum framing, zstd packing and expansion bound shared by `HBM`, `HBDM` and `HBFF`; embedded-model blobs), `native`, `sections` (shared by every container and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (public `Shrinkage` record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact/` (public, `HBTD`; `mod.rs` model and layout docs, `bitstream`, `decode`, `encode`), `xgboost/` (JSON/UBJSON schema: `document` model mapping, `tree` node columns, `objective` objective and `base_score`, `parse` scalar parsers), `categories` (`CategoryPool`, shared by the XGBoost and LightGBM importers), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `SampleOptions`, `Samples`, the borrowed `SamplesView`, `Quantiles`), `io` (`DiffusionFormat`, shared with `forest`), `format` (`HBDM` container embedding native GBDT containers; JSON), `forest/` (public, ForestFlow/ForestDiffusion: per-level GBDTs, generation, RePaint imputation; `fit`: table preparation and per-level training; `encoding`: column ranges, one-hot encoding, scaling; `format`: `HBFF`)|
-|`backend/`|`metal.rs` (MSL histograms/prediction), `wgpu.rs` (portable WGSL GPU training/prediction), `shared.rs` (Metal/wgpu histogram staging; shared forest validation and row materialization), `cuda/` (`mod.rs`: exact histogram strategies, CSR storage, device bin preparation and row engine; `categorical.rs`: stable category sorting, resident node winners and diagnostics; `predict.rs`: compact forests and bounded three-stream prediction; `kernels.rs`: the embedded `training.ptx`/`prediction.ptx`, built from `cuda-kernels/`, one loaded per context), `exact_sum.rs` (`SumDomain` proof on every platform)|
+|`backend/`|`metal.rs` (MSL histograms/prediction), `wgpu.rs` (portable WGSL GPU training/prediction), `shared.rs` (Metal/wgpu histogram staging; shared forest validation and row materialization), `cuda/` (`mod.rs`: exact histogram strategies, CSR storage, device bin preparation, row engine, and the transfer staging (`Staging` descriptor arena, `Ring` of bounded pieces, the device's `PinnedPool`); `categorical.rs`: stable category sorting, resident node winners and diagnostics; `predict.rs`: compact forests and bounded three-stream prediction; `abi.rs`: the kernels' by-value parameter structs, checked against the embedded PTX; `kernels.rs`: the embedded `training.ptx`/`prediction.ptx`, built from `cuda-kernels/`, one loaded per context), `exact_sum.rs` (`SumDomain` proof on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
 The CUDA kernels live outside `src/`, in `cuda-kernels/src/` (not part of
@@ -205,9 +207,12 @@ the crate's build or package): `lib.rs` (exactness and ABI rules, the
 histograms, partitions, reductions, numeric split search; per-width entries
 from `per_width!`) and `categorical.rs` (category keys, merge sort,
 partition scan, `merge_scans`) behind the `train` feature, `predict.rs`
-(compact-forest walks) behind `predict`. Entries take raw pointers and
-scalars, one PTX parameter each, in the order the host's launch builders
-push them; a kernel's signature and its launch change together.
+(compact-forest walks) behind `predict`. Entries take raw pointers,
+scalars and `#[repr(C)]` parameter structs by value (mirrored field for
+field in `src/backend/cuda/abi.rs`), one PTX parameter each, in the order
+the host's launch builders push them; a kernel's signature and its launch
+change together. The crate has the root's lint policy (CI runs its clippy
+on the pinned nightly).
 
 Tests: `tests/parity.rs` and `tests/lightgbm_parity.rs` are ignored without fixtures; `properties.rs` is
 proptest; shared helpers are in `tests/common/` and `examples/common/`;
@@ -296,11 +301,16 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   only the gradients whose host kernel they reproduce operation for
   operation. Non-finite gradients, inputs that do not fit, and every tree
   after a CUDA error run on the CPU.
-  Pinned uploads retain a completion event through reuse and destruction;
-  upload and readback staging have separate cache modes. The uploaded
-  binned index is matched by immutable identity (moves and clones retain
-  it), not aggregate shape. A fresh margin run invalidates cached labels
-  and weights. GPU parity tests reject sticky runtime fallback.
+  Small uploads (descriptors, leaf values) are staged in the backend's
+  write-combined pinned arena and queued without waiting; its bytes are
+  rewritten only after a stream synchronization (each readback resets it,
+  a full arena synchronizes first). Large copies move through `Ring`'s
+  pooled 1 MiB pieces, each reused after its completion event; upload and
+  readback pieces have separate cache modes. Page-locked blocks return to
+  the device's pool (at most 64 MiB) only after their stream drains. The
+  uploaded binned index is matched by immutable identity (moves and clones
+  retain it), not aggregate shape. A fresh margin run invalidates cached
+  labels and weights. GPU parity tests reject sticky runtime fallback.
   No Rayon work may run under the backend state mutex: pool work stealing
   can re-enter another histogram call and deadlock. Locked CPU fallback
   uses the serial helper with the same chunk order, not one long chain.
@@ -310,13 +320,16 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   Each backend forks its stream before allocating or raw-binning data;
   immutable kernel handles are cached, not mutable submission streams.
   All retained bins, encoder use and frees stay on the owning stream.
-  Pageable H2D sources explicitly complete before their slices leave
-  scope; asynchronous large copies use event-owned pinned memory.
+  Pageable H2D sources complete before their slices leave scope.
   Numeric split search assigns one warp per feature: lane 0 forms exact
-  CPU-order prefix/suffix chains, lanes score candidates independently,
+  CPU-order prefix/suffix chains, unless the tree's staged gradients pass
+  `sums_exact(tree rows)` (then every histogram and total is exact, and a
+  warp scan gives the chain's bits); lanes score candidates independently,
   and argmax keeps score then earliest forward/backward position. All
   lanes participate in warp synchronization, including ragged bin tails;
-  any NaN still triggers host replay.
+  any NaN still triggers host replay. `merge_scans` runs one warp per node.
+  An exact-built child's sibling is subtracted in its finalization
+  (`finalize_exact_sub`, the same `f64` subtraction as `subtract_hists`).
   Categorical weights use stable device sorting (equal weights retain bin
   order); category prefixes/suffixes retain CPU sums and child orientation.
   Non-finite sort keys or NaN scores replay explicitly. Per-feature results

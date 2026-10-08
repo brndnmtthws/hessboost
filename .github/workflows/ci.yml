@@ -245,6 +245,14 @@ jobs:
             !~/.cargo/cuda-oxide/target
             ~/.cargo/git/db
           key: cuda-oxide-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cuda-kernels/Cargo.lock', 'cuda-kernels/rust-toolchain.toml') }}
+      # The root crate's lint policy (cuda-kernels/Cargo.toml's [lints]), on
+      # the host target: clippy type-checks the kernels without cuda-oxide's
+      # codegen backend, once per PTX module's feature.
+      - name: Lint the kernels
+        working-directory: cuda-kernels
+        run: |
+          mise exec -- cargo clippy --features train -- -D warnings
+          mise exec -- cargo clippy --features predict -- -D warnings
       - name: Rebuild the PTX
         working-directory: cuda-kernels
         run: mise exec -- ./build.sh

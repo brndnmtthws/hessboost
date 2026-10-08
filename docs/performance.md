@@ -899,9 +899,11 @@ histogram construction across all strategies passed `racecheck` with zero
 hazards or warnings. Compilation alone does not establish those runtime
 properties.
 The 512-thread histogram blocks and shared-memory budget remain starting
-configurations, not measured optima. Pinned uploads retain completion
-events before reuse or destruction; row readbacks use separate cacheable staging.
-Partial-histogram waves are capped by currently available device memory.
+configurations, not measured optima. Descriptors are staged in a pinned
+arena and queued without waiting; large copies move through pooled 1 MiB
+pinned pieces, each reused only after its completion event, with separate
+cacheable readback pieces. Partial-histogram waves are capped by currently
+available device memory.
 
 Complete dense input uses padded row-major and feature-major local bins,
 encoded/transposed on CUDA against CPU-authoritative cuts. Sparse input
@@ -947,11 +949,13 @@ defaults and positional `device` argument remain unchanged.
 The kernels are Rust: the `cuda-kernels/` crate, compiled to PTX for
 `sm_75` by [cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/)
 (revision `6921d3e`, `nightly-2026-08-28`, `--no-fmad`) and embedded as two
-modules, `training.ptx` (51 kernels) and `prediction.ptx` (2). They
-replaced the CUDA C++ kernels that NVRTC compiled at run time with the
-same entry points, parameters, launch geometry and arithmetic order, so the
-host code, the exactness argument and the measurements in the later
-subsections carry over. Three differ in memory access only: the numeric
+modules, `training.ptx` (52 kernels since the fused finalization below)
+and `prediction.ptx` (2). They replaced the CUDA C++ kernels that NVRTC
+compiled at run time with the same entry points, parameters, launch
+geometry and arithmetic order, so the host code, the exactness argument
+and the measurements in the later subsections carry over ("Transfer
+staging" below then grouped parameters into `#[repr(C)]` structs and
+retuned the scans). Three differ in memory access only: the numeric
 and categorical split scans stage each window of bins in shared memory
 with every lane before lane 0 chains them in order (the C++ lane 0 loaded
 each bin itself, one global load per serial step), and the row scatter
@@ -1014,6 +1018,73 @@ driver (`~/.nv/ComputeCache`). Splitting out the prediction module keeps a
 prediction-only process from compiling the training kernels: as one
 module, a cold `to_cuda` took about 0.71 s.
 
+### Transfer staging, exact scans and kernel tuning
+
+Nsight Systems on the lossguide case (200k × 30, max 64 leaves) put most
+of a fit in the host's transfer protocol rather than the kernels: each
+node's descriptor uploads were pageable copies that synchronized the
+stream (15 `cuStreamSynchronize` and 13 `cuMemcpyHtoDAsync` calls per node;
+3.0 s of synchronization against 1.9 s of kernels per trace), and every fit
+page-locked fresh staging (18 `cuMemHostAlloc` calls per fit at 1M × 30,
+about 37 ms with their frees, the global bins through a full-size 60 MB
+copy). The backend now:
+
+- writes an operation's descriptors (partition rules and tiles, histogram
+  tiles, scan requests, leaf values) into a write-combined pinned arena and
+  uploads them with one queued copy; the arena is rewritten only after a
+  stream synchronization, which every readback is. A loss-guided node
+  synchronizes twice (partition counts, split winners) and uploads three
+  times;
+- streams large copies (bins, gradients, row lists, histogram and row
+  readbacks, raw binning) through four pooled 1 MiB pinned pieces per
+  direction, and keeps released page-locked blocks (up to 64 MiB) per
+  device for the next training run; readback buffers start at 64 KiB;
+- generates an ascending row list on the device instead of uploading it
+  (after a parallel bounds check), and shrinks exact histogram tiles down
+  to 512 rows for small batches so their blocks cover the SMs (integer sums
+  do not depend on the tiling);
+- scans splits with warp scans when the tree's gradients sum exactly over
+  all of its rows (then every histogram and total is exact, and any
+  association gives the chain's bits; other trees keep lane 0's chain),
+  one warp per block (a scan is latency-bound on its SM's `f64` units),
+  merges each node's feature winners with one warp, subtracts an exact
+  child's sibling in its finalization, and lays shared histograms out in
+  four 32-bit planes;
+- keeps four prediction row blocks in flight instead of two.
+
+Against `43409b8` on the same L40S, through `scripts/compare_benchmarks.py`
+(baseline, candidate, candidate, baseline; 8 Rayon threads; 1 s warmup, 10
+samples over 3 s; the mean of each version's two medians). The CPU rows
+run identical code and bound the noise (−1.7% to +4.3%):
+
+| Benchmark | Before | After | Change |
+|---|---:|---:|---:|
+| Histogram build, 1M × 30 | 0.830 ms | 0.367 ms | −55.8% |
+| Histogram build, 10M × 30 | 7.473 ms | 2.348 ms | −68.6% |
+| Train 1M × 30, 20 depth-8 rounds | 328.9 ms | 283.3 ms | −13.9% |
+| Categorical training, 200k × 30 | 91.46 ms | 67.45 ms | −26.3% |
+| Lossguide training, 200k × 30 | 318.5 ms | 163.9 ms | −48.5% |
+| CSR training, 200k × 30 | 98.08 ms | 58.47 ms | −40.4% |
+| Predict 500k × 30, 100 depth-6 trees | 8.205 ms | 6.713 ms | −18.2% |
+
+Both halves of every pair agree within 2.5 points. Per lossguide node,
+launches stay at 8 while synchronizations fall from 15 to 2 and uploads
+from 13 to 3; per launch, `scan_splits` takes 16.7 µs (42.1 µs before),
+`hist_shared_u8` 9.2 µs (28.9 µs), `merge_scans` 2.3 µs (9.1 µs) and the
+fused finalization 2.0 µs (3.4 µs with the separate subtraction). At 1M ×
+30, the CPU's cuts (139 ms) and binning (82 ms) are now about 78% of a
+CUDA fit; both are shared with CPU training.
+
+**Required CUDA tests passed on the L40S** with these changes,
+`HESSBOOST_REQUIRE_CUDA=1`: `cargo nextest run --features cuda --release`
+ran 823 tests, all passing, among them 38 CUDA cases (a new one grows the
+same trees with exact and with ordered scans and checks the diagnostics
+saw each kind, and a unit test checks every by-value kernel parameter's
+size and alignment against the embedded PTX). Python passed 436 tests and
+`tests/test_gpu.py` 15. Compute Sanitizer's `memcheck`, `racecheck`,
+`synccheck` and `initcheck` ran the 38 CUDA cases with zero errors and
+zero hazards.
+
 The subsections below predate the Rust kernels: their qualification runs
 and measurements used the CUDA C++ kernels.
 
@@ -1072,23 +1143,23 @@ unit-only `Device` enum makes numeric discriminant casts invalid. Fixed
 CPU histogram/root chunking can also alter newly trained models' low bits
 outside the exact-sum domain; existing saved models remain supported.
 
-Permanent Criterion groups now cover categorical/lossguide/CSR training
-and reused CUDA prediction. The final lifetime-safe L40S qualification
-run (8 host threads, 200k × 30, 20 depth-6 rounds; 1 s warmup, 3 s target,
-10 samples) gave the point estimates below. This is a CPU-versus-CUDA
-comparison on these shapes, not an alternating optimization experiment.
+Permanent Criterion groups cover categorical/lossguide/CSR training and
+reused CUDA prediction. With the transfer staging above (the alternating
+run's candidate medians; 8 host threads, 200k × 30, 20 depth-6 rounds),
+CPU against CUDA on these shapes:
 
 | Permanent benchmark | CPU | CUDA | CPU/CUDA |
 |---|---:|---:|---:|
-| Categorical training | 178.9 ms | 96.1 ms | 1.86× |
-| Lossguide training | 207.5 ms | 338.4 ms | 0.61× |
-| CSR training, ~40% present | 122.7 ms | 99.7 ms | 1.23× |
-| Predict 500k × 30, 100 depth-6 trees | 29.87 ms | 8.16 ms | 3.66× |
+| Categorical training | 168.4 ms | 67.45 ms | 2.50× |
+| Lossguide training | 196.2 ms | 163.9 ms | 1.20× |
+| CSR training, ~40% present | 138.2 ms | 58.47 ms | 2.36× |
+| Predict 500k × 30, 100 depth-6 trees | 26.81 ms | 6.713 ms | 3.99× |
 
-Small lossguide frontiers do not amortize GPU/host decision boundaries;
-choose CPU when this workload is latency-sensitive. Sparse memory
-improvements similarly do not guarantee a speedup for every shape. Keep
-transfer/setup costs inside end-to-end training and prediction timings.
+Before the staging, lossguide ran at 0.61× the CPU (338.4 ms against
+207.5 ms): two device round trips per node remain, so small frontiers
+gain least. Sparse memory improvements likewise do not guarantee a
+speedup for every shape. Keep transfer/setup costs inside end-to-end
+training and prediction timings.
 The comparison harness rejects sticky CUDA fallback and checks XGBoost's
 effective device; its reports hash the executable, which embeds the
 kernels' PTX.
@@ -1109,11 +1180,12 @@ Backend state locking deliberately contains no Rayon work, avoiding
 work-stealing re-entry; integer staging skips unsafe conversions while
 retaining the domains used by floating chains and CPU fallback.
 
-Each backend owns its allocation/submission stream. Pageable descriptors
-complete before their source slices leave scope; large asynchronous copies
-use completion-owned pinned buffers. These lifetime fences add host/device
-boundaries, particularly for lossguide. The earlier optimization tables are
-historical measurements, not assertions of final-release wall time.
+Each backend owns its allocation/submission stream. Staged descriptors
+keep their pinned bytes until a stream synchronization; large copies use
+completion-owned pinned pieces (see "Transfer staging" above, which
+removed the per-descriptor fences that once dominated lossguide). The
+earlier optimization tables are historical measurements, not assertions
+of final-release wall time.
 
 An intermittent driver-side host crash exposed by concurrent-trainer
 memcheck was investigated rather than ignored. After source-lifetime and

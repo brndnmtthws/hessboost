@@ -3,5 +3,5 @@
 # in Cargo.toml). mise.toml selects the same toolchain for mise users.
 [toolchain]
 channel = "nightly-2026-08-28"
-components = ["rust-src", "rustc-dev", "llvm-tools"]
+components = ["rust-src", "rustc-dev", "llvm-tools", "clippy"]
 profile = "minimal"

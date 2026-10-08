@@ -1,11 +1,12 @@
 # Layered over the repository's mise.toml when mise runs in this directory:
 # building the kernels needs cuda-oxide's pinned nightly (rust-toolchain.toml
 # names the same one, which `cargo oxide` checks) and cargo-oxide from the
-# cuda-oxide revision Cargo.toml's `cuda-device` pins. The nightly has no
-# rustfmt: mise.toml's formats this crate from the root
+# cuda-oxide revision Cargo.toml's `cuda-device` pins, plus clippy for CI's
+# lint gate (`cargo clippy --features train`, then `predict`). The nightly
+# has no rustfmt: mise.toml's formats this crate from the root
 # (`cargo fmt --all --manifest-path cuda-kernels/Cargo.toml`).
 [tools]
-rust = { version = "nightly-2026-08-28", profile = "minimal", components = "rust-src,rustc-dev,llvm-tools" }
+rust = { version = "nightly-2026-08-28", profile = "minimal", components = "rust-src,rustc-dev,llvm-tools,clippy" }
 "cargo:https://github.com/NVIDIA/cuda-rust" = { version = "rev:6921d3ee07e28ec62895ea40fc2fef39977ca411", crate = "cargo-oxide" }
 
 # The repository's enter hook does not fire when moving into this directory

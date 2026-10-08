@@ -72,6 +72,7 @@ def test_cuda_is_available_or_missing_runtime(trained: tuple[Booster, np.ndarray
         expected in reason
         for expected in (
             "libcuda not found",
+            "the NVIDIA driver supports CUDA",
             "has compute capability",
             "no CUDA device",
             "only available on Linux",

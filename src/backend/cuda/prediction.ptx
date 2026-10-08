@@ -13,10 +13,7 @@
 	.param .u64 .ptr .align 1 predict8_param_1,
 	.param .u64 .ptr .align 1 predict8_param_2,
 	.param .u64 .ptr .align 1 predict8_param_3,
-	.param .u32 predict8_param_4,
-	.param .u32 predict8_param_5,
-	.param .u32 predict8_param_6,
-	.param .u32 predict8_param_7
+	.param .align 4 .b8 predict8_param_4[16]
 )
 {
 	.reg .pred 	%p<9>;
@@ -24,7 +21,7 @@
 	.reg .b64 	%rd<24>;
 
 // %bb.0:                               // %entry
-	ld.param.b32 	%r2, [predict8_param_4];
+	ld.param.b32 	%r1, [predict8_param_4];
 	ld.param.b64 	%rd8, [predict8_param_0];
 	ld.param.b64 	%rd9, [predict8_param_2];
 	cvta.to.global.u64 	%rd1, %rd9;
@@ -37,15 +34,15 @@
 	mov.u32 	%r7, %ntid.x;
 	mov.u32 	%r8, %tid.x;
 	mad.lo.s32 	%r18, %r6, %r7, %r8;
-	setp.ge.u32 	%p1, %r18, %r2;
+	setp.ge.u32 	%p1, %r18, %r1;
 	@%p1 bra 	$L__BB0_9;
 	bra.uni 	$L__BB0_1;
 $L__BB0_1:                              // %bb5.lr.ph
-	ld.param.b32 	%r5, [predict8_param_7];
-	ld.param.b32 	%r4, [predict8_param_6];
-	ld.param.b32 	%r3, [predict8_param_5];
-	cvt.u64.u32 	%rd5, %r3;
-	setp.ge.u32 	%p2, %r4, %r5;
+	ld.param.b32 	%r3, [predict8_param_4+12];
+	ld.param.b32 	%r2, [predict8_param_4+8];
+	ld.param.b32 	%r5, [predict8_param_4+4];
+	cvt.u64.u32 	%rd5, %r5;
+	setp.ge.u32 	%p2, %r2, %r3;
 $L__BB0_2:                              // %bb5
                                         // =>This Loop Header: Depth=1
                                         //     Child Loop BB0_4 Depth 2
@@ -61,15 +58,15 @@ $L__BB0_3:                              // %bb7.preheader
 	mul.lo.s64 	%rd13, %rd12, %rd5;
 	shl.b64 	%rd14, %rd13, 2;
 	add.s64 	%rd6, %rd1, %rd14;
-	mov.b32 	%r19, %r4;
+	mov.b32 	%r19, %r2;
 $L__BB0_4:                              // %bb7
                                         //   Parent Loop BB0_2 Depth=1
                                         // =>  This Loop Header: Depth=2
                                         //       Child Loop BB0_6 Depth 3
 	mul.wide.u32 	%rd16, %r19, 4;
 	add.s64 	%rd17, %rd3, %rd16;
-	ld.global.b32 	%r1, [%rd17];
-	mul.wide.u32 	%rd18, %r1, 8;
+	ld.global.b32 	%r4, [%rd17];
+	mul.wide.u32 	%rd18, %r4, 8;
 	add.s64 	%rd19, %rd4, %rd18;
 	ld.global.v2.b32 	{%r21, %r20}, [%rd19];
 	setp.lt.s32 	%p3, %r20, 0;
@@ -89,7 +86,7 @@ $L__BB0_6:                              // %bb9
 	neg.f32 	%r11, %r10;
 	selp.f32 	%r12, %r10, %r11, %p4;
 	and.b32 	%r13, %r20, 32767;
-	add.s32 	%r14, %r13, %r1;
+	add.s32 	%r14, %r13, %r4;
 	setp.gt.f32 	%p5, %r12, %r21;
 	selp.b32 	%r15, 1, 0, %p5;
 	add.s32 	%r16, %r14, %r15;
@@ -103,7 +100,7 @@ $L__BB0_7:                              // %bb13
                                         //   in Loop: Header=BB0_4 Depth=2
 	add.rn.f32 	%r22, %r22, %r21;
 	add.s32 	%r19, %r19, 1;
-	setp.ne.b32 	%p7, %r19, %r5;
+	setp.ne.b32 	%p7, %r19, %r3;
 	@%p7 bra 	$L__BB0_4;
 	bra.uni 	$L__BB0_8;
 $L__BB0_8:                              // %bb14
@@ -111,7 +108,7 @@ $L__BB0_8:                              // %bb14
 	st.global.b32 	[%rd7], %r22;
 	mov.u32 	%r17, %nctaid.x;
 	mad.lo.s32 	%r18, %r7, %r17, %r18;
-	setp.lt.u32 	%p8, %r18, %r2;
+	setp.lt.u32 	%p8, %r18, %r1;
 	@%p8 bra 	$L__BB0_2;
 	bra.uni 	$L__BB0_9;
 $L__BB0_9:                              // %bb17
@@ -126,11 +123,7 @@ $L__BB0_9:                              // %bb17
 	.param .u64 .ptr .align 1 predict16_param_3,
 	.param .u64 .ptr .align 1 predict16_param_4,
 	.param .u64 .ptr .align 1 predict16_param_5,
-	.param .u32 predict16_param_6,
-	.param .u32 predict16_param_7,
-	.param .u32 predict16_param_8,
-	.param .u32 predict16_param_9,
-	.param .u32 predict16_param_10
+	.param .align 4 .b8 predict16_param_6[20]
 )                                       // @predict16
 {
 	.reg .pred 	%p<28>;
@@ -138,7 +131,7 @@ $L__BB0_9:                              // %bb17
 	.reg .b64 	%rd<47>;
 
 // %bb.0:                               // %entry
-	ld.param.b32 	%r11, [predict16_param_6];
+	ld.param.b32 	%r1, [predict16_param_6];
 	ld.param.b64 	%rd18, [predict16_param_0];
 	ld.param.b64 	%rd19, [predict16_param_4];
 	cvta.to.global.u64 	%rd1, %rd19;
@@ -155,25 +148,25 @@ $L__BB0_9:                              // %bb17
 	mov.u32 	%r17, %ntid.x;
 	mov.u32 	%r18, %tid.x;
 	mad.lo.s32 	%r55, %r16, %r17, %r18;
-	setp.ge.u32 	%p1, %r55, %r11;
+	setp.ge.u32 	%p1, %r55, %r1;
 	@%p1 bra 	$L__BB1_25;
 	bra.uni 	$L__BB1_1;
 $L__BB1_1:                              // %bb5.lr.ph
-	ld.param.b32 	%r15, [predict16_param_10];
-	ld.param.b32 	%r14, [predict16_param_9];
-	ld.param.b32 	%r13, [predict16_param_8];
-	ld.param.b32 	%r12, [predict16_param_7];
-	cvt.u64.u32 	%rd7, %r12;
-	cvt.u64.u32 	%rd8, %r13;
-	and.b32 	%r1, %r13, 3;
-	and.b32 	%r2, %r13, -4;
+	ld.param.b32 	%r4, [predict16_param_6+16];
+	ld.param.b32 	%r3, [predict16_param_6+12];
+	ld.param.b32 	%r2, [predict16_param_6+8];
+	ld.param.b32 	%r15, [predict16_param_6+4];
+	cvt.u64.u32 	%rd7, %r15;
+	cvt.u64.u32 	%rd8, %r2;
+	and.b32 	%r5, %r2, 3;
+	and.b32 	%r6, %r2, -4;
 	add.s64 	%rd9, %rd2, 8;
-	mul.wide.u32 	%rd10, %r13, 4;
+	mul.wide.u32 	%rd10, %r2, 4;
 	add.s64 	%rd11, %rd6, 8;
-	setp.ge.u32 	%p2, %r14, %r15;
-	setp.eq.b32 	%p19, %r13, 0;
-	setp.lt.u32 	%p20, %r13, 4;
-	setp.eq.b32 	%p22, %r1, 0;
+	setp.ge.u32 	%p2, %r3, %r4;
+	setp.eq.b32 	%p19, %r2, 0;
+	setp.lt.u32 	%p20, %r2, 4;
+	setp.eq.b32 	%p22, %r5, 0;
 $L__BB1_2:                              // %bb5
                                         // =>This Loop Header: Depth=1
                                         //     Child Loop BB1_4 Depth 2
@@ -195,7 +188,7 @@ $L__BB1_3:                              // %bb7.preheader
 	mul.lo.s64 	%rd28, %rd10, %rd12;
 	add.s64 	%rd15, %rd9, %rd28;
 	add.s64 	%rd16, %rd2, %rd28;
-	mov.b32 	%r56, %r14;
+	mov.b32 	%r56, %r3;
 $L__BB1_4:                              // %bb7
                                         //   Parent Loop BB1_2 Depth=1
                                         // =>  This Loop Header: Depth=2
@@ -205,7 +198,7 @@ $L__BB1_4:                              // %bb7
                                         //       Child Loop BB1_22 Depth 3
 	mul.wide.u32 	%rd29, %r56, 16;
 	add.s64 	%rd30, %rd3, %rd29;
-	ld.global.v4.b32 	{%r19, %r3, %r4, %r20}, [%rd30];
+	ld.global.v4.b32 	{%r19, %r7, %r8, %r20}, [%rd30];
 	mul.wide.u32 	%rd31, %r19, 16;
 	add.s64 	%rd42, %rd4, %rd31;
 	ld.global.v2.b32 	{%r57, %r59}, [%rd42+8];
@@ -219,11 +212,11 @@ $L__BB1_6:                              // %bb9
                                         //     Parent Loop BB1_4 Depth=2
                                         // =>    This Loop Header: Depth=3
                                         //         Child Loop BB1_10 Depth 4
-	ld.global.v2.b32 	{%r5, %r58}, [%rd42];
-	shr.u32 	%r21, %r5, 5;
+	ld.global.v2.b32 	{%r9, %r58}, [%rd42];
+	shr.u32 	%r21, %r9, 5;
 	mul.wide.u32 	%rd32, %r21, 4;
 	add.s64 	%rd33, %rd13, %rd32;
-	ld.global.b32 	%r6, [%rd33];
+	ld.global.b32 	%r10, [%rd33];
 	and.b32 	%r22, %r59, 1;
 	setp.ne.b32 	%p4, %r22, 0;
 	not.pred 	%p5, %p4;
@@ -234,24 +227,24 @@ $L__BB1_7:                              // %bb10
 	shr.u32 	%r23, %r59, 1;
 	and.b32 	%r24, %r23, 1;
 	setp.ne.b32 	%p26, %r24, 0;
-	setp.nan.f32 	%p6, %r6, %r6;
+	setp.nan.f32 	%p6, %r10, %r10;
 	@%p6 bra 	$L__BB1_11;
 	bra.uni 	$L__BB1_8;
 $L__BB1_8:                              // %bb11
                                         //   in Loop: Header=BB1_6 Depth=3
-	shr.u32 	%r8, %r59, 2;
-	setp.ge.u32 	%p9, %r58, %r8;
+	shr.u32 	%r12, %r59, 2;
+	setp.ge.u32 	%p9, %r58, %r12;
 	mov.pred 	%p26, 0;
 	@%p9 bra 	$L__BB1_11;
 	bra.uni 	$L__BB1_9;
 $L__BB1_9:                              // %bb13.preheader
                                         //   in Loop: Header=BB1_6 Depth=3
-	setp.ltu.f32 	%p7, %r6, 0f00000000;
-	cvt.rzi.u32.f32 	%r25, %r6;
+	setp.ltu.f32 	%p7, %r10, 0f00000000;
+	cvt.rzi.u32.f32 	%r25, %r10;
 	selp.b32 	%r26, 0, %r25, %p7;
-	setp.gt.f32 	%p8, %r6, 0f4F7FFFFF;
-	selp.b32 	%r7, -1, %r26, %p8;
-	add.s32 	%r9, %r8, -1;
+	setp.gt.f32 	%p8, %r10, 0f4F7FFFFF;
+	selp.b32 	%r11, -1, %r26, %p8;
+	add.s32 	%r13, %r12, -1;
 $L__BB1_10:                             // %bb13
                                         //   Parent Loop BB1_2 Depth=1
                                         //     Parent Loop BB1_4 Depth=2
@@ -260,12 +253,12 @@ $L__BB1_10:                             // %bb13
 	mul.wide.u32 	%rd34, %r58, 4;
 	add.s64 	%rd35, %rd5, %rd34;
 	ld.global.b32 	%r27, [%rd35];
-	setp.eq.b32 	%p26, %r27, %r7;
-	setp.ne.b32 	%p10, %r27, %r7;
-	add.s32 	%r10, %r58, 1;
-	setp.ne.b32 	%p11, %r9, %r58;
+	setp.eq.b32 	%p26, %r27, %r11;
+	setp.ne.b32 	%p10, %r27, %r11;
+	add.s32 	%r14, %r58, 1;
+	setp.ne.b32 	%p11, %r13, %r58;
 	and.pred 	%p12, %p10, %p11;
-	mov.b32 	%r58, %r10;
+	mov.b32 	%r58, %r14;
 	@%p12 bra 	$L__BB1_10;
 	bra.uni 	$L__BB1_11;
 $L__BB1_11:                             // %bb18
@@ -274,10 +267,10 @@ $L__BB1_11:                             // %bb18
 	bra.uni 	$L__BB1_13;
 $L__BB1_12:                             // %bb19
                                         //   in Loop: Header=BB1_6 Depth=3
-	and.b32 	%r28, %r5, 16;
+	and.b32 	%r28, %r9, 16;
 	setp.eq.b32 	%p13, %r28, 0;
-	neg.f32 	%r29, %r6;
-	selp.f32 	%r30, %r6, %r29, %p13;
+	neg.f32 	%r29, %r10;
+	selp.f32 	%r30, %r10, %r29, %p13;
 	setp.num.f32 	%p14, %r30, %r30;
 	mov.pred 	%p27, 0;
 	@%p14 bra 	$L__BB1_26;
@@ -294,7 +287,7 @@ $L__BB1_13:                             // %bb23
 	bra.uni 	$L__BB1_14;
 $L__BB1_14:                             // %bb24
                                         //   in Loop: Header=BB1_4 Depth=2
-	setp.eq.b32 	%p18, %r4, 0;
+	setp.eq.b32 	%p18, %r8, 0;
 	@%p18 bra 	$L__BB1_18;
 	bra.uni 	$L__BB1_15;
 $L__BB1_15:                             // %bb27.preheader
@@ -316,7 +309,7 @@ $L__BB1_17:                             // %bb28.preheader
 	bra.uni 	$L__BB1_19;
 $L__BB1_18:                             // %bb26
                                         //   in Loop: Header=BB1_4 Depth=2
-	mul.wide.u32 	%rd39, %r3, 4;
+	mul.wide.u32 	%rd39, %r7, 4;
 	add.s64 	%rd40, %rd14, %rd39;
 	ld.global.b32 	%r51, [%rd40];
 	add.rn.f32 	%r52, %r51, %r59;
@@ -345,7 +338,7 @@ $L__BB1_19:                             // %bb28
 	add.s32 	%r60, %r60, 4;
 	add.s64 	%rd44, %rd44, 16;
 	add.s64 	%rd43, %rd43, 16;
-	setp.ne.b32 	%p21, %r2, %r60;
+	setp.ne.b32 	%p21, %r6, %r60;
 	@%p21 bra 	$L__BB1_19;
 	bra.uni 	$L__BB1_20;
 $L__BB1_20:                             // %bb30.loopexit.unr-lcssa
@@ -358,7 +351,7 @@ $L__BB1_21:                             // %bb28.epil.preheader
 	add.s64 	%rd38, %rd41, %rd37;
 	add.s64 	%rd46, %rd6, %rd38;
 	add.s64 	%rd45, %rd16, %rd37;
-	mov.b32 	%r61, %r1;
+	mov.b32 	%r61, %r5;
 $L__BB1_22:                             // %bb28.epil
                                         //   Parent Loop BB1_2 Depth=1
                                         //     Parent Loop BB1_4 Depth=2
@@ -377,7 +370,7 @@ $L__BB1_22:                             // %bb28.epil
 $L__BB1_23:                             // %bb30
                                         //   in Loop: Header=BB1_4 Depth=2
 	add.s32 	%r56, %r56, 1;
-	setp.ne.b32 	%p24, %r56, %r15;
+	setp.ne.b32 	%p24, %r56, %r4;
 	@%p24 bra 	$L__BB1_4;
 	bra.uni 	$L__BB1_24;
 $L__BB1_24:                             // %bb31
@@ -385,14 +378,14 @@ $L__BB1_24:                             // %bb31
 	cvt.u32.u64 	%r53, %rd12;
 	mov.u32 	%r54, %nctaid.x;
 	mad.lo.s32 	%r55, %r17, %r54, %r53;
-	setp.lt.u32 	%p25, %r55, %r11;
+	setp.lt.u32 	%p25, %r55, %r1;
 	@%p25 bra 	$L__BB1_2;
 	bra.uni 	$L__BB1_25;
 $L__BB1_25:                             // %bb34
 	ret;
 $L__BB1_26:                             // %bb37
                                         //   in Loop: Header=BB1_6 Depth=3
-	setp.neu.f32 	%p15, %r6, 0f00000000;
+	setp.neu.f32 	%p15, %r10, 0f00000000;
 	selp.b32 	%r31, %r30, 0, %p15;
 	setp.gt.s32 	%p16, %r31, -1;
 	selp.b32 	%r32, -2147483648, -1, %p16;

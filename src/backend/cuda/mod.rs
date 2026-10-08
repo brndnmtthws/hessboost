@@ -75,6 +75,22 @@
 //! afterwards): the tree in progress is regrown on the host, and every
 //! later tree too, so the result is unchanged.
 //!
+//! Split search scans each feature's bins in the CPU's order with the
+//! CPU's `f64` operations. When a tree's gradients sum exactly over all of
+//! its rows, every histogram and total of the tree is exact in grains, so
+//! any association of the prefix additions gives the CPU's bits: those
+//! trees form the prefixes with warp scans instead of one lane's chain.
+//!
+//! # Transfers
+//!
+//! Descriptors (tiles, rules, scan requests) are staged in a pinned arena
+//! and copied without waiting, so the host waits only where it reads the
+//! device's results: partition counts and split winners (once per level,
+//! or per loss-guided expansion) and the root's totals. Large copies (bins,
+//! gradients, row lists) move through pooled 1 MiB pinned pieces, and each
+//! device keeps released page-locked blocks (up to 64 MiB) for the next
+//! training run.
+//!
 //! CUDA prediction is explicit through [`BoostedModel::to_cuda`](crate::model::BoostedModel::to_cuda).
 //! Tree traversal and ordered margin summation run on a dedicated tracked
 //! stream; objective transforms use the model's CPU implementation.
@@ -94,6 +110,7 @@
 //!   margins, labels and weights another 12 bytes per row. Resident growth
 //!   retains open-node histograms when they fit in half the free memory.
 
+mod abi;
 mod categorical;
 mod kernels;
 pub use categorical::ScanDiagnostics;
@@ -133,9 +150,12 @@ const PART_TILE: usize = 4096;
 /// Threads per partition block.
 const PART_THREADS: u32 = 512;
 /// Warps per split-scan block (`SCAN_WARPS` in `cuda-kernels/src/lib.rs`).
-const SCAN_WARPS: usize = 4;
-/// Rows per histogram tile of an exact node.
+const SCAN_WARPS: usize = 1;
+/// Most rows per histogram tile of an exact node.
 const HIST_TILE: usize = 4096;
+/// Fewest rows per exact tile: a small batch's tiles shrink to this so its
+/// blocks still cover the device.
+const MIN_HIST_TILE: usize = 512;
 /// Largest shared histogram per block; XGBoost's single-target limit.
 const MAX_SHARED_BYTES: usize = 96 << 10;
 /// Shared memory the driver reserves per resident block.
@@ -197,6 +217,7 @@ struct Kernels {
     route_scan: CudaFunction,
     route_copy: CudaFunction,
     finalize_exact: CudaFunction,
+    finalize_exact_sub: CudaFunction,
     reduce_chunks: CudaFunction,
     reduce_chains: CudaFunction,
     squared_error: CudaFunction,
@@ -224,6 +245,8 @@ struct Device {
     /// Set by the first CUDA error: the context is unusable afterwards, so
     /// every later build on this device runs on the CPU.
     failed: Arc<AtomicBool>,
+    /// Page-locked blocks the context's backends reuse.
+    pinned: Arc<PinnedPool>,
 }
 
 impl Device {
@@ -275,6 +298,7 @@ impl Device {
             route_scan: function("route_scan")?,
             route_copy: function("route_copy")?,
             finalize_exact: function("finalize_exact")?,
+            finalize_exact_sub: function("finalize_exact_sub")?,
             reduce_chunks: function("reduce_chunks")?,
             reduce_chains: function("reduce_chains")?,
             squared_error: function("squared_error")?,
@@ -340,6 +364,7 @@ impl Device {
             sm_count: u32::try_from(sm_count).unwrap_or(1).max(1),
             shared_bytes,
             failed: Arc::new(AtomicBool::new(false)),
+            pinned: Arc::default(),
         })
     }
 
@@ -352,6 +377,7 @@ impl Device {
             sm_count: self.sm_count,
             shared_bytes: self.shared_bytes,
             failed: self.failed.clone(),
+            pinned: self.pinned.clone(),
         }))
     }
 
@@ -554,6 +580,27 @@ enum RowSource<'a> {
     Upload(&'a [u32]),
 }
 
+/// A resident build's destinations: node `k`'s histogram goes to pool slot
+/// `targets[k]`, and each `(parent, built)` sibling becomes `parent - built`
+/// in the parent's slot.
+#[derive(Clone, Copy)]
+struct Resident<'a> {
+    targets: &'a [HistSlot],
+    siblings: &'a [(HistSlot, HistSlot)],
+}
+
+/// Whether no pool slot is written twice by one resident build: the
+/// targets are distinct, and so are the parents, none of them a target.
+fn distinct_writes(nodes: &[(Segment, HistSlot)], siblings: &[(HistSlot, HistSlot)]) -> bool {
+    let mut written: Vec<HistSlot> = nodes
+        .iter()
+        .map(|&(_, slot)| slot)
+        .chain(siblings.iter().map(|&(parent, _)| parent))
+        .collect();
+    written.sort_unstable();
+    written.windows(2).all(|pair| pair[0] != pair[1])
+}
+
 /// Host partition descriptors retain capacity across levels and trees.
 #[derive(Default)]
 struct PartitionHost {
@@ -611,15 +658,11 @@ struct State {
     wave_slots: usize,
     /// The batch's histograms, two `f64`s per bin per node.
     out: CudaSlice<f64>,
-    /// Descriptor uploads.
-    tiles: CudaSlice<u64>,
-    nodes: CudaSlice<u32>,
+    /// One operation's descriptors (tiles, rules, scan requests, ...),
+    /// uploaded together by [`Staging::upload_parts`].
+    desc: CudaSlice<u8>,
+    /// The root's per-chunk totals.
     totals: CudaSlice<i64>,
-    segs: CudaSlice<u64>,
-    rules: CudaSlice<u32>,
-    table: CudaSlice<u8>,
-    ptiles: CudaSlice<u64>,
-    split_tiles: CudaSlice<u32>,
     tile_left: CudaSlice<u32>,
     left_len: CudaSlice<u32>,
     /// The gradient statistics the device folds.
@@ -627,18 +670,15 @@ struct State {
     /// Per-block `f64` totals of a root whose blocks are not exact.
     chains: CudaSlice<f64>,
     /// Device-side rounds: the training margins, labels and weights (the
-    /// latter two keyed by the host slices they were copied from), and
-    /// per-leaf values.
+    /// latter two keyed by the host slices they were copied from).
     margins: Option<CudaSlice<f32>>,
     labels: Option<(usize, CudaSlice<f32>)>,
     weights: Option<(usize, CudaSlice<f32>)>,
-    values: CudaSlice<f32>,
     staged: Staged,
-    /// Page-locked staging: gradients up, histograms and rows down.
-    pin_grad: Option<Pinned<f32>>,
-    pin_out: Option<Pinned<f64>>,
-    pin_rows: Option<Pinned<u32>>,
-    pin_row_upload: Option<Pinned<u32>>,
+    /// Page-locked staging: small uploads queued without waiting, and the
+    /// bounded pieces of large copies both ways.
+    staging: Staging,
+    ring: Ring,
     /// Resident growth: the histogram slots (two `f64`s per bin per slot)
     /// and how many it holds.
     pool: CudaSlice<f64>,
@@ -647,16 +687,88 @@ struct State {
     scan: categorical::ScanState,
 }
 
+/// Plain numeric values: every bit pattern is a valid value, so page-locked
+/// bytes reused from an earlier owner are initialized values of any of them.
+trait Plain: Copy + DeviceRepr + ValidAsZeroBits {}
+impl Plain for u8 {}
+impl Plain for u16 {}
+impl Plain for u32 {}
+impl Plain for u64 {}
+impl Plain for i64 {}
+impl Plain for f32 {}
+impl Plain for f64 {}
+
+/// Most bytes of released page-locked blocks a device keeps for reuse.
+const POOL_BYTES: usize = 64 << 20;
+/// Readback buffers start at this size, so their growth through a tree's
+/// first levels (partition counts, scan winners) stays rare.
+const MIN_PINNED_BYTES: usize = 64 << 10;
+/// Bytes the descriptor arena of a backend starts with.
+const STAGING_BYTES: usize = 256 << 10;
+/// Bytes per piece of a large transfer, and the pieces in flight: small
+/// enough that the host's copy of one piece overlaps the DMA of the last.
+const PIECE_BYTES: usize = 1 << 20;
+const PIECES: usize = 4;
+
+/// Page-locked blocks of one context, released by finished owners and
+/// reused by later ones: every training run builds a backend, and
+/// `cuMemHostAlloc` / `cuMemFreeHost` take up to milliseconds a call.
+#[derive(Default)]
+struct PinnedPool(Mutex<Vec<Block>>);
+
+/// One page-locked allocation.
+struct Block {
+    ptr: std::ptr::NonNull<u8>,
+    bytes: usize,
+    write_combined: bool,
+}
+
+// SAFETY: plain host memory with a single owner (a `Pinned` or the pool).
+unsafe impl Send for Block {}
+
+impl PinnedPool {
+    /// The smallest kept block of at least `bytes` in mode `write_combined`.
+    fn take(&self, bytes: usize, write_combined: bool) -> Option<Block> {
+        let mut blocks = self.0.lock();
+        let at = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.write_combined == write_combined && b.bytes >= bytes)
+            .min_by_key(|(_, b)| b.bytes)
+            .map(|(at, _)| at)?;
+        Some(blocks.swap_remove(at))
+    }
+
+    /// Keep `block`, which no copy accesses any more, unless the pool would
+    /// exceed [`POOL_BYTES`]; then free it.
+    fn give(&self, block: Block) {
+        let mut blocks = self.0.lock();
+        let held: usize = blocks.iter().map(|b| b.bytes).sum();
+        if held + block.bytes <= POOL_BYTES {
+            blocks.push(block);
+            return;
+        }
+        drop(blocks);
+        // SAFETY: allocated by `malloc_host`; its last owner released it
+        // after all DMA completed.
+        let _ = unsafe { cudarc::driver::result::free_host(block.ptr.as_ptr().cast()) };
+    }
+}
+
 /// Page-locked host memory: copies from and to it run at full PCIe speed
 /// and asynchronously (pageable copies go through a driver bounce buffer,
 /// at a fraction of the bandwidth).
 struct Pinned<T> {
     ptr: std::ptr::NonNull<T>,
     len: usize,
+    /// The allocation's size (at least `len` elements).
+    bytes: usize,
     stream: Arc<CudaStream>,
     completion: CudaEvent,
     pending: bool,
     write_combined: bool,
+    /// Where the block returns on drop; `None` frees it.
+    pool: Option<Arc<PinnedPool>>,
 }
 
 // SAFETY: plain host memory owned by this value, accessed through `&self`
@@ -665,46 +777,78 @@ unsafe impl<T: Send> Send for Pinned<T> {}
 // SAFETY: as above.
 unsafe impl<T: Sync> Sync for Pinned<T> {}
 
-impl<T: Copy + ValidAsZeroBits> Pinned<T> {
-    /// `len` zeroed elements. Write-combined memory is for uploads only;
-    /// readbacks use cacheable memory.
+impl<T: Plain> Pinned<T> {
+    /// At least `len` elements, freed on drop. Write-combined memory is for
+    /// uploads only; readbacks use cacheable memory.
     fn new(
         stream: &Arc<CudaStream>,
         len: usize,
         write_combined: bool,
     ) -> std::result::Result<Self, DriverError> {
+        Self::alloc(stream, len, write_combined, None)
+    }
+
+    /// At least `len` elements taken from `pool` (or allocated), returned
+    /// to it on drop.
+    fn pooled(
+        pool: &Arc<PinnedPool>,
+        stream: &Arc<CudaStream>,
+        len: usize,
+        write_combined: bool,
+    ) -> std::result::Result<Self, DriverError> {
+        Self::alloc(stream, len, write_combined, Some(pool))
+    }
+
+    fn alloc(
+        stream: &Arc<CudaStream>,
+        len: usize,
+        write_combined: bool,
+        pool: Option<&Arc<PinnedPool>>,
+    ) -> std::result::Result<Self, DriverError> {
         let ctx = stream.context();
         ctx.bind_to_thread()?;
         let completion = ctx.new_event(None)?;
-        let len = len.max(1);
         let bytes = len
+            .max(1)
             .checked_mul(std::mem::size_of::<T>())
             .filter(|&bytes| isize::try_from(bytes).is_ok())
             .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
-        let flags = if write_combined {
-            sys::CU_MEMHOSTALLOC_WRITECOMBINED
+        let block = if let Some(block) = pool.and_then(|pool| pool.take(bytes, write_combined)) {
+            block
         } else {
-            0
+            let flags = if write_combined {
+                sys::CU_MEMHOSTALLOC_WRITECOMBINED
+            } else {
+                0
+            };
+            // SAFETY: allocates `bytes` bytes of page-locked host memory,
+            // owned by the returned value.
+            let raw = unsafe { cudarc::driver::result::malloc_host(bytes, flags) }?;
+            let ptr = std::ptr::NonNull::new(raw.cast::<u8>())
+                .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+            // SAFETY: the allocation holds `bytes` writable bytes; zeroing
+            // initializes them.
+            unsafe { ptr.as_ptr().write_bytes(0, bytes) };
+            Block {
+                ptr,
+                bytes,
+                write_combined,
+            }
         };
-        // SAFETY: allocates `bytes` bytes of page-locked host memory, owned
-        // by the returned value and freed on drop.
-        let raw = unsafe { cudarc::driver::result::malloc_host(bytes, flags) }?;
-        let ptr = std::ptr::NonNull::new(raw.cast::<T>())
-            .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
-        // SAFETY: the allocation holds `bytes` writable bytes, suitably
-        // aligned for `T` (page-aligned).
-        unsafe { ptr.as_ptr().cast::<u8>().write_bytes(0, bytes) };
+        // Page-aligned, so suitably aligned for any `T`.
         Ok(Pinned {
-            ptr,
-            len,
+            ptr: block.ptr.cast(),
+            len: block.bytes / std::mem::size_of::<T>(),
+            bytes: block.bytes,
             stream: stream.clone(),
             completion,
             pending: false,
             write_combined,
+            pool: pool.cloned(),
         })
     }
 
-    /// Wait only for this buffer's last upload before host reuse.
+    /// Wait only for this buffer's last copy before host reuse.
     fn wait(&mut self) -> std::result::Result<(), DriverError> {
         if self.pending {
             self.completion.synchronize()?;
@@ -714,7 +858,8 @@ impl<T: Copy + ValidAsZeroBits> Pinned<T> {
     }
 
     fn as_slice(&self) -> &[T] {
-        // SAFETY: `len` initialized elements owned by `self`.
+        // SAFETY: `len` initialized elements (zeroed or written as `Plain`
+        // values) owned by `self`.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
@@ -727,17 +872,29 @@ impl<T: Copy + ValidAsZeroBits> Pinned<T> {
 impl<T> Drop for Pinned<T> {
     fn drop(&mut self) {
         // Drain even on an error exit before an upload's event was recorded.
-        // If CUDA cannot establish completion, leak rather than free memory
-        // that the DMA engine may still access.
-        if self.stream.synchronize().is_ok() {
-            // SAFETY: allocated by `malloc_host`, freed once after all DMA.
-            let _ = unsafe { cudarc::driver::result::free_host(self.ptr.as_ptr().cast()) };
+        // If CUDA cannot establish completion, leak rather than free or
+        // reuse memory that the DMA engine may still access.
+        if self.stream.synchronize().is_err() {
+            return;
+        }
+        let block = Block {
+            ptr: self.ptr.cast(),
+            bytes: self.bytes,
+            write_combined: self.write_combined,
+        };
+        match &self.pool {
+            Some(pool) => pool.give(block),
+            None => {
+                // SAFETY: allocated by `malloc_host`, freed once after all DMA.
+                let _ = unsafe { cudarc::driver::result::free_host(block.ptr.as_ptr().cast()) };
+            }
         }
     }
 }
 
-/// A pinned buffer of at least `len` elements in `slot`.
-fn pinned<'a, T: Copy + ValidAsZeroBits>(
+/// A pooled pinned buffer of at least `len` elements in `slot`.
+fn pinned<'a, T: Plain>(
+    pool: &Arc<PinnedPool>,
     stream: &Arc<CudaStream>,
     slot: &'a mut Option<Pinned<T>>,
     len: usize,
@@ -748,30 +905,280 @@ fn pinned<'a, T: Copy + ValidAsZeroBits>(
         .is_none_or(|p| p.len < len || p.write_combined != write_combined)
     {
         *slot = None;
-        *slot = Some(Pinned::new(
-            stream,
-            len.checked_next_power_of_two()
-                .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?,
-            write_combined,
-        )?);
+        let len = len
+            .max(MIN_PINNED_BYTES / std::mem::size_of::<T>())
+            .checked_next_power_of_two()
+            .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+        *slot = Some(Pinned::pooled(pool, stream, len, write_combined)?);
     }
-    Ok(slot.as_mut().expect("just allocated"))
+    slot.as_mut()
+        .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))
+}
+
+/// `values` as their bytes.
+fn bytes_of<T: Plain>(values: &[T]) -> &[u8] {
+    // SAFETY: `Plain` values have no padding or invalid bit patterns.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+/// `values` as their bytes, writable: any bytes are valid `Plain` values.
+fn bytes_of_mut<T: Plain>(values: &mut [T]) -> &mut [u8] {
+    let len = std::mem::size_of_val(values);
+    // SAFETY: as for `bytes_of`; every bit pattern is a valid value.
+    unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), len) }
+}
+
+/// Small uploads (descriptors, leaf values, gradient-domain seeds) staged in
+/// one write-combined pinned arena and copied without waiting. A pageable
+/// copy synchronizes the stream (cudarc cannot track its source), and a
+/// node issued about a dozen of them, each stalling the host behind every
+/// queued kernel. A queued copy's bytes are not rewritten until the stream
+/// has synchronized after it: at the next readback ([`Self::synced`]), or
+/// here when the arena is full.
+#[derive(Default)]
+struct Staging {
+    arena: Option<Pinned<u8>>,
+    used: usize,
+}
+
+impl Staging {
+    /// `bytes` writable arena bytes (16-byte aligned) for a queued copy,
+    /// waiting for the stream first when the arena is full.
+    fn reserve(
+        &mut self,
+        pool: &Arc<PinnedPool>,
+        stream: &Arc<CudaStream>,
+        bytes: usize,
+    ) -> std::result::Result<&mut [u8], DriverError> {
+        let capacity = self.arena.as_ref().map_or(0, |arena| arena.len);
+        let mut start = self.used.next_multiple_of(16);
+        if start + bytes > capacity {
+            // Every queued copy from the arena completes before any of it
+            // is rewritten.
+            stream.synchronize()?;
+            start = 0;
+            if bytes > capacity {
+                self.arena = None;
+                let size = bytes
+                    .max(STAGING_BYTES)
+                    .checked_next_power_of_two()
+                    .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+                self.arena = Some(Pinned::pooled(pool, stream, size, true)?);
+            }
+        }
+        self.used = start + bytes;
+        let arena = self
+            .arena
+            .as_mut()
+            .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+        Ok(&mut arena.as_mut_slice()[start..start + bytes])
+    }
+
+    /// Copy `data` to the front of `buf`, growing it as needed.
+    fn upload<T: Plain>(
+        &mut self,
+        pool: &Arc<PinnedPool>,
+        stream: &Arc<CudaStream>,
+        buf: &mut CudaSlice<T>,
+        data: &[T],
+    ) -> std::result::Result<(), DriverError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        fit(stream, buf, data.len())?;
+        let src = bytes_of(data);
+        let host = self.reserve(pool, stream, src.len())?;
+        host.copy_from_slice(src);
+        // Other host work can change the thread's current CUDA context.
+        stream.context().bind_to_thread()?;
+        let (dst, _record) = buf.device_ptr_mut(stream);
+        // SAFETY: the pinned source is not rewritten before the stream has
+        // synchronized after this copy (see the type docs), and `buf` holds
+        // at least `data.len()` elements.
+        unsafe { cudarc::driver::result::memcpy_htod_async(dst, &*host, stream.cu_stream()) }?;
+        Ok(())
+    }
+
+    /// Copy `parts` to consecutive 16-byte-aligned ranges at the front of
+    /// `buf` (growing it as needed) with one queued copy: each part's
+    /// device address. The descriptors of one operation travel together.
+    fn upload_parts<const N: usize>(
+        &mut self,
+        pool: &Arc<PinnedPool>,
+        stream: &Arc<CudaStream>,
+        buf: &mut CudaSlice<u8>,
+        parts: [&[u8]; N],
+    ) -> std::result::Result<[sys::CUdeviceptr; N], DriverError> {
+        let mut offsets = [0usize; N];
+        let mut total = 0usize;
+        for (offset, part) in offsets.iter_mut().zip(&parts) {
+            *offset = total;
+            total = (total + part.len()).next_multiple_of(16);
+        }
+        fit(stream, buf, total.max(16))?;
+        let host = self.reserve(pool, stream, total)?;
+        for (&offset, part) in offsets.iter().zip(&parts) {
+            host[offset..offset + part.len()].copy_from_slice(part);
+        }
+        stream.context().bind_to_thread()?;
+        let (dst, _record) = buf.device_ptr_mut(stream);
+        if total > 0 {
+            // SAFETY: as for `upload`; `buf` holds at least `total` bytes.
+            unsafe { cudarc::driver::result::memcpy_htod_async(dst, &*host, stream.cu_stream()) }?;
+        }
+        Ok(offsets.map(|offset| dst + offset as u64))
+    }
+
+    /// The stream has synchronized: no queued copy reads the arena.
+    fn synced(&mut self) {
+        self.used = 0;
+    }
+}
+
+/// Bounded pinned staging for large copies (bins, gradients, row lists,
+/// histograms, leaf rows): [`PIECES`] pooled buffers of [`PIECE_BYTES`] per
+/// direction, each rewritten only after its previous piece's copy has
+/// completed. The host fills or drains one piece while DMA moves another,
+/// and no transfer page-locks memory of its own size.
+#[derive(Default)]
+struct Ring {
+    up: Vec<Pinned<u8>>,
+    down: Vec<Pinned<u8>>,
+}
+
+impl Ring {
+    /// Piece buffer `k` of `pieces`, allocated on first use.
+    fn piece<'a>(
+        pieces: &'a mut Vec<Pinned<u8>>,
+        k: usize,
+        pool: &Arc<PinnedPool>,
+        stream: &Arc<CudaStream>,
+        write_combined: bool,
+    ) -> std::result::Result<&'a mut Pinned<u8>, DriverError> {
+        while pieces.len() <= k {
+            pieces.push(Pinned::pooled(pool, stream, PIECE_BYTES, write_combined)?);
+        }
+        Ok(&mut pieces[k])
+    }
+
+    /// Copy `src` into `dst`'s front; returns once the last piece is
+    /// queued (its buffer's reuse waits for it).
+    fn upload<T: Plain>(
+        &mut self,
+        pool: &Arc<PinnedPool>,
+        stream: &Arc<CudaStream>,
+        src: &[T],
+        dst: &mut CudaSlice<T>,
+    ) -> std::result::Result<(), DriverError> {
+        if src.len() > dst.len() {
+            return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));
+        }
+        stream.context().bind_to_thread()?;
+        let (base, _record) = dst.device_ptr_mut(stream);
+        let copied = (|| {
+            for (k, chunk) in bytes_of(src).chunks(PIECE_BYTES).enumerate() {
+                let piece = Self::piece(&mut self.up, k % PIECES, pool, stream, true)?;
+                piece.wait()?;
+                // This also runs under the backend mutex: no Rayon here,
+                // which could steal another build that blocks on it.
+                let host = &mut piece.as_mut_slice()[..chunk.len()];
+                host.copy_from_slice(chunk);
+                stream.context().bind_to_thread()?;
+                let offset = (k * PIECE_BYTES) as u64;
+                // SAFETY: the piece stays untouched until its completion
+                // event (recorded next) passes; the destination range lies
+                // within `dst`.
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_async(
+                        base + offset,
+                        &*host,
+                        stream.cu_stream(),
+                    )
+                }?;
+                piece.completion.record(stream)?;
+                piece.pending = true;
+            }
+            Ok(())
+        })();
+        if copied.is_err() {
+            // Earlier pieces may still be in flight.
+            let _ = stream.synchronize();
+        }
+        copied
+    }
+
+    /// Copy `out.len()` elements from `src`'s front into `out`, waiting for
+    /// them.
+    fn download<T: Plain>(
+        &mut self,
+        pool: &Arc<PinnedPool>,
+        stream: &Arc<CudaStream>,
+        src: &CudaSlice<T>,
+        out: &mut [T],
+    ) -> std::result::Result<(), DriverError> {
+        if out.len() > src.len() {
+            return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));
+        }
+        let out = bytes_of_mut(out);
+        let total = out.len();
+        let n = total.div_ceil(PIECE_BYTES);
+        let span = |k: usize| k * PIECE_BYTES..((k + 1) * PIECE_BYTES).min(total);
+        stream.context().bind_to_thread()?;
+        let (base, _record) = src.device_ptr(stream);
+        let copied = (|| {
+            for k in 0..n + PIECES {
+                // Drain piece `k - PIECES` before its buffer takes piece `k`.
+                if let Some(done) = k.checked_sub(PIECES).filter(|&done| done < n) {
+                    let piece = &mut self.down[done % PIECES];
+                    piece.wait()?;
+                    let range = span(done);
+                    let len = range.len();
+                    out[range].copy_from_slice(&piece.as_slice()[..len]);
+                }
+                if k < n {
+                    let range = span(k);
+                    let piece = Self::piece(&mut self.down, k % PIECES, pool, stream, false)?;
+                    stream.context().bind_to_thread()?;
+                    let host = &mut piece.as_mut_slice()[..range.len()];
+                    // SAFETY: the piece is read only after its completion
+                    // event (recorded next) passes; the source range lies
+                    // within `src`.
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtoh_async(
+                            host,
+                            base + range.start as u64,
+                            stream.cu_stream(),
+                        )
+                    }?;
+                    piece.completion.record(stream)?;
+                    piece.pending = true;
+                }
+            }
+            Ok(())
+        })();
+        if copied.is_err() {
+            let _ = stream.synchronize();
+        }
+        copied
+    }
 }
 
 /// Copy `src` into `dst`'s front through the pinned buffer `staging`, in
 /// pieces: the host fills piece `k + 1` while DMA moves piece `k`. Record
 /// completion on the owner before returning; host reuse waits on that event.
-fn upload_pinned<T: Copy + Send + Sync + DeviceRepr + ValidAsZeroBits>(
+fn upload_pinned<T: Plain>(
     stream: &Arc<CudaStream>,
     staging: &mut Pinned<T>,
     src: &[T],
     dst: &mut CudaSlice<T>,
 ) -> std::result::Result<(), DriverError> {
-    /// Bytes per DMA piece.
-    const PIECE_BYTES: usize = 8 << 20;
     stream.context().bind_to_thread()?;
     staging.wait()?;
-    assert!(src.len() <= staging.len && src.len() <= dst.len());
+    if src.len() > staging.len || src.len() > dst.len() {
+        return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));
+    }
     let piece = (PIECE_BYTES / std::mem::size_of::<T>()).max(1);
     let (base, _record) = dst.device_ptr_mut(stream);
     let copied = (|| {
@@ -801,7 +1208,7 @@ fn upload_pinned<T: Copy + Send + Sync + DeviceRepr + ValidAsZeroBits>(
 }
 
 /// Copy `len` elements from `src`'s front into `staging` and wait for them.
-fn download_pinned<'a, T: Copy + DeviceRepr + ValidAsZeroBits>(
+fn download_pinned<'a, T: Plain>(
     stream: &Arc<CudaStream>,
     staging: &'a mut Pinned<T>,
     src: &CudaSlice<T>,
@@ -809,7 +1216,9 @@ fn download_pinned<'a, T: Copy + DeviceRepr + ValidAsZeroBits>(
 ) -> std::result::Result<&'a [T], DriverError> {
     stream.context().bind_to_thread()?;
     staging.wait()?;
-    assert!(len <= staging.len && len <= src.len());
+    if len > staging.len || len > src.len() {
+        return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));
+    }
     if len > 0 {
         let (ptr, _record) = src.device_ptr(stream);
         let host = &mut staging.as_mut_slice()[..len];
@@ -858,6 +1267,10 @@ impl std::fmt::Debug for CudaHistBackend {
     }
 }
 
+/// Device buffers grown by [`fit`] start at this many elements, so the
+/// descriptor buffers' growth through a run's first levels stays rare.
+const MIN_DEVICE_LEN: usize = 1 << 10;
+
 /// A device buffer of at least `len` elements: `buf` itself, or a fresh
 /// (zeroed) one replacing it, sized up to a power of two so repeated growth
 /// stays rare.
@@ -868,24 +1281,12 @@ fn fit<T: DeviceRepr + ValidAsZeroBits>(
 ) -> std::result::Result<(), DriverError> {
     if buf.len() < len {
         let capacity = len
+            .max(MIN_DEVICE_LEN)
             .checked_next_power_of_two()
             .ok_or(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
         *buf = stream.alloc_zeros(sized::<T>(capacity)?)?;
     }
     Ok(())
-}
-
-/// Copy `data` to the front of `buf`, growing it as needed.
-fn upload<T: DeviceRepr + ValidAsZeroBits>(
-    stream: &Arc<CudaStream>,
-    buf: &mut CudaSlice<T>,
-    data: &[T],
-) -> std::result::Result<(), DriverError> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    fit(stream, buf, data.len())?;
-    copy_host(stream, data, &mut buf.slice_mut(..data.len()))
 }
 
 /// Pageable source slices are not event-tracked by cudarc. Complete their
@@ -965,21 +1366,23 @@ fn sized<T>(len: usize) -> std::result::Result<usize, DriverError> {
 
 /// Upload the CPU-authoritative global bins without a second host bin vector.
 fn global_bins(
-    stream: &Arc<CudaStream>,
+    device: &Device,
+    ring: &mut Ring,
     index: &GHistIndex,
 ) -> std::result::Result<DeviceBins, DriverError> {
-    fn copy<T: Copy + Send + Sync + DeviceRepr + ValidAsZeroBits>(
-        stream: &Arc<CudaStream>,
+    fn copy<T: Plain>(
+        device: &Device,
+        ring: &mut Ring,
         src: &[T],
     ) -> std::result::Result<CudaSlice<T>, DriverError> {
+        let stream = &device.stream;
         let mut dst = stream.alloc_zeros(sized::<T>(src.len().max(1))?)?;
-        let mut staging = Pinned::new(stream, src.len(), true)?;
-        upload_pinned(stream, &mut staging, src, &mut dst)?;
+        ring.upload(&device.pinned, stream, src, &mut dst)?;
         Ok(dst)
     }
     match index.bins() {
-        Bins::U16(src) => copy(stream, src).map(DeviceBins::U16),
-        Bins::U32(src) => copy(stream, src).map(DeviceBins::U32),
+        Bins::U16(src) => copy(device, ring, src).map(DeviceBins::U16),
+        Bins::U32(src) => copy(device, ring, src).map(DeviceBins::U32),
     }
 }
 
@@ -1051,17 +1454,23 @@ impl CudaHistBackend {
         cuts: HistCuts,
         ordinal: usize,
     ) -> Result<(GHistIndex, Self)> {
+        if cuts.n_features() != data.n_cols() {
+            return Err(HessboostError::dimension_mismatch(
+                "cut features",
+                data.n_cols(),
+                cuts.n_features(),
+            ));
+        }
         if data.n_rows() == 0
             || data.n_cols() == 0
             || cuts.total_bins() == 0
-            || cuts.n_features() != data.n_cols()
             || u32::try_from(data.n_rows()).is_err()
             || u32::try_from(data.n_cols()).is_err()
             || u32::try_from(cuts.total_bins()).is_err()
         {
             return Err(HessboostError::invalid_data(
                 "data",
-                "CUDA binning needs a non-empty dataset with matching cuts and 32-bit row, feature and bin counts",
+                "CUDA binning needs a non-empty dataset and 32-bit row, feature and bin counts",
             ));
         }
         let Some(values) = data.dense_values() else {
@@ -1074,11 +1483,12 @@ impl CudaHistBackend {
             .for_backend()
             .map_err(gpu_error)?;
         let stream = &device.stream;
+        let pool = &device.pinned;
+        let mut ring = Ring::default();
         let binned = (|| {
             let count = sized::<u32>(values.len())?;
             let mut raw = stream.alloc_zeros::<f32>(count)?;
-            let mut staging = Pinned::new(stream, count, true)?;
-            upload_pinned(stream, &mut staging, values, &mut raw)?;
+            ring.upload(pool, stream, values, &mut raw)?;
             let first: Vec<u32> = (0..=data.n_cols())
                 .map(|f| {
                     if f == data.n_cols() {
@@ -1096,13 +1506,15 @@ impl CudaHistBackend {
             let categories = clone_host(stream, &categories)?;
             let cut_values = clone_host(stream, &cut_values)?;
             let mut global = stream.alloc_zeros::<u32>(count)?;
-            let (cells, n_cols, missing) = (count as u64, data.n_cols() as u32, data.missing());
+            let matrix = abi::DenseCells {
+                cells: count as u64,
+                n_cols: data.n_cols() as u32,
+                missing: data.missing(),
+            };
             let mut launch = stream.launch_builder(&device.kernels.bin_dense);
             launch
                 .arg(&raw)
-                .arg(&cells)
-                .arg(&n_cols)
-                .arg(&missing)
+                .arg(&matrix)
                 .arg(&cut_values)
                 .arg(&first)
                 .arg(&categories)
@@ -1110,9 +1522,9 @@ impl CudaHistBackend {
             // SAFETY: validated dense cells and matching cuts, one global
             // output per cell; missing markers are excluded by the host index.
             unsafe { launch.launch(device.grid(count)) }?;
-            let mut staging = Pinned::new(stream, count, false)?;
-            let host = download_pinned(stream, &mut staging, &global, count)?;
-            let index = GHistIndex::from_dense_bins(data, cuts, host);
+            let mut host = vec![0u32; count];
+            ring.download(pool, stream, &global, &mut host)?;
+            let index = GHistIndex::from_dense_bins(data, cuts, &host);
             Ok((index, global))
         })();
         let (index, global) = binned
@@ -1200,9 +1612,10 @@ impl CudaHistBackend {
         let mut first: Vec<u32> = (0..n_cols).map(|f| cuts.feature_bins(f).0 as u32).collect();
         first.push(total_bins as u32);
         let feature_first = clone_host(stream, &first)?;
+        let mut ring = Ring::default();
         let global_bins = match retained {
             Some(bins) => bins,
-            None => global_bins(stream, index)?,
+            None => global_bins(device, &mut ring, index)?,
         };
         let (bins, cols, row_ptr, stride) = if dense {
             let (bins, cols, stride) = if widest <= u8::MAX as usize + 1 {
@@ -1260,10 +1673,8 @@ impl CudaHistBackend {
         let group_bins = shared.chunks(4).map(|g| g[3] as usize).max().unwrap_or(0);
         let alloc_u32 = |len: usize| stream.alloc_zeros::<u32>(len.max(1));
         let alloc_u64 = |len: usize| stream.alloc_zeros::<u64>(len.max(1));
-        let mut groups_shared = alloc_u32(shared.len())?;
-        upload(stream, &mut groups_shared, &shared)?;
-        let mut groups_global = alloc_u32(global.len())?;
-        upload(stream, &mut groups_global, &global)?;
+        let groups_shared = clone_host(stream, &shared)?;
+        let groups_global = clone_host(stream, &global)?;
         Ok(State {
             bins,
             cols,
@@ -1288,14 +1699,8 @@ impl CudaHistBackend {
             partials: alloc_u64(1)?,
             wave_slots: (PARTIAL_BYTES / (hist_words * 8)).max(1),
             out: stream.alloc_zeros(hist_words)?,
-            tiles: alloc_u64(1)?,
-            nodes: alloc_u32(1)?,
+            desc: stream.alloc_zeros(1)?,
             totals: stream.alloc_zeros(2)?,
-            segs: alloc_u64(1)?,
-            rules: alloc_u32(1)?,
-            table: stream.alloc_zeros(1)?,
-            ptiles: alloc_u64(1)?,
-            split_tiles: alloc_u32(1)?,
             tile_left: alloc_u32(1)?,
             left_len: alloc_u32(1)?,
             partition_host: PartitionHost::default(),
@@ -1305,17 +1710,14 @@ impl CudaHistBackend {
             margins: None,
             labels: None,
             weights: None,
-            values: stream.alloc_zeros(1)?,
             staged: Staged {
                 addr: 0,
                 len: 0,
                 grad: SumDomain::EMPTY,
                 hess: SumDomain::EMPTY,
             },
-            pin_grad: None,
-            pin_out: None,
-            pin_rows: None,
-            pin_row_upload: None,
+            staging: Staging::default(),
+            ring,
             pool: stream.alloc_zeros(2)?,
             pool_slots: 0,
             scan: categorical::ScanState::new(stream)?,
@@ -1343,6 +1745,48 @@ impl CudaHistBackend {
             .ok()
     }
 
+    /// One parallel pass over `rows` (before taking the state lock): every
+    /// row inside the index (the kernels do not bounds-check), and whether
+    /// the rows are one ascending run (then generated on the device instead
+    /// of uploaded).
+    fn check_rows(&self, rows: &[u32]) -> (bool, bool) {
+        let first = rows.first().map_or(0, |&r| r as usize);
+        rows.par_chunks(1 << 16)
+            .enumerate()
+            .map(|(c, chunk)| {
+                let base = first + (c << 16);
+                let inside = chunk.iter().all(|&r| (r as usize) < self.n_rows);
+                let run = chunk
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &r)| r as usize == base + i);
+                (inside, run)
+            })
+            .reduce(|| (true, true), |a, b| (a.0 && b.0, a.1 && b.1))
+    }
+
+    /// Put `rows` (all below `n_rows`) at the front of `dst`: generated on
+    /// the device when they are one ascending `run`, else uploaded.
+    fn place_rows(
+        &self,
+        ring: &mut Ring,
+        dst: &mut CudaSlice<u32>,
+        rows: &[u32],
+        run: bool,
+    ) -> std::result::Result<(), DriverError> {
+        let stream = &self.device.stream;
+        match rows.first() {
+            Some(&first) if run => {
+                let n = rows.len() as u64;
+                let mut launch = stream.launch_builder(&self.device.kernels.iota_rows);
+                launch.arg(dst).arg(&n).arg(&first);
+                // SAFETY: writes `rows.len() <= n_rows` entries.
+                unsafe { launch.launch(self.device.grid(rows.len())) }.map(|_| ())
+            }
+            _ => ring.upload(&self.device.pinned, stream, rows, dst),
+        }
+    }
+
     /// Stage `gpair` on the device with its exactness statistics. A slice
     /// of any length other than `n_rows` is not staged.
     fn stage(&self, state: &mut State, gpair: &[GradPair]) -> std::result::Result<(), DriverError> {
@@ -1361,8 +1805,9 @@ impl CudaHistBackend {
         let flat =
             unsafe { std::slice::from_raw_parts(gpair.as_ptr().cast::<f32>(), gpair.len() * 2) };
         let stream = &self.device.stream;
-        let staging = pinned(stream, &mut state.pin_grad, flat.len(), true)?;
-        upload_pinned(stream, staging, flat, &mut state.gpair)?;
+        state
+            .ring
+            .upload(&self.device.pinned, stream, flat, &mut state.gpair)?;
         self.stage_units(state, grad, hess)?;
         state.staged.addr = gpair.as_ptr().addr();
         Ok(())
@@ -1409,7 +1854,12 @@ impl CudaHistBackend {
     ) -> std::result::Result<(SumDomain, SumDomain), DriverError> {
         let device = &*self.device;
         let stream = &device.stream;
-        upload(stream, &mut state.domain, &[0, u32::MAX, 1, 0, u32::MAX, 1])?;
+        state.staging.upload(
+            &device.pinned,
+            stream,
+            &mut state.domain,
+            &[0, u32::MAX, 1, 0, u32::MAX, 1],
+        )?;
         let n = self.n_rows as u64;
         let mut launch = stream.launch_builder(&device.kernels.grad_domain);
         launch.arg(&state.gpair).arg(&n).arg(&mut state.domain);
@@ -1418,18 +1868,20 @@ impl CudaHistBackend {
         let mut host = [0u32; 6];
         stream.memcpy_dtoh(&state.domain.slice(..6), &mut host[..])?;
         stream.synchronize()?;
+        state.staging.synced();
         Ok((
             SumDomain::from_device(host[0], host[1], host[2] != 0),
             SumDomain::from_device(host[3], host[4], host[5] != 0),
         ))
     }
 
-    /// Launch the integer histogram kernels over `n_tiles` tiles (uploaded
-    /// to `state.tiles`) reading `source`.
+    /// Launch the integer histogram kernels over the `n_tiles` tiles at
+    /// device address `tiles`, reading `source`.
     fn launch_tiles(
         &self,
         state: &mut State,
         source: RowSource<'_>,
+        tiles: sys::CUdeviceptr,
         n_tiles: usize,
     ) -> std::result::Result<(), DriverError> {
         let device = &*self.device;
@@ -1450,7 +1902,6 @@ impl CudaHistBackend {
             upload,
             acc,
             partials,
-            tiles,
             ..
         } = state;
         let rows = match source {
@@ -1461,16 +1912,16 @@ impl CudaHistBackend {
         let total_bins = self.total_bins as u64;
         let w = bins.width();
         if let Some(row_ptr) = &*row_ptr {
+            let work = abi::SparseTiles { tiles, total_bins };
             let mut launch = stream.launch_builder(&device.kernels.hist_sparse[w]);
             bins.push(&mut launch);
             launch
                 .arg(row_ptr)
                 .arg(rows)
-                .arg(&*tiles)
                 .arg(&*units)
                 .arg(&mut *acc)
                 .arg(&mut *partials)
-                .arg(&total_bins);
+                .arg(&work);
             let blocks = u32::try_from(n_tiles)
                 .ok()
                 .filter(|&n| i32::try_from(n).is_ok())
@@ -1503,19 +1954,23 @@ impl CudaHistBackend {
             if n_groups == 0 {
                 continue;
             }
-            let groups_u32 = n_groups as u32;
+            let work = abi::TileWork {
+                tiles,
+                groups: abi::ptr(groups, stream),
+                total_bins,
+                stride,
+                sentinel: *sentinel,
+                n_groups: n_groups as u32,
+            };
             let mut launch = stream.launch_builder(kernel);
             bins.push(&mut launch);
-            launch.arg(&stride).arg(&*sentinel).arg(&*feature_first);
             launch
+                .arg(&*feature_first)
                 .arg(rows)
-                .arg(&*tiles)
-                .arg(groups)
                 .arg(&*units)
                 .arg(&mut *acc)
                 .arg(&mut *partials)
-                .arg(&total_bins)
-                .arg(&groups_u32);
+                .arg(&work);
             let blocks = n_tiles
                 .checked_mul(n_groups)
                 .and_then(|n| u32::try_from(n).ok())
@@ -1564,10 +2019,10 @@ impl CudaHistBackend {
 
     /// The histograms of `nodes` (`(rows of source, contiguous)`), reading
     /// rows from `source` (an upload's host copy feeds CPU-built nodes).
-    /// With `targets`, node
-    /// `k`'s histogram is written to slot `targets[k]` of `state.out`
-    /// (which the caller has made the resident pool) and nothing is read
-    /// back (`Some` of an empty list).
+    /// With `resident`, node `k`'s histogram is written to slot
+    /// `targets[k]` of `state.out` (which the caller has made the resident
+    /// pool), each sibling is subtracted in its parent's slot, and nothing
+    /// is read back (`Some` of an empty list).
     fn histograms_on(
         &self,
         state: &mut State,
@@ -1575,17 +2030,21 @@ impl CudaHistBackend {
         ghist: &GHistIndex,
         gpair: Option<&[GradPair]>,
         nodes: &[Segment],
-        targets: Option<&[HistSlot]>,
+        resident: Option<Resident<'_>>,
     ) -> std::result::Result<Option<Vec<Histogram>>, DriverError> {
         let bins = self.total_bins;
         let device = &*self.device;
         let stream = &device.stream;
+        let pool = &device.pinned;
+        let targets = resident.map(|r| r.targets);
         let mut results: Vec<Option<Histogram>> = (0..nodes.len()).map(|_| None).collect();
         let mut exact = Vec::new();
         let mut chunked = Vec::new();
         let mut chains = Vec::new();
         let mut cpu = Vec::new();
         let mut slots = Vec::new();
+        // Built slots whose sibling the exact finalization subtracted.
+        let mut subtracted = Vec::new();
         // Output slot of node `k`, the next free one without `targets`.
         let slot_of = |k: usize, next: usize| targets.map_or(next, |t| t[k] as usize);
         // Rows per tile must keep `rows * features` of a group in a `u32`.
@@ -1648,7 +2107,20 @@ impl CudaHistBackend {
         for batch in exact.chunks(MAX_GRID_Y) {
             fit(stream, &mut state.acc, batch.len() * bins * 2)?;
             stream.memset_zeros(&mut state.acc.slice_mut(..batch.len() * bins * 2))?;
-            let tile_rows = HIST_TILE.min(max_tile);
+            // Rows per tile: a small batch takes smaller tiles, so its (tile,
+            // feature group) blocks still cover the SMs; integer sums do not
+            // depend on the tiling.
+            let rows: usize = batch.iter().map(|&(_, seg, _)| seg.len).sum();
+            let groups = if state.row_ptr.is_some() {
+                1
+            } else {
+                (state.n_shared + state.n_global).max(1)
+            };
+            let tiles_wanted = (device.sm_count as usize * 4).div_ceil(groups);
+            let tile_rows = rows
+                .div_ceil(tiles_wanted)
+                .clamp(MIN_HIST_TILE, HIST_TILE)
+                .min(max_tile);
             let mut tiles = Vec::new();
             for (j, &(_, seg, _)) in batch.iter().enumerate() {
                 for start in (0..seg.len).step_by(tile_rows) {
@@ -1656,25 +2128,48 @@ impl CudaHistBackend {
                     tiles.extend([(seg.offset + start) as u64, count as u64 | (j as u64) << 32]);
                 }
             }
-            upload(stream, &mut state.tiles, &tiles)?;
-            self.launch_tiles(state, source, tiles.len() / 2)?;
-            let pairs: Vec<u32> = batch
-                .iter()
-                .enumerate()
-                .flat_map(|(j, &(_, _, slot))| [j as u32, slot as u32])
-                .collect();
-            upload(stream, &mut state.nodes, &pairs)?;
             let total_bins = bins as u64;
-            let mut launch = stream.launch_builder(&device.kernels.finalize_exact);
+            // Each node's accumulator and output slot (the resident form adds
+            // the parent slot whose sibling the finalization subtracts: the
+            // same `f64` subtraction as `subtract_hists`, fused per bin).
+            let mut work = Vec::with_capacity(batch.len() * 3);
+            for (j, &(_, _, slot)) in batch.iter().enumerate() {
+                work.extend([j as u32, slot as u32]);
+                if let Some(resident) = resident {
+                    let parent = resident
+                        .siblings
+                        .iter()
+                        .find(|&&(_, built)| built as usize == slot)
+                        .map(|&(parent, built)| {
+                            subtracted.push(built);
+                            parent
+                        });
+                    work.push(parent.unwrap_or(u32::MAX));
+                }
+            }
+            let [d_tiles, d_work] = state.staging.upload_parts(
+                pool,
+                stream,
+                &mut state.desc,
+                [bytes_of(&tiles), bytes_of(&work)],
+            )?;
+            self.launch_tiles(state, source, d_tiles, tiles.len() / 2)?;
+            let finalize = if resident.is_some() {
+                &device.kernels.finalize_exact_sub
+            } else {
+                &device.kernels.finalize_exact
+            };
+            let mut launch = stream.launch_builder(finalize);
             launch
                 .arg(&state.acc)
-                .arg(&state.nodes)
+                .arg(&d_work)
                 .arg(&total_bins)
                 .arg(&grad_value)
                 .arg(&hess_value)
                 .arg(&mut state.out);
             // SAFETY: reads `batch.len()` accumulators and writes their
-            // output slots, both within the sized buffers.
+            // output slots (and distinct parent slots, validated by
+            // `build_resident`), all within the sized buffers.
             unsafe { launch.launch(Device::per_node_bins(bins, batch.len())) }?;
         }
 
@@ -1704,8 +2199,6 @@ impl CudaHistBackend {
             if state.row_ptr.is_some() {
                 stream.memset_zeros(&mut state.partials.slice_mut(..wave.len() * bins * 2))?;
             }
-            upload(stream, &mut state.tiles, &tiles)?;
-            self.launch_tiles(state, source, wave.len())?;
             // Consecutive chunks of one node reduce together.
             let mut ranges: Vec<u32> = Vec::new();
             let mut s = 0;
@@ -1718,12 +2211,19 @@ impl CudaHistBackend {
                 ranges.extend([s as u32, (e - s) as u32, slot as u32, u32::from(c == 0)]);
                 s = e;
             }
-            upload(stream, &mut state.nodes, &ranges)?;
+            let [d_tiles, d_ranges] = state.staging.upload_parts(
+                pool,
+                stream,
+                &mut state.desc,
+                [bytes_of(&tiles), bytes_of(&ranges)],
+            )?;
+            self.launch_tiles(state, source, d_tiles, wave.len())?;
             let total_bins = bins as u64;
             for batch in 0..(ranges.len() / 4).div_ceil(MAX_GRID_Y) {
                 let first = batch * MAX_GRID_Y;
                 let count = (ranges.len() / 4 - first).min(MAX_GRID_Y);
-                let view = state.nodes.slice(first * 4..(first + count) * 4);
+                // This batch's ranges: four `u32`s each.
+                let view = d_ranges + (first * 16) as u64;
                 let mut launch = stream.launch_builder(&device.kernels.reduce_chunks);
                 launch
                     .arg(&state.partials)
@@ -1764,9 +2264,18 @@ impl CudaHistBackend {
                     RowSource::Tree => tree_rows.slice(begin..end),
                     RowSource::Upload(_) => uploaded.slice(begin..end),
                 };
-                let (n, seg_rows64, segs64) = ((end - begin) as u64, seg_rows as u64, wave as u64);
-                let n_cols = self.n_cols as u32;
-                let total_bins = bins as u64;
+                let chunks = abi::Chunks {
+                    n: (end - begin) as u64,
+                    seg_rows: seg_rows as u64,
+                    segs: wave as u64,
+                    total_bins: bins as u64,
+                };
+                let chain = abi::ChainWork {
+                    chunks,
+                    stride: *stride,
+                    n_cols: self.n_cols as u32,
+                    sentinel: *sentinel,
+                };
                 let kernel = if row_ptr.is_some() {
                     &device.kernels.hist_sparse_chain[dev_bins.width()]
                 } else {
@@ -1774,23 +2283,18 @@ impl CudaHistBackend {
                 };
                 let mut launch = stream.launch_builder(kernel);
                 dev_bins.push(&mut launch);
-                if let Some(row_ptr) = &*row_ptr {
-                    launch.arg(row_ptr);
+                match &*row_ptr {
+                    Some(row_ptr) => launch.arg(row_ptr),
+                    None => launch.arg(&*feature_first),
+                };
+                launch.arg(&rows).arg(&*dev_gpair).arg(&mut *partials);
+                if row_ptr.is_some() {
+                    launch.arg(&chunks);
                 } else {
-                    launch
-                        .arg(&*stride)
-                        .arg(&n_cols)
-                        .arg(&*sentinel)
-                        .arg(&*feature_first);
+                    launch.arg(&chain);
                 }
-                launch
-                    .arg(&rows)
-                    .arg(&n)
-                    .arg(&seg_rows64)
-                    .arg(&segs64)
-                    .arg(&*dev_gpair)
-                    .arg(&mut *partials)
-                    .arg(&total_bins);
+                let segs64 = chunks.segs;
+                let total_bins = chunks.total_bins;
                 let config = if row_ptr.is_some() {
                     device.grid(wave)
                 } else {
@@ -1829,6 +2333,7 @@ impl CudaHistBackend {
                     &mut rows,
                 )?;
                 stream.synchronize()?;
+                state.staging.synced();
                 rows
             };
             let mut hist = zeroed(bins);
@@ -1846,25 +2351,48 @@ impl CudaHistBackend {
                 None => results[k] = Some(hist),
             }
         }
-        if targets.is_some() {
+        if let Some(resident) = resident {
+            // Siblings of children built by the other strategies.
+            let pairs: Vec<u32> = resident
+                .siblings
+                .iter()
+                .filter(|(_, built)| !subtracted.contains(built))
+                .flat_map(|&(parent, built)| [parent, built])
+                .collect();
+            if !pairs.is_empty() {
+                let [d_pairs] = state.staging.upload_parts(
+                    pool,
+                    stream,
+                    &mut state.desc,
+                    [bytes_of(&pairs)],
+                )?;
+                let (n_pairs, total_bins) = ((pairs.len() / 2) as u64, bins as u64);
+                let mut launch = stream.launch_builder(&device.kernels.subtract_hists);
+                launch
+                    .arg(&mut state.out)
+                    .arg(&d_pairs)
+                    .arg(&n_pairs)
+                    .arg(&total_bins);
+                // SAFETY: every pair names two distinct slots of the pool,
+                // and each element writes only its own parent bin.
+                unsafe { launch.launch(device.grid(pairs.len() / 2 * bins)) }?;
+            }
             return Ok(Some(Vec::new()));
         }
 
         if !slots.is_empty() {
-            let staging = pinned(stream, &mut state.pin_out, slots.len() * bins * 2, false)?;
-            // Kernel faults surface at this synchronization point.
-            let all = download_pinned(stream, staging, &state.out, slots.len() * bins * 2)?;
+            let mut all = vec![GradStats::default(); slots.len() * bins];
             // SAFETY: `GradStats` is `repr(C)` of two `f64`s, so `all` is
-            // `slots.len() * bins` contiguous `GradStats`.
-            let all = unsafe {
-                std::slice::from_raw_parts(all.as_ptr().cast::<GradStats>(), slots.len() * bins)
+            // `2 * len` contiguous `f64`s.
+            let flat = unsafe {
+                std::slice::from_raw_parts_mut(all.as_mut_ptr().cast::<f64>(), all.len() * 2)
             };
+            // Kernel faults surface at this synchronization point.
+            state.ring.download(pool, stream, &state.out, flat)?;
+            state.staging.synced();
             // Copy while holding state without Rayon work stealing.
-            let copied: Vec<Histogram> = (0..slots.len())
-                .map(|slot| all[slot * bins..(slot + 1) * bins].to_vec())
-                .collect();
-            for (hist, &k) in copied.into_iter().zip(&slots) {
-                results[k] = Some(hist);
+            for (hist, &k) in all.chunks(bins).zip(&slots) {
+                results[k] = Some(hist.to_vec());
             }
         }
         Ok(Some(
@@ -1926,13 +2454,20 @@ impl CudaHistBackend {
         }
         let n_splits = splits.len() as u32;
         let n_tiles = ptiles.len();
-        upload(stream, &mut state.segs, segs)?;
-        upload(stream, &mut state.rules, rules)?;
-        upload(stream, &mut state.table, table)?;
-        upload(stream, &mut state.split_tiles, split_tiles)?;
-        if n_tiles > 0 {
-            upload(stream, &mut state.ptiles, ptiles)?;
-        }
+        let pool = &device.pinned;
+        // One queued copy of the partition's descriptors.
+        let [d_segs, d_rules, d_table, d_split_tiles, d_ptiles] = state.staging.upload_parts(
+            pool,
+            stream,
+            &mut state.desc,
+            [
+                bytes_of(segs.as_slice()),
+                bytes_of(rules.as_slice()),
+                bytes_of(table.as_slice()),
+                bytes_of(split_tiles.as_slice()),
+                bytes_of(ptiles.as_slice()),
+            ],
+        )?;
         fit(stream, &mut state.left_len, splits.len())?;
         let State {
             cols,
@@ -1943,14 +2478,10 @@ impl CudaHistBackend {
             sentinel,
             tree_rows,
             scratch,
-            segs: d_segs,
-            rules: d_rules,
-            table: d_table,
-            ptiles: d_ptiles,
-            split_tiles: d_split_tiles,
             tile_left,
             left_len,
             pin_counts,
+            staging,
             ..
         } = state;
         let n_rows = self.n_rows as u64;
@@ -1967,6 +2498,12 @@ impl CudaHistBackend {
             } else {
                 &device.kernels.route_count[route_bins.width()]
             };
+            let tiles = abi::PartTiles {
+                segs: d_segs,
+                ptiles: d_ptiles,
+                rules: d_rules,
+                tile_left: abi::ptr_mut(tile_left, stream),
+            };
             let mut count = stream.launch_builder(kernel);
             route_bins.push(&mut count);
             if let Some(row_ptr) = &*row_ptr {
@@ -1975,20 +2512,17 @@ impl CudaHistBackend {
                 count.arg(&n_rows).arg(&*sentinel);
             }
             count
-                .arg(&*d_segs)
-                .arg(&*d_rules)
-                .arg(&*d_table)
-                .arg(&*d_ptiles)
+                .arg(&d_table)
                 .arg(&*tree_rows)
                 .arg(&mut *flags)
-                .arg(&mut *tile_left);
+                .arg(&tiles);
             // SAFETY: one block per tile; every segment lies in the tree's
             // valid rows, every row id is below `n_rows`, and each rule's
             // table range covers its feature's bins.
             unsafe { count.launch(tiles_config) }?;
         }
         let mut scan = stream.launch_builder(&device.kernels.route_scan);
-        scan.arg(&*d_split_tiles)
+        scan.arg(&d_split_tiles)
             .arg(&n_splits)
             .arg(&mut *tile_left)
             .arg(&mut *left_len);
@@ -2002,8 +2536,8 @@ impl CudaHistBackend {
             };
             let mut scatter = stream.launch_builder(&device.kernels.route_scatter);
             scatter
-                .arg(&*d_segs)
-                .arg(&*d_ptiles)
+                .arg(&d_segs)
+                .arg(&d_ptiles)
                 .arg(&*tree_rows)
                 .arg(&*flags)
                 .arg(&*tile_left)
@@ -2013,15 +2547,16 @@ impl CudaHistBackend {
             // segment of `scratch` (`n_rows` long).
             unsafe { scatter.launch(tiles_config) }?;
             let mut copy = stream.launch_builder(&device.kernels.route_copy);
-            copy.arg(&*d_segs)
-                .arg(&*d_ptiles)
+            copy.arg(&d_segs)
+                .arg(&d_ptiles)
                 .arg(&*scratch)
                 .arg(&mut *tree_rows);
             // SAFETY: copies each tile's span within its segment.
             unsafe { copy.launch(tiles_config) }?;
         }
-        let staging = pinned(stream, pin_counts, splits.len(), false)?;
-        let host = download_pinned(stream, staging, left_len, splits.len())?;
+        let counts = pinned(pool, stream, pin_counts, splits.len(), false)?;
+        let host = download_pinned(stream, counts, left_len, splits.len())?;
+        staging.synced();
         Ok(splits
             .iter()
             .zip(host)
@@ -2065,10 +2600,9 @@ fn gpu_error(error: DriverError) -> HessboostError {
 
 impl HistogramBackend for CudaHistBackend {
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
-        let fits = self.fits(ghist)
-            && out.len() == self.total_bins
-            && rows.len() <= self.n_rows
-            && rows.iter().all(|&r| (r as usize) < self.n_rows);
+        let (inside, run) = self.check_rows(rows);
+        let fits =
+            self.fits(ghist) && out.len() == self.total_bins && rows.len() <= self.n_rows && inside;
         let built = fits.then(|| self.lock()).flatten().and_then(|mut state| {
             let state = &mut *state;
             if !state.staged.holds(Some(gpair)) {
@@ -2077,8 +2611,8 @@ impl HistogramBackend for CudaHistBackend {
                     return None;
                 }
             }
-            let stream = &self.device.stream;
-            self.ok(upload(stream, &mut state.upload, rows))?;
+            let placed = self.place_rows(&mut state.ring, &mut state.upload, rows, run);
+            self.ok(placed)?;
             let node = Segment {
                 offset: 0,
                 len: rows.len(),
@@ -2122,23 +2656,7 @@ impl RowEngine for CudaHistBackend {
         if !self.fits(ghist) || rows.len() > self.n_rows {
             return None;
         }
-        // One parallel pass: every row inside the index (the kernels do not
-        // bounds-check), and whether the rows are one ascending run (then
-        // generated on the device instead of uploaded).
-        let first = rows.first().copied().unwrap_or(0) as usize;
-        let (inside, run) = rows
-            .par_chunks(1 << 16)
-            .enumerate()
-            .map(|(c, chunk)| {
-                let base = first + (c << 16);
-                let inside = chunk.iter().all(|&r| (r as usize) < self.n_rows);
-                let run = chunk
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &r)| r as usize == base + i);
-                (inside, run)
-            })
-            .reduce(|| (true, true), |a, b| (a.0 && b.0, a.1 && b.1));
+        let (inside, run) = self.check_rows(rows);
         if !inside {
             return None;
         }
@@ -2146,22 +2664,8 @@ impl RowEngine for CudaHistBackend {
         if state.staged.len == 0 {
             return None;
         }
-        let stream = &self.device.stream;
-        let placed = match run.then_some(first..first + rows.len()) {
-            Some(range) if !rows.is_empty() => {
-                let n = rows.len() as u64;
-                let first = range.start as u32;
-                let mut launch = stream.launch_builder(&self.device.kernels.iota_rows);
-                launch.arg(&mut state.tree_rows).arg(&n).arg(&first);
-                // SAFETY: writes `rows.len() <= n_rows` entries.
-                unsafe { launch.launch(self.device.grid(rows.len())) }.map(|_| ())
-            }
-            _ => {
-                let state = &mut *state;
-                pinned(stream, &mut state.pin_row_upload, rows.len(), true)
-                    .and_then(|staging| upload_pinned(stream, staging, rows, &mut state.tree_rows))
-            }
-        };
+        let state = &mut *state;
+        let placed = self.place_rows(&mut state.ring, &mut state.tree_rows, rows, run);
         self.ok(placed)?;
         state.tree_len = rows.len();
         Some(Segment {
@@ -2214,6 +2718,7 @@ impl RowEngine for CudaHistBackend {
                 let mut units = vec![0i64; chunks * 2];
                 stream.memcpy_dtoh(&state.totals.slice(..chunks * 2), &mut units)?;
                 stream.synchronize()?;
+                state.staging.synced();
                 let (grad, hess) = (&state.staged.grad, &state.staged.hess);
                 for (h, k) in host.chunks_mut(2).zip(units.chunks(2)) {
                     // Each block's exact sum, as its `f64` chain is.
@@ -2234,6 +2739,7 @@ impl RowEngine for CudaHistBackend {
                 unsafe { launch.launch(Device::one_per(chunks)) }?;
                 stream.memcpy_dtoh(&state.chains.slice(..chunks * 2), &mut host)?;
                 stream.synchronize()?;
+                state.staging.synced();
             }
             Ok(host)
         })();
@@ -2302,9 +2808,12 @@ impl RowEngine for CudaHistBackend {
         }
         let stream = &self.device.stream;
         let state = &mut *state;
-        let all = pinned(stream, &mut state.pin_rows, end, false)
-            .and_then(|staging| download_pinned(stream, staging, &state.tree_rows, end));
-        let all = self.ok(all)?;
+        let mut all = vec![0u32; end];
+        let read = state
+            .ring
+            .download(&self.device.pinned, stream, &state.tree_rows, &mut all);
+        self.ok(read)?;
+        state.staging.synced();
         Some(
             segs.iter()
                 .map(|s| all[s.offset..s.offset + s.len].to_vec())
@@ -2398,6 +2907,7 @@ impl RowEngine for CudaHistBackend {
                         let mut tail = vec![0f32; n - split.rows];
                         stream.memcpy_dtoh(&margins.slice(split.rows..n), &mut tail)?;
                         stream.synchronize()?;
+                        state.staging.synced();
                         let mut pairs = vec![GradPair::default(); tail.len()];
                         crate::simd::logistic_gradient(
                             &tail,
@@ -2413,21 +2923,23 @@ impl RowEngine for CudaHistBackend {
                             &flat,
                             &mut state.gpair.slice_mut(2 * split.rows..2 * n),
                         )?;
+                        state.staging.synced();
                     }
                     if split.rows > 0 {
-                        let rows = split.rows as u64;
-                        let lanes = split.lanes as u32;
+                        let params = abi::LogisticParams {
+                            weighted,
+                            scale_pos_weight,
+                            min_hess,
+                            max_input: split.max_input,
+                            lanes: split.lanes as u32,
+                            n: split.rows as u64,
+                        };
                         let mut launch = stream.launch_builder(&device.kernels.logistic);
                         launch
                             .arg(margins)
                             .arg(dev_labels)
                             .arg(dev_weights)
-                            .arg(&weighted)
-                            .arg(&scale_pos_weight)
-                            .arg(&min_hess)
-                            .arg(&split.max_input)
-                            .arg(&lanes)
-                            .arg(&rows)
+                            .arg(&params)
                             .arg(&mut state.gpair);
                         // SAFETY: `split.rows <= n_rows` is a whole number
                         // of vectors, so every vector's margins are read
@@ -2469,17 +2981,20 @@ impl RowEngine for CudaHistBackend {
             return Some(());
         }
         let added = (|| {
-            upload(stream, &mut state.segs, &segs)?;
-            upload(stream, &mut state.values, &values)?;
-            upload(stream, &mut state.ptiles, &ptiles)?;
+            let [d_segs, d_values, d_ptiles] = state.staging.upload_parts(
+                &device.pinned,
+                stream,
+                &mut state.desc,
+                [bytes_of(&segs), bytes_of(&values), bytes_of(&ptiles)],
+            )?;
             let Some(margins) = state.margins.as_mut() else {
                 return Ok(());
             };
             let mut launch = stream.launch_builder(&device.kernels.add_leaves);
             launch
-                .arg(&state.segs)
-                .arg(&state.values)
-                .arg(&state.ptiles)
+                .arg(&d_segs)
+                .arg(&d_values)
+                .arg(&d_ptiles)
                 .arg(&state.tree_rows)
                 .arg(margins);
             let config = LaunchConfig {
@@ -2554,6 +3069,7 @@ impl RowEngine for CudaHistBackend {
             || siblings
                 .iter()
                 .any(|&(parent, built)| parent == built || !in_pool(parent) || !in_pool(built))
+            || !distinct_writes(nodes, siblings)
         {
             return None;
         }
@@ -2562,33 +3078,14 @@ impl RowEngine for CudaHistBackend {
         let state = &mut *state;
         // The build writes `state.out`: make it the pool for this call.
         std::mem::swap(&mut state.out, &mut state.pool);
-        let built = self.histograms_on(state, RowSource::Tree, ghist, gpair, &segs, Some(&targets));
+        let resident = Resident {
+            targets: &targets,
+            siblings,
+        };
+        let built = self.histograms_on(state, RowSource::Tree, ghist, gpair, &segs, Some(resident));
         std::mem::swap(&mut state.out, &mut state.pool);
         // `None`: CPU-built nodes without the host gradients.
-        self.ok(built)??;
-        if siblings.is_empty() {
-            return Some(());
-        }
-        let device = &*self.device;
-        let stream = &device.stream;
-        let subtracted = (|| {
-            let pairs: Vec<u32> = siblings
-                .iter()
-                .flat_map(|&(parent, built)| [parent, built])
-                .collect();
-            upload(stream, &mut state.nodes, &pairs)?;
-            let (n_pairs, total_bins) = (siblings.len() as u64, self.total_bins as u64);
-            let mut launch = stream.launch_builder(&device.kernels.subtract_hists);
-            launch
-                .arg(&mut state.pool)
-                .arg(&state.nodes)
-                .arg(&n_pairs)
-                .arg(&total_bins);
-            // SAFETY: every pair names two distinct slots of the pool, and
-            // each element writes only its own parent bin.
-            unsafe { launch.launch(device.grid(siblings.len() * self.total_bins)) }.map(|_| ())
-        })();
-        self.ok(subtracted)
+        self.ok(built)?.map(|_| ())
     }
 
     fn scan_resident(
@@ -2641,7 +3138,11 @@ mod tests {
             let cuts = HistCuts::from_dmatrix(&cuts_data, 16);
             assert!(matches!(
                 CudaHistBackend::from_dmatrix(data, cuts, 0),
-                Err(HessboostError::InvalidData { .. })
+                Err(HessboostError::DimensionMismatch {
+                    expected: 2,
+                    got: 1,
+                    ..
+                })
             ));
         }
     }

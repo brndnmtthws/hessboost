@@ -113,7 +113,9 @@ impl Predictor {
             #[cfg(target_os = "linux")]
             Backend::Cuda { ordinal } => py.detached(|| model.to_cuda(ordinal)).map(Self::Cuda),
             #[cfg(not(target_os = "linux"))]
-            Backend::Cuda { .. } => Err(refuse("CUDA GPU prediction is only available on Linux")),
+            Backend::Cuda { ordinal } => Err(refuse(format!(
+                "CUDA GPU prediction (device \"cuda:{ordinal}\") is only available on Linux"
+            ))),
         }
     }
 

@@ -63,7 +63,8 @@ pub(super) enum Prepared {
         /// hold every category. A zero-weight row's value can lie beyond the
         /// last cut, where binning clamps it into the last bin while the tree
         /// routes it by its threshold, so linear leaves then route instead of
-        /// reading the builder's rows.
+        /// reading the builder's rows, and rounds stay off the device
+        /// ([`Prepared::device_backend`]).
         rows_route_like_trees: bool,
     },
     /// `tree_method=approx`: Hessian-weighted cuts. XGBoost regenerates them
@@ -81,11 +82,17 @@ pub(super) enum Prepared {
 impl Prepared {
     /// The binned index and backend of a histogram run whose backend keeps
     /// the rows on a device (the CUDA backend), for device-resident rounds.
+    /// `None` unless the rows route like trees (`rows_route_like_trees`):
+    /// after a device failure the host rebuilds the margins by routing the
+    /// rows through the trees, which equals the binned partitions the
+    /// device's margins came from only then.
     pub(super) fn device_backend(&self) -> Option<(&GHistIndex, &dyn HistogramBackend)> {
         match self {
-            Prepared::Hist { index, backend, .. } if backend.row_engine().is_some() => {
-                Some((index, backend.as_ref()))
-            }
+            Prepared::Hist {
+                index,
+                backend,
+                rows_route_like_trees: true,
+            } if backend.row_engine().is_some() => Some((index, backend.as_ref())),
             _ => None,
         }
     }

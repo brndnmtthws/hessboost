@@ -219,16 +219,12 @@
 //!     ([`device`](config::TrainingParams::device) = `wgpu`), runnable
 //!     without a GPU on a software adapter such as Mesa's lavapipe
 //!     ([`backend::wgpu`]).
-//!   - NVIDIA CUDA on Linux (`cuda` feature): bit-identical GPU training
+//!   - NVIDIA CUDA on Linux (`cuda` feature): the same bit-identical
+//!     prediction ([`to_cuda`](model::BoostedModel::to_cuda)) and training
 //!     ([`device`](config::TrainingParams::device) = `cuda`/`cuda:<n>`;
-//!     exact integer sums, `f64` chains in the CPU's order outside them),
-//!     with the tree's rows, and for the common objectives the margins and
-//!     gradients, kept on the GPU. The kernels are Rust, compiled to
-//!     embedded PTX by [cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/);
-//!     the driver loads at run time, and nothing else is needed.
-//!     [`to_cuda`](model::BoostedModel::to_cuda) uploads compact forests for
-//!     ordered GPU batch prediction. CPU bit-parity tests pass on an NVIDIA
-//!     L40S ([`backend::cuda`]).
+//!     exact integer sums or the CPU's ordered `f64` sums, CPU fallback
+//!     for the rest), with the driver loaded at run time and no CUDA
+//!     toolkit needed ([`backend::cuda`]).
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
@@ -331,6 +327,8 @@ pub mod prelude {
 /// part of the public API: hidden from the docs and changed without notice.
 #[doc(hidden)]
 pub mod internals {
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    pub use crate::backend::cuda::diagnostics::{NodeCounts, ScanDiagnostics};
     pub use crate::data::ghist::GHistIndex;
     pub use crate::data::quantile::HistCuts;
     pub use crate::tree::builder::HistTreeBuilder;

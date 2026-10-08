@@ -190,6 +190,14 @@ same benchmark source, lockfile, compiler, and release settings before running
 the comparison. See [Performance](../docs/performance.md) for recorded results,
 workload definitions, and complete reproduction commands.
 
+The CUDA Criterion groups (`--filter '^cuda_'`, executables built with
+`--features cuda`) time the CPU and CUDA engines side by side: one-node
+histogram builds, dense, categorical, loss-guided, and CSR training, and
+reused-forest prediction (row transfers included; forest upload and the
+driver's first PTX compilation excluded). The executable embeds the
+kernels' PTX, so its hash in `comparison.json` identifies the CUDA code
+too.
+
 ## XGBoost comparison
 
 `bench_xgb.py` generates shared training and held-out datasets, then benchmarks
@@ -207,25 +215,6 @@ batch discards one warmup fit and records three fits. The report uses the
 median of all six measurements for each engine. Held-out RMSE or log loss
 checks model quality alongside timing.
 
-The comparison report hashes the Rust sources and the benchmark executable,
-which embeds the CUDA kernels' PTX (`src/backend/cuda/*.ptx`), so the
-executable hash identifies the CUDA code too; retain `source_sha256` and
-`hessboost_executable_sha256` with the results.
-
-Permanent CUDA Criterion groups cover histogram construction, dense
-training, categorical/lossguide/CSR training variants, and reused forest
-prediction including row transfers:
-
-```sh
-RAYON_NUM_THREADS=8 cargo bench --features cuda --bench training -- cuda_train_variants
-RAYON_NUM_THREADS=8 cargo bench --features cuda --bench training -- cuda_predict
-```
-
-Build baseline and candidate benchmark binaries from identical benchmark
-source and use `compare_benchmarks.py` for alternating-order comparisons.
-Forest upload and the driver's first PTX compilation are outside
-reused-predictor timings.
-
 ```sh
 cargo build --release --example bench_compare
 uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
@@ -236,8 +225,9 @@ uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
 Use a new output directory for each comparison. It contains the shared binary
 datasets and `comparison.json`, including every timing sample, held-out score,
 training parameters, native XGBoost build information, package versions, and
-source, executable, and dataset hashes. Build before timing and avoid running
-other benchmarks or compiler jobs concurrently.
+source, executable (which embeds the CUDA kernels' PTX), and dataset hashes.
+Build before timing and avoid running other benchmarks or compiler jobs
+concurrently.
 
 For a quick harness check, add `--rows 512 --rounds 3 --repeats 1`. Use
 `--workloads regression` to select one dataset or `--threads 1` for a

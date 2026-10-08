@@ -17,15 +17,6 @@ pub(super) fn ptr_mut<T>(slice: &mut CudaSlice<T>, stream: &CudaStream) -> sys::
     slice.device_ptr_mut(stream).0
 }
 
-/// `bin_dense`'s matrix shape and missing-value marker.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct DenseCells {
-    pub cells: u64,
-    pub n_cols: u32,
-    pub missing: f32,
-}
-
 /// The `logistic` kernel's scalars.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -182,8 +173,6 @@ pub(super) struct Batch8 {
 // SAFETY: each is `#[repr(C)]` of plain integers, floats and device
 // addresses, with the size and alignment of the kernel parameter it is
 // pushed as (the kernels' layouts above).
-unsafe impl DeviceRepr for DenseCells {}
-// SAFETY: as above.
 unsafe impl DeviceRepr for LogisticParams {}
 // SAFETY: as above.
 unsafe impl DeviceRepr for TileWork {}
@@ -252,7 +241,6 @@ mod tests {
             (align_of::<T>(), size_of::<T>())
         }
         let training = [
-            ("bin_dense", 1, of::<DenseCells>()),
             ("logistic", 3, of::<LogisticParams>()),
             ("scan_splits", 3, of::<NumericTasks>()),
             ("scan_splits", 4, of::<Regularization>()),

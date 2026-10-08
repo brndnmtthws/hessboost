@@ -112,90 +112,6 @@ encode!(encode_u32_u8, u8, u32);
 encode!(encode_u32_u16, u16, u32);
 encode!(encode_u32_u32, u32, u32);
 
-/// [`bin_dense`]'s matrix: `cells` values, `n_cols` per row, and the value
-/// marking a missing one.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct DenseCells {
-    pub cells: u64,
-    pub n_cols: u32,
-    pub missing: f32,
-}
-
-/// Raw dense binning against the CPU's cuts: an upper bound for a numeric
-/// value, an exact binary search (unseen: the feature's first bin) for a
-/// category; a missing value (as `DMatrix` defines it) is `u32::MAX`.
-///
-/// # Safety
-///
-/// `values` and `global` hold `cells` entries, `first` `n_cols + 1`,
-/// `categorical` `n_cols`, and `cuts` every bin `first` names.
-#[kernel]
-pub unsafe extern "C" fn bin_dense(
-    values: *const f32,
-    matrix: DenseCells,
-    cuts: *const f32,
-    first: *const u32,
-    categorical: *const u8,
-    global: *mut u32,
-) {
-    let DenseCells {
-        cells,
-        n_cols,
-        missing,
-    } = matrix;
-    // SAFETY: the caller's; one thread per cell.
-    unsafe {
-        let mut i = grid_index();
-        while i < cells {
-            let v = ld(values, i);
-            let absent = if missing.is_nan() {
-                v.is_nan()
-            } else {
-                v == missing
-            };
-            if absent {
-                st(global, i, u32::MAX);
-            } else {
-                let f = i % u64::from(n_cols);
-                let (fs, fe) = (ld(first, f), ld(first, f + 1));
-                let (mut lo, mut hi) = (u64::from(fs), u64::from(fe));
-                if ld(categorical, f) != 0 {
-                    while lo < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        if ld(cuts, mid) < v {
-                            lo = mid + 1;
-                        } else {
-                            hi = mid;
-                        }
-                    }
-                    let found = lo < u64::from(fe) && ld(cuts, lo) == v;
-                    st(global, i, if found { lo as u32 } else { fs });
-                } else {
-                    while lo < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        if ld(cuts, mid) <= v {
-                            lo = mid + 1;
-                        } else {
-                            hi = mid;
-                        }
-                    }
-                    let (local, len) = ((lo - u64::from(fs)) as u32, fe - fs);
-                    let local = if local < len {
-                        local
-                    } else if len == 0 {
-                        0
-                    } else {
-                        len - 1
-                    };
-                    st(global, i, fs + local);
-                }
-            }
-            i += grid_threads();
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Gradients and rows
 
@@ -307,7 +223,7 @@ fn fma(a: f32, b: f32, c: f32) -> f32 {
 }
 
 /// The host vector kernels' exponential (`simd/x86_64.rs` `exp_f32`,
-/// `simd/aarch64.rs` `expq_f32::<true>`, identical operations) for
+/// `simd/aarch64.rs` `expq_f32`, identical operations) for
 /// `|v| <= 80`: range reduction by a split ln 2, Estrin's seventh-order
 /// polynomial, the `2^e` scaling. [`fma`] where the host fuses; every other
 /// operation is a separate IEEE one.
@@ -550,41 +466,6 @@ pub unsafe extern "C" fn add_leaves(
             let r = u64::from(ld(rows, off + i));
             st(margins, r, ld(margins, r) + v);
             i += u64::from(thread::blockDim_x());
-        }
-    }
-}
-
-/// Each `grain`-row chunk's pairs summed as one `f64` chain from zero in
-/// row order, one thread per chunk (the host's `sum_rows` blocks, for
-/// chunks whose sums are not exact in integers).
-///
-/// # Safety
-///
-/// `rows` holds `n` entries, `gpair` every row they name, and `totals` one
-/// entry per chunk (one for `n == 0`).
-#[kernel]
-pub unsafe extern "C" fn chunk_chains(
-    rows: *const u32,
-    n: u64,
-    grain: u64,
-    gpair: *const F32x2,
-    totals: *mut F64x2,
-) {
-    let c = grid_index();
-    let begin = c * grain;
-    if begin < n || (c == 0 && n == 0) {
-        // SAFETY: the caller's; one thread per chunk.
-        unsafe {
-            let end = (begin + grain).min(n);
-            let (mut g, mut h) = (0.0f64, 0.0f64);
-            let mut i = begin;
-            while i < end {
-                let p = ld(gpair, u64::from(ld(rows, i)));
-                g += f64::from(p.x);
-                h += f64::from(p.y);
-                i += 1;
-            }
-            st(totals, c, F64x2 { x: g, y: h });
         }
     }
 }
@@ -842,17 +723,19 @@ unsafe fn hist_tile<B: Bin, const SHARED: bool>(
         let target = tile.histogram(acc, partials, total_bins);
         let (tid, step) = (thread::threadIdx_x(), thread::blockDim_x());
         if SHARED {
-            let mut i = tid;
-            while i < 2 * g.bins {
-                st(words, u64::from(i), 0);
-                i += step;
+            // Counted in `u64`: `2 * bins` and the stride wrap a `u32` near
+            // 2^31 bins, which `with_global` accepts.
+            let mut i = u64::from(tid);
+            while i < 2 * u64::from(g.bins) {
+                st(words, i, 0);
+                i += u64::from(step);
             }
             thread::sync_threads();
         } else if partial {
-            let mut i = tid;
-            while i < 2 * g.bins {
-                st(target, 2 * u64::from(g.bin0) + u64::from(i), 0);
-                i += step;
+            let mut i = u64::from(tid);
+            while i < 2 * u64::from(g.bins) {
+                st(target, 2 * u64::from(g.bin0) + i, 0);
+                i += u64::from(step);
             }
             thread::sync_threads();
         }
@@ -2209,3 +2092,47 @@ per_width!(
     hist_sparse_chain_u32,
     route_sparse_u32
 );
+
+/// After a partition (`route_copy`), whether each split's children are runs
+/// of consecutive rows: `left_len[n_splits + s]` holds bit 0 for split
+/// `s`'s left child and bit 1 for its right one. A child's rows ascend
+/// without repeats, so it is a run when its last row is its first plus its
+/// length minus one; an empty child counts as a run.
+///
+/// # Safety
+///
+/// `segs` holds `n_splits` (offset, length) pairs naming segments of
+/// `rows`, and `left_len` `2 * n_splits` entries, the first `n_splits` the
+/// left children's lengths.
+#[kernel]
+pub unsafe extern "C" fn route_runs(
+    segs: *const u64,
+    rows: *const u32,
+    n_splits: u32,
+    left_len: *mut u32,
+) {
+    let s = grid_index();
+    if s < u64::from(n_splits) {
+        // SAFETY: the caller's; one thread per split writes its own word.
+        unsafe {
+            let off = ld(segs, 2 * s);
+            let len = ld(segs, 2 * s + 1);
+            let left = u64::from(ld(left_len, s));
+            let runs = u32::from(is_run(rows, off, left))
+                | u32::from(is_run(rows, off + left, len - left)) << 1;
+            st(left_len, u64::from(n_splits) + s, runs);
+        }
+    }
+}
+
+/// Whether the `n` ascending, distinct rows at `rows[begin..]` are
+/// consecutive.
+///
+/// # Safety
+///
+/// `rows` holds `begin + n` entries.
+#[inline(always)]
+unsafe fn is_run(rows: *const u32, begin: u64, n: u64) -> bool {
+    // SAFETY: the caller's.
+    n == 0 || unsafe { u64::from(ld(rows, begin + n - 1)) - u64::from(ld(rows, begin)) == n - 1 }
+}

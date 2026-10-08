@@ -85,18 +85,15 @@ impl HistTreeBuilder<'_> {
         };
         // The scans of plain numeric features do not depend on the
         // incumbent, so they are computed up front (a wide search in
-        // parallel); they are then merged in feature order.
+        // parallel); they are then merged in feature order. Reuse penalties
+        // depend on each candidate's bin, so they scan in the merge.
         let scans = if self.reuse.is_some() {
-            None
+            Vec::new()
         } else {
-            Some(
-                Self::parallel_scans(cuts, &feature_subset, scan_chunk)
-                    .unwrap_or_else(|| scan_chunk(&feature_subset)),
-            )
+            Self::parallel_scans(cuts, &feature_subset, scan_chunk)
+                .unwrap_or_else(|| scan_chunk(&feature_subset))
         };
-        // Never `None` given the histogram.
-        self.merge(ghist, Some(hist), &feature_subset, node, scans)
-            .unwrap_or_else(BestSplit::none)
+        self.merge(ghist, hist, &feature_subset, node, scans)
     }
 
     /// The node's scorer (no monotone direction yet).
@@ -120,18 +117,17 @@ impl HistTreeBuilder<'_> {
     /// The best split of `feature_subset` (already restricted to the
     /// permitted features) in feature order with XGBoost's tie rule, from
     /// `scans` (each plain numeric feature's [`scan_numeric_splits`] by
-    /// position, `None` to scan here) and the node's histogram, which is
-    /// read for categorical features, reuse penalties, NaN scans, and
-    /// features without a scan. `None` when one of those needs it and
-    /// `hist` is `None`.
-    pub(super) fn merge(
+    /// position; a feature without one, or past the end, scans here) and
+    /// the node's histogram `hist`, which is read for categorical features,
+    /// reuse penalties, NaN scans, and features without a scan.
+    fn merge(
         &self,
         ghist: &GHistIndex,
-        hist: Option<&[GradStats]>,
+        hist: &[GradStats],
         feature_subset: &[u32],
         node: NodeCtx,
-        mut scans: Option<Vec<Option<NumericScan>>>,
-    ) -> Option<BestSplit> {
+        mut scans: Vec<Option<NumericScan>>,
+    ) -> BestSplit {
         let cuts = ghist.cuts();
         let dense = ghist.dense_stride().is_some();
         let total = node.stats;
@@ -142,7 +138,6 @@ impl HistTreeBuilder<'_> {
             let scorer = self.scorer(node_scorer, f);
 
             if cuts.is_categorical(f as usize) {
-                let hist = hist?;
                 // Every category bin, empty ones included, as XGBoost
                 // enumerates them (a lone category can still split present
                 // from missing values).
@@ -164,7 +159,7 @@ impl HistTreeBuilder<'_> {
             }
 
             if let Some(reuse) = &self.reuse {
-                for_each_numeric_split(&hist?[fs..fe], fs, total, dense, |pos, children| {
+                for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
                     let Some(mut score) = scorer.loss_chg(children.left, children.right) else {
                         return;
                     };
@@ -173,10 +168,10 @@ impl HistTreeBuilder<'_> {
                 });
                 continue;
             }
-            let scanned = if let Some(scan) = scans.as_mut().and_then(|scans| scans[i].take()) {
+            let scanned = if let Some(scan) = scans.get_mut(i).and_then(Option::take) {
                 scan
             } else {
-                let input = numeric_input(cuts, hist?, f, total, dense, scorer);
+                let input = numeric_input(cuts, hist, f, total, dense, scorer);
                 with_scan_scratch(|[s, _]| input.scan(s))
             };
             match scanned {
@@ -193,7 +188,7 @@ impl HistTreeBuilder<'_> {
                     }
                 }
                 NumericScan::Nan => {
-                    for_each_numeric_split(&hist?[fs..fe], fs, total, dense, |pos, children| {
+                    for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
                         if let Some(score) = scorer.loss_chg(children.left, children.right) {
                             xgb_update(&mut best, f, pos, children, score);
                         }
@@ -201,7 +196,7 @@ impl HistTreeBuilder<'_> {
                 }
             }
         }
-        Some(best)
+        best
     }
 
     /// `scan_chunk` over parallel chunks of `feature_subset`, concatenated,

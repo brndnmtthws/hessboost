@@ -44,29 +44,35 @@
 //!
 //! # Exactness
 //!
-//! The CPU adds each histogram bin in `f64` in a fixed order: one chain in
-//! row order below 8,192 rows, else fixed chunks of rows each chained from
-//! zero and then added in chunk order (`tree::hist::sum_order`, chosen from
-//! the node's row count alone). Every node uses the first strategy that
-//! applies:
+//! The CPU adds each histogram bin in `f64` in a fixed order
+//! (`tree::hist::sum_order`): one chain in row order for a node below
+//! 8,192 rows, for a contiguous row range of a dense index with a
+//! column-major copy, and for any row subset of such an index of at most
+//! 2^18 rows; otherwise fixed blocks of about 4,096 rows, each chained from
+//! zero and then added in block order. Every node uses the first strategy
+//! that applies:
 //!
 //! 1. **Exact integers.** When every sum of the node's rows is exact
 //!    (`n * max <= 2^53` gradient grains for both components, the domain
 //!    the Metal backend also uses; proof in the private `exact_sum` module),
 //!    the GPU sums 64-bit grain counts in any order (shared-memory
 //!    histograms per row tile and feature group, flushed with 64-bit
-//!    atomics) and scales them back exactly.
-//! 2. **Exact chunks.** For a chunked node whose *chunks* are exact, each
-//!    chunk's integer sum is that chunk's `f64` chain, and the GPU then adds
-//!    the chunk partials in chunk order in `f64`, the CPU's own operations.
-//! 3. **Chains.** Otherwise dense storage uses one GPU thread per
-//!    (chunk, feature); CSR uses one per chunk visiting stored entries once.
-//!    Each bin follows the CPU's row-order `f64` chain and chunk reduction.
+//!    atomics) and scales them back exactly, whatever the CPU's order.
+//! 2. **Exact blocks.** For a blocked node whose *blocks* are exact, each
+//!    block's integer sum is that block's `f64` chain, and the GPU then adds
+//!    the block partials in block order in `f64`, the CPU's own operations.
+//! 3. **Chains.** Otherwise a blocked node runs one GPU thread per (block,
+//!    feature) on dense storage and one per block on CSR (visiting stored
+//!    entries once), each bin following the CPU's row-order `f64` chain and
+//!    block reduction; a chain node below 8,192 rows is one such chain per
+//!    feature.
 //!
-//! The root's statistics follow the same chunks (`sum_rows`): each chunk's
-//! total is summed on the GPU (in integers when the chunks' sums are exact,
-//! else as `f64` chains) and the totals are added on the host in chunk
-//! order. The kernels are compiled without floating-point contraction
+//! A non-exact node the CPU sums as one chain of 8,192 or more rows is
+//! built on the host, from the host's gradients or the device's (read back
+//! once per tree), on every core and while the GPU builds the rest of its
+//! level. The root's statistics (`sum_rows`, one chain in row
+//! order) are summed on the GPU in integers when exact, else on the host.
+//! The kernels are compiled without floating-point contraction
 //! (cuda-oxide's `--no-fmad`), flush-to-zero, or approximate division, so
 //! every `f64` operation is the single IEEE operation the CPU performs;
 //! there are no floating-point atomics. Trees with a non-finite gradient
@@ -112,14 +118,15 @@
 
 mod abi;
 mod categorical;
+pub(crate) mod diagnostics;
 mod kernels;
-pub use categorical::ScanDiagnostics;
 mod predict;
-pub use predict::{GpuModel, prediction_available, prediction_device_name};
+pub use predict::{
+    GpuModel, prediction_available, prediction_device_name, prediction_unavailable_reason,
+};
 
 use crate::backend::exact_sum::SumDomain;
 use crate::data::ghist::{Bins, GHistIndex};
-use crate::data::{DMatrix, quantile::HistCuts};
 use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
 use crate::tree::gain::{GradStats, RegParams};
@@ -131,8 +138,10 @@ use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     DeviceRepr, DriverError, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits, sys,
 };
+use diagnostics::NodeCounts;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -170,29 +179,123 @@ const MIN_DRIVER: i32 = 12_080;
 /// Most nodes one reduction launch covers (a grid's `y` limit).
 const MAX_GRID_Y: usize = 65_535;
 
-/// Whether CUDA device 0 is available and has not suffered a runtime error.
-#[must_use]
-pub fn available() -> bool {
-    unavailable_reason().is_none()
+/// Why a CUDA device cannot run the backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Unavailable {
+    /// No NVIDIA driver (`libcuda`) is installed.
+    NoDriver,
+    /// The driver supports CUDA `major.minor`, older than the 12.8 the
+    /// backend needs.
+    OldDriver {
+        /// The CUDA major version the driver supports.
+        major: i32,
+        /// The CUDA minor version the driver supports.
+        minor: i32,
+    },
+    /// There is no device `ordinal`.
+    NoDevice {
+        /// The requested device.
+        ordinal: usize,
+        /// How many devices the driver reports.
+        count: usize,
+    },
+    /// Device `ordinal` has compute capability `major.minor`, older than
+    /// the kernels' 7.5 (Turing).
+    OldDevice {
+        /// The requested device.
+        ordinal: usize,
+        /// The device's compute capability major version.
+        major: i32,
+        /// The device's compute capability minor version.
+        minor: i32,
+    },
+    /// Device `ordinal` had a runtime error earlier in the process; it runs
+    /// nothing more.
+    Disabled {
+        /// The device.
+        ordinal: usize,
+    },
+    /// Initializing the device failed (a driver error, such as a kernel
+    /// module that does not load).
+    Failed(String),
 }
 
-/// Why CUDA device 0 is unavailable, including a sticky runtime failure.
+impl Unavailable {
+    /// Whether the machine lacks what the backend needs (no driver, an old
+    /// driver, no such device, an old device), as opposed to the backend
+    /// failing on a machine that has it.
+    #[must_use]
+    pub fn is_environment(&self) -> bool {
+        matches!(
+            self,
+            Self::NoDriver
+                | Self::OldDriver { .. }
+                | Self::NoDevice { .. }
+                | Self::OldDevice { .. }
+        )
+    }
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDriver => f.write_str("libcuda not found (no NVIDIA driver is installed)"),
+            Self::OldDriver { major, minor } => write!(
+                f,
+                "the NVIDIA driver supports CUDA {major}.{minor}; the backend needs {}.{} or later",
+                MIN_DRIVER / 1000,
+                MIN_DRIVER % 1000 / 10
+            ),
+            Self::NoDevice { ordinal, count } => {
+                write!(f, "no CUDA device {ordinal} ({count} found)")
+            }
+            Self::OldDevice {
+                ordinal,
+                major,
+                minor,
+            } => {
+                let (min_major, min_minor) = kernels::MIN_COMPUTE_CAPABILITY;
+                write!(
+                    f,
+                    "CUDA device {ordinal} has compute capability {major}.{minor}; the backend \
+                     needs {min_major}.{min_minor} or newer"
+                )
+            }
+            Self::Disabled { ordinal } => {
+                write!(f, "CUDA device {ordinal} disabled after a runtime error")
+            }
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// Whether CUDA device `ordinal` can train, and has not had a runtime
+/// error.
 #[must_use]
-pub fn unavailable_reason() -> Option<String> {
-    match device(0) {
+pub fn available(ordinal: usize) -> bool {
+    unavailable_reason(ordinal).is_none()
+}
+
+/// Why CUDA device `ordinal` cannot train, if it cannot.
+#[must_use]
+pub fn unavailable_reason(ordinal: usize) -> Option<Unavailable> {
+    match device(ordinal) {
         Ok(opened) if opened.failed.load(Ordering::Acquire) => {
-            Some("CUDA device 0 disabled after a runtime error".into())
+            Some(Unavailable::Disabled { ordinal })
         }
         Ok(_) => None,
         Err(reason) => Some(reason),
     }
 }
 
-/// The name of CUDA device 0, if it is available (for diagnostics and
-/// benchmarks).
+/// The name of CUDA device `ordinal`, if it can train.
 #[must_use]
-pub fn device_name() -> Option<String> {
-    device(0).ok().map(|device| device.name.clone())
+pub fn device_name(ordinal: usize) -> Option<String> {
+    device(ordinal)
+        .ok()
+        .filter(|device| !device.failed.load(Ordering::Acquire))
+        .map(|device| device.name.clone())
 }
 
 /// The kernels of one device's module; per-width kernels are indexed by
@@ -200,7 +303,6 @@ pub fn device_name() -> Option<String> {
 #[derive(Clone)]
 struct Kernels {
     stage_units: CudaFunction,
-    bin_dense: CudaFunction,
     iota_rows: CudaFunction,
     chunk_totals: CudaFunction,
     hist_shared: [CudaFunction; 3],
@@ -216,6 +318,7 @@ struct Kernels {
     route_scatter: CudaFunction,
     route_scan: CudaFunction,
     route_copy: CudaFunction,
+    route_runs: CudaFunction,
     finalize_exact: CudaFunction,
     finalize_exact_sub: CudaFunction,
     reduce_chunks: CudaFunction,
@@ -224,7 +327,6 @@ struct Kernels {
     logistic: CudaFunction,
     grad_domain: CudaFunction,
     add_leaves: CudaFunction,
-    chunk_chains: CudaFunction,
     subtract_hists: CudaFunction,
     scan_splits: CudaFunction,
     category_keys: CudaFunction,
@@ -250,29 +352,20 @@ struct Device {
 }
 
 impl Device {
-    fn open(ordinal: usize) -> std::result::Result<Self, String> {
-        driver()?;
-        let count = match CudaContext::device_count() {
-            Ok(count) => count,
-            Err(e) if e.0 == sys::CUresult::CUDA_ERROR_NO_DEVICE => 0,
-            Err(e) => return Err(format!("CUDA init failed: {e}")),
-        };
-        let count = usize::try_from(count).unwrap_or(0);
-        if ordinal >= count {
-            return Err(format!("no CUDA device {ordinal} ({count} found)"));
-        }
-        let ctx = CudaContext::new(ordinal).map_err(|e| format!("CUDA context: {e}"))?;
+    fn open(ordinal: usize) -> std::result::Result<Self, Unavailable> {
+        find_device(ordinal)?;
+        let ctx = CudaContext::new(ordinal).map_err(|e| failed("context", e))?;
         // SAFETY: each backend allocates, uses and frees every slice on its
-        // own stream, including retained preparation bins. Only immutable
-        // kernel/module handles cross backend boundaries.
+        // own stream. Only immutable kernel/module handles cross backend
+        // boundaries.
         unsafe { ctx.disable_event_tracking() };
         let module = kernels::load(&ctx, kernels::Module::Training)?;
         let function = |name: &str| {
             module
                 .load_function(name)
-                .map_err(|e| format!("CUDA kernel `{name}`: {e}"))
+                .map_err(|e| failed(&format!("kernel `{name}`"), e))
         };
-        let widths = |prefix: &str| -> std::result::Result<[CudaFunction; 3], String> {
+        let widths = |prefix: &str| -> std::result::Result<[CudaFunction; 3], Unavailable> {
             Ok([
                 function(&format!("{prefix}_u8"))?,
                 function(&format!("{prefix}_u16"))?,
@@ -281,7 +374,6 @@ impl Device {
         };
         let kernels = Kernels {
             stage_units: function("stage_units")?,
-            bin_dense: function("bin_dense")?,
             iota_rows: function("iota_rows")?,
             chunk_totals: function("chunk_totals")?,
             hist_shared: widths("hist_shared")?,
@@ -297,6 +389,7 @@ impl Device {
             route_scatter: function("route_scatter")?,
             route_scan: function("route_scan")?,
             route_copy: function("route_copy")?,
+            route_runs: function("route_runs")?,
             finalize_exact: function("finalize_exact")?,
             finalize_exact_sub: function("finalize_exact_sub")?,
             reduce_chunks: function("reduce_chunks")?,
@@ -305,7 +398,6 @@ impl Device {
             logistic: function("logistic")?,
             grad_domain: function("grad_domain")?,
             add_leaves: function("add_leaves")?,
-            chunk_chains: function("chunk_chains")?,
             subtract_hists: function("subtract_hists")?,
             scan_splits: function("scan_splits")?,
             category_keys: function("category_keys")?,
@@ -313,10 +405,8 @@ impl Device {
             scan_categorical: function("scan_categorical")?,
             merge_scans: function("merge_scans")?,
         };
-        let attribute = |attribute, what: &str| {
-            ctx.attribute(attribute)
-                .map_err(|e| format!("CUDA {what}: {e}"))
-        };
+        let attribute =
+            |attribute, what: &str| ctx.attribute(attribute).map_err(|e| failed(what, e));
         let sm_count = attribute(
             sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
             "SM count",
@@ -353,10 +443,10 @@ impl Device {
                 )
             }
             .result()
-            .map_err(|e| format!("CUDA shared memory attribute: {e}"))?;
+            .map_err(|e| failed("shared memory attribute", e))?;
         }
-        let stream = ctx.new_stream().map_err(|e| format!("CUDA stream: {e}"))?;
-        let name = ctx.name().map_err(|e| format!("CUDA device name: {e}"))?;
+        let stream = ctx.new_stream().map_err(|e| failed("stream", e))?;
+        let name = ctx.name().map_err(|e| failed("device name", e))?;
         Ok(Device {
             stream,
             kernels,
@@ -413,28 +503,40 @@ impl Device {
     }
 }
 
-/// The driver loads and is new enough. Checked before any other `cudarc`
-/// call: its lazy loaders panic when the library is missing, and the
-/// release profile aborts on panic.
-fn driver() -> std::result::Result<(), String> {
+/// Check that the driver loads, is new enough, and has device `ordinal`.
+/// Checked before any other `cudarc` call: its lazy loaders panic when the
+/// library is missing, and the release profile aborts on panic.
+fn find_device(ordinal: usize) -> std::result::Result<(), Unavailable> {
     // SAFETY: only tries to open the shared library by name.
     if !unsafe { sys::is_culib_present() } {
-        return Err("libcuda not found (no NVIDIA driver is installed)".into());
+        return Err(Unavailable::NoDriver);
     }
     let mut version = 0;
     // SAFETY: the driver library loads (checked above), and the call only
     // writes the version through the pointer.
     unsafe { sys::cuDriverGetVersion(&raw mut version) }
         .result()
-        .map_err(|e| format!("CUDA driver version: {e}"))?;
+        .map_err(|e| failed("driver version", e))?;
     if version < MIN_DRIVER {
-        return Err(format!(
-            "the NVIDIA driver supports CUDA {}.{}; the backend needs 12.8 or later",
-            version / 1000,
-            version % 1000 / 10
-        ));
+        return Err(Unavailable::OldDriver {
+            major: version / 1000,
+            minor: version % 1000 / 10,
+        });
+    }
+    let count = match CudaContext::device_count() {
+        Ok(count) => usize::try_from(count).unwrap_or(0),
+        Err(e) if e.0 == sys::CUresult::CUDA_ERROR_NO_DEVICE => 0,
+        Err(e) => return Err(failed("init", e)),
+    };
+    if ordinal >= count {
+        return Err(Unavailable::NoDevice { ordinal, count });
     }
     Ok(())
+}
+
+/// A driver error while opening a device.
+fn failed(what: &str, error: impl std::fmt::Display) -> Unavailable {
+    Unavailable::Failed(format!("CUDA {what}: {error}"))
 }
 
 /// The opened devices, by ordinal (each opened once per process; a failure
@@ -442,10 +544,10 @@ fn driver() -> std::result::Result<(), String> {
 static DEVICES: Mutex<Vec<(usize, Opened)>> = Mutex::new(Vec::new());
 
 /// A device opened once, or why it could not be.
-type Opened = std::result::Result<Arc<Device>, String>;
+type Opened = std::result::Result<Arc<Device>, Unavailable>;
 
 /// Open (once) CUDA device `ordinal`.
-fn device(ordinal: usize) -> std::result::Result<Arc<Device>, String> {
+fn device(ordinal: usize) -> Opened {
     let mut devices = DEVICES.lock();
     if let Some((_, opened)) = devices.iter().find(|(o, _)| *o == ordinal) {
         return opened.clone();
@@ -453,30 +555,6 @@ fn device(ordinal: usize) -> std::result::Result<Arc<Device>, String> {
     let opened = Device::open(ordinal).map(Arc::new);
     devices.push((ordinal, opened.clone()));
     opened
-}
-
-/// How many nodes (and rows) a [`CudaHistBackend`] built with each
-/// strategy of the [module docs](self), for benchmarks and diagnostics.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct NodeCounts {
-    /// Nodes summed as exact integers in one piece (strategy 1).
-    pub exact_nodes: u64,
-    /// Nodes summed as exact integer chunks reduced in `f64` (strategy 2).
-    pub exact_chunk_nodes: u64,
-    /// Nodes summed as `f64` chains on the GPU (strategy 3).
-    pub chain_nodes: u64,
-    /// Nodes built by the CPU backend (non-finite gradients, input
-    /// mismatches, and every node after a CUDA error).
-    pub cpu_nodes: u64,
-    /// Rows of the nodes counted in `exact_nodes`.
-    pub exact_rows: u64,
-    /// Rows of the nodes counted in `exact_chunk_nodes`.
-    pub exact_chunk_rows: u64,
-    /// Rows of the nodes counted in `chain_nodes`.
-    pub chain_rows: u64,
-    /// Rows of the nodes counted in `cpu_nodes`.
-    pub cpu_rows: u64,
 }
 
 /// Atomic [`NodeCounts`].
@@ -548,6 +626,9 @@ struct Staged {
     len: usize,
     grad: SumDomain,
     hess: SumDomain,
+    /// The device-computed gradients (`addr == 0`), downloaded the first
+    /// time a node summed on the CPU needs them; `None` until then.
+    host: Option<Vec<GradPair>>,
 }
 
 impl Staged {
@@ -589,16 +670,30 @@ struct Resident<'a> {
     siblings: &'a [(HistSlot, HistSlot)],
 }
 
-/// Whether no pool slot is written twice by one resident build: the
-/// targets are distinct, and so are the parents, none of them a target.
-fn distinct_writes(nodes: &[(Segment, HistSlot)], siblings: &[(HistSlot, HistSlot)]) -> bool {
-    let mut written: Vec<HistSlot> = nodes
-        .iter()
-        .map(|&(_, slot)| slot)
-        .chain(siblings.iter().map(|&(parent, _)| parent))
-        .collect();
+/// Whether one resident build's kernels never touch a pool slot from two
+/// places at once: every write (a node's target, a sibling's parent) goes
+/// to a distinct slot, and no sibling reads a slot another one writes.
+fn race_free(nodes: &[(Segment, HistSlot)], siblings: &[(HistSlot, HistSlot)]) -> bool {
+    let mut parents: Vec<HistSlot> = siblings.iter().map(|&(parent, _)| parent).collect();
+    parents.sort_unstable();
+    let mut written: Vec<HistSlot> = nodes.iter().map(|&(_, slot)| slot).collect();
+    written.extend_from_slice(&parents);
     written.sort_unstable();
     written.windows(2).all(|pair| pair[0] != pair[1])
+        && siblings
+            .iter()
+            .all(|(_, built)| parents.binary_search(built).is_err())
+}
+
+/// Whether no two segments share a row position (so no two leaves add to
+/// one margin).
+fn disjoint(segs: impl Iterator<Item = Segment>) -> bool {
+    let mut spans: Vec<(usize, usize)> = segs
+        .filter(|s| s.len > 0)
+        .map(|s| (s.offset, s.offset + s.len))
+        .collect();
+    spans.sort_unstable();
+    spans.windows(2).all(|pair| pair[0].1 <= pair[1].0)
 }
 
 /// Host partition descriptors retain capacity across levels and trees.
@@ -664,11 +759,11 @@ struct State {
     /// The root's per-chunk totals.
     totals: CudaSlice<i64>,
     tile_left: CudaSlice<u32>,
+    /// A partition's left child lengths, then each split's child run bits
+    /// (`route_runs`): two words per split.
     left_len: CudaSlice<u32>,
     /// The gradient statistics the device folds.
     domain: CudaSlice<u32>,
-    /// Per-block `f64` totals of a root whose blocks are not exact.
-    chains: CudaSlice<f64>,
     /// Device-side rounds: the training margins, labels and weights (the
     /// latter two keyed by the host slices they were copied from).
     margins: Option<CudaSlice<f32>>,
@@ -1439,110 +1534,6 @@ impl CudaHistBackend {
     /// Build the backend for `index` on CUDA device `ordinal`: upload its
     /// bins and allocate the per-tree buffers.
     pub fn new(index: &GHistIndex, ordinal: usize) -> Result<Self> {
-        let device = device(ordinal)
-            .map_err(HessboostError::gpu)?
-            .for_backend()
-            .map_err(gpu_error)?;
-        Self::with_global(index, device, None)
-    }
-
-    /// Bin dense values on CUDA against CPU-authoritative cuts, then retain
-    /// the device bins while constructing the identical CPU index. CSR input
-    /// is binned in its compact CPU layout and uploaded without densification.
-    pub fn from_dmatrix(
-        data: &DMatrix,
-        cuts: HistCuts,
-        ordinal: usize,
-    ) -> Result<(GHistIndex, Self)> {
-        if cuts.n_features() != data.n_cols() {
-            return Err(HessboostError::dimension_mismatch(
-                "cut features",
-                data.n_cols(),
-                cuts.n_features(),
-            ));
-        }
-        if data.n_rows() == 0
-            || data.n_cols() == 0
-            || cuts.total_bins() == 0
-            || u32::try_from(data.n_rows()).is_err()
-            || u32::try_from(data.n_cols()).is_err()
-            || u32::try_from(cuts.total_bins()).is_err()
-        {
-            return Err(HessboostError::invalid_data(
-                "data",
-                "CUDA binning needs a non-empty dataset and 32-bit row, feature and bin counts",
-            ));
-        }
-        let Some(values) = data.dense_values() else {
-            let index = GHistIndex::from_dmatrix(data, cuts);
-            let backend = Self::new(&index, ordinal)?;
-            return Ok((index, backend));
-        };
-        let device = device(ordinal)
-            .map_err(HessboostError::gpu)?
-            .for_backend()
-            .map_err(gpu_error)?;
-        let stream = &device.stream;
-        let pool = &device.pinned;
-        let mut ring = Ring::default();
-        let binned = (|| {
-            let count = sized::<u32>(values.len())?;
-            let mut raw = stream.alloc_zeros::<f32>(count)?;
-            ring.upload(pool, stream, values, &mut raw)?;
-            let first: Vec<u32> = (0..=data.n_cols())
-                .map(|f| {
-                    if f == data.n_cols() {
-                        cuts.total_bins() as u32
-                    } else {
-                        cuts.feature_bins(f).0 as u32
-                    }
-                })
-                .collect();
-            let categories: Vec<u8> = (0..data.n_cols())
-                .map(|f| u8::from(cuts.is_categorical(f)))
-                .collect();
-            let cut_values: Vec<f32> = (0..cuts.total_bins()).map(|b| cuts.cut_value(b)).collect();
-            let first = clone_host(stream, &first)?;
-            let categories = clone_host(stream, &categories)?;
-            let cut_values = clone_host(stream, &cut_values)?;
-            let mut global = stream.alloc_zeros::<u32>(count)?;
-            let matrix = abi::DenseCells {
-                cells: count as u64,
-                n_cols: data.n_cols() as u32,
-                missing: data.missing(),
-            };
-            let mut launch = stream.launch_builder(&device.kernels.bin_dense);
-            launch
-                .arg(&raw)
-                .arg(&matrix)
-                .arg(&cut_values)
-                .arg(&first)
-                .arg(&categories)
-                .arg(&mut global);
-            // SAFETY: validated dense cells and matching cuts, one global
-            // output per cell; missing markers are excluded by the host index.
-            unsafe { launch.launch(device.grid(count)) }?;
-            let mut host = vec![0u32; count];
-            ring.download(pool, stream, &global, &mut host)?;
-            let index = GHistIndex::from_dense_bins(data, cuts, &host);
-            Ok((index, global))
-        })();
-        let (index, global) = binned
-            .inspect_err(|_| device.failed.store(true, Ordering::Release))
-            .map_err(gpu_error)?;
-        let retained = index
-            .dense_stride()
-            .is_some()
-            .then_some(DeviceBins::U32(global));
-        let backend = Self::with_global(&index, device, retained)?;
-        Ok((index, backend))
-    }
-
-    fn with_global(
-        index: &GHistIndex,
-        device: Arc<Device>,
-        global: Option<DeviceBins>,
-    ) -> Result<Self> {
         let n_rows = index.n_rows();
         let n_cols = index.n_cols();
         let total_bins = index.total_bins();
@@ -1564,7 +1555,11 @@ impl CudaHistBackend {
                 ),
             ));
         }
-        let state = Self::upload(&device, index, global)
+        let device = device(ordinal)
+            .map_err(|reason| HessboostError::gpu(reason.to_string()))?
+            .for_backend()
+            .map_err(gpu_error)?;
+        let state = Self::upload(&device, index)
             .inspect_err(|_| device.failed.store(true, Ordering::Release))
             .map_err(gpu_error)?;
         Ok(CudaHistBackend {
@@ -1585,17 +1580,15 @@ impl CudaHistBackend {
         &self.device.name
     }
 
-    /// The nodes (and rows) built so far with each strategy.
+    /// The nodes (and rows) built so far with each strategy
+    /// (`hessboost::internals`, for tests and benchmarks).
+    #[doc(hidden)]
     #[must_use]
     pub fn node_counts(&self) -> NodeCounts {
         self.counters.snapshot()
     }
 
-    fn upload(
-        device: &Device,
-        index: &GHistIndex,
-        retained: Option<DeviceBins>,
-    ) -> std::result::Result<State, DriverError> {
+    fn upload(device: &Device, index: &GHistIndex) -> std::result::Result<State, DriverError> {
         let stream = &device.stream;
         let n_rows = index.n_rows();
         let n_cols = index.n_cols();
@@ -1613,10 +1606,7 @@ impl CudaHistBackend {
         first.push(total_bins as u32);
         let feature_first = clone_host(stream, &first)?;
         let mut ring = Ring::default();
-        let global_bins = match retained {
-            Some(bins) => bins,
-            None => global_bins(device, &mut ring, index)?,
-        };
+        let global_bins = global_bins(device, &mut ring, index)?;
         let (bins, cols, row_ptr, stride) = if dense {
             let (bins, cols, stride) = if widest <= u8::MAX as usize + 1 {
                 let (r, c, s) = encode_dense::<u8>(
@@ -1706,7 +1696,6 @@ impl CudaHistBackend {
             partition_host: PartitionHost::default(),
             pin_counts: None,
             domain: alloc_u32(6)?,
-            chains: stream.alloc_zeros(2)?,
             margins: None,
             labels: None,
             weights: None,
@@ -1715,6 +1704,7 @@ impl CudaHistBackend {
                 len: 0,
                 grad: SumDomain::EMPTY,
                 hess: SumDomain::EMPTY,
+                host: None,
             },
             staging: Staging::default(),
             ring,
@@ -1833,9 +1823,9 @@ impl CudaHistBackend {
                 .arg(&n)
                 .arg(&to_grad)
                 .arg(&to_hess);
-            // SAFETY: both per-value conversions are finite, exact integers
-            // bounded by 2^53. Other domains use floating chains/CPU and
-            // must never execute an undefined C++ float-to-integer cast.
+            // SAFETY: `n_rows` pairs in and units out; every scaled value
+            // is finite, an exact integer, and at most 2^53 in magnitude
+            // (`sums_exact(1)`), so the kernel's `as i64` keeps it exactly.
             unsafe { launch.launch(self.device.grid(self.n_rows)) }?;
         }
         state.staged = Staged {
@@ -1843,6 +1833,7 @@ impl CudaHistBackend {
             len: self.n_rows,
             grad,
             hess,
+            host: None,
         };
         Ok(())
     }
@@ -2017,12 +2008,12 @@ impl CudaHistBackend {
         Ok(wave)
     }
 
-    /// The histograms of `nodes` (`(rows of source, contiguous)`), reading
-    /// rows from `source` (an upload's host copy feeds CPU-built nodes).
-    /// With `resident`, node `k`'s histogram is written to slot
-    /// `targets[k]` of `state.out` (which the caller has made the resident
-    /// pool), each sibling is subtracted in its parent's slot, and nothing
-    /// is read back (`Some` of an empty list).
+    /// The histograms of `nodes` (segments of `source`'s rows; an upload's
+    /// host copy feeds CPU-built nodes), put where `dest` says: read back
+    /// (one per node), read back into the single node's buffer, or written
+    /// to resident pool slots (both returning an empty list).
+    /// CPU-built nodes use `gpair`, or the device's gradients downloaded
+    /// once per staging when only the device has them.
     fn histograms_on(
         &self,
         state: &mut State,
@@ -2030,12 +2021,21 @@ impl CudaHistBackend {
         ghist: &GHistIndex,
         gpair: Option<&[GradPair]>,
         nodes: &[Segment],
-        resident: Option<Resident<'_>>,
-    ) -> std::result::Result<Option<Vec<Histogram>>, DriverError> {
+        mut dest: Dest<'_>,
+    ) -> std::result::Result<Vec<Histogram>, DriverError> {
         let bins = self.total_bins;
         let device = &*self.device;
         let stream = &device.stream;
         let pool = &device.pinned;
+        let resident = match dest {
+            Dest::Resident(resident) => Some(resident),
+            Dest::Read | Dest::Into(_) => None,
+        };
+        if let Dest::Into(out) = &dest
+            && (nodes.len() != 1 || out.len() != bins)
+        {
+            return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));
+        }
         let targets = resident.map(|r| r.targets);
         let mut results: Vec<Option<Histogram>> = (0..nodes.len()).map(|_| None).collect();
         let mut exact = Vec::new();
@@ -2047,36 +2047,23 @@ impl CudaHistBackend {
         let mut subtracted = Vec::new();
         // Output slot of node `k`, the next free one without `targets`.
         let slot_of = |k: usize, next: usize| targets.map_or(next, |t| t[k] as usize);
-        // Rows per tile must keep `rows * features` of a group in a `u32`.
-        // (Halved: the kernel's unrolled indices run up to four block widths
-        // past the tile's last element.)
-        let max_tile = if state.row_ptr.is_some() {
-            u32::MAX as usize
-        } else {
-            (u32::MAX as usize / 2 / state.group_features.max(1)).max(1)
-        };
+        let max_tile = max_tile(state);
         for (k, &seg) in nodes.iter().enumerate() {
             if seg.len == 0 {
-                match targets {
-                    Some(t) => {
+                match (targets, &mut dest) {
+                    (Some(t), _) => {
                         let s = t[k] as usize;
                         stream.memset_zeros(
                             &mut state.out.slice_mut(s * bins * 2..(s + 1) * bins * 2),
                         )?;
                     }
-                    None => results[k] = Some(zeroed(bins)),
+                    (None, Dest::Into(out)) => out.fill(GradStats::default()),
+                    (None, _) => results[k] = Some(zeroed(bins)),
                 }
                 self.counters.count(Strategy::Exact, 0);
                 continue;
             }
-            let order = sum_order(seg.len);
-            let mut strategy = plan(&state.staged, order, seg.len);
-            if let (Strategy::ExactChunks | Strategy::Chains, SumOrder::Blocked { grain }) =
-                (strategy, order)
-                && grain > max_tile
-            {
-                strategy = Strategy::Cpu;
-            }
+            let (strategy, order) = plan(&state.staged, ghist, seg, max_tile);
             self.counters.count(strategy, seg.len);
             let slot = slot_of(k, slots.len());
             match (strategy, order) {
@@ -2102,6 +2089,39 @@ impl CudaHistBackend {
             state.staged.grad.value_scale(),
             state.staged.hess.value_scale(),
         );
+        // Strategy 4's inputs (the gradients and rows the CPU reads), read
+        // back before this call's kernels are queued, so that the CPU builds
+        // below overlap them.
+        let downloaded = if gpair.is_none() && !cpu.is_empty() {
+            Some(self.device_gradients(state)?)
+        } else {
+            None
+        };
+        let cpu_rows: Vec<Cow<'_, [u32]>> = match source {
+            RowSource::Upload(rows) => cpu
+                .iter()
+                .map(|&k| Cow::Borrowed(&rows[nodes[k].offset..nodes[k].offset + nodes[k].len]))
+                .collect(),
+            RowSource::Tree => {
+                let mut all = Vec::with_capacity(cpu.len());
+                for &k in &cpu {
+                    let seg = nodes[k];
+                    let mut rows = vec![0u32; seg.len];
+                    stream.memcpy_dtoh(
+                        &state.tree_rows.slice(seg.offset..seg.offset + seg.len),
+                        &mut rows,
+                    )?;
+                    all.push(Cow::Owned(rows));
+                }
+                if !all.is_empty() {
+                    // Pageable copies: their bytes are there once the
+                    // stream has synchronized.
+                    stream.synchronize()?;
+                    state.staging.synced();
+                }
+                all
+            }
+        };
 
         // Strategy 1: exact integers, any tiling, into per-node accumulators.
         for batch in exact.chunks(MAX_GRID_Y) {
@@ -2317,27 +2337,19 @@ impl CudaHistBackend {
             }
         }
 
-        // Strategy 4 on the CPU, while the GPU works: needs the host
-        // gradients (callers without them checked there are no such nodes).
-        for &k in &cpu {
-            let Some(gpair) = gpair else {
-                return Ok(None);
+        // Strategy 4 on the CPU, while the GPU works.
+        let host_gpair = gpair.or(downloaded.as_deref());
+        let threads = rayon::current_num_threads();
+        for (&k, rows) in cpu.iter().zip(&cpu_rows) {
+            let Some(gpair) = host_gpair else {
+                return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));
             };
-            let seg = nodes[k];
-            let rows = if let RowSource::Upload(rows) = source {
-                rows[seg.offset..seg.offset + seg.len].to_vec()
-            } else {
-                let mut rows = vec![0u32; seg.len];
-                stream.memcpy_dtoh(
-                    &state.tree_rows.slice(seg.offset..seg.offset + seg.len),
-                    &mut rows,
-                )?;
-                stream.synchronize()?;
-                state.staging.synced();
-                rows
-            };
+            if let Dest::Into(out) = &mut dest {
+                CpuBackend::build_locked(ghist, rows, gpair, out, threads);
+                continue;
+            }
             let mut hist = zeroed(bins);
-            CpuBackend::build_serial(ghist, &rows, gpair, &mut hist);
+            CpuBackend::build_locked(ghist, rows, gpair, &mut hist, threads);
             match targets {
                 Some(t) => {
                     let s = t[k] as usize;
@@ -2350,6 +2362,9 @@ impl CudaHistBackend {
                 }
                 None => results[k] = Some(hist),
             }
+        }
+        if downloaded.is_some() {
+            state.staged.host = downloaded;
         }
         if let Some(resident) = resident {
             // Siblings of children built by the other strategies.
@@ -2377,10 +2392,21 @@ impl CudaHistBackend {
                 // and each element writes only its own parent bin.
                 unsafe { launch.launch(device.grid(pairs.len() / 2 * bins)) }?;
             }
-            return Ok(Some(Vec::new()));
+            return Ok(Vec::new());
         }
 
         if !slots.is_empty() {
+            if let Dest::Into(out) = dest {
+                // SAFETY: `GradStats` is `repr(C)` of two `f64`s, so `out`
+                // is `2 * len` contiguous `f64`s.
+                let flat = unsafe {
+                    std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<f64>(), out.len() * 2)
+                };
+                // Kernel faults surface at this synchronization point.
+                state.ring.download(pool, stream, &state.out, flat)?;
+                state.staging.synced();
+                return Ok(Vec::new());
+            }
             let mut all = vec![GradStats::default(); slots.len() * bins];
             // SAFETY: `GradStats` is `repr(C)` of two `f64`s, so `all` is
             // `2 * len` contiguous `f64`s.
@@ -2395,9 +2421,36 @@ impl CudaHistBackend {
                 results[k] = Some(hist.to_vec());
             }
         }
-        Ok(Some(
-            results.into_iter().map(Option::unwrap_or_default).collect(),
-        ))
+        if matches!(dest, Dest::Into(_)) {
+            return Ok(Vec::new());
+        }
+        Ok(results.into_iter().map(Option::unwrap_or_default).collect())
+    }
+
+    /// The device-computed gradients on the host: the staging's cached
+    /// copy, taken (the caller puts it back), or downloaded.
+    fn device_gradients(
+        &self,
+        state: &mut State,
+    ) -> std::result::Result<Vec<GradPair>, DriverError> {
+        if let Some(host) = state.staged.host.take() {
+            return Ok(host);
+        }
+        if !state.staged.holds(None) {
+            return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));
+        }
+        let mut host = vec![GradPair::default(); self.n_rows];
+        // SAFETY: `GradPair` is `repr(C)` of two `f32`s, so `host` is
+        // `2 * len` contiguous `f32`s, as the device's pairs are.
+        let flat = unsafe {
+            std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<f32>(), host.len() * 2)
+        };
+        let device = &*self.device;
+        state
+            .ring
+            .download(&device.pinned, &device.stream, &state.gpair, flat)?;
+        state.staging.synced();
+        Ok(host)
     }
 
     fn partition_on(
@@ -2468,7 +2521,8 @@ impl CudaHistBackend {
                 bytes_of(ptiles.as_slice()),
             ],
         )?;
-        fit(stream, &mut state.left_len, splits.len())?;
+        // Each split's left length, then its children's run bits.
+        fit(stream, &mut state.left_len, splits.len() * 2)?;
         let State {
             cols,
             bins,
@@ -2554,22 +2608,33 @@ impl CudaHistBackend {
             // SAFETY: copies each tile's span within its segment.
             unsafe { copy.launch(tiles_config) }?;
         }
-        let counts = pinned(pool, stream, pin_counts, splits.len(), false)?;
-        let host = download_pinned(stream, counts, left_len, splits.len())?;
+        let mut runs = stream.launch_builder(&device.kernels.route_runs);
+        runs.arg(&d_segs)
+            .arg(&*tree_rows)
+            .arg(&n_splits)
+            .arg(&mut *left_len);
+        // SAFETY: one thread per split reads its own (partitioned) segment
+        // and length and writes its own run word.
+        unsafe { runs.launch(Device::one_per(splits.len())) }?;
+        let counts = pinned(pool, stream, pin_counts, splits.len() * 2, false)?;
+        let host = download_pinned(stream, counts, left_len, splits.len() * 2)?;
         staging.synced();
+        let (lens, runs) = host.split_at(splits.len());
         Ok(splits
             .iter()
-            .zip(host)
-            .map(|(split, left_len)| {
-                let left_len = *left_len as usize;
+            .zip(lens.iter().zip(runs))
+            .map(|(split, (&left_len, &runs))| {
+                let left_len = left_len as usize;
                 Partitioned {
                     left: Segment {
                         offset: split.seg.offset,
                         len: left_len,
+                        contiguous: runs & 1 != 0,
                     },
                     right: Segment {
                         offset: split.seg.offset + left_len,
                         len: split.seg.len - left_len,
+                        contiguous: runs & 2 != 0,
                     },
                 }
             })
@@ -2577,21 +2642,69 @@ impl CudaHistBackend {
     }
 }
 
-/// The strategy for a node of `n` rows summed in `order` (the
-/// [module docs](self)' numbering).
-fn plan(staged: &Staged, order: SumOrder, n: usize) -> Strategy {
+/// Where [`CudaHistBackend::histograms_on`] puts the histograms.
+enum Dest<'a> {
+    /// Read back, one per node.
+    Read,
+    /// Read back into the single node's histogram.
+    Into(&'a mut [GradStats]),
+    /// Written to resident pool slots.
+    Resident(Resident<'a>),
+}
+
+/// The longest row-order chain the GPU sums (one thread per feature walks
+/// the node's rows): every node below the CPU's 8,192-row blocking
+/// threshold. Longer chains, which only the CPU's feature sweeps of a
+/// column-major index form, are summed on the CPU, as Metal and wgpu leave
+/// the nodes they cannot reproduce there.
+const MAX_CHAIN_ROWS: usize = 8191;
+
+/// Rows per block of an exact root total (any grouping of exact sums gives
+/// the chain's).
+const ROOT_CHUNK: usize = 1 << 14;
+
+/// The most rows one histogram tile may hold: `rows * features` of a
+/// group must fit a `u32` (halved: the kernel's unrolled indices run up to
+/// four block widths past the tile's last element).
+fn max_tile(state: &State) -> usize {
+    if state.row_ptr.is_some() {
+        u32::MAX as usize
+    } else {
+        (u32::MAX as usize / 2 / state.group_features.max(1)).max(1)
+    }
+}
+
+/// The strategy for the nonempty node `seg` of `ghist` (the
+/// [module docs](self)' numbering) and the CPU's order for it
+/// ([`sum_order`]), with tiles of at most `max_tile` rows.
+fn plan(
+    staged: &Staged,
+    ghist: &GHistIndex,
+    seg: Segment,
+    max_tile: usize,
+) -> (Strategy, SumOrder) {
+    let order = sum_order(
+        ghist.column_bins().is_some(),
+        ghist.n_rows(),
+        seg.len,
+        seg.contiguous,
+    );
     // NaN payloads are not portable between the CPU's and the GPU's
     // arithmetic, so a non-finite slice keeps the CPU's bits by running there.
-    if !staged.finite() {
-        return Strategy::Cpu;
-    }
-    if staged.sums_exact(n) {
-        return Strategy::Exact;
-    }
-    match order {
-        SumOrder::Blocked { grain } if staged.sums_exact(grain) => Strategy::ExactChunks,
-        SumOrder::Blocked { .. } | SumOrder::Chain => Strategy::Chains,
-    }
+    let strategy = if !staged.finite() {
+        Strategy::Cpu
+    } else if staged.sums_exact(seg.len) {
+        Strategy::Exact
+    } else {
+        match order {
+            SumOrder::Blocked { grain } if grain > max_tile => Strategy::Cpu,
+            SumOrder::Blocked { grain } if staged.sums_exact(grain) => Strategy::ExactChunks,
+            SumOrder::Blocked { .. } => Strategy::Chains,
+            SumOrder::Chain if seg.len <= MAX_CHAIN_ROWS => Strategy::Chains,
+            SumOrder::Chain => Strategy::Cpu,
+        }
+    };
+    (strategy, order)
 }
 
 fn gpu_error(error: DriverError) -> HessboostError {
@@ -2603,6 +2716,11 @@ impl HistogramBackend for CudaHistBackend {
         let (inside, run) = self.check_rows(rows);
         let fits =
             self.fits(ghist) && out.len() == self.total_bins && rows.len() <= self.n_rows && inside;
+        let node = Segment {
+            offset: 0,
+            len: rows.len(),
+            contiguous: run,
+        };
         let built = fits.then(|| self.lock()).flatten().and_then(|mut state| {
             let state = &mut *state;
             if !state.staged.holds(Some(gpair)) {
@@ -2611,25 +2729,24 @@ impl HistogramBackend for CudaHistBackend {
                     return None;
                 }
             }
+            // A node the CPU sums is built below, outside the lock, on
+            // every thread.
+            if node.len > 0 && plan(&state.staged, ghist, node, max_tile(state)).0 == Strategy::Cpu
+            {
+                return None;
+            }
             let placed = self.place_rows(&mut state.ring, &mut state.upload, rows, run);
             self.ok(placed)?;
-            let node = Segment {
-                offset: 0,
-                len: rows.len(),
-            };
             self.ok(self.histograms_on(
                 state,
                 RowSource::Upload(rows),
                 ghist,
                 Some(gpair),
                 &[node],
-                None,
-            ))??
-            .pop()
+                Dest::Into(&mut *out),
+            ))
         });
-        if let Some(hist) = built {
-            out.copy_from_slice(&hist);
-        } else {
+        if built.is_none() {
             self.counters.count(Strategy::Cpu, rows.len());
             CpuBackend.build(ghist, rows, gpair, out);
         }
@@ -2671,85 +2788,82 @@ impl RowEngine for CudaHistBackend {
         Some(Segment {
             offset: 0,
             len: rows.len(),
+            contiguous: run,
         })
     }
 
-    fn root_total(&self, seg: Segment) -> Option<GradStats> {
+    fn root_total(
+        &self,
+        gpair: Option<&[GradPair]>,
+        rows: &[u32],
+        seg: Segment,
+    ) -> Option<GradStats> {
         let mut state = self.lock()?;
-        // `sum_rows`'s blocks, each summed on the device (in integers when
-        // the blocks' sums are exact, else as `f64` chains), and the block
-        // totals added here in block order, the host's own operations.
-        let grain = match sum_order(seg.len) {
-            SumOrder::Blocked { grain } => grain,
-            SumOrder::Chain => seg.len.max(1),
-        };
-        if !state.staged.finite() || seg.offset + seg.len > state.tree_len {
+        let state = &mut *state;
+        if rows.len() != seg.len
+            || seg.offset + seg.len > state.tree_len
+            || !state.staged.holds(gpair)
+        {
             return None;
         }
-        let exact = state.staged.sums_exact(grain);
+        if !state.staged.finite() || !state.staged.sums_exact(seg.len) {
+            // `sum_rows`'s row-order chain, on the host.
+            let downloaded = match gpair {
+                Some(_) => None,
+                None => Some(self.ok(self.device_gradients(state))?),
+            };
+            let pairs = gpair.or(downloaded.as_deref())?;
+            let mut total = GradStats::default();
+            for &r in rows {
+                total.add(GradStats::from_pair(*pairs.get(r as usize)?));
+            }
+            if downloaded.is_some() {
+                state.staged.host = downloaded;
+            }
+            return Some(total);
+        }
+        // Every partial sum is exact, so the chain's sum is the integer
+        // total in any grouping: per-block totals on the device, added here.
         let device = &*self.device;
         let stream = &device.stream;
-        let state = &mut *state;
-        let chunks = seg.len.div_ceil(grain).max(1);
-        let blocks = (|| {
-            let config = LaunchConfig {
-                grid_dim: (chunks as u32, 1, 1),
-                block_dim: (PART_THREADS, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let rows = state.tree_rows.slice(seg.offset..seg.offset + seg.len);
-            let (n, grain64) = (seg.len as u64, grain as u64);
-            let mut host = vec![0f64; chunks * 2];
-            if exact {
-                fit(stream, &mut state.totals, chunks * 2)?;
-                stream.memset_zeros(&mut state.totals.slice_mut(..chunks * 2))?;
-                if seg.len > 0 {
-                    let mut launch = stream.launch_builder(&device.kernels.chunk_totals);
-                    launch
-                        .arg(&rows)
-                        .arg(&n)
-                        .arg(&grain64)
-                        .arg(&state.units)
-                        .arg(&mut state.totals);
-                    // SAFETY: one block per chunk reads its rows (below
-                    // `n_rows`) and writes its two totals.
-                    unsafe { launch.launch(config) }?;
-                }
-                let mut units = vec![0i64; chunks * 2];
-                stream.memcpy_dtoh(&state.totals.slice(..chunks * 2), &mut units)?;
-                stream.synchronize()?;
-                state.staging.synced();
-                let (grad, hess) = (&state.staged.grad, &state.staged.hess);
-                for (h, k) in host.chunks_mut(2).zip(units.chunks(2)) {
-                    // Each block's exact sum, as its `f64` chain is.
-                    h[0] = grad.value(k[0]);
-                    h[1] = hess.value(k[1]);
-                }
-            } else {
-                fit(stream, &mut state.chains, chunks * 2)?;
-                let mut launch = stream.launch_builder(&device.kernels.chunk_chains);
+        let chunks = seg.len.div_ceil(ROOT_CHUNK).max(1);
+        let units = (|| {
+            fit(stream, &mut state.totals, chunks * 2)?;
+            stream.memset_zeros(&mut state.totals.slice_mut(..chunks * 2))?;
+            if seg.len > 0 {
+                let rows = state.tree_rows.slice(seg.offset..seg.offset + seg.len);
+                let (n, grain) = (seg.len as u64, ROOT_CHUNK as u64);
+                let mut launch = stream.launch_builder(&device.kernels.chunk_totals);
                 launch
                     .arg(&rows)
                     .arg(&n)
-                    .arg(&grain64)
-                    .arg(&state.gpair)
-                    .arg(&mut state.chains);
-                // SAFETY: one thread per chunk reads its rows' pairs and
-                // writes its total.
-                unsafe { launch.launch(Device::one_per(chunks)) }?;
-                stream.memcpy_dtoh(&state.chains.slice(..chunks * 2), &mut host)?;
-                stream.synchronize()?;
-                state.staging.synced();
+                    .arg(&grain)
+                    .arg(&state.units)
+                    .arg(&mut state.totals);
+                let config = LaunchConfig {
+                    grid_dim: (chunks as u32, 1, 1),
+                    block_dim: (PART_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // SAFETY: one block per chunk reads its rows (below
+                // `n_rows`) and writes its two totals.
+                unsafe { launch.launch(config) }?;
             }
-            Ok(host)
+            let mut units = vec![0i64; chunks * 2];
+            stream.memcpy_dtoh(&state.totals.slice(..chunks * 2), &mut units)?;
+            stream.synchronize()?;
+            state.staging.synced();
+            Ok(units)
         })();
-        let blocks = self.ok(blocks)?;
-        let mut blocks = blocks.chunks(2).map(|b| GradStats::new(b[0], b[1]));
-        let mut total = blocks.next().unwrap_or_default();
-        for block in blocks {
-            total.add(block);
-        }
-        Some(total)
+        let units = self.ok(units)?;
+        // At most `2^53` grains in magnitude, every partial sum included.
+        let (grad, hess) = units
+            .chunks(2)
+            .fold((0i64, 0i64), |(g, h), k| (g + k[0], h + k[1]));
+        Some(GradStats::new(
+            state.staged.grad.value(grad),
+            state.staged.hess.value(hess),
+        ))
     }
 
     fn partition(&self, ghist: &GHistIndex, splits: &[RowSplit<'_>]) -> Option<Vec<Partitioned>> {
@@ -2796,8 +2910,9 @@ impl RowEngine for CudaHistBackend {
         if nodes.is_empty() {
             return Some(Vec::new());
         }
-        let hists = self.histograms_on(&mut state, RowSource::Tree, ghist, gpair, nodes, None);
-        self.ok(hists)?
+        let hists =
+            self.histograms_on(&mut state, RowSource::Tree, ghist, gpair, nodes, Dest::Read);
+        self.ok(hists)
     }
 
     fn rows(&self, segs: &[Segment]) -> Option<Vec<Vec<u32>>> {
@@ -2962,6 +3077,7 @@ impl RowEngine for CudaHistBackend {
         if leaves
             .iter()
             .any(|(s, _)| s.offset + s.len > state.tree_len)
+            || !disjoint(leaves.iter().map(|&(seg, _)| seg))
             || state.margins.is_none()
         {
             return None;
@@ -3068,8 +3184,8 @@ impl RowEngine for CudaHistBackend {
                 .any(|&(s, slot)| s.offset + s.len > state.tree_len || !in_pool(slot))
             || siblings
                 .iter()
-                .any(|&(parent, built)| parent == built || !in_pool(parent) || !in_pool(built))
-            || !distinct_writes(nodes, siblings)
+                .any(|&(parent, built)| !in_pool(parent) || !in_pool(built))
+            || !race_free(nodes, siblings)
         {
             return None;
         }
@@ -3082,10 +3198,16 @@ impl RowEngine for CudaHistBackend {
             targets: &targets,
             siblings,
         };
-        let built = self.histograms_on(state, RowSource::Tree, ghist, gpair, &segs, Some(resident));
+        let built = self.histograms_on(
+            state,
+            RowSource::Tree,
+            ghist,
+            gpair,
+            &segs,
+            Dest::Resident(resident),
+        );
         std::mem::swap(&mut state.out, &mut state.pool);
-        // `None`: CPU-built nodes without the host gradients.
-        self.ok(built)?.map(|_| ())
+        self.ok(built).map(|_| ())
     }
 
     fn scan_resident(
@@ -3123,37 +3245,31 @@ impl RowEngine for CudaHistBackend {
     }
 }
 
+/// Whether CUDA device 0 trains, for device tests: a machine without one
+/// skips them (unless `HESSBOOST_REQUIRE_CUDA` is set); any other reason,
+/// such as a kernel module that does not load, fails the test.
+#[cfg(test)]
+pub(crate) fn has_device() -> bool {
+    match unavailable_reason(0) {
+        None => true,
+        Some(reason) => {
+            assert!(
+                reason.is_environment() && std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
+                "CUDA unavailable: {reason}"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::DMatrix;
     use crate::data::quantile::HistCuts;
 
-    #[test]
-    fn raw_binning_refuses_mismatched_cuts_before_device_access() {
-        let cuts_data = DMatrix::from_dense(&[0.0, 1.0], 2, 1).unwrap();
-        let csr = DMatrix::from_csr(vec![0, 1, 1], vec![1], vec![1.0], 2).unwrap();
-        let dense = DMatrix::from_dense(&[0.0, 1.0, 2.0, 3.0], 2, 2).unwrap();
-        for data in [&csr, &dense] {
-            let cuts = HistCuts::from_dmatrix(&cuts_data, 16);
-            assert!(matches!(
-                CudaHistBackend::from_dmatrix(data, cuts, 0),
-                Err(HessboostError::DimensionMismatch {
-                    expected: 2,
-                    got: 1,
-                    ..
-                })
-            ));
-        }
-    }
-
     fn backend() -> Option<(GHistIndex, CudaHistBackend)> {
-        if let Some(reason) = unavailable_reason() {
-            assert!(
-                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
-                "CUDA required: {reason}"
-            );
-            eprintln!("skipping CUDA regression: {reason}");
+        if !has_device() {
             return None;
         }
         let values: Vec<f32> = (0..20_000).map(|r| (r % 5) as f32).collect();
@@ -3167,6 +3283,35 @@ mod tests {
         hist.iter()
             .map(|p| [p.grad.to_bits(), p.hess.to_bits()])
             .collect()
+    }
+
+    /// A resident build or leaf update that would race on the device is
+    /// refused before any launch: a slot written twice, a sibling reading a
+    /// slot another sibling writes, overlapping leaf segments.
+    #[test]
+    fn racing_resident_writes_and_overlapping_leaves_are_refused() {
+        let seg = |offset, len| Segment {
+            offset,
+            len,
+            contiguous: false,
+        };
+        let nodes = [(seg(0, 4), 0), (seg(4, 4), 1)];
+        // Built children subtracted from their parents' slots.
+        assert!(race_free(&nodes, &[(2, 0), (3, 1)]));
+        // Two nodes into one slot.
+        assert!(!race_free(&[(seg(0, 4), 0), (seg(4, 4), 0)], &[]));
+        // A parent slot that is also a node's target.
+        assert!(!race_free(&nodes, &[(1, 0)]));
+        // Two siblings into one parent slot.
+        assert!(!race_free(&nodes, &[(2, 0), (2, 1)]));
+        // A sibling reading a slot another sibling writes.
+        assert!(!race_free(&nodes, &[(2, 0), (3, 2)]));
+        assert!(!race_free(&nodes, &[(2, 2)]));
+        assert!(disjoint(
+            [seg(0, 4), seg(4, 4), seg(8, 0), seg(8, 2)].into_iter()
+        ));
+        assert!(!disjoint([seg(0, 4), seg(3, 2)].into_iter()));
+        assert!(!disjoint([seg(4, 4), seg(0, 5)].into_iter()));
     }
 
     #[test]
@@ -3199,7 +3344,7 @@ mod tests {
         // Drop with the last pinned upload still in flight.
         backend.prepare(&index, &first);
         drop(backend);
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 
     #[test]
@@ -3231,7 +3376,7 @@ mod tests {
             CpuBackend.build(&index, &rows, &pairs, &mut expected);
             assert_eq!(bits(&actual), bits(&expected));
         }
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 
     #[test]
@@ -3259,7 +3404,7 @@ mod tests {
             });
         });
         assert_eq!(backend.node_counts().cpu_nodes, 16);
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 
     #[test]
@@ -3302,7 +3447,7 @@ mod tests {
             CpuBackend.build(&index, rows, &pairs, &mut expected);
             assert_eq!(bits(hist), bits(&expected));
         }
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 
     #[test]
@@ -3324,21 +3469,17 @@ mod tests {
         assert_eq!(backend.gradients(loss, &labels, Some(&weights)), Some(true));
         let rows: Vec<u32> = (0..index.n_rows() as u32).collect();
         let root = backend.begin_tree(&index, &rows).unwrap();
-        let total = backend.root_total(root).unwrap();
+        let total = backend.root_total(None, &rows, root).unwrap();
         assert_eq!(
             total,
             GradStats::new(-6.0 * index.n_rows() as f64, 2.0 * index.n_rows() as f64)
         );
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 
     #[test]
     fn csr_storage_and_all_histogram_orders_match_cpu() {
-        if let Some(reason) = unavailable_reason() {
-            assert!(
-                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
-                "CUDA required: {reason}"
-            );
+        if !has_device() {
             return;
         }
         let n = 40_003;
@@ -3428,59 +3569,12 @@ mod tests {
                 );
             }
         }
-        assert!(available(), "{:?}", unavailable_reason());
-    }
-
-    #[test]
-    fn device_raw_bins_match_cpu_with_categories_and_missing() {
-        if let Some(reason) = unavailable_reason() {
-            assert!(
-                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
-                "CUDA required: {reason}"
-            );
-            return;
-        }
-        for missing in [f32::NAN, -999.0] {
-            let values: Vec<f32> = (0..257 * 3)
-                .map(|i| {
-                    if i % 11 == 0 {
-                        missing
-                    } else {
-                        (i % 17) as f32
-                    }
-                })
-                .collect();
-            let data = DMatrix::from_dense_with_missing(&values, 257, 3, missing)
-                .unwrap()
-                .with_feature_types(&[
-                    crate::data::FeatureType::Categorical,
-                    crate::data::FeatureType::Numerical,
-                    crate::data::FeatureType::Numerical,
-                ])
-                .unwrap();
-            let cuts = HistCuts::from_dmatrix(&data, 256);
-            let expected = GHistIndex::from_dmatrix(&data, cuts.clone());
-            let (actual, _) = CudaHistBackend::from_dmatrix(&data, cuts, 0).unwrap();
-            assert_eq!(actual.row_ptr(), expected.row_ptr());
-            for r in 0..257 {
-                for f in 0..3 {
-                    let (fs, fe) = expected.cuts().feature_bins(f);
-                    assert_eq!(
-                        actual.feature_bin(r, fs, fe),
-                        expected.feature_bin(r, fs, fe)
-                    );
-                }
-            }
-        }
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 
     #[test]
     fn wide_global_csr_bins_keep_sparse_device_storage() {
-        if let Some(reason) = unavailable_reason() {
-            assert!(
-                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
-                "CUDA required: {reason}"
-            );
+        if !has_device() {
             return;
         }
         // 70,000 feature bins force u32 globally; rows contain one entry
@@ -3506,16 +3600,28 @@ mod tests {
         backend.build(&index, &rows, &pairs, &mut actual);
         assert_eq!(bits(&actual), bits(&expected));
         assert_eq!(backend.node_counts().cpu_nodes, 0);
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 
+    /// `bins` widened to `u32`. `clone_dtoh` into a `Vec` is a pageable
+    /// asynchronous copy: its bytes are only there once the stream has
+    /// synchronized.
+    fn download<T: DeviceRepr + Into<u32>>(
+        stream: &Arc<CudaStream>,
+        bins: &CudaSlice<T>,
+    ) -> Vec<u32> {
+        let host = stream.clone_dtoh(bins).unwrap();
+        stream.synchronize().unwrap();
+        host.into_iter().map(Into::into).collect()
+    }
+
+    /// Dense device bins take the widest feature's width (`u8`, `u16`,
+    /// `u32`), encoded row-major and feature-major as the CPU bins them,
+    /// and every width's histogram kernels give the CPU's histogram: exact
+    /// integer sums over all rows, `f64` chains over a small subset.
     #[test]
-    fn dense_device_transpose_matches_cpu_at_every_bin_width() {
-        if let Some(reason) = unavailable_reason() {
-            assert!(
-                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
-                "CUDA required: {reason}"
-            );
+    fn dense_bins_match_cpu_at_every_width() {
+        if !has_device() {
             return;
         }
         for (n, expected_width) in [(255, 0), (513, 1), (65_537, 2)] {
@@ -3524,63 +3630,60 @@ mod tests {
                 .unwrap()
                 .with_feature_types(&[crate::data::FeatureType::Categorical; 3])
                 .unwrap();
-            let cuts = HistCuts::from_dmatrix(&data, 256);
-            let expected = GHistIndex::from_dmatrix(&data, cuts.clone());
-            let (actual, backend) = CudaHistBackend::from_dmatrix(&data, cuts, 0).unwrap();
-            assert_eq!(actual.row_ptr(), expected.row_ptr());
-            let state = backend.lock().unwrap();
-            assert_eq!(state.bins.width(), expected_width);
-            assert!(state.row_ptr.is_none());
-            assert!(state.cols.is_some());
-            let first: Vec<u32> = (0..3)
-                .map(|f| actual.cuts().feature_bins(f).0 as u32)
-                .collect();
-            let check = |rows: Vec<u32>, cols: Vec<u32>| {
+            let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256));
+            let backend = CudaHistBackend::new(&index, 0).unwrap();
+            {
+                let state = backend.lock().unwrap();
+                assert_eq!(state.bins.width(), expected_width);
+                assert!(state.row_ptr.is_none());
+                assert!(state.cols.is_some());
+                let stream = &backend.device.stream;
+                let read = |bins: &DeviceBins| match bins {
+                    DeviceBins::U8(bins) => download(stream, bins),
+                    DeviceBins::U16(bins) => download(stream, bins),
+                    DeviceBins::U32(bins) => download(stream, bins),
+                };
+                let rows = read(&state.bins);
+                let cols = read(state.cols.as_ref().unwrap());
                 for r in 0..n {
                     for f in 0..3 {
-                        let (fs, fe) = expected.cuts().feature_bins(f);
-                        let local = expected.feature_bin(r, fs, fe).unwrap() - first[f];
+                        let (fs, fe) = index.cuts().feature_bins(f);
+                        let local = index.feature_bin(r, fs, fe).unwrap() - fs as u32;
                         assert_eq!(rows[r * state.stride as usize + f], local);
                         assert_eq!(cols[f * n + r], local);
                     }
                 }
-            };
-            let read = |bins: &DeviceBins| -> Vec<u32> {
-                match bins {
-                    DeviceBins::U8(bins) => backend
-                        .device
-                        .stream
-                        .clone_dtoh(bins)
-                        .unwrap()
-                        .into_iter()
-                        .map(u32::from)
-                        .collect(),
-                    DeviceBins::U16(bins) => backend
-                        .device
-                        .stream
-                        .clone_dtoh(bins)
-                        .unwrap()
-                        .into_iter()
-                        .map(u32::from)
-                        .collect(),
-                    DeviceBins::U32(bins) => backend.device.stream.clone_dtoh(bins).unwrap(),
-                }
-            };
-            let rows = read(&state.bins);
-            let cols = read(state.cols.as_ref().unwrap());
-            backend.device.stream.synchronize().unwrap();
-            check(rows, cols);
+            }
+            let all: Vec<u32> = (0..n as u32).collect();
+            let some: Vec<u32> = (0..n as u32).step_by(n.div_ceil(4_000)).collect();
+            let exact: Vec<GradPair> = (0..n)
+                .map(|r| GradPair::new((r % 7) as f32 - 3.0, 1.0))
+                .collect();
+            // Magnitudes from 1e-30 to 1e30, far outside the exact domain.
+            let wide: Vec<GradPair> = (0..n)
+                .map(|r| GradPair::new(10f32.powi((r % 61) as i32 - 30), 1.0))
+                .collect();
+            for (rows, gpair) in [(&all, &exact), (&some, &wide)] {
+                let mut expected = zeroed(index.total_bins());
+                let mut actual = zeroed(index.total_bins());
+                CpuBackend.build(&index, rows, gpair, &mut expected);
+                backend.prepare(&index, gpair);
+                backend.build(&index, rows, gpair, &mut actual);
+                assert_eq!(bits(&actual), bits(&expected), "{n} rows");
+            }
+            let counts = backend.node_counts();
+            assert_eq!(counts.cpu_nodes, 0, "{counts:?}");
+            assert!(
+                counts.exact_nodes > 0 && counts.chain_nodes > 0,
+                "{counts:?}"
+            );
         }
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 
     #[test]
     fn empty_csr_entries_keep_only_offsets_and_zero_histograms() {
-        if let Some(reason) = unavailable_reason() {
-            assert!(
-                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
-                "CUDA required: {reason}"
-            );
+        if !has_device() {
             return;
         }
         let n = 257;
@@ -3616,6 +3719,6 @@ mod tests {
             assert_eq!(parts.left.len, if default_left { n } else { 0 });
         }
         assert_eq!(backend.node_counts().cpu_nodes, 0);
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 }

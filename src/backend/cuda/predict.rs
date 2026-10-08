@@ -1,4 +1,4 @@
-//! Resident compact forests and a bounded, double-buffered prediction pipeline.
+//! Resident compact forests and a bounded, pipelined prediction.
 //!
 //! Prediction owns an event-tracked context, separate from training's
 //! single-stream context. Each concurrent call owns its streams and staging
@@ -7,14 +7,14 @@
 //! categorical splits, multiclass and vector leaves. Leaf weighting happens
 //! once on the CPU in f32; the GPU adds in tree order without FMA or FTZ.
 
-use super::{Pinned, Plain, abi, driver, kernels, upload_pinned};
+use super::{Pinned, Plain, Unavailable, abi, failed, find_device, kernels, upload_pinned};
 use crate::backend::shared::{ensure_forest_model, materialize_rows};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Iterations, Predictions};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
-    DriverError, LaunchConfig, PushKernelArg, result, sys,
+    DriverError, LaunchConfig, PushKernelArg, result,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -34,32 +34,24 @@ struct Context {
     failed: AtomicBool,
 }
 
-type Opened = std::result::Result<Arc<Context>, String>;
+type Opened = std::result::Result<Arc<Context>, Unavailable>;
 static CONTEXTS: Mutex<Vec<(usize, Opened)>> = Mutex::new(Vec::new());
 
 impl Context {
-    fn open(ordinal: usize) -> std::result::Result<Self, String> {
-        driver()?;
-        let count = match CudaContext::device_count() {
-            Ok(count) => count,
-            Err(e) if e.0 == sys::CUresult::CUDA_ERROR_NO_DEVICE => 0,
-            Err(e) => return Err(format!("CUDA init: {e}")),
-        };
-        if ordinal >= usize::try_from(count).unwrap_or(0) {
-            return Err(format!("no CUDA device {ordinal} ({count} found)"));
-        }
+    fn open(ordinal: usize) -> std::result::Result<Self, Unavailable> {
+        find_device(ordinal)?;
         // An independent context: training disables tracking on its own
         // context, which must never govern this multi-stream pipeline.
         let cuda = CudaContext::new_non_primary(ordinal, 0)
-            .map_err(|e| format!("CUDA prediction context: {e}"))?;
+            .map_err(|e| failed("prediction context", e))?;
         let module = kernels::load(&cuda, kernels::Module::Prediction)?;
         let predict8 = module
             .load_function("predict8")
-            .map_err(|e| format!("CUDA predict8: {e}"))?;
+            .map_err(|e| failed("predict8", e))?;
         let predict16 = module
             .load_function("predict16")
-            .map_err(|e| format!("CUDA predict16: {e}"))?;
-        let name = cuda.name().map_err(|e| format!("CUDA device name: {e}"))?;
+            .map_err(|e| failed("predict16", e))?;
+        let name = cuda.name().map_err(|e| failed("device name", e))?;
         Ok(Self {
             cuda,
             predict8,
@@ -94,14 +86,25 @@ impl Context {
     }
 }
 
-/// Whether CUDA device `ordinal` can predict, including its kernel compiler
-/// and any previous runtime failure. Does not initialize the training context.
+/// Whether CUDA device `ordinal` can predict, and has not had a runtime
+/// error. Does not initialize the training context.
 #[must_use]
 pub fn prediction_available(ordinal: usize) -> bool {
-    Context::get(ordinal).is_ok_and(|ctx| !ctx.failed.load(Ordering::Acquire))
+    prediction_unavailable_reason(ordinal).is_none()
 }
 
-/// The name of CUDA device `ordinal` when it can predict.
+/// Why CUDA device `ordinal` cannot predict, if it cannot. Does not
+/// initialize the training context.
+#[must_use]
+pub fn prediction_unavailable_reason(ordinal: usize) -> Option<Unavailable> {
+    match Context::get(ordinal) {
+        Ok(ctx) if ctx.failed.load(Ordering::Acquire) => Some(Unavailable::Disabled { ordinal }),
+        Ok(_) => None,
+        Err(reason) => Some(reason),
+    }
+}
+
+/// The name of CUDA device `ordinal`, if it can predict.
 #[must_use]
 pub fn prediction_device_name(ordinal: usize) -> Option<String> {
     Context::get(ordinal)
@@ -436,10 +439,21 @@ impl GpuModel {
             };
             call.run(self, data, trees, &mut margins)
                 .map_err(|e| self.ctx.error(e))?;
-            let mut pool = self.pool.lock();
-            if pool.len() < POOL_CALLS {
-                pool.push(call);
-            }
+            // Keep a call that serves this shape: when the pool is full and
+            // none does, this one replaces one that does not, so later calls
+            // of this shape reuse their buffers instead of reallocating.
+            let evicted = {
+                let mut pool = self.pool.lock();
+                if pool.len() < POOL_CALLS {
+                    pool.push(call);
+                    None
+                } else if pool.iter().all(|pooled| !pooled.shape.serves(shape)) {
+                    Some(std::mem::replace(&mut pool[0], call))
+                } else {
+                    Some(call)
+                }
+            };
+            drop(evicted);
         }
         Ok(Predictions::new(margins, data.n_rows(), outputs))
     }
@@ -500,7 +514,8 @@ impl BoostedModel {
                 "CUDA forest indexing exceeds 32 bits",
             ));
         }
-        let ctx = Context::get(ordinal).map_err(HessboostError::gpu)?;
+        let ctx =
+            Context::get(ordinal).map_err(|reason| HessboostError::gpu(reason.to_string()))?;
         ctx.check()?;
         let compact = self.compact_forest();
         let stream = ctx.cuda.new_stream().map_err(|e| ctx.error(e))?;
@@ -592,23 +607,14 @@ mod tests {
     use crate::objective::{Objective, RegLoss};
     use crate::tree::{ChildLeaf, RegTree, SplitRule};
 
+    /// Whether device 0 predicts; a missing device skips (unless
+    /// `HESSBOOST_REQUIRE_CUDA` is set), and any other reason fails.
     fn available() -> bool {
-        match Context::get(0) {
-            Ok(_) => true,
-            Err(reason) => {
+        match prediction_unavailable_reason(0) {
+            None => true,
+            Some(reason) => {
                 assert!(
-                    std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
-                    "{reason}"
-                );
-                assert!(
-                    [
-                        "libcuda not found",
-                        "the NVIDIA driver supports CUDA",
-                        "no CUDA device",
-                        "has compute capability"
-                    ]
-                    .iter()
-                    .any(|expected| reason.contains(expected)),
+                    reason.is_environment() && std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
                     "{reason}"
                 );
                 false
@@ -730,5 +736,30 @@ mod tests {
             .unwrap();
             assert!(matches!(parity(&model, &data).forest, Forest::Wide { .. }));
         }
+    }
+
+    /// Calls of 1, 2, then 3 rows fill the pool with calls too small for
+    /// the third shape: the call built for it must replace one of them, so
+    /// a repeat of that shape reuses its buffers.
+    #[test]
+    fn pool_keeps_a_call_for_a_shape_it_missed() {
+        if !available() {
+            return;
+        }
+        let mut tree = RegTree::with_root(1.0);
+        tree.set_leaf_value(0, 0.5);
+        let gpu = model(vec![tree], Vec::new()).to_cuda(0).unwrap();
+        let rows = |n: usize| DMatrix::from_dense(&vec![0.0; n], n, 1).unwrap();
+        for n in [1, 2, 3] {
+            gpu.predict_margin(&rows(n), ..).unwrap();
+        }
+        let wanted = Shape {
+            rows: 3,
+            cols: 1,
+            outputs: 1,
+        };
+        let pool = gpu.pool.lock();
+        assert_eq!(pool.len(), POOL_CALLS);
+        assert!(pool.iter().any(|call| call.shape.serves(wanted)));
     }
 }

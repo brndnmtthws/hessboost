@@ -15,6 +15,8 @@ use crate::data::ghist::GHistIndex;
 use crate::objective::GradPair;
 use crate::tree::gain::{GradStats, RegParams};
 use rayon::prelude::*;
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+use walk::by_features_scoped;
 use walk::{Bucket, RowValue, SweepRows, accumulate, by_features, contiguous_range};
 
 /// A gradient histogram: one [`GradStats`] bucket per global bin.
@@ -89,11 +91,18 @@ pub trait HistogramBackend: Send + Sync {
 }
 
 /// A node's rows as a [`RowEngine`] keeps them: `len` ascending row ids at
-/// `offset` of the engine's row buffer.
+/// `offset` of the engine's row buffer; `contiguous` when they are one run
+/// of consecutive rows (which, on a column-major index, chooses the CPU's
+/// order: [`sum_order`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
     pub(crate) offset: usize,
     pub(crate) len: usize,
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "cuda")),
+        allow(dead_code, reason = "only the CUDA row engine reads the contiguity")
+    )]
+    pub(crate) contiguous: bool,
 }
 
 /// Where a split sends a row's present bin of the split feature; a missing
@@ -124,7 +133,8 @@ pub struct RowSplit<'a> {
 }
 
 /// A partitioned node: the left child holds the segment's first rows, the
-/// right child the rest, both in ascending order.
+/// right child the rest, both in ascending order, each segment recording
+/// whether its rows are a run of consecutive rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Partitioned {
     pub(crate) left: Segment,
@@ -146,11 +156,17 @@ pub trait RowEngine: Sync {
     /// the root's segment.
     fn begin_tree(&self, ghist: &GHistIndex, rows: &[u32]) -> Option<Segment>;
 
-    /// The statistics of `seg`'s rows, the host `sum_rows`'s blocks summed
-    /// on the device (exactly in integers where their sums are exact, else
-    /// as `f64` chains) and added in block order: the host's sum bit for
-    /// bit. `None` for non-finite gradients.
-    fn root_total(&self, seg: Segment) -> Option<GradStats>;
+    /// The statistics of `seg`'s rows (`rows`, their host copy), the host
+    /// `sum_rows`'s row-order chain bit for bit: summed on the device in
+    /// integers when the sum is exact, else on the host from `gpair` (the
+    /// host copy of the staged gradients, `None` when only the device has
+    /// them).
+    fn root_total(
+        &self,
+        gpair: Option<&[GradPair]>,
+        rows: &[u32],
+        seg: Segment,
+    ) -> Option<GradStats>;
 
     /// Partition each split's segment in place (stable), in one batch.
     fn partition(&self, ghist: &GHistIndex, splits: &[RowSplit<'_>]) -> Option<Vec<Partitioned>>;
@@ -287,17 +303,19 @@ pub enum DeviceLoss {
 
 /// Multi-core CPU histogram backend.
 ///
-/// The order of each bin's `f64` additions depends on the node's row count
-/// alone, never on the thread count or the index layout, so the serial and
-/// parallel builds agree bit for bit and a GPU backend can reproduce them
-/// in parallel. A node below 8,192 rows adds each bin's rows in ascending
-/// order: the plain chain XGBoost's single-threaded build forms. A larger
-/// node sums fixed blocks of about 4,096 rows, each in row order from zero,
-/// and adds the block partials to the first block's in block order.
-/// Outside the range where `f64` sums are exact (`backend/exact_sum.rs`)
-/// that can round differently from the chain, which XGBoost's threaded
-/// build does too (its per-thread buffers are reduced in thread order);
-/// inside it every grouping gives the chain's sum.
+/// Each bin's `f64` sum is a function of the rows alone, never of the
+/// thread count, so the serial and parallel builds agree bit for bit. A node
+/// below 8,192 rows, and a column-major index swept by feature (a
+/// contiguous row range, or any subset of an index of at most 2^18 rows),
+/// add each bin's rows in ascending order: the plain chain XGBoost's
+/// single-threaded build forms. Every other node (a sparse index, or a row
+/// subset of a larger dense one) sums fixed blocks of about 4,096 rows,
+/// each in row order from zero, and adds
+/// the block partials to the first block's in block order. Outside the
+/// range where `f64` sums are exact (`backend/exact_sum.rs`) that can round
+/// differently from the chain, which XGBoost's threaded build does too
+/// (its per-thread buffers are reduced in thread order); inside it every
+/// grouping gives the chain's sum.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuBackend;
 
@@ -308,13 +326,12 @@ const ROWS_PER_TASK: usize = 4096;
 const PARALLEL_THRESHOLD: usize = 2 * ROWS_PER_TASK;
 /// Bins per task when the partial histograms are summed.
 const REDUCE_BINS: usize = 2048;
-/// Datasets up to this many rows build row subsets feature by feature: the
+/// Datasets up to this many rows gather row subsets feature by feature: the
 /// gradients (8 bytes a row) then fit a core's 2 MiB L2.
 const GATHER_MAX_ROWS: usize = 1 << 18;
 
-/// The order in which [`CpuBackend`] adds each bin's rows: a function of
-/// the node's row count alone. A device backend reproducing the CPU's `f64`
-/// sums bit for bit follows the same order.
+/// The order in which [`CpuBackend`] adds each bin's rows ([`sum_order`]).
+/// A device backend reproducing the CPU's `f64` sums bit for bit follows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SumOrder {
     /// One chain in ascending row order, from `+0.0`.
@@ -330,11 +347,20 @@ pub(crate) enum SumOrder {
     },
 }
 
-/// The summation order [`CpuBackend::build`] uses for a node of `len` rows:
-/// one chain below [`PARALLEL_THRESHOLD`] rows, else `len / 4096` equal
-/// blocks.
-pub(crate) fn sum_order(len: usize) -> SumOrder {
-    if len < PARALLEL_THRESHOLD {
+/// The order [`CpuBackend::build`] sums a node of `len` rows in, on an
+/// index of `index_rows` rows that has a column-major copy
+/// (`column_major`, [`GHistIndex::column_bins`]); `contiguous`: the node's
+/// rows are one ascending range. A node below [`PARALLEL_THRESHOLD`] rows,
+/// or one the column-major copy is swept for by feature (a contiguous
+/// range, or any subset of an index of at most [`GATHER_MAX_ROWS`] rows),
+/// is one chain; any other node sums `len / ROWS_PER_TASK` equal blocks.
+pub(crate) fn sum_order(
+    column_major: bool,
+    index_rows: usize,
+    len: usize,
+    contiguous: bool,
+) -> SumOrder {
+    if len < PARALLEL_THRESHOLD || column_major && (contiguous || index_rows <= GATHER_MAX_ROWS) {
         return SumOrder::Chain;
     }
     let blocks = len / ROWS_PER_TASK;
@@ -345,28 +371,51 @@ pub(crate) fn sum_order(len: usize) -> SumOrder {
 
 #[cfg(all(target_os = "linux", feature = "cuda"))]
 impl CpuBackend {
-    /// CUDA's locked fallback must never enter Rayon: work stealing can
-    /// re-enter the same backend mutex. This reproduces `build`'s fixed
-    /// chunk order with one reusable partial and no pool tasks.
-    pub(crate) fn build_serial(
+    /// [`CpuBackend::build`]'s histogram, bit for bit, without entering
+    /// Rayon: CUDA's fallback runs under its state lock, which pool work
+    /// stealing could re-enter. A chained node with a column-major copy is
+    /// swept by feature on up to `threads` scoped threads (one per
+    /// [`PARALLEL_THRESHOLD`] rows); anything else runs on the caller.
+    pub(crate) fn build_locked(
         ghist: &GHistIndex,
         rows: &[u32],
         gpair: &[GradPair],
         out: &mut [GradStats],
+        threads: usize,
     ) {
         out.fill(GradStats::default());
-        let SumOrder::Blocked { grain } = sum_order(rows.len()) else {
-            accumulate(ghist, rows, gpair, out);
-            return;
-        };
-        let mut chunks = rows.chunks(grain);
-        accumulate(ghist, chunks.next().unwrap_or(&[]), gpair, out);
-        let mut partial = zeroed(out.len());
-        for chunk in chunks {
-            partial.fill(GradStats::default());
-            accumulate(ghist, chunk, gpair, &mut partial);
-            for (total, value) in out.iter_mut().zip(&partial) {
-                total.add(*value);
+        let columns = ghist.column_bins();
+        let range = columns
+            .as_ref()
+            .filter(|_| rows.len() >= PARALLEL_THRESHOLD)
+            .and_then(|_| contiguous_range(rows));
+        let order = sum_order(
+            columns.is_some(),
+            ghist.n_rows(),
+            rows.len(),
+            range.is_some(),
+        );
+        let threads = threads.min(rows.len() / PARALLEL_THRESHOLD);
+        match (order, columns) {
+            (SumOrder::Chain, Some(columns)) if threads > 1 => {
+                let rows = match range {
+                    Some(range) => SweepRows::Range(range),
+                    None => SweepRows::Subset(rows),
+                };
+                by_features_scoped(ghist, &columns, &rows, gpair, out, threads);
+            }
+            (SumOrder::Chain, _) => accumulate(ghist, rows, gpair, out),
+            (SumOrder::Blocked { grain }, _) => {
+                let mut chunks = rows.chunks(grain);
+                accumulate(ghist, chunks.next().unwrap_or(&[]), gpair, out);
+                let mut partial = zeroed(out.len());
+                for chunk in chunks {
+                    partial.fill(GradStats::default());
+                    accumulate(ghist, chunk, gpair, &mut partial);
+                    for (total, value) in out.iter_mut().zip(&partial) {
+                        total.add(*value);
+                    }
+                }
             }
         }
     }
@@ -374,34 +423,47 @@ impl CpuBackend {
 
 impl HistogramBackend for CpuBackend {
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
-        let SumOrder::Blocked { grain } = sum_order(rows.len()) else {
+        if rows.len() < PARALLEL_THRESHOLD {
+            out.fill(GradStats::default());
+            accumulate(ghist, rows, gpair, out);
+            return;
+        }
+        let threads = rayon::current_num_threads();
+        let columns = ghist.column_bins();
+        let range = columns.as_ref().and_then(|_| contiguous_range(rows));
+        let order = sum_order(
+            columns.is_some(),
+            ghist.n_rows(),
+            rows.len(),
+            range.is_some(),
+        );
+        if let SumOrder::Blocked { grain } = order {
+            accumulate_blocks(ghist, rows, gpair, out, grain, threads);
+            return;
+        }
+        // The feature sweeps below are chains in row order, as is
+        // `accumulate`, which runs them serially.
+        let Some(columns) = columns.filter(|_| threads > 1) else {
             out.fill(GradStats::default());
             accumulate(ghist, rows, gpair, out);
             return;
         };
-        let threads = rayon::current_num_threads();
-        // With a column-major copy, a contiguous row range, or any row
-        // subset of an index small enough that every feature group's
-        // re-read of the gradients stays in a core's cache, is split by
-        // feature; both builds sum the same blocks in the same order.
-        let range = contiguous_range(rows);
-        let columns = ghist
-            .column_bins()
-            .filter(|_| threads > 1 && (range.is_some() || ghist.n_rows() <= GATHER_MAX_ROWS));
-        if let Some(columns) = columns {
-            let rows = match range {
-                Some(range) => SweepRows::Range(range),
-                None => SweepRows::Subset(rows),
-            };
-            by_features(ghist, &columns, &rows, gpair, out, grain, threads);
-        } else {
-            accumulate_blocks(ghist, rows, gpair, out, grain, threads);
-        }
+
+        // A contiguous row range with a column-major copy is split by
+        // feature. Any other row subset of a small enough column-major index
+        // is gathered the same way: every feature group re-reads the
+        // gradients, so this pays only while they stay in a core's cache.
+        let rows = match range {
+            Some(range) => SweepRows::Range(range),
+            None => SweepRows::Subset(rows),
+        };
+        by_features(ghist, &columns, &rows, gpair, out, threads);
     }
 }
 
-/// The blocked build of [`CpuBackend`] ([`SumOrder::Blocked`]): `rows`
-/// split into `rows.chunks(grain)`, each accumulated from zero into a
+/// The blocked build of [`CpuBackend`] ([`SumOrder::Blocked`]): `rows` (at
+/// least [`PARALLEL_THRESHOLD`]) split into `rows.chunks(grain)`, each
+/// accumulated from zero into a
 /// partial histogram, and `out` = the first partial plus every later one in
 /// block order. The blocks depend only on the row count; `threads` only
 /// sets how many are built at once (in waves, each reduced into `out`
@@ -499,56 +561,6 @@ mod tests {
     use crate::data::ghist::Bins;
     use crate::data::quantile::HistCuts;
 
-    #[cfg(all(target_os = "linux", feature = "cuda"))]
-    #[test]
-    fn locked_serial_fallback_matches_blocked_and_chain_bits() {
-        for n in [8191, 8192, 16_513] {
-            for missing in [false, true] {
-                let values: Vec<f32> = (0..n * 3)
-                    .map(|i| {
-                        if missing && i % 7 == 0 {
-                            f32::NAN
-                        } else {
-                            (i % 13) as f32
-                        }
-                    })
-                    .collect();
-                let data = DMatrix::from_dense(&values, n, 3).unwrap();
-                let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 16));
-                for nonfinite in [false, true] {
-                    let mut pairs: Vec<_> = (0..n)
-                        .map(|i| {
-                            let scale = 2.0f32.powi((i * 37 % 61) as i32 - 30);
-                            GradPair::new(((i % 17) as f32 - 8.0) * scale, scale)
-                        })
-                        .collect();
-                    if nonfinite {
-                        pairs[31].grad = f32::NAN;
-                    }
-                    let rows: Vec<u32> = (0..n as u32).collect();
-                    let mut serial = zeroed(index.total_bins());
-                    CpuBackend::build_serial(&index, &rows, &pairs, &mut serial);
-                    let mut parallel = zeroed(index.total_bins());
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(4)
-                        .build()
-                        .unwrap()
-                        .install(|| CpuBackend.build(&index, &rows, &pairs, &mut parallel));
-                    let bits = |hist: &[GradStats]| {
-                        hist.iter()
-                            .map(|v| [v.grad.to_bits(), v.hess.to_bits()])
-                            .collect::<Vec<_>>()
-                    };
-                    assert_eq!(
-                        bits(&serial),
-                        bits(&parallel),
-                        "rows={n}, missing={missing}, nonfinite={nonfinite}"
-                    );
-                }
-            }
-        }
-    }
-
     #[test]
     fn subtraction_identity() {
         // parent = left + right, so parent - left = right.
@@ -570,7 +582,8 @@ mod tests {
     }
 
     /// Row-major reference independent of `accumulate`: every bin receives
-    /// its rows in ascending order.
+    /// its rows in ascending order, which is the order both the row sweep and
+    /// the column sweep must reproduce bit for bit.
     fn row_order_reference(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Histogram {
         let stride = ghist.dense_stride().expect("dense index");
         let mut h = zeroed(ghist.total_bins());
@@ -588,29 +601,8 @@ mod tests {
         h
     }
 
-    /// The block-order reference of a dense index: [`row_order_reference`]
-    /// of each `grain`-row chunk, the partials added in chunk order to the
-    /// first one.
-    fn block_order_reference(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Histogram {
-        let SumOrder::Blocked { grain } = sum_order(rows.len()) else {
-            return row_order_reference(ghist, rows, gpair);
-        };
-        let mut chunks = rows.chunks(grain);
-        let mut h = row_order_reference(ghist, chunks.next().unwrap_or(&[]), gpair);
-        for chunk in chunks {
-            for (o, p) in h.iter_mut().zip(row_order_reference(ghist, chunk, gpair)) {
-                o.add(p);
-            }
-        }
-        h
-    }
-
-    /// On a dense index the feature-parallel sweep (several threads) and
-    /// the row-blocked build (one thread) both give the block-order
-    /// reference bit for bit, for contiguous ranges and row subsets, on
-    /// gradients spanning enough exponents that the grouping shows.
     #[test]
-    fn dense_builds_match_the_block_order_reference() {
+    fn column_and_row_sweeps_match_reference_bit_for_bit() {
         let (n, f) = (3 * PARALLEL_THRESHOLD + 129, 7);
         let x: Vec<f32> = (0..n * f)
             .map(|i| ((i * 2_654_435_761_usize) % 1009) as f32 / 7.0)
@@ -624,9 +616,8 @@ mod tests {
         );
         let gpair: Vec<GradPair> = (0..n)
             .map(|i| {
-                let scale = 2f32.powi((i * 37 % 61) as i32 - 30);
                 GradPair::new(
-                    ((i * 7919) % 1237) as f32 / 331.0 * scale - 1.9,
+                    ((i * 7919) % 1237) as f32 / 331.0 - 1.9,
                     0.25 + (i % 5) as f32,
                 )
             })
@@ -642,13 +633,8 @@ mod tests {
         assert!(contiguous_range(&all).is_some() && contiguous_range(&offset).is_some());
         assert!(contiguous_range(&subset).is_none());
         assert!(contiguous_range(&[2, 0, 1]).is_none() && contiguous_range(&[5, 5]).is_none());
-        assert_ne!(
-            bits(&block_order_reference(&ghist, &all, &gpair)),
-            bits(&row_order_reference(&ghist, &all, &gpair)),
-            "the case must separate the groupings"
-        );
         for rows in [&all, &subset, &offset] {
-            let expect = bits(&block_order_reference(&ghist, rows, &gpair));
+            let expect = bits(&row_order_reference(&ghist, rows, &gpair));
             for threads in [1, 4] {
                 let mut out = zeroed(ghist.total_bins());
                 rayon::ThreadPoolBuilder::new()
@@ -688,6 +674,87 @@ mod tests {
             .unwrap()
             .install(|| CpuBackend.build(ghist, rows, gpair, &mut out));
         out.iter().map(|s| (s.grad, s.hess)).collect()
+    }
+
+    /// `sum_order` is the order `CpuBackend::build` follows: rows below the
+    /// threshold, and nodes swept by feature, chain; the rest are blocked.
+    #[test]
+    fn sum_order_describes_the_build() {
+        let big = GATHER_MAX_ROWS + 1;
+        let blocked = SumOrder::Blocked {
+            grain: PARALLEL_THRESHOLD.div_ceil(2),
+        };
+        assert_eq!(
+            sum_order(false, big, PARALLEL_THRESHOLD - 1, false),
+            SumOrder::Chain
+        );
+        assert_eq!(sum_order(false, big, PARALLEL_THRESHOLD, true), blocked);
+        assert_eq!(
+            sum_order(true, big, PARALLEL_THRESHOLD, true),
+            SumOrder::Chain
+        );
+        assert_eq!(sum_order(true, big, PARALLEL_THRESHOLD, false), blocked);
+        assert_eq!(
+            sum_order(true, GATHER_MAX_ROWS, PARALLEL_THRESHOLD, false),
+            SumOrder::Chain
+        );
+        assert_eq!(
+            sum_order(false, big, 6 * ROWS_PER_TASK + 123, false),
+            SumOrder::Blocked {
+                grain: (6 * ROWS_PER_TASK + 123).div_ceil(6)
+            }
+        );
+    }
+
+    /// CUDA's locked fallback gives `CpuBackend::build`'s bits for chained
+    /// (dense) and blocked (sparse) nodes, with and without a NaN, on one
+    /// thread and on several.
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    #[test]
+    fn locked_build_matches_the_parallel_build() {
+        let n = 6 * ROWS_PER_TASK + 123;
+        let dense = {
+            let x: Vec<f32> = (0..n * 3).map(|i| (i % 13) as f32).collect();
+            let data = DMatrix::from_dense(&x, n, 3).unwrap();
+            GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 16))
+        };
+        let sparse = sparse_index(&(0..n).map(|i| (i % 7) as f32).collect::<Vec<_>>());
+        let all: Vec<u32> = (0..n as u32).collect();
+        let subset: Vec<u32> = (0..n as u32).filter(|r| r % 11 != 3).collect();
+        for nonfinite in [false, true] {
+            let mut gpair: Vec<GradPair> = (0..n)
+                .map(|i| {
+                    let scale = 2f32.powi((i * 37 % 61) as i32 - 30);
+                    GradPair::new(((i * 7919) % 1237) as f32 / 331.0 * scale - 1.0, scale)
+                })
+                .collect();
+            if nonfinite {
+                gpair[31].grad = f32::NAN;
+            }
+            for ghist in [&dense, &sparse] {
+                for (rows, threads) in [&all, &subset, &all[..PARALLEL_THRESHOLD - 1]]
+                    .into_iter()
+                    .flat_map(|rows| [(rows, 1), (rows, 4)])
+                {
+                    let mut serial = zeroed(ghist.total_bins());
+                    CpuBackend::build_locked(ghist, rows, &gpair, &mut serial, threads);
+                    let serial: Vec<_> = serial
+                        .iter()
+                        .map(|s| (s.grad.to_bits(), s.hess.to_bits()))
+                        .collect();
+                    let parallel: Vec<_> = build_on(4, ghist, rows, &gpair)
+                        .iter()
+                        .map(|&(g, h)| (g.to_bits(), h.to_bits()))
+                        .collect();
+                    assert_eq!(
+                        serial,
+                        parallel,
+                        "rows={} threads={threads} nonfinite={nonfinite}",
+                        rows.len()
+                    );
+                }
+            }
+        }
     }
 
     /// The reported case: 8,192 sparse rows in one bin, gradients `2^54` at

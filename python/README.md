@@ -472,15 +472,17 @@ models save and load like `DiffusionModel`s.
 
 ### GPU training and prediction
 
-Three GPU backends reproduce CPU results bit for bit: native Metal
-(`"metal"`, macOS), wgpu (`"wgpu"`: Vulkan, Metal or DirectX 12), and
-NVIDIA CUDA (`"cuda"`, Linux). `Booster.to_gpu()` still selects Metal on
-macOS and wgpu elsewhere; `to_gpu(backend="cuda", ordinal=0)` explicitly
-selects an NVIDIA device. The forest uploads once, and each call preserves
-`Booster.predict` values and raw margins. Objective transforms run on the
-CPU; model-shrinkage models explicitly use CPU prediction, as with the
-other backends. `gblinear` and linear-leaf models are refused.
-`GpuModel.available()` says whether the selected device can predict:
+Three GPU backends reproduce the CPU's results bit for bit: native Metal
+(`"metal"`, macOS), wgpu (`"wgpu"`: Vulkan on Linux and Windows, Metal on
+macOS, DirectX 12 on Windows), and NVIDIA CUDA (`"cuda"` or
+`"cuda:<ordinal>"`, Linux). `Booster.to_gpu()` lays a model out for batch
+prediction (on Metal on macOS and on wgpu elsewhere; `to_gpu("wgpu")` asks
+for wgpu, `to_gpu("cuda:1")` for the second NVIDIA GPU): the forest
+uploads once, and each call predicts bit-identically to `Booster.predict`
+(values or raw margins). Objective transforms run on the CPU; models
+trained with model shrinkage predict on the CPU. `gblinear` and
+linear-leaf models are refused. `GpuModel.available()` says whether the
+device can predict here:
 
 ```python
 from hessboost import GpuModel
@@ -512,12 +514,11 @@ running it: CUDA needs only an NVIDIA GPU of compute capability 7.5
 (Turing) or newer and a driver supporting CUDA 12.8 or newer, which
 compiles the kernels for the GPU on first use and caches them. A missing
 driver or device returns an error rather than silently predicting on the
-CPU. CUDA prediction stages bounded dense or CSR row blocks
-through two pinned buffers, overlapping upload, compute and download.
+CPU.
 
 ```python
-if GpuModel.available(backend="cuda", ordinal=0):
-    gpu = booster.to_gpu(backend="cuda", ordinal=0)
+if GpuModel.available("cuda"):
+    gpu = booster.to_gpu("cuda")
     probabilities = gpu.predict(X_test)
 ```
 
@@ -622,10 +623,11 @@ LightGBM's `rank_xendcg` stream.
   scikit-learn behavior); pass `iteration_range=(0, 0)` for all. SHAP and
   leaf ranges start at iteration 0; `pred_leaf` defaults to every iteration
   instead, and returns `int32`.
-- GPUs: `device="metal"` (macOS), `device="wgpu"` or `device="cuda"`
-  (NVIDIA on Linux) selects GPU training. `Booster.to_gpu()` lays the
-  model out for GPU prediction; use `backend="cuda", ordinal=0` for CUDA
-  instead of assuming prediction uses the training device.
+- GPUs: besides XGBoost's `device="cuda"`/`"cuda:<ordinal>"` (NVIDIA on
+  Linux), `device="metal"` (macOS) and `device="wgpu"` train on a GPU.
+  Prediction does not follow the training device: `Booster.to_gpu(device)`
+  lays the model out for GPU batch prediction (`GpuModel.predict`,
+  bit-identical to `Booster.predict`), taking the same GPU `device` strings.
 - Model files do not store feature names or categories (pickles do).
 - Not available: `DMatrix` from files or `QuantileDMatrix`, `inplace_predict`
   (`predict` takes arrays directly, and `predict_row` single rows),

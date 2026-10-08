@@ -1389,11 +1389,11 @@ fn bench_cuda(c: &mut Criterion) {
     use hessboost::backend::cuda::CudaHistBackend;
     use hessboost::config::Device;
 
-    if let Some(reason) = cuda::unavailable_reason() {
+    if let Some(reason) = cuda::unavailable_reason(0) {
         eprintln!("skipping cuda benches: {reason}");
         return;
     }
-    eprintln!("cuda device: {}", cuda::device_name().unwrap_or_default());
+    eprintln!("cuda device: {}", cuda::device_name(0).unwrap_or_default());
     {
         let mut group = c.benchmark_group("cuda_histogram_build");
         group.sample_size(10);
@@ -1411,9 +1411,9 @@ fn bench_cuda(c: &mut Criterion) {
                 b.iter(|| gpu.build(&ghist, &rows, &gpair, &mut gpu_out));
             });
             assert!(
-                cuda::available(),
+                cuda::available(0),
                 "CUDA benchmark fell back: {:?}",
-                cuda::unavailable_reason()
+                cuda::unavailable_reason(0)
             );
             eprintln!("cuda_histogram_build/{n}: {:?}", gpu.node_counts());
         }
@@ -1437,9 +1437,9 @@ fn bench_cuda(c: &mut Criterion) {
             });
             if matches!(device, Device::Cuda { .. }) {
                 assert!(
-                    cuda::available(),
+                    cuda::available(0),
                     "CUDA benchmark fell back: {:?}",
-                    cuda::unavailable_reason()
+                    cuda::unavailable_reason(0)
                 );
             }
         }
@@ -1469,9 +1469,9 @@ fn bench_cuda(c: &mut Criterion) {
                 });
                 if matches!(device, Device::Cuda { .. }) {
                     assert!(
-                        cuda::available(),
+                        cuda::available(0),
                         "CUDA benchmark fell back: {:?}",
-                        cuda::unavailable_reason()
+                        cuda::unavailable_reason(0)
                     );
                 }
             }

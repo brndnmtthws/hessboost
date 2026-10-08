@@ -707,44 +707,57 @@ impl<'a> HistTreeBuilder<'a> {
         split: PendingSplit,
         left: Child,
         right: Child,
-        searched: Option<(BestSplit, BestSplit)>,
+        searched: Option<Searched>,
     ) -> (NodeEntry, NodeEntry) {
-        let (child_allowed, left_ctx, right_ctx) = self.child_contexts(&split, left.len, right.len);
+        let (child_allowed, left_best, right_best) = if let Some(Searched { allowed, best }) =
+            searched
+        {
+            let (left_best, right_best) =
+                best.unwrap_or_else(|| (BestSplit::none(), BestSplit::none()));
+            (allowed, left_best, right_best)
+        } else {
+            let (allowed, left_ctx, right_ctx) = self.child_contexts(&split, left.len, right.len);
+            // The children's split searches are independent; near the root,
+            // where the frontier holds too few nodes to occupy the pool,
+            // running them side by side halves the serial evaluation time.
+            // Each search keeps its sequential candidate order, so the chosen
+            // split is identical.
+            let (left_best, right_best) = if split.terminal {
+                (BestSplit::none(), BestSplit::none())
+            } else {
+                let allowed = allowed.as_ref();
+                let eval_left =
+                    || self.evaluate(ghist, &left.hist, &split.left_features, allowed, left_ctx);
+                let eval_right = || {
+                    self.evaluate(
+                        ghist,
+                        &right.hist,
+                        &split.right_features,
+                        allowed,
+                        right_ctx,
+                    )
+                };
+                if left.len + right.len >= PARALLEL_EVALUATE_ROWS && rayon_available() {
+                    rayon::join(eval_left, eval_right)
+                } else {
+                    (eval_left(), eval_right())
+                }
+            };
+            (allowed, left_best, right_best)
+        };
         let PendingSplit {
             entry,
             left_id,
             right_id,
             left_bounds: lb_bounds,
             right_bounds: rb_bounds,
-            left_features,
-            right_features,
-            terminal,
+            ..
         } = split;
         let NodeEntry {
             depth: parent_depth,
             tree_seed,
             ..
         } = entry;
-
-        // The children's split searches are independent; near the root, where
-        // the frontier holds too few nodes to occupy the pool, running them
-        // side by side halves the serial evaluation time. Each search keeps
-        // its sequential candidate order, so the chosen split is identical.
-        let (left_best, right_best) = if terminal {
-            (BestSplit::none(), BestSplit::none())
-        } else if let Some(searched) = searched {
-            searched
-        } else {
-            let allowed = child_allowed.as_ref();
-            let eval_left = || self.evaluate(ghist, &left.hist, &left_features, allowed, left_ctx);
-            let eval_right =
-                || self.evaluate(ghist, &right.hist, &right_features, allowed, right_ctx);
-            if left.len + right.len >= PARALLEL_EVALUATE_ROWS && rayon_available() {
-                rayon::join(eval_left, eval_right)
-            } else {
-                (eval_left(), eval_right())
-            }
-        };
 
         let left = NodeEntry {
             nid: left_id,
@@ -784,6 +797,14 @@ struct Child {
     seg: Option<Segment>,
     hist: Histogram,
     quant: Option<QuantNode>,
+}
+
+/// Children whose split searches ran before
+/// [`HistTreeBuilder::finish_children`] (resident growth): the interaction
+/// state they share and their best splits (`None` for a terminal split).
+struct Searched {
+    allowed: Option<InteractionState>,
+    best: Option<(BestSplit, BestSplit)>,
 }
 
 /// The nodes whose children loss-guided growth builds together: `entry` (the

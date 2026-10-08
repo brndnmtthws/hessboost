@@ -62,10 +62,10 @@ def test_wgpu_is_available_or_the_machine_has_no_adapter(
 
 def test_cuda_is_available_or_missing_runtime(trained: tuple[Booster, np.ndarray]) -> None:
     """A kernel-load error is never a valid device-test skip."""
-    if GpuModel.available(backend="cuda"):
+    if GpuModel.available("cuda"):
         return
     with pytest.raises(HessboostError) as refused:
-        trained[0].to_gpu(backend="cuda")
+        trained[0].to_gpu("cuda")
     reason = str(refused.value)
     assert "HESSBOOST_REQUIRE_CUDA" not in os.environ, reason
     assert any(
@@ -78,30 +78,39 @@ def test_cuda_is_available_or_missing_runtime(trained: tuple[Booster, np.ndarray
             "only available on Linux",
         )
     ), reason
-    assert GpuModel.device_name(backend="cuda") is None
+    assert GpuModel.device_name("cuda") is None
 
 
-def test_cuda_backend_and_ordinal(trained: tuple[Booster, np.ndarray]) -> None:
-    """Explicit selection shares the existing prediction API and validation."""
-    with pytest.raises(HessboostError, match="different GPU backends"):
-        trained[0].to_gpu("wgpu", backend="cuda")
-    with pytest.raises(HessboostError, match="ordinal is only supported"):
-        GpuModel.available("wgpu", ordinal=1)
+def test_cuda_ordinals_are_spelled_as_in_training(trained: tuple[Booster, np.ndarray]) -> None:
+    """``"cuda:<ordinal>"`` takes a non-negative decimal ordinal; anything
+    else is an unknown device, never a Python ``OverflowError``."""
+    for bad in ["cuda:-1", "cuda:x", "cuda:+1", "cuda:", "cuda:99999999999999999999999"]:
+        with pytest.raises(HessboostError, match="unknown GPU device"):
+            trained[0].to_gpu(bad)
+        with pytest.raises(HessboostError, match="unknown GPU device"):
+            GpuModel.available(bad)
+        with pytest.raises(HessboostError, match="unknown GPU device"):
+            GpuModel.device_name(bad)
+    assert GpuModel.available("cuda:0") == GpuModel.available("cuda")
     needs("cuda")
     booster, x = trained
-    gpu = booster.to_gpu(backend="cuda", ordinal=0)
+    gpu = booster.to_gpu("cuda:0")
     assert gpu.device == "cuda"
     np.testing.assert_array_equal(gpu.predict(x), booster.predict(x))
 
 
 def test_cuda_sparse_batches(trained: tuple[Booster, np.ndarray]) -> None:
-    """Sparse input spans both pinned slots without expanding the whole batch."""
+    """Sparse input of more than 4 x 16,384 rows (the staging slots times
+    the block size) with a partial last block uses every slot and reuses
+    one, without expanding the whole batch."""
     needs("cuda")
     sparse = pytest.importorskip("scipy.sparse")
     booster, x = trained
-    batch = np.tile(x, (40, 1))
+    batch = np.tile(x, (200, 1))
+    assert len(batch) > 4 * 16_384
+    assert len(batch) % 16_384
     matrix = DMatrix(sparse.csr_matrix(batch))
-    gpu = booster.to_gpu(backend="cuda")
+    gpu = booster.to_gpu("cuda")
     np.testing.assert_array_equal(
         gpu.predict(matrix, output_margin=True), booster.predict(matrix, output_margin=True)
     )
@@ -125,11 +134,11 @@ def test_default_device_is_metal_on_macos_and_wgpu_elsewhere(
 
 def test_unknown_devices_are_refused(trained: tuple[Booster, np.ndarray]) -> None:
     with pytest.raises(HessboostError, match='unknown GPU device "bogus"'):
-        trained[0].to_gpu("bogus")  # ty: ignore[invalid-argument-type]
+        trained[0].to_gpu("bogus")
     with pytest.raises(HessboostError, match='unknown GPU device "cpu"'):
-        GpuModel.available("cpu")  # ty: ignore[invalid-argument-type]
+        GpuModel.available("cpu")
     with pytest.raises(HessboostError, match='unknown GPU device "Metal"'):
-        GpuModel.device_name("Metal")  # ty: ignore[invalid-argument-type]
+        GpuModel.device_name("Metal")
     with pytest.raises(TypeError, match="to_gpu"):
         GpuModel()
 

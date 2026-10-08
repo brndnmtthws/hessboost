@@ -145,7 +145,10 @@ fn device_round(
 
 /// Bring `state.margins.train` up to date when the device holds the
 /// current margins: read them back, or (after a device failure) recompute
-/// them from the model, which reproduces the incremental sums.
+/// them from the model. Recomputing routes the rows through the trees by
+/// raw value, which equals the binned partitions the device's margins were
+/// accumulated from because device rounds run only when the rows route like
+/// trees ([`Prepared::device_backend`]).
 fn sync_host_margins(prepared: &Prepared, state: &mut RoundState) {
     if !state.device_margins {
         return;

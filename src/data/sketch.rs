@@ -552,9 +552,8 @@ impl WQSketch {
     /// summary merge order are exactly those of repeated [`Self::push`].
     pub(crate) fn push_unit_column(&mut self, values: &[f32], missing: f32) {
         debug_assert!(self.unit_weights);
-        let capacity = 2 * self.limit_size;
-        self.queue
-            .reserve(capacity.saturating_sub(self.queue.len()));
+        // The queue grows as `push`'s does: it holds only unfolded entries.
+        let full = 2 * self.limit_size;
         for &value in values {
             if crate::data::dmatrix::is_missing(value, missing) {
                 continue;
@@ -566,7 +565,7 @@ impl WQSketch {
                 last.1 += 1.0;
                 continue;
             }
-            if self.queue.len() == capacity {
+            if self.queue.len() == full {
                 self.flush_queue();
             }
             self.queue.push((value, 1.0));

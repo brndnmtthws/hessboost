@@ -56,14 +56,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let model = train(&params, &dtrain, meta.num_round)?;
         let elapsed = start.elapsed().as_secs_f64();
         #[cfg(all(target_os = "linux", feature = "cuda"))]
-        if matches!(params.device, hessboost::config::Device::Cuda { .. })
-            && !hessboost::backend::cuda::available()
+        if let hessboost::config::Device::Cuda { ordinal } = params.device
+            && let Some(reason) = hessboost::backend::cuda::unavailable_reason(ordinal)
         {
-            return Err(format!(
-                "CUDA timing is invalid after fallback: {:?}",
-                hessboost::backend::cuda::unavailable_reason()
-            )
-            .into());
+            return Err(format!("CUDA timing is invalid after fallback: {reason}").into());
         }
         if run > 0 {
             samples.push(elapsed);

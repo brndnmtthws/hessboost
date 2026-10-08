@@ -1,25 +1,27 @@
 //! Device-resident growth: a [`RowEngine`] keeps the tree's rows on its
 //! device, so each depthwise level (or loss-guided expansion) partitions
 //! every splitting node and builds every needed child histogram in one
-//! batch there. The host keeps everything that decides the tree — node
-//! order, the column sampler, bounds, interaction state, and the merge of
-//! the split search — so the tree is the host builder's, bit for bit.
+//! batch there. The host keeps node order, the column sampler, bounds and
+//! interaction state, so the tree is the host builder's, bit for bit.
 //!
 //! Under resident growth the numeric and categorical histograms never
 //! leave the device. A bounded, recycled slot pool holds the frontier (or
 //! the loss-guided host heap), siblings are subtracted from their original
-//! parent histograms, and the device returns only each node's winning split.
-//! Feature-order merging and stable category ordering retain the CPU's bits;
-//! non-total NaN comparisons explicitly request a host histogram replay.
+//! parent histograms, and the device searches every feature, merges the
+//! per-feature winners in the host's feature order and tie rule, and
+//! returns only each node's winning split. Stable category ordering keeps
+//! the CPU's bits; non-total NaN comparisons explicitly request a host
+//! histogram replay. Without resident slots the host searches and merges
+//! the device-built histograms itself.
 
 use super::search::{permitted, plain_numeric};
-use super::{Child, HistTreeBuilder, NodeCtx, NodeEntry, NodeStore, PendingSplit};
+use super::{Child, HistTreeBuilder, NodeCtx, NodeEntry, NodeStore, PendingSplit, Searched};
 use crate::config::GrowPolicy;
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
 use crate::tree::builder::partition::{category_left, with_sibling};
-use crate::tree::builder::shared::{InteractionState, LeafRows, rayon_available, sum_rows};
+use crate::tree::builder::shared::{InteractionState, LeafRows, rayon_available};
 use crate::tree::builder::split::SplitScorer;
 use crate::tree::builder::{BestSplit, Children, SplitLocation, SplitPos, limit_or_unbounded};
 use crate::tree::gain::GradStats;
@@ -150,13 +152,8 @@ impl HistTreeBuilder<'_> {
         report: LeafReport,
     ) -> Option<DeviceTree> {
         let seg = engine.begin_tree(ghist, row_subset)?;
-        // The root's statistics, the host's `sum_rows` bit for bit (on the
-        // host only for non-finite gradients).
-        let root_stats = match (engine.root_total(seg), gpair) {
-            (Some(stats), _) => stats,
-            (None, Some(gpair)) => sum_rows(gpair, row_subset),
-            (None, None) => return None,
-        };
+        // The root's statistics, the host's `sum_rows` bit for bit.
+        let root_stats = engine.root_total(gpair, row_subset, seg)?;
         let on = Device {
             engine,
             ghist,
@@ -504,8 +501,13 @@ impl HistTreeBuilder<'_> {
         }
         let mut bests = self.resident_search(on, &nodes)?.into_iter();
         let mut out = Vec::with_capacity(pending.len());
-        for ((split, part), slots) in pending.into_iter().zip(&parts).zip(child_slots) {
-            let searched = match slots {
+        for (((split, part), slots), (allowed, _, _)) in pending
+            .into_iter()
+            .zip(&parts)
+            .zip(child_slots)
+            .zip(contexts)
+        {
+            let best = match slots {
                 Some(_) => Some((bests.next()?, bests.next()?)),
                 None => None,
             };
@@ -514,7 +516,7 @@ impl HistTreeBuilder<'_> {
                 split,
                 device_child(part.left, Vec::new()),
                 device_child(part.right, Vec::new()),
-                searched,
+                Some(Searched { allowed, best }),
             );
             out.push(match slots {
                 Some((left_slot, right_slot)) => (
@@ -684,20 +686,20 @@ fn resident_best<'a>(
 #[cfg(all(test, target_os = "linux", feature = "cuda"))]
 mod tests {
     use super::*;
-    use crate::backend::cuda::{CudaHistBackend, available, unavailable_reason};
+    use crate::backend::cuda::{CudaHistBackend, available, has_device, unavailable_reason};
     use crate::config::{Monotone, TrainingParams};
     use crate::data::{DMatrix, FeatureType};
-    use crate::tree::hist::{CpuBackend, HistogramBackend, ScanFallback, zeroed};
+    use crate::tree::builder::shared::sum_rows;
+    use crate::tree::hist::{CpuBackend, DeviceLoss, HistogramBackend, ScanFallback, zeroed};
 
-    fn has_device() -> bool {
-        if let Some(reason) = unavailable_reason() {
-            assert!(
-                std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
-                "CUDA required: {reason}"
-            );
-            return false;
-        }
-        true
+    fn hist_bits(hist: &[GradStats]) -> Vec<[u64; 2]> {
+        hist.iter()
+            .map(|s| [s.grad.to_bits(), s.hess.to_bits()])
+            .collect()
+    }
+
+    fn stats_bits(s: GradStats) -> [u64; 2] {
+        [s.grad.to_bits(), s.hess.to_bits()]
     }
 
     /// Repeated gradient groups give exactly equal f32 category weights.
@@ -771,7 +773,7 @@ mod tests {
             backend
                 .build_resident(&index, Some(&gradients), &[(seg, 0)], &[])
                 .unwrap();
-            let total = backend.root_total(seg).unwrap();
+            let total = backend.root_total(Some(&gradients), &rows, seg).unwrap();
             let mut hist = zeroed(index.total_bins());
             CpuBackend.build(&index, &rows, &gradients, &mut hist);
             for direction in [Monotone::None, Monotone::Increasing, Monotone::Decreasing] {
@@ -829,7 +831,7 @@ mod tests {
             assert_eq!(counts.numeric_score_replays, 0);
             assert_eq!(counts.categorical_order_replays, 0);
             assert_eq!(counts.categorical_score_replays, 0);
-            assert!(available(), "{:?}", unavailable_reason());
+            assert!(available(0), "{:?}", unavailable_reason(0));
         }
     }
 
@@ -879,7 +881,7 @@ mod tests {
                 assert_eq!(counts.categorical_order_replays, 0);
                 assert_eq!(counts.categorical_score_replays, 0);
                 assert_eq!(backend.node_counts().cpu_nodes, 0);
-                assert!(available(), "{:?}", unavailable_reason());
+                assert!(available(0), "{:?}", unavailable_reason(0));
             }
         }
     }
@@ -933,7 +935,7 @@ mod tests {
                 assert_eq!(backend.node_counts().cpu_nodes, 0);
             }
         }
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 
     #[test]
@@ -955,7 +957,7 @@ mod tests {
             .build()
             .unwrap();
         let builder = HistTreeBuilder::new(&params);
-        let total = backend.root_total(seg).unwrap();
+        let total = backend.root_total(Some(&gradients), &rows, seg).unwrap();
         let (_, ctx) = builder.root_context(&mut ColumnSampler::all(3), total, rows.len());
         let node = ResidentNode {
             slot: 0,
@@ -1014,6 +1016,85 @@ mod tests {
         }
         assert_eq!(backend.scan_diagnostics().categorical_score_replays, 1);
         assert_eq!(backend.scan_diagnostics().numeric_score_replays, 1);
-        assert!(available(), "{:?}", unavailable_reason());
+        assert!(available(0), "{:?}", unavailable_reason(0));
+    }
+
+    /// On a dense index above 2^18 rows the CPU chains a contiguous node
+    /// and blocks any other one, so the device must know which children are
+    /// runs: a split on the row-ordered feature leaves both children runs,
+    /// one on an interleaved feature neither. Non-exact chains of 8,192+
+    /// rows are built on the CPU (from the host gradients, or the device's
+    /// downloaded once), the blocked nodes on the device; all match the CPU.
+    #[test]
+    fn device_children_know_their_contiguity_and_follow_the_cpu_order() {
+        if !has_device() {
+            return;
+        }
+        let n = (1 << 18) + 7_777;
+        let values: Vec<f32> = (0..n)
+            .flat_map(|r| [r as f32, (r * 7 % 13) as f32])
+            .collect();
+        let data = DMatrix::from_dense(&values, n, 2).unwrap();
+        let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 64));
+        assert!(index.column_bins().is_some());
+        // Spread over 60 binades: no chunk's sum is exact.
+        let labels: Vec<f32> = (0..n)
+            .map(|r| ((r * 7919) % 1237) as f32 / 331.0 * 2f32.powi((r * 37 % 61) as i32 - 30))
+            .collect();
+        // The device's squared-error gradients at margin 0: `(0 - y) * 1`.
+        let gradients: Vec<GradPair> = labels
+            .iter()
+            .map(|&y| GradPair::new(0.0 - y, 1.0))
+            .collect();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let backend = CudaHistBackend::new(&index, 0).unwrap();
+        let check = |gpair: Option<&[GradPair]>, feature: u32, limit: u32, runs: bool| {
+            let root = backend.begin_tree(&index, &rows).unwrap();
+            assert!(root.contiguous);
+            let total = backend.root_total(gpair, &rows, root).unwrap();
+            assert_eq!(stats_bits(total), stats_bits(sum_rows(&gradients, &rows)));
+            let root_hist = backend.histograms(&index, gpair, &[root]).unwrap().pop();
+            let mut expected = zeroed(index.total_bins());
+            CpuBackend.build(&index, &rows, &gradients, &mut expected);
+            assert_eq!(hist_bits(&root_hist.unwrap()), hist_bits(&expected));
+            let split = RowSplit {
+                seg: root,
+                feature,
+                rule: RowRule::Below(limit),
+                default_left: false,
+            };
+            let part = backend.partition(&index, &[split]).unwrap()[0];
+            assert!(part.left.len > 8_192 && part.right.len > 8_192);
+            assert_eq!((part.left.contiguous, part.right.contiguous), (runs, runs));
+            let children = [part.left, part.right];
+            let hists = backend.histograms(&index, gpair, &children).unwrap();
+            for (hist, rows) in hists.iter().zip(backend.rows(&children).unwrap()) {
+                CpuBackend.build(&index, &rows, &gradients, &mut expected);
+                assert_eq!(hist_bits(hist), hist_bits(&expected), "feature {feature}");
+            }
+        };
+        backend.prepare(&index, &gradients);
+        // Feature 0 (the row id, 64 bins) splits into two runs; feature 1
+        // (13 interleaved values) into two subsets.
+        let cases = [(0, 24, true), (1, 6, false)];
+        for (feature, limit, runs) in cases {
+            check(Some(&gradients), feature, limit, runs);
+        }
+        let counts = backend.node_counts();
+        assert!(
+            counts.cpu_nodes >= 4 && counts.chain_nodes >= 2,
+            "{counts:?}"
+        );
+        // The same nodes from the device's own gradients (`-y`, weight 1).
+        let margins = vec![0.0; n];
+        backend.load_margins(&margins).unwrap();
+        let loss = DeviceLoss::SquaredError {
+            scale_pos_weight: 1.0,
+        };
+        assert_eq!(backend.gradients(loss, &labels, None), Some(true));
+        for (feature, limit, runs) in cases {
+            check(None, feature, limit, runs);
+        }
+        assert!(available(0), "{:?}", unavailable_reason(0));
     }
 }

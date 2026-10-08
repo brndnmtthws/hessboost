@@ -46,8 +46,8 @@ pub struct ColumnSampler {
     /// `bylevel` draws nothing).
     levels: Vec<Option<Arc<[u32]>>>,
     /// Per-feature sampling weights indexed by feature id; `None` samples
-    /// uniformly.
-    weights: Option<Vec<f32>>,
+    /// uniformly. Shared, so a clone copies only the draw state.
+    weights: Option<Arc<[f32]>>,
     bylevel: f32,
     bynode: f32,
     rng: Rng,
@@ -106,7 +106,7 @@ impl ColumnSampler {
         if let Some(w) = weights {
             assert_eq!(w.len(), n_features, "one feature weight per feature");
         }
-        let weights = weights.map(<[f32]>::to_vec);
+        let weights: Option<Arc<[f32]>> = weights.map(Arc::from);
         let mut rng = Rng::new(seed);
         let all: Vec<u32> = (0..n_features as u32).collect();
         let tree = draw(&mut rng, weights.as_deref(), &all, bytree as f32).unwrap_or(all);

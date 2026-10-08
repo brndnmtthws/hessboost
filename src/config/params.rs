@@ -160,10 +160,11 @@ pub enum GrowPolicy {
 /// the other GPU backends here are `metal` and `wgpu`. Serializes as those
 /// strings (`cuda` for ordinal 0).
 ///
-/// GPU backends preserve CPU training bits. Metal/wgpu offload nodes within
-/// their exact integer-sum domain; CUDA can also replay the CPU's ordered
-/// floating-point chunks. Work unsupported by a backend remains on the CPU.
-/// All require `tree_method = hist`/`auto` and a tree booster, and are opt-in.
+/// Each GPU backend moves histogram construction to the GPU for every node
+/// whose sums it can reproduce exactly (Metal and wgpu: exact integer sums;
+/// CUDA also the CPU's ordered `f64` sums) and keeps the rest on the CPU,
+/// reproducing single-threaded CPU training bit for bit. All require
+/// `tree_method = hist`/`auto` and a tree booster, and are opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Device {
@@ -185,11 +186,10 @@ pub enum Device {
     /// [`backend::wgpu`](crate::backend::wgpu)); prediction goes through
     /// [`BoostedModel::to_wgpu`](crate::model::BoostedModel::to_wgpu).
     Wgpu,
-    /// An NVIDIA GPU through CUDA, on Linux with the `cuda` feature (see
-    /// [`backend::cuda`](crate::backend::cuda)): the tree's rows stay on
-    /// the GPU, which partitions them and builds the histograms, and for
-    /// `reg:squarederror` and the logistic objectives keeps the margins and
-    /// computes the gradients too. CPU bit-parity tests pass on an L40S.
+    /// An NVIDIA GPU (compute capability 7.5 or newer) through CUDA, on
+    /// Linux with the `cuda` feature; the driver is loaded at run time (see
+    /// [`backend::cuda`](crate::backend::cuda)). Prediction goes through
+    /// [`BoostedModel::to_cuda`](crate::model::BoostedModel::to_cuda).
     Cuda {
         /// The CUDA device ordinal (XGBoost `cuda:<ordinal>`; `0` for
         /// plain `cuda`).

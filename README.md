@@ -179,12 +179,11 @@ See [`python/README.md`](python/README.md).
   - [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/): Training controlled by one budget value, based on PerpetualBooster.
   - [Metal GPU](https://docs.rs/hessboost/latest/hessboost/backend/metal/): Apple Silicon GPU prediction and training (`--features metal`).
   - [wgpu GPU](https://docs.rs/hessboost/latest/hessboost/backend/wgpu/): Vulkan, Metal, and DirectX 12 GPU prediction and training through wgpu (`--features wgpu`), bit-identical to the CPU.
-  - [CUDA GPU](https://docs.rs/hessboost/latest/hessboost/backend/cuda/): NVIDIA GPU training and batch prediction on Linux (`--features cuda`), bit-identical to the CPU, with Rust kernels compiled by [cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/): device-resident numeric/categorical split search, compact CSR storage, and ordered prediction; CPU bit-parity tests pass on an L40S (see [verification](docs/performance.md#cuda-gpu-linux)).
+  - [CUDA GPU](https://docs.rs/hessboost/latest/hessboost/backend/cuda/): NVIDIA GPU prediction and training on Linux (`--features cuda`), bit-identical to the CPU.
 
 ## Caveats
 
 - Full technical details, invariants, and statistical assumptions are documented in the [API reference](https://docs.rs/hessboost).
-- CUDA is introduced for the 0.3.0 release: `Device` now carries CUDA ordinals and can no longer be cast to a numeric discriminant. CPU histogram/root sums use fixed blocks above 8,191 rows; outside the exact-sum domain this can change the low bits of newly trained models. Existing model files and prediction semantics remain supported.
 - Approximate in-place updates are designed for incremental shifts (under ~1% of rows); larger changes benefit from a retrain.
 - Asymptotic Boulevard inference and prediction intervals require specific noise and structure assumptions; see the [`inference` docs](https://docs.rs/hessboost/latest/hessboost/inference/#validation) for conditions and empirical coverage validation.
 ## Not implemented

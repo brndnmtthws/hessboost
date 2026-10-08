@@ -29,10 +29,12 @@ module() {
     exit 1
   fi
   # Bit-for-bit CPU parity rests on every floating-point instruction being
-  # the IEEE one: refuse approximate or flush-to-zero instructions, and adds,
-  # subtractions and multiplications without an explicit rounding mode,
-  # which ptxas may fuse into FMAs.
-  if grep -nE '\.(approx|ftz)\b|\b(add|sub|mul|mad)\.f(32|64)\b|\bdiv\.full\b|__nv_' "$ptx"; then
+  # the IEEE round-to-nearest one: refuse approximate, flush-to-zero,
+  # directed-rounding (`.rz`/`.rm`/`.rp`, conversions included) or saturating
+  # floating-point instructions, and adds, subtractions and multiplications
+  # without an explicit rounding mode, which ptxas may fuse into FMAs. (The
+  # integer conversions `cvt.rzi`/`cvt.rni` are exact.)
+  if grep -nE '\.(approx|ftz)\b|\b(add|sub|mul|mad)\.f(32|64)\b|\.(rz|rm|rp)\.(bf16|f16|f32|f64)\b|\.sat\.(bf16|f16|f32|f64)\b|\bdiv\.full\b|__nv_' "$ptx"; then
     echo "error: the '$1' PTX has a non-IEEE floating-point instruction" >&2
     exit 1
   fi

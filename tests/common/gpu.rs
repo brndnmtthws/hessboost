@@ -16,7 +16,8 @@ use super::{incompatible_model, invalid_param, with_threads};
 
 /// A GPU backend under test.
 pub trait GpuBackend {
-    /// Name in skip messages (`metal`, `wgpu`).
+    /// Name in skip messages and the `device` XGBoost spells it as (`cuda`,
+    /// `metal`, `wgpu`).
     const NAME: &'static str;
     /// The `device` that trains on this backend.
     const DEVICE: Device;
@@ -29,7 +30,7 @@ pub trait GpuBackend {
     fn unavailable_reason() -> Option<String>;
     /// The backend's histogram builder for `index`.
     fn hist_backend(index: &GHistIndex) -> Box<dyn HistogramBackend>;
-    /// `model` laid out for GPU prediction (`to_gpu`, `to_wgpu`).
+    /// `model` laid out for GPU prediction (`to_cuda`, `to_gpu`, `to_wgpu`).
     fn to_gpu(model: &BoostedModel) -> Result<Self::Model>;
 }
 

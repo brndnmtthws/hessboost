@@ -6,45 +6,22 @@ use super::{
     CudaHistBackend, CudaSlice, CudaStream, DriverError, LaunchConfig, Pinned, SCAN_WARPS, abi,
     bytes_of, download_pinned, fit, pinned,
 };
+use crate::backend::cuda::diagnostics::ScanDiagnostics;
 use crate::data::ghist::GHistIndex;
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::hist::{NodeScan, ScanFallback, ScanRequest};
 use cudarc::driver::PushKernelArg;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Maximum ordinary sorting workspace (keys plus two index buffers).
-/// A single wider feature needs its own full workspace, never a category
-/// cap or host sort. The workspace is reused across the batch's waves.
-const SORT_BYTES: usize = 64 << 20;
+/// Entries of the ordinary sorting workspace: keys plus two index buffers,
+/// 12 bytes an entry, 48 MiB in all. A power of two, as `fit` rounds each
+/// buffer up to one, so a wave of at most this many entries allocates no
+/// more. A single wider feature needs its own full workspace, never a
+/// category cap or host sort. The workspace is reused across the batch's
+/// waves.
+const SORT_ENTRIES: usize = 1 << 22;
 const SET_BINS: usize = 63;
 const HEADER_WORDS: usize = 7;
-
-/// Resident device work and searches that required the CPU's non-total
-/// comparisons. Semantic fallbacks are not CUDA failures or category caps.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ScanDiagnostics {
-    /// Nodes whose feature results were merged on the device.
-    pub device_nodes: u64,
-    /// Of those, nodes whose prefixes were formed by warp scans: their
-    /// tree's gradients sum exactly over all of its rows, so every
-    /// association of the additions gives the CPU's chain bits.
-    pub exact_nodes: u64,
-    /// Numeric features scanned on the device.
-    pub numeric_features: u64,
-    /// Categorical features searched on the device.
-    pub categorical_features: u64,
-    /// Bytes read back for packed per-node winners, including their chosen
-    /// category bins but excluding explicit NaN histogram replays.
-    pub winner_readback_bytes: u64,
-    /// Nodes replayed because a numeric candidate scored NaN.
-    pub numeric_score_replays: u64,
-    /// Nodes replayed because a categorical sort key was non-finite.
-    pub categorical_order_replays: u64,
-    /// Nodes replayed because a categorical candidate scored NaN.
-    pub categorical_score_replays: u64,
-}
 
 /// Reused sorting scratch, device results and pinned output (descriptors
 /// travel in the backend's packed descriptor buffer).
@@ -59,8 +36,7 @@ pub(super) struct ScanState {
     categorical_sets: CudaSlice<u32>,
     out: CudaSlice<u64>,
     pin: Option<Pinned<u64>>,
-    replays: [AtomicU64; 3],
-    work: [AtomicU64; 5],
+    diagnostics: ScanDiagnostics,
 }
 
 impl ScanState {
@@ -76,22 +52,8 @@ impl ScanState {
             categorical_sets: stream.alloc_zeros(SET_BINS)?,
             out: stream.alloc_zeros(HEADER_WORDS)?,
             pin: None,
-            replays: std::array::from_fn(|_| AtomicU64::new(0)),
-            work: std::array::from_fn(|_| AtomicU64::new(0)),
+            diagnostics: ScanDiagnostics::default(),
         })
-    }
-
-    fn snapshot(&self) -> ScanDiagnostics {
-        ScanDiagnostics {
-            device_nodes: self.work[0].load(Ordering::Relaxed),
-            exact_nodes: self.work[4].load(Ordering::Relaxed),
-            numeric_features: self.work[1].load(Ordering::Relaxed),
-            categorical_features: self.work[2].load(Ordering::Relaxed),
-            winner_readback_bytes: self.work[3].load(Ordering::Relaxed),
-            numeric_score_replays: self.replays[0].load(Ordering::Relaxed),
-            categorical_order_replays: self.replays[1].load(Ordering::Relaxed),
-            categorical_score_replays: self.replays[2].load(Ordering::Relaxed),
-        }
     }
 }
 
@@ -113,12 +75,12 @@ fn scan_config(tasks: usize) -> LaunchConfig {
 }
 
 impl CudaHistBackend {
-    /// Counters for resident split searches replayed on the host to retain
-    /// the CPU's NaN comparisons. Ordinary numeric and categorical searches
-    /// of either growth policy run entirely on the device.
+    /// What the resident split searches did (`hessboost::internals`, for
+    /// tests and benchmarks).
+    #[doc(hidden)]
     #[must_use]
     pub fn scan_diagnostics(&self) -> ScanDiagnostics {
-        self.state.lock().scan.snapshot()
+        self.state.lock().scan.diagnostics
     }
 
     #[cfg(test)]
@@ -286,7 +248,7 @@ impl CudaHistBackend {
                     &mut scan.categorical_sets,
                     SET_BINS * categorical.len(),
                 )?;
-                let capacity = SORT_BYTES / 12;
+                let capacity = SORT_ENTRIES;
                 let mut next = 0;
                 while next < categorical.len() {
                     let begin = next;
@@ -411,12 +373,13 @@ impl CudaHistBackend {
             let readback = pinned(pool, stream, &mut scan.pin, output_words, false)?;
             let packed = download_pinned(stream, readback, &scan.out, output_words)?;
             staging.synced();
-            scan.work[0].fetch_add(requests.len() as u64, Ordering::Relaxed);
-            scan.work[1].fetch_add(n_numeric as u64, Ordering::Relaxed);
-            scan.work[2].fetch_add(categorical.len() as u64, Ordering::Relaxed);
-            scan.work[3].fetch_add((output_words * 8) as u64, Ordering::Relaxed);
+            let counts = &mut scan.diagnostics;
+            counts.device_nodes += requests.len() as u64;
+            counts.numeric_features += n_numeric as u64;
+            counts.categorical_features += categorical.len() as u64;
+            counts.winner_readback_bytes += (output_words * 8) as u64;
             if exact != 0 {
-                scan.work[4].fetch_add(requests.len() as u64, Ordering::Relaxed);
+                counts.exact_nodes += requests.len() as u64;
             }
             let mut results = Vec::with_capacity(requests.len());
             for &offset in &out_at[..requests.len()] {
@@ -461,12 +424,20 @@ impl CudaHistBackend {
                         }
                     }
                     fallback => {
-                        let index = (fallback - 3) as usize;
-                        scan.replays[index].fetch_add(1, Ordering::Relaxed);
-                        NodeScan::Replay(match index {
-                            0 => ScanFallback::NumericScore,
-                            1 => ScanFallback::CategoricalOrder,
-                            _ => ScanFallback::CategoricalScore,
+                        let counts = &mut scan.diagnostics;
+                        NodeScan::Replay(match fallback {
+                            3 => {
+                                counts.numeric_score_replays += 1;
+                                ScanFallback::NumericScore
+                            }
+                            4 => {
+                                counts.categorical_order_replays += 1;
+                                ScanFallback::CategoricalOrder
+                            }
+                            _ => {
+                                counts.categorical_score_replays += 1;
+                                ScanFallback::CategoricalScore
+                            }
                         })
                     }
                 };

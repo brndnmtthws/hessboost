@@ -4,6 +4,7 @@
 //! `prediction.ptx`. CI rebuilds them and fails when a file differs from the
 //! source's.
 
+use super::{Unavailable, failed};
 use cudarc::driver::{CudaContext, CudaModule};
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use std::sync::Arc;
 /// The oldest compute capability the PTX targets (`sm_75`, Turing); the
 /// driver JIT-compiles a module for the device's own architecture (any
 /// later one) when a context loads it, and caches the machine code.
-const MIN_COMPUTE_CAPABILITY: (i32, i32) = (7, 5);
+pub(super) const MIN_COMPUTE_CAPABILITY: (i32, i32) = (7, 5);
 
 /// One of the embedded modules.
 #[derive(Clone, Copy)]
@@ -38,18 +39,17 @@ impl Module {
 pub(super) fn load(
     ctx: &Arc<CudaContext>,
     module: Module,
-) -> std::result::Result<Arc<CudaModule>, String> {
+) -> std::result::Result<Arc<CudaModule>, Unavailable> {
     let (major, minor) = ctx
         .compute_capability()
-        .map_err(|e| format!("CUDA compute capability: {e}"))?;
+        .map_err(|e| failed("compute capability", e))?;
     if (major, minor) < MIN_COMPUTE_CAPABILITY {
-        let (min_major, min_minor) = MIN_COMPUTE_CAPABILITY;
-        return Err(format!(
-            "CUDA device {} has compute capability {major}.{minor}; the backend needs \
-             {min_major}.{min_minor} or newer",
-            ctx.ordinal()
-        ));
+        return Err(Unavailable::OldDevice {
+            ordinal: ctx.ordinal(),
+            major,
+            minor,
+        });
     }
     ctx.load_module(Ptx::from_src(module.ptx()))
-        .map_err(|e| format!("CUDA module load (sm_{major}{minor}): {e}"))
+        .map_err(|e| failed(&format!("module load (sm_{major}{minor})"), e))
 }

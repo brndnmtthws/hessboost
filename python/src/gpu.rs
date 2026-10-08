@@ -9,11 +9,14 @@ use crate::booster::{dense, iterations};
 use crate::data::{DMatrix, to_numpy};
 use crate::errors::{DetachExt, refuse};
 use hessboost::backend::wgpu;
+use hessboost::config::Device;
 use hessboost::error::Result;
 use hessboost::model::{BoostedModel, Iterations, Predictions};
 use numpy::PyArrayDyn;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use serde::Deserialize;
+use serde::de::value::StrDeserializer;
 
 /// A GPU backend, as the `device` argument names it.
 #[derive(Clone, Copy)]
@@ -22,28 +25,30 @@ enum Backend {
     Metal,
     /// wgpu over Vulkan, Metal, or DirectX 12.
     Wgpu,
-    /// NVIDIA CUDA on Linux, with an explicit device ordinal.
-    Cuda,
+    /// NVIDIA CUDA on Linux, on the device `ordinal` (`"cuda:<ordinal>"`).
+    Cuda { ordinal: usize },
 }
 
 impl Backend {
-    /// The backend `device` names; `None` is the platform's default, Metal
-    /// on macOS and wgpu elsewhere.
-    fn parse(device: Option<&str>, backend: Option<&str>, ordinal: usize) -> PyResult<Self> {
-        if device.is_some() && backend.is_some() && device != backend {
-            return Err(refuse("device and backend name different GPU backends"));
-        }
-        let device = backend.or(device);
-        if ordinal != 0 && device != Some("cuda") {
-            return Err(refuse("ordinal is only supported for backend=\"cuda\""));
-        }
-        match device {
-            None if cfg!(target_os = "macos") => Ok(Self::Metal),
-            None | Some("wgpu") => Ok(Self::Wgpu),
-            Some("metal") => Ok(Self::Metal),
-            Some("cuda") => Ok(Self::Cuda),
-            Some(other) => Err(refuse(format!(
-                "unknown GPU device {other:?}; expected \"metal\", \"wgpu\" or \"cuda\""
+    /// The backend `device` names, spelled as training's `device` spells it
+    /// (`"metal"`, `"wgpu"`, `"cuda"`, `"cuda:<ordinal>"`); `None` is the
+    /// platform's default, Metal on macOS and wgpu elsewhere.
+    fn parse(device: Option<&str>) -> PyResult<Self> {
+        let Some(device) = device else {
+            return Ok(if cfg!(target_os = "macos") {
+                Self::Metal
+            } else {
+                Self::Wgpu
+            });
+        };
+        let parsed = Device::deserialize(StrDeserializer::<serde::de::value::Error>::new(device));
+        match parsed {
+            Ok(Device::Metal) => Ok(Self::Metal),
+            Ok(Device::Wgpu) => Ok(Self::Wgpu),
+            Ok(Device::Cuda { ordinal }) => Ok(Self::Cuda { ordinal }),
+            _ => Err(refuse(format!(
+                "unknown GPU device {device:?}; expected \"metal\", \"wgpu\", \"cuda\" or \
+                 \"cuda:<ordinal>\""
             ))),
         }
     }
@@ -51,7 +56,7 @@ impl Backend {
     /// Whether the backend predicts here ([`Predictor::build`] lays forest
     /// models out on it). The first call per backend initializes it
     /// (adapter selection, kernel compilation, wgpu's addition-order probe).
-    fn available(self, ordinal: usize) -> bool {
+    fn available(self) -> bool {
         match self {
             #[cfg(target_os = "macos")]
             Self::Metal => hessboost::backend::metal::available(),
@@ -59,17 +64,14 @@ impl Backend {
             Self::Metal => false,
             Self::Wgpu => wgpu::prediction_available(),
             #[cfg(target_os = "linux")]
-            Self::Cuda => hessboost::backend::cuda::prediction_available(ordinal),
+            Self::Cuda { ordinal } => hessboost::backend::cuda::prediction_available(ordinal),
             #[cfg(not(target_os = "linux"))]
-            Self::Cuda => {
-                let _ = ordinal;
-                false
-            }
+            Self::Cuda { .. } => false,
         }
     }
 
     /// The name of the GPU the backend picked, if any.
-    fn device_name(self, ordinal: usize) -> Option<String> {
+    fn device_name(self) -> Option<String> {
         match self {
             #[cfg(target_os = "macos")]
             Self::Metal => hessboost::backend::metal::device_name(),
@@ -77,12 +79,9 @@ impl Backend {
             Self::Metal => None,
             Self::Wgpu => wgpu::device_name(),
             #[cfg(target_os = "linux")]
-            Self::Cuda => hessboost::backend::cuda::prediction_device_name(ordinal),
+            Self::Cuda { ordinal } => hessboost::backend::cuda::prediction_device_name(ordinal),
             #[cfg(not(target_os = "linux"))]
-            Self::Cuda => {
-                let _ = ordinal;
-                None
-            }
+            Self::Cuda { .. } => None,
         }
     }
 }
@@ -98,12 +97,7 @@ enum Predictor {
 
 impl Predictor {
     /// `model` laid out on `backend`, without the GIL.
-    fn build(
-        py: Python<'_>,
-        model: &BoostedModel,
-        backend: Backend,
-        ordinal: usize,
-    ) -> PyResult<Self> {
+    fn build(py: Python<'_>, model: &BoostedModel, backend: Backend) -> PyResult<Self> {
         match backend {
             #[cfg(target_os = "macos")]
             Backend::Metal => py.detached(|| model.to_gpu()).map(Self::Metal),
@@ -117,12 +111,9 @@ impl Predictor {
             }
             Backend::Wgpu => py.detached(|| model.to_wgpu()).map(Self::Wgpu),
             #[cfg(target_os = "linux")]
-            Backend::Cuda => py.detached(|| model.to_cuda(ordinal)).map(Self::Cuda),
+            Backend::Cuda { ordinal } => py.detached(|| model.to_cuda(ordinal)).map(Self::Cuda),
             #[cfg(not(target_os = "linux"))]
-            Backend::Cuda => {
-                let _ = ordinal;
-                Err(refuse("CUDA GPU prediction is only available on Linux"))
-            }
+            Backend::Cuda { .. } => Err(refuse("CUDA GPU prediction is only available on Linux")),
         }
     }
 
@@ -181,11 +172,9 @@ impl GpuModel {
         py: Python<'_>,
         model: &BoostedModel,
         device: Option<&str>,
-        backend: Option<&str>,
-        ordinal: usize,
     ) -> PyResult<Self> {
-        let backend = Backend::parse(device, backend, ordinal)?;
-        Predictor::build(py, model, backend, ordinal).map(|gpu| Self { gpu })
+        let backend = Backend::parse(device)?;
+        Predictor::build(py, model, backend).map(|gpu| Self { gpu })
     }
 }
 
@@ -194,31 +183,20 @@ impl GpuModel {
     /// Whether `device` (`None`: the platform's default) predicts here: for
     /// Metal, a device with working compute pipelines (`false` off macOS);
     /// for wgpu, an adapter with 64-bit shader integers that passed the
-    /// addition-order probe.
+    /// addition-order probe; for CUDA, a driver and device that load the
+    /// prediction kernels (`false` off Linux).
     #[staticmethod]
-    #[pyo3(signature = (device=None, *, backend=None, ordinal=0))]
-    fn available(
-        py: Python<'_>,
-        device: Option<&str>,
-        backend: Option<&str>,
-        ordinal: usize,
-    ) -> PyResult<bool> {
-        let backend = Backend::parse(device, backend, ordinal)?;
-        Ok(py.detach(|| backend.available(ordinal)))
+    fn available(py: Python<'_>, device: Option<&str>) -> PyResult<bool> {
+        let backend = Backend::parse(device)?;
+        Ok(py.detach(|| backend.available()))
     }
 
     /// The name of the GPU `device` picked, if any (for diagnostics and
     /// benchmarks).
     #[staticmethod]
-    #[pyo3(signature = (device=None, *, backend=None, ordinal=0))]
-    fn device_name(
-        py: Python<'_>,
-        device: Option<&str>,
-        backend: Option<&str>,
-        ordinal: usize,
-    ) -> PyResult<Option<String>> {
-        let backend = Backend::parse(device, backend, ordinal)?;
-        Ok(py.detach(|| backend.device_name(ordinal)))
+    fn device_name(py: Python<'_>, device: Option<&str>) -> PyResult<Option<String>> {
+        let backend = Backend::parse(device)?;
+        Ok(py.detach(|| backend.device_name()))
     }
 
     /// The backend this model predicts on (`"metal"`, `"wgpu"` or `"cuda"`).

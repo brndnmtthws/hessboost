@@ -373,17 +373,13 @@ impl Booster {
         Ok(Self::new(model))
     }
 
-    /// Upload the forest to Metal, wgpu or CUDA (Linux). CUDA uses `ordinal`.
-    /// Default selection remains Metal on macOS, wgpu elsewhere.
-    #[pyo3(signature = (device=None, *, backend=None, ordinal=0))]
-    fn to_gpu(
-        &self,
-        py: Python<'_>,
-        device: Option<&str>,
-        backend: Option<&str>,
-        ordinal: usize,
-    ) -> PyResult<GpuModel> {
-        GpuModel::build(py, &self.model, device, backend, ordinal)
+    /// Lays this model out for GPU batch prediction on `device` (`"metal"`
+    /// on macOS, `"wgpu"` anywhere, `"cuda"`/`"cuda:<ordinal>"` on Linux;
+    /// `None`: Metal on macOS, wgpu elsewhere). `gblinear` and
+    /// `linear_tree` models are refused, as they do not predict through
+    /// the forest.
+    fn to_gpu(&self, py: Python<'_>, device: Option<&str>) -> PyResult<GpuModel> {
+        GpuModel::build(py, &self.model, device)
     }
 
     /// This model in the bit-packed compact layout (the trees prediction

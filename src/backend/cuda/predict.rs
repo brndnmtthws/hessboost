@@ -139,6 +139,19 @@ impl Shape {
     }
 }
 
+/// The entry of a full pool a finished call of shape `call` replaces: the
+/// smallest pooled call that cannot serve it, else none (every pooled call
+/// serves it, and it is dropped). Judged by the call's own shape, not its
+/// request's, so concurrent misses of one shape all end up pooled and a
+/// larger call back from a smaller request is kept.
+fn replaced(pooled: impl Iterator<Item = Shape>, call: Shape) -> Option<usize> {
+    pooled
+        .enumerate()
+        .filter(|&(_, shape)| !shape.serves(call))
+        .min_by_key(|&(_, shape)| shape.rows)
+        .map(|(i, _)| i)
+}
+
 struct Slot {
     rows: CudaSlice<f32>,
     out: CudaSlice<f32>,
@@ -353,10 +366,10 @@ impl Drop for Call {
 /// [`BoostedModel::to_cuda`]. Forest traversal and tree-order f32 accumulation
 /// run on the GPU; the objective transform runs on the CPU for bit parity.
 /// Inputs, including CSR, materialize only bounded row blocks, not the full
-/// batch. Calls may run concurrently; each owns a double-buffered pinned
-/// H2D/compute/D2H pipeline. Runtime failures return an error, never silently
-/// predict on the CPU. As with the existing GPU predictors, model shrinkage
-/// uses the CPU's per-iteration shrink-then-add path explicitly.
+/// batch. Calls may run concurrently; each owns a pinned H2D/compute/D2H
+/// pipeline of four row-block slots. Runtime failures return an error, never
+/// silently predict on the CPU. As with the existing GPU predictors, model
+/// shrinkage uses the CPU's per-iteration shrink-then-add path explicitly.
 pub struct GpuModel {
     model: Arc<BoostedModel>,
     ctx: Arc<Context>,
@@ -439,16 +452,17 @@ impl GpuModel {
             };
             call.run(self, data, trees, &mut margins)
                 .map_err(|e| self.ctx.error(e))?;
-            // Keep a call that serves this shape: when the pool is full and
-            // none does, this one replaces one that does not, so later calls
-            // of this shape reuse their buffers instead of reallocating.
+            // Keep the call when the pool has room, or in place of a pooled
+            // call that cannot serve it, so later calls of its shape reuse
+            // its buffers instead of reallocating.
             let evicted = {
                 let mut pool = self.pool.lock();
                 if pool.len() < POOL_CALLS {
                     pool.push(call);
                     None
-                } else if pool.iter().all(|pooled| !pooled.shape.serves(shape)) {
-                    Some(std::mem::replace(&mut pool[0], call))
+                } else if let Some(i) = replaced(pool.iter().map(|pooled| pooled.shape), call.shape)
+                {
+                    Some(std::mem::replace(&mut pool[i], call))
                 } else {
                     Some(call)
                 }
@@ -761,5 +775,31 @@ mod tests {
         let pool = gpu.pool.lock();
         assert_eq!(pool.len(), POOL_CALLS);
         assert!(pool.iter().any(|call| call.shape.serves(wanted)));
+    }
+
+    /// A finished call replaces the smallest pooled call that cannot serve
+    /// its own shape: overlapping misses of one shape both end up pooled, a
+    /// larger call back from a smaller request is kept, and a call every
+    /// pooled one serves is dropped.
+    #[test]
+    fn returning_calls_replace_pooled_calls_that_cannot_serve_them() {
+        let shape = |rows| Shape {
+            rows,
+            cols: 1,
+            outputs: 1,
+        };
+        // Two overlapping 3-row misses over pooled 2- and 1-row calls: the
+        // first replaces the 1-row call, the second the 2-row one.
+        let mut pool = [shape(2), shape(1)];
+        for expect in [1, 0] {
+            assert_eq!(replaced(pool.iter().copied(), shape(3)), Some(expect));
+            pool[expect] = shape(3);
+        }
+        // A 3-row call back from a smaller request, over two 2-row calls.
+        assert_eq!(
+            replaced([shape(2), shape(2)].into_iter(), shape(3)),
+            Some(0)
+        );
+        assert_eq!(replaced([shape(3), shape(2)].into_iter(), shape(2)), None);
     }
 }

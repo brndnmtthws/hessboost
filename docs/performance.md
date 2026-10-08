@@ -877,33 +877,7 @@ the design and determinism contract). Its kernels are Rust, the
 `cuda-kernels/` crate compiled to PTX by
 [cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/) and embedded;
 the driver JIT-compiles a module the first time a process on the machine
-loads it and caches the machine code. Measured on an **NVIDIA L40S**
-(compute capability 8.9, driver 595.91.07, CUDA 13.2, 8 Rayon threads,
-Rust 1.99.0, 2026-10-07), the crate's `cuda_*` benches, before CUDA
-followed the CPU's row-order chains (a non-exact chain of 8,192 or more
-rows now runs on the CPU; see below), so rerun them for current figures:
-
-| Workload | CPU | CUDA | Speedup |
-|---|---|---|---|
-| train 1M rows × 30 features, 20 depth-8 rounds | 905.0 ms | 283.3 ms | **3.19×** |
-| train 200k × 30, categorical, 20 depth-6 rounds | 168.4 ms | 67.45 ms | **2.50×** |
-| train 200k × 30, lossguide (64 leaves), 20 rounds | 196.2 ms | 163.9 ms | **1.20×** |
-| train 200k × 30, CSR (~40% present), 20 depth-6 rounds | 138.2 ms | 58.47 ms | **2.36×** |
-| predict 500k × 30, 100 depth-6 trees | 26.81 ms | 6.713 ms | **3.99×** |
-
-Histogram builds of one node holding every row (`cuda_histogram_build`):
-
-| Rows × 30 features | CPU | CUDA | Speedup |
-|---|---|---|---|
-| 10M | 67.71 ms | 2.348 ms | **28.8×** |
-| 1M | 7.005 ms | 0.367 ms | **19.1×** |
-
-Each figure is the mean of two Criterion medians (1 s warmup, 10 samples
-over 3 s) from `scripts/compare_benchmarks.py`'s alternating runs of the
-bench executable. Training times include cuts, binning, and device setup;
-at 1M × 30 the CPU's cuts and binning, shared with CPU training, are about
-three quarters of a CUDA fit. Prediction times include the row uploads,
-not the forest's.
+loads it and caches the machine code.
 
 The tree's rows and histograms stay on the device. Depthwise growth
 handles a whole level per round trip: the GPU partitions every splitting
@@ -922,14 +896,15 @@ strategy that applies: exact integer sums in any order (Metal's exactness
 bound), exact integer blocks reduced in `f64` in the CPU's block order, or
 the CPU's row-order `f64` chains, one GPU thread per (block, feature) on
 dense storage and per block on CSR. A non-exact node the CPU sums as one
-chain of 8,192 or more rows runs on the CPU (on every core, overlapping the
-GPU's work on the rest of its level), as do trees with non-finite
-gradients and every tree after a CUDA error. Split search chains each
-feature's prefixes on one lane in the CPU's order, or uses warp scans when
-the tree's gradients sum exactly over all its rows (then any association
-gives the chain's bits); a NaN score replays the node on the host. The
-kernels are built without contraction, flush-to-zero, or approximate
-division, and use no floating-point atomics.
+chain of 8,192 or more rows runs on the CPU (on scoped threads, as many as
+`nthread` allows and at most one per 8,192 rows, overlapping the GPU's work
+on the rest of its level), as do trees with non-finite gradients and every
+tree after a CUDA error. Split search chains each feature's prefixes on one
+lane in the CPU's order, or uses warp scans when the tree's gradients sum
+exactly over all its rows (then any association gives the chain's bits); a
+NaN score replays the node on the host. The kernels are built without
+contraction, flush-to-zero, or approximate division, and use no
+floating-point atomics.
 
 Complete dense input is reencoded on the device from the CPU's global bins
 into padded row-major and feature-major local bins. Sparse input, and dense
@@ -960,7 +935,7 @@ cargo bench --features cuda --bench training -- cuda
 The second command runs the `backend::cuda` unit tests (including
 `backend::cuda::predict`'s) and `tree::builder::hist::device`'s. To compare
 two builds, pass their bench executables to `scripts/compare_benchmarks.py`
-with `--threads 8 --filter '^cuda_'`.
+with `--threads 8 --filter '^cuda_' --warmup 1 --measurement 3 --samples 10`.
 
 ## Reproduce the measurements
 

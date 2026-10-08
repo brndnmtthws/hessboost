@@ -159,44 +159,6 @@ fn wide_dynamic_range_training_matches_single_threaded_cpu() {
 fn mismatched_inputs_match_the_cpu_backend() {
     gpu::mismatched_inputs_match_the_cpu_backend::<Cuda>();
 }
-/// [`gpu::dataset`] with or without missing values, and with the first
-/// column categorical or numeric.
-fn dataset_with(n: usize, cols: usize, missing: bool, categorical: bool) -> DMatrix {
-    let mut x = vec![0.0f32; n * cols];
-    let mut y = vec![0.0f32; n];
-    for r in 0..n {
-        let mut target = 0.0;
-        for f in 0..cols {
-            let v = if f == 0 {
-                ((r * 31 + f) % 5) as f32
-            } else if missing && (r + f) % 13 == 0 {
-                f32::NAN
-            } else {
-                (((r * 97 + f * 13) % 1000) as f32) * 0.001
-            };
-            x[r * cols + f] = v;
-            if f > 0 && v.is_finite() {
-                target += v * (f as f32);
-            }
-        }
-        y[r] = target % 3.0;
-    }
-    let types: Vec<hessboost::data::FeatureType> = (0..cols)
-        .map(|f| {
-            if f == 0 && categorical {
-                hessboost::data::FeatureType::Categorical
-            } else {
-                hessboost::data::FeatureType::Numerical
-            }
-        })
-        .collect();
-    DMatrix::from_dense_with_missing(&x, n, cols, f32::NAN)
-        .unwrap()
-        .with_feature_types(&types)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
-}
 
 /// The binned index of `n x cols` values from `value(row, feature)`
 /// (`NaN` is missing).
@@ -482,7 +444,7 @@ fn device_cuda_configurations_match_single_threaded_cpu() {
     if !gpu::available::<Cuda>() {
         return;
     }
-    let dense = dataset_with(40_000, 10, false, true);
+    let dense = gpu::dataset_with(40_000, 10, false, true);
     let missing = gpu::dataset(40_000, 10);
     let labelled = |f: fn(f32) -> f32| {
         let y: Vec<f32> = missing.labels().unwrap().iter().map(|&v| f(v)).collect();
@@ -490,7 +452,7 @@ fn device_cuda_configurations_match_single_threaded_cpu() {
     };
     let binary = labelled(|v| f32::from(v >= 1.5));
     let classes = labelled(f32::floor);
-    let numeric = dataset_with(40_000, 10, true, false);
+    let numeric = gpu::dataset_with(40_000, 10, true, false);
     // Weights, and labels of exactly 1 for `scale_pos_weight` to reweight.
     let weights: Vec<f32> = (0..40_000).map(|i| 0.5 + (i % 7) as f32 * 0.25).collect();
     let ones: Vec<f32> = missing
@@ -649,8 +611,8 @@ fn device_cuda_resident_search_matches_single_threaded_cpu() {
     if !gpu::available::<Cuda>() {
         return;
     }
-    let dense = dataset_with(40_000, 10, false, false);
-    let missing = dataset_with(40_000, 10, true, false);
+    let dense = gpu::dataset_with(40_000, 10, false, false);
+    let missing = gpu::dataset_with(40_000, 10, true, false);
     let binary_labels: Vec<f32> = missing
         .labels()
         .unwrap()
@@ -731,7 +693,7 @@ fn device_cuda_training_matches_cpu_at_scale() {
     if !gpu::available::<Cuda>() {
         return;
     }
-    let dense = dataset_with(300_000, 8, false, false);
+    let dense = gpu::dataset_with(300_000, 8, false, false);
     let missing = gpu::dataset(300_000, 8);
     let y: Vec<f32> = missing
         .labels()
@@ -1089,12 +1051,12 @@ fn concurrent_resident_training_and_prediction_match_cpu() {
     if !gpu::available::<Cuda>() {
         return;
     }
-    let a = dataset_with(8_192, 3, true, false);
+    let a = gpu::dataset_with(8_192, 3, true, false);
     let a_margins: Vec<f32> = (0..a.n_rows())
         .map(|row| (row % 7) as f32 * 0.125)
         .collect();
     let a = a.with_base_margin(&a_margins).unwrap();
-    let b = dataset_with(12_288, 4, false, false);
+    let b = gpu::dataset_with(12_288, 4, false, false);
     let b_labels: Vec<f32> = b
         .labels()
         .unwrap()

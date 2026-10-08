@@ -69,9 +69,11 @@
 //!
 //! A non-exact node the CPU sums as one chain of 8,192 or more rows is
 //! built on the host, from the host's gradients or the device's (read back
-//! once per tree), on every core and while the GPU builds the rest of its
-//! level. The root's statistics (`sum_rows`, one chain in row
-//! order) are summed on the GPU in integers when exact, else on the host.
+//! once per tree), while the GPU builds the rest of its level: swept by
+//! feature on scoped threads, as many as training's thread count (`nthread`)
+//! allows and at most one per 8,192 rows. The root's statistics (`sum_rows`,
+//! one chain in row order) are summed on the GPU in integers when exact,
+//! else on the host.
 //! The kernels are compiled without floating-point contraction
 //! (cuda-oxide's `--no-fmad`), flush-to-zero, or approximate division, so
 //! every `f64` operation is the single IEEE operation the CPU performs;
@@ -672,21 +674,27 @@ struct Resident<'a> {
 
 /// Whether one resident build's kernels never touch a pool slot from two
 /// places at once: every write (a node's target, a sibling's parent) goes
-/// to a distinct slot, and no sibling reads a slot another one writes.
+/// to a distinct slot, no sibling reads a slot another one writes, and no
+/// built slot is subtracted from two parents (a child has one sibling).
 fn race_free(nodes: &[(Segment, HistSlot)], siblings: &[(HistSlot, HistSlot)]) -> bool {
+    let distinct = |slots: &[HistSlot]| slots.windows(2).all(|pair| pair[0] != pair[1]);
     let mut parents: Vec<HistSlot> = siblings.iter().map(|&(parent, _)| parent).collect();
     parents.sort_unstable();
+    let mut built: Vec<HistSlot> = siblings.iter().map(|&(_, built)| built).collect();
+    built.sort_unstable();
     let mut written: Vec<HistSlot> = nodes.iter().map(|&(_, slot)| slot).collect();
     written.extend_from_slice(&parents);
     written.sort_unstable();
-    written.windows(2).all(|pair| pair[0] != pair[1])
-        && siblings
+    distinct(&written)
+        && distinct(&built)
+        && built
             .iter()
-            .all(|(_, built)| parents.binary_search(built).is_err())
+            .all(|slot| parents.binary_search(slot).is_err())
 }
 
-/// Whether no two segments share a row position (so no two leaves add to
-/// one margin).
+/// Whether no two segments share a row position: no two splits partition
+/// one position, and (the tree's rows being distinct, [`check_rows`]) no
+/// two leaves add to one margin.
 fn disjoint(segs: impl Iterator<Item = Segment>) -> bool {
     let mut spans: Vec<(usize, usize)> = segs
         .filter(|s| s.len > 0)
@@ -694,6 +702,59 @@ fn disjoint(segs: impl Iterator<Item = Segment>) -> bool {
         .collect();
     spans.sort_unstable();
     spans.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+}
+
+/// Rows per task of [`check_rows`].
+const CHECK_CHUNK: usize = 1 << 16;
+
+/// What [`check_rows`] finds in a row list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowCheck {
+    /// Every row is inside the index (the kernels do not bounds-check).
+    inside: bool,
+    /// The rows strictly ascend, so none repeats.
+    ascending: bool,
+    /// The rows are one run of consecutive rows (then generated on the
+    /// device instead of uploaded).
+    run: bool,
+}
+
+impl RowCheck {
+    const ALL: Self = Self {
+        inside: true,
+        ascending: true,
+        run: true,
+    };
+
+    fn and(self, other: Self) -> Self {
+        Self {
+            inside: self.inside && other.inside,
+            ascending: self.ascending && other.ascending,
+            run: self.run && other.run,
+        }
+    }
+}
+
+/// One parallel pass over `rows`, for an index of `n_rows` rows (run before
+/// taking the state lock).
+fn check_rows(rows: &[u32], n_rows: usize) -> RowCheck {
+    let first = rows.first().map_or(0, |&r| r as usize);
+    rows.par_chunks(CHECK_CHUNK)
+        .enumerate()
+        .map(|(c, chunk)| {
+            let base = first + c * CHECK_CHUNK;
+            // A chunk also compares its first row with the previous one's last.
+            let joined = c == 0 || rows[c * CHECK_CHUNK - 1] < chunk[0];
+            RowCheck {
+                inside: chunk.iter().all(|&r| (r as usize) < n_rows),
+                ascending: joined && chunk.windows(2).all(|pair| pair[0] < pair[1]),
+                run: chunk
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &r)| r as usize == base + i),
+            }
+        })
+        .reduce(|| RowCheck::ALL, RowCheck::and)
 }
 
 /// Host partition descriptors retain capacity across levels and trees.
@@ -1204,13 +1265,13 @@ impl Ring {
         copied
     }
 
-    /// Copy `out.len()` elements from `src`'s front into `out`, waiting for
-    /// them.
+    /// Copy `out.len()` elements from `src`'s front (a buffer or a view of
+    /// one) into `out`, waiting for them.
     fn download<T: Plain>(
         &mut self,
         pool: &Arc<PinnedPool>,
         stream: &Arc<CudaStream>,
-        src: &CudaSlice<T>,
+        src: &impl DevicePtr<T>,
         out: &mut [T],
     ) -> std::result::Result<(), DriverError> {
         if out.len() > src.len() {
@@ -1735,26 +1796,6 @@ impl CudaHistBackend {
             .ok()
     }
 
-    /// One parallel pass over `rows` (before taking the state lock): every
-    /// row inside the index (the kernels do not bounds-check), and whether
-    /// the rows are one ascending run (then generated on the device instead
-    /// of uploaded).
-    fn check_rows(&self, rows: &[u32]) -> (bool, bool) {
-        let first = rows.first().map_or(0, |&r| r as usize);
-        rows.par_chunks(1 << 16)
-            .enumerate()
-            .map(|(c, chunk)| {
-                let base = first + (c << 16);
-                let inside = chunk.iter().all(|&r| (r as usize) < self.n_rows);
-                let run = chunk
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &r)| r as usize == base + i);
-                (inside, run)
-            })
-            .reduce(|| (true, true), |a, b| (a.0 && b.0, a.1 && b.1))
-    }
-
     /// Put `rows` (all below `n_rows`) at the front of `dst`: generated on
     /// the device when they are one ascending `run`, else uploaded.
     fn place_rows(
@@ -2043,8 +2084,16 @@ impl CudaHistBackend {
         let mut chains = Vec::new();
         let mut cpu = Vec::new();
         let mut slots = Vec::new();
-        // Built slots whose sibling the exact finalization subtracted.
-        let mut subtracted = Vec::new();
+        // The resident siblings by built slot (one each: `race_free`), and
+        // which of them the exact finalization subtracts.
+        let siblings = resident.map_or(&[][..], |r| r.siblings);
+        let mut by_built: Vec<(usize, usize)> = siblings
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, built))| (built as usize, i))
+            .collect();
+        by_built.sort_unstable();
+        let mut fused = vec![false; siblings.len()];
         // Output slot of node `k`, the next free one without `targets`.
         let slot_of = |k: usize, next: usize| targets.map_or(next, |t| t[k] as usize);
         let max_tile = max_tile(state);
@@ -2107,16 +2156,15 @@ impl CudaHistBackend {
                 for &k in &cpu {
                     let seg = nodes[k];
                     let mut rows = vec![0u32; seg.len];
-                    stream.memcpy_dtoh(
-                        &state.tree_rows.slice(seg.offset..seg.offset + seg.len),
-                        &mut rows,
-                    )?;
+                    // Through the ring, `rows` is filled only from pieces
+                    // already copied, so no copy into it outlives an error.
+                    let src = state.tree_rows.slice(seg.offset..seg.offset + seg.len);
+                    state.ring.download(pool, stream, &src, &mut rows)?;
                     all.push(Cow::Owned(rows));
                 }
                 if !all.is_empty() {
-                    // Pageable copies: their bytes are there once the
-                    // stream has synchronized.
-                    stream.synchronize()?;
+                    // Each (non-empty) download waited for the stream's
+                    // work through it.
                     state.staging.synced();
                 }
                 all
@@ -2155,16 +2203,15 @@ impl CudaHistBackend {
             let mut work = Vec::with_capacity(batch.len() * 3);
             for (j, &(_, _, slot)) in batch.iter().enumerate() {
                 work.extend([j as u32, slot as u32]);
-                if let Some(resident) = resident {
-                    let parent = resident
-                        .siblings
-                        .iter()
-                        .find(|&&(_, built)| built as usize == slot)
-                        .map(|&(parent, built)| {
-                            subtracted.push(built);
-                            parent
+                if resident.is_some() {
+                    let parent = by_built
+                        .binary_search_by_key(&slot, |&(built, _)| built)
+                        .map_or(u32::MAX, |at| {
+                            let i = by_built[at].1;
+                            fused[i] = true;
+                            siblings[i].0
                         });
-                    work.push(parent.unwrap_or(u32::MAX));
+                    work.push(parent);
                 }
             }
             let [d_tiles, d_work] = state.staging.upload_parts(
@@ -2366,13 +2413,13 @@ impl CudaHistBackend {
         if downloaded.is_some() {
             state.staged.host = downloaded;
         }
-        if let Some(resident) = resident {
+        if resident.is_some() {
             // Siblings of children built by the other strategies.
-            let pairs: Vec<u32> = resident
-                .siblings
+            let pairs: Vec<u32> = siblings
                 .iter()
-                .filter(|(_, built)| !subtracted.contains(built))
-                .flat_map(|&(parent, built)| [parent, built])
+                .zip(&fused)
+                .filter(|&(_, &done)| !done)
+                .flat_map(|(&(parent, built), _)| [parent, built])
                 .collect();
             if !pairs.is_empty() {
                 let [d_pairs] = state.staging.upload_parts(
@@ -2713,13 +2760,15 @@ fn gpu_error(error: DriverError) -> HessboostError {
 
 impl HistogramBackend for CudaHistBackend {
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
-        let (inside, run) = self.check_rows(rows);
-        let fits =
-            self.fits(ghist) && out.len() == self.total_bins && rows.len() <= self.n_rows && inside;
+        let check = check_rows(rows, self.n_rows);
+        let fits = self.fits(ghist)
+            && out.len() == self.total_bins
+            && rows.len() <= self.n_rows
+            && check.inside;
         let node = Segment {
             offset: 0,
             len: rows.len(),
-            contiguous: run,
+            contiguous: check.run,
         };
         let built = fits.then(|| self.lock()).flatten().and_then(|mut state| {
             let state = &mut *state;
@@ -2735,7 +2784,7 @@ impl HistogramBackend for CudaHistBackend {
             {
                 return None;
             }
-            let placed = self.place_rows(&mut state.ring, &mut state.upload, rows, run);
+            let placed = self.place_rows(&mut state.ring, &mut state.upload, rows, check.run);
             self.ok(placed)?;
             self.ok(self.histograms_on(
                 state,
@@ -2773,8 +2822,9 @@ impl RowEngine for CudaHistBackend {
         if !self.fits(ghist) || rows.len() > self.n_rows {
             return None;
         }
-        let (inside, run) = self.check_rows(rows);
-        if !inside {
+        // Repeated rows would give `add_leaf_values` two writes of one margin.
+        let check = check_rows(rows, self.n_rows);
+        if !check.inside || !check.ascending {
             return None;
         }
         let mut state = self.lock()?;
@@ -2782,13 +2832,13 @@ impl RowEngine for CudaHistBackend {
             return None;
         }
         let state = &mut *state;
-        let placed = self.place_rows(&mut state.ring, &mut state.tree_rows, rows, run);
+        let placed = self.place_rows(&mut state.ring, &mut state.tree_rows, rows, check.run);
         self.ok(placed)?;
         state.tree_len = rows.len();
         Some(Segment {
             offset: 0,
             len: rows.len(),
-            contiguous: run,
+            contiguous: check.run,
         })
     }
 
@@ -2883,7 +2933,10 @@ impl RowEngine for CudaHistBackend {
                         RowRule::Below(_) => true,
                         RowRule::Table(table) => table.len() == fe - fs,
                     }
-            });
+            })
+            // Overlapping splits would race on their rows' positions and
+            // could repeat a row in the tree's list.
+            && disjoint(splits.iter().map(|s| s.seg));
         if !valid || u32::try_from(splits.len()).is_err() {
             return None;
         }
@@ -2921,6 +2974,11 @@ impl RowEngine for CudaHistBackend {
         if end > state.tree_len {
             return None;
         }
+        if end == 0 {
+            // Every segment is empty: no download, so no wait, and the
+            // arena's queued copies stay pending.
+            return Some(vec![Vec::new(); segs.len()]);
+        }
         let stream = &self.device.stream;
         let state = &mut *state;
         let mut all = vec![0u32; end];
@@ -2928,6 +2986,7 @@ impl RowEngine for CudaHistBackend {
             .ring
             .download(&self.device.pinned, stream, &state.tree_rows, &mut all);
         self.ok(read)?;
+        // The download waited for the stream's work through it.
         state.staging.synced();
         Some(
             segs.iter()
@@ -3119,7 +3178,9 @@ impl RowEngine for CudaHistBackend {
                 shared_mem_bytes: 0,
             };
             // SAFETY: one block per tile of a leaf segment inside the tree's
-            // rows; each row (below `n_rows`) is in exactly one leaf.
+            // rows; each row (below `n_rows`) is in exactly one leaf: the
+            // tree's rows are distinct (`begin_tree`), partitions permute
+            // them within segments, and the leaves are `disjoint`.
             unsafe { launch.launch(config) }.map(|_| ())
         })();
         self.ok(added)
@@ -3285,11 +3346,12 @@ mod tests {
             .collect()
     }
 
-    /// A resident build or leaf update that would race on the device is
-    /// refused before any launch: a slot written twice, a sibling reading a
-    /// slot another sibling writes, overlapping leaf segments.
+    /// A resident build, partition or leaf update that would race on the
+    /// device is refused before any launch: a slot written twice, a sibling
+    /// reading a slot another sibling writes, a built slot subtracted from
+    /// two parents, overlapping segments, repeated tree rows.
     #[test]
-    fn racing_resident_writes_and_overlapping_leaves_are_refused() {
+    fn racing_device_writes_are_refused() {
         let seg = |offset, len| Segment {
             offset,
             len,
@@ -3307,11 +3369,30 @@ mod tests {
         // A sibling reading a slot another sibling writes.
         assert!(!race_free(&nodes, &[(2, 0), (3, 2)]));
         assert!(!race_free(&nodes, &[(2, 2)]));
+        // One built slot subtracted from two parents.
+        assert!(!race_free(&nodes, &[(2, 0), (3, 0)]));
         assert!(disjoint(
             [seg(0, 4), seg(4, 4), seg(8, 0), seg(8, 2)].into_iter()
         ));
         assert!(!disjoint([seg(0, 4), seg(3, 2)].into_iter()));
         assert!(!disjoint([seg(4, 4), seg(0, 5)].into_iter()));
+        let n = 3 * CHECK_CHUNK;
+        let all: Vec<u32> = (0..n as u32).collect();
+        let odd: Vec<u32> = (1..n as u32).step_by(2).collect();
+        let check = |inside, ascending, run| RowCheck {
+            inside,
+            ascending,
+            run,
+        };
+        assert_eq!(check_rows(&all, n), check(true, true, true));
+        assert_eq!(check_rows(&odd, n), check(true, true, false));
+        assert_eq!(check_rows(&[0, 0], n), check(true, false, false));
+        assert_eq!(check_rows(&[2, 1], n), check(true, false, false));
+        assert_eq!(check_rows(&[n as u32], n), check(false, true, true));
+        // A repeat across the pass's chunk boundary.
+        let mut seam = all.clone();
+        seam[CHECK_CHUNK] = seam[CHECK_CHUNK - 1];
+        assert_eq!(check_rows(&seam, n), check(true, false, false));
     }
 
     #[test]

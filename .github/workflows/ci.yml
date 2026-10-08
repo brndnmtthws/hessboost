@@ -257,9 +257,12 @@ jobs:
         working-directory: cuda-kernels
         run: mise exec -- ./build.sh
       - name: Check that the committed PTX is the source's
+        id: ptx-check
         run: git diff --stat --exit-code -- 'src/backend/cuda/*.ptx'
+      # Only on a mismatch: `failure()` alone also covers a failed lint or
+      # build, which would upload the committed PTX.
       - name: Upload the rebuilt PTX
-        if: failure()
+        if: failure() && steps.ptx-check.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
           name: cuda-ptx

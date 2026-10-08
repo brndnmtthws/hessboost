@@ -542,14 +542,18 @@ pub unsafe extern "C" fn merge_scans(
             let mut chosen = u32::MAX;
             // The lane's first candidate requiring the host's replay.
             let mut replay = u32::MAX;
-            let mut i = ld(first, node) + lane;
-            while i < ld(first, node + 1) {
+            // Counted in `u64`: `first + lane` and the stride wrap a `u32`
+            // near the `u32::MAX` candidates the host admits. A candidate
+            // index is below `end`, so it never takes the sentinel's value.
+            let end = u64::from(ld(first, node + 1));
+            let mut i = u64::from(ld(first, node)) + u64::from(lane);
+            while i < end {
                 let candidate = refs.add(3 * i as usize);
                 let (feature, kind, index) = (ld(candidate, 0), ld(candidate, 1), ld(candidate, 2));
                 let meta = meta_of(kind, index);
                 let status = ld(meta, 0);
                 if (kind == 0 && status == 2) || (kind != 0 && status >= 3) {
-                    replay = i;
+                    replay = i as u32;
                     break;
                 }
                 if status == 1 {
@@ -563,7 +567,7 @@ pub unsafe extern "C" fn merge_scans(
                     if replace {
                         best = loss;
                         best_feature = feature;
-                        chosen = i;
+                        chosen = i as u32;
                     }
                 }
                 i += 32;

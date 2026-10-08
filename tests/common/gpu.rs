@@ -58,14 +58,20 @@ pub fn available<B: GpuBackend>() -> bool {
 /// A deterministic regression dataset with missing values and a categorical
 /// first column.
 pub fn dataset(n: usize, cols: usize) -> DMatrix {
+    dataset_with(n, cols, true, true)
+}
+
+/// [`dataset`] with or without its missing values, and with its first column
+/// categorical or numeric.
+pub fn dataset_with(n: usize, cols: usize, missing: bool, categorical: bool) -> DMatrix {
     let mut x = vec![0.0f32; n * cols];
     let mut y = vec![0.0f32; n];
     for r in 0..n {
         let mut target = 0.0;
         for f in 0..cols {
             let v = if f == 0 {
-                ((r * 31 + f) % 5) as f32 // categorical codes
-            } else if (r + f) % 13 == 0 {
+                ((r * 31 + f) % 5) as f32 // five codes, categories if `categorical`
+            } else if missing && (r + f) % 13 == 0 {
                 f32::NAN
             } else {
                 (((r * 97 + f * 13) % 1000) as f32) * 0.001
@@ -79,7 +85,7 @@ pub fn dataset(n: usize, cols: usize) -> DMatrix {
     }
     let types: Vec<FeatureType> = (0..cols)
         .map(|f| {
-            if f == 0 {
+            if f == 0 && categorical {
                 FeatureType::Categorical
             } else {
                 FeatureType::Numerical

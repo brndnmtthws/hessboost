@@ -182,9 +182,12 @@ impl HistCuts {
             // counted in a pass.
             let n_values = csc.as_ref().map_or_else(
                 || {
-                    let mut n = 0usize;
-                    for_each_value(f, &mut |_, _| n += 1);
-                    n
+                    let column =
+                        &columns.as_ref().expect("dense columns")[f * n_rows..(f + 1) * n_rows];
+                    column
+                        .iter()
+                        .filter(|&&v| !crate::data::dmatrix::is_missing(v, missing))
+                        .count()
                 },
                 |csc| csc.col_len(f),
             );
@@ -199,6 +202,8 @@ impl HistCuts {
                 for_each_value(f, &mut |row, v| pairs.push((v, weight_of(row))));
                 pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
                 sketch.push_sorted(pairs);
+            } else if unit_weights && let Some(columns) = &columns {
+                sketch.push_unit_column(&columns[f * n_rows..(f + 1) * n_rows], missing);
             } else {
                 for_each_value(f, &mut |row, v| sketch.push(v, weight_of(row)));
             }

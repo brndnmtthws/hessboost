@@ -84,6 +84,7 @@ xfail_strict = true
 [tool.uv]
 # `uv sync` and `uv run` rebuild the extension when these change (by default
 # uv only watches pyproject.toml). The root crate is a path dependency.
+# `MATURIN_PEP517_ARGS="--features cuda"` builds it with CUDA.
 cache-keys = [
   { file = "pyproject.toml" },
   { file = "Cargo.toml" },
@@ -91,4 +92,6 @@ cache-keys = [
   { file = "src/**/*.rs" },
   { file = "../Cargo.toml" },
   { file = "../src/**/*.rs" },
+  { file = "../src/**/*.ptx" },
+  { env = "MATURIN_PEP517_ARGS" },
 ]

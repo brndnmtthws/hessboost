@@ -306,7 +306,11 @@ pub(crate) struct CompactForest {
 /// [`CNode`](super::compact) is `repr(C)` of four `u32`s), the category pool,
 /// the vector-leaf weight pool, and each tree's root index. Only the GPU
 /// backends read them.
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    feature = "wgpu",
+    all(target_os = "linux", feature = "cuda")
+))]
 pub(crate) struct GpuForestParts<'a> {
     /// Node arena, 16 bytes per node.
     pub(crate) nodes: &'a [u8],
@@ -333,8 +337,11 @@ pub(crate) struct GpuForestParts<'a> {
 /// prediction is bound by the cache lines a warp's scattered node loads
 /// touch: 16 nodes share a line instead of 8, which halves the traffic at
 /// the deeper levels of a tree, where a warp's rows spread over most of the
-/// level. Only the Metal backend uses it.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+/// level. The Metal and CUDA backends use it.
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    all(target_os = "linux", feature = "cuda")
+))]
 pub(crate) struct GpuArena8 {
     /// The `key` and `packed` words, node after node.
     pub(crate) words: Vec<u32>,
@@ -343,16 +350,28 @@ pub(crate) struct GpuArena8 {
 }
 
 /// Leaf marker of [`GpuArena8::words`]'s `packed` word.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    all(target_os = "linux", feature = "cuda")
+))]
 const GPU8_LEAF: u32 = 1 << 31;
 /// Mirrored-value marker of [`GpuArena8::words`]'s `packed` word (the
 /// [mirrored slot](LANES) bit of the CPU encoding, transposed).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    all(target_os = "linux", feature = "cuda")
+))]
 const GPU8_MIRROR: u32 = 1 << 30;
 /// Bits of the `packed` word's child and feature fields.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    all(target_os = "linux", feature = "cuda")
+))]
 const GPU8_BITS: u32 = 15;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    all(target_os = "linux", feature = "cuda")
+))]
 const GPU8_MASK: u32 = (1 << GPU8_BITS) - 1;
 
 impl CompactForest {
@@ -366,7 +385,10 @@ impl CompactForest {
     /// The encoding is exact for what it covers — a numeric node needs its
     /// threshold key, its feature, its mirrored flag, and one child index —
     /// so a model that fits predicts identically through either arena.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(any(
+        all(target_os = "macos", feature = "metal"),
+        all(target_os = "linux", feature = "cuda")
+    ))]
     pub(crate) fn gpu_arena8(&self, mut excluded: impl FnMut(usize) -> bool) -> Option<GpuArena8> {
         let mut arena = GpuArena8 {
             words: Vec::with_capacity(self.nodes.len() * 2),
@@ -570,7 +592,11 @@ impl CompactForest {
     }
 
     /// The forest's GPU-upload parts (see [`GpuForestParts`]).
-    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+    #[cfg(any(
+        all(target_os = "macos", feature = "metal"),
+        feature = "wgpu",
+        all(target_os = "linux", feature = "cuda")
+    ))]
     pub(crate) fn gpu_parts(&self) -> GpuForestParts<'_> {
         // SAFETY: `CNode` is `repr(C)` with four `u32` fields and no padding
         // (asserted by the layout tests), so the arena is exactly
@@ -1165,7 +1191,10 @@ mod tests {
     /// threshold is `NaN`: its key is `0`, where the walk's float compare
     /// (`v > NaN`, false for everything) would disagree with the CPU's key
     /// compare (`key_of(v) > 0`, true for everything but a missing value).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(any(
+        all(target_os = "macos", feature = "metal"),
+        all(target_os = "linux", feature = "cuda")
+    ))]
     #[test]
     fn arena8_keeps_nan_thresholds_on_the_wide_arena() {
         let mut ordinary = RegTree::with_root(1.0);

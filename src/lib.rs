@@ -219,6 +219,13 @@
 //!     ([`device`](config::TrainingParams::device) = `wgpu`), runnable
 //!     without a GPU on a software adapter such as Mesa's lavapipe
 //!     ([`backend::wgpu`]).
+//!   - NVIDIA CUDA on Linux (`cuda` feature): the same bit-identical
+//!     prediction ([`to_cuda`](model::BoostedModel::to_cuda)) and training
+//!     ([`device`](config::TrainingParams::device) = `cuda`/`cuda:<n>`;
+//!     exact integer sums or the CPU's ordered `f64` sums, CPU fallback
+//!     for the rest), with the driver loaded at run time; building the
+//!     feature needs CUDA 13's headers and libclang, running it no CUDA
+//!     toolkit ([`backend::cuda`]).
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
@@ -241,7 +248,7 @@
 //! forests, DART) match in quality only — the random streams differ.
 //! ### Not implemented
 //!
-//! - Distributed and external-memory training; CUDA.
+//! - Distributed and external-memory training.
 //! - XGBoost options available at one setting only (so they are not
 //!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
 //!   setting): gblinear uses `updater = coord_descent`
@@ -321,6 +328,8 @@ pub mod prelude {
 /// part of the public API: hidden from the docs and changed without notice.
 #[doc(hidden)]
 pub mod internals {
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    pub use crate::backend::cuda::diagnostics::{NodeCounts, ScanDiagnostics};
     pub use crate::data::ghist::GHistIndex;
     pub use crate::data::quantile::HistCuts;
     pub use crate::tree::builder::HistTreeBuilder;

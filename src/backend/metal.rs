@@ -106,8 +106,8 @@
 unsafe extern "C" {}
 
 use crate::backend::shared::{
-    IndexShape, MAX_BUFFER_ENTRIES, MarginPlan, StagedSlice, ensure_forest_model, materialize_rows,
-    plan_margins,
+    IndexShape, MAX_BUFFER_ENTRIES, MarginPlan, StagedSlice, ensure_dense_copy_fits,
+    ensure_forest_model, materialize_rows, plan_margins,
 };
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::error::{HessboostError, Result};
@@ -1862,6 +1862,7 @@ impl GpuModel {
             MarginPlan::Done(margins) => return Ok(margins),
             MarginPlan::Walk { trees, margins } => (trees, margins),
         };
+        ensure_dense_copy_fits(data)?;
         let k = self.model.n_outputs();
         let n = data.n_rows();
         // Split the batch into row blocks and pipeline them: each block's

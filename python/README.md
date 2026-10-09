@@ -472,13 +472,18 @@ models save and load like `DiffusionModel`s.
 
 ### GPU training and prediction
 
-Two GPU backends reproduce the CPU's results bit for bit: native Metal
-(`"metal"`, macOS) and wgpu (`"wgpu"`: Vulkan on Linux and Windows, Metal
-on macOS, DirectX 12 on Windows). `Booster.to_gpu()` lays a model out for
-batch prediction (on Metal on macOS and on wgpu elsewhere;
-`to_gpu("wgpu")` asks for wgpu): the forest uploads once, and each call
-predicts bit-identically to `Booster.predict` (values or raw margins).
-`GpuModel.available()` says whether the device can predict here:
+Three GPU backends reproduce the CPU's results bit for bit: native Metal
+(`"metal"`, macOS), wgpu (`"wgpu"`: Vulkan on Linux and Windows, Metal on
+macOS, DirectX 12 on Windows), and NVIDIA CUDA (`"cuda"` or
+`"cuda:<ordinal>"`, Linux, in a build with the `cuda` feature; see below).
+`Booster.to_gpu()` lays a model out for batch
+prediction (on Metal on macOS and on wgpu elsewhere; `to_gpu("wgpu")` asks
+for wgpu, `to_gpu("cuda:1")` for the second NVIDIA GPU): the forest
+uploads once, and each call predicts bit-identically to `Booster.predict`
+(values or raw margins). Objective transforms run on the CPU; models
+trained with model shrinkage predict on the CPU. `gblinear` and
+linear-leaf models are refused. `GpuModel.available()` says whether the
+device can predict here:
 
 ```python
 from hessboost import GpuModel
@@ -488,8 +493,8 @@ if GpuModel.available():
     probabilities = gpu.predict(X_test)
 ```
 
-Training with `device="metal"` or `device="wgpu"` builds the larger nodes'
-histograms on the GPU and gives the CPU's model bit for bit:
+Training with `device="metal"`, `device="wgpu"` or `device="cuda"` builds
+histograms on the selected GPU and gives the CPU's model bit for bit:
 
 ```python
 booster = hessboost.train({"device": "wgpu", "max_depth": 6}, dtrain, 100)
@@ -502,6 +507,25 @@ desktop Vulkan drivers, Apple GPUs, or DirectX 12 with
 as Mesa's lavapipe (correct, but slower than the CPU) only when there is no
 other; `GpuModel.device_name("wgpu")` names the adapter it picked, and the
 `WGPU_ADAPTER_NAME` environment variable picks one by name.
+
+The published wheels and the source distribution leave CUDA out, so
+installing them never needs CUDA. CUDA support (kernels compiled in:
+Rust, compiled to PTX by cuda-oxide) comes from building hessboost-python
+from source on Linux with its `cuda` feature, e.g.
+`MATURIN_PEP517_ARGS="--features cuda" pip install --no-binary hessboost
+hessboost` or `maturin build --features cuda`; that build needs CUDA 13's
+driver and cuRAND headers and libclang. Running it needs no CUDA toolkit,
+only an NVIDIA GPU of compute capability 7.5 (Turing) or newer and a
+driver supporting CUDA 12.8 or newer, which compiles the kernels for the
+GPU on first use and caches them. A missing driver or device, or an
+extension built without CUDA, returns an error rather than silently
+predicting on the CPU.
+
+```python
+if GpuModel.available("cuda"):
+    gpu = booster.to_gpu("cuda")
+    probabilities = gpu.predict(X_test)
+```
 
 ### Compact models
 
@@ -604,17 +628,18 @@ LightGBM's `rank_xendcg` stream.
   scikit-learn behavior); pass `iteration_range=(0, 0)` for all. SHAP and
   leaf ranges start at iteration 0; `pred_leaf` defaults to every iteration
   instead, and returns `int32`.
-- GPUs: `device="metal"` (macOS) or `device="wgpu"` trains on one instead of
-  `device="cuda"`, and `Booster.to_gpu()` lays the model out for GPU batch
-  prediction (`GpuModel.predict`, bit-identical to `Booster.predict`)
-  instead of predicting on the training device.
+- GPUs: besides XGBoost's `device="cuda"`/`"cuda:<ordinal>"` (NVIDIA on
+  Linux, in a build with the `cuda` feature), `device="metal"` (macOS) and
+  `device="wgpu"` train on a GPU.
+  Prediction does not follow the training device: `Booster.to_gpu(device)`
+  lays the model out for GPU batch prediction (`GpuModel.predict`,
+  bit-identical to `Booster.predict`), taking the same GPU `device` strings.
 - Model files do not store feature names or categories (pickles do).
 - Not available: `DMatrix` from files or `QuantileDMatrix`, `inplace_predict`
   (`predict` takes arrays directly, and `predict_row` single rows),
   `Booster.get_dump`/`trees_to_dataframe`/`dump_model` (`model_info()`
   returns the trees as arrays), attributes (`set_attr`), plotting,
-  distributed (Dask/Spark) and CUDA training, `approx_contribs`, and
-  `strict_shape`.
+  distributed (Dask/Spark), `approx_contribs`, and `strict_shape`.
 
 ## Development
 

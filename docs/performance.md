@@ -870,6 +870,73 @@ cargo bench --features wgpu --bench training -- wgpu
 cargo run --release --features wgpu --example wgpu
 ```
 
+## CUDA GPU (Linux)
+
+The `cuda` feature adds an NVIDIA backend (`src/backend/cuda/mod.rs` has
+the design and determinism contract). Its kernels are Rust, the
+`cuda-kernels/` crate compiled to PTX by
+[cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/) and embedded;
+the driver JIT-compiles a module the first time a process on the machine
+loads it and caches the machine code.
+
+The tree's rows and histograms stay on the device. Depthwise growth
+handles a whole level per round trip: the GPU partitions every splitting
+node, builds the smaller child of each split, subtracts its sibling, and
+scans the candidates, merging each node's feature winners on the device
+into one packed record (40 bytes for numeric-only searches, a 56-byte
+header plus at most 256 category bytes otherwise). Loss-guided growth keeps
+its heap on the host while histograms and split search stay resident, so it
+synchronizes twice per expanded node (partition counts, split winners) and
+small frontiers gain least. Squared-error and logistic rounds in a plain
+`gbtree` keep the margins and gradients resident; other configurations
+upload gradients once per tree.
+
+Each node's histogram reproduces the CPU's summation order with the first
+strategy that applies: exact integer sums in any order (Metal's exactness
+bound), exact integer blocks reduced in `f64` in the CPU's block order, or
+the CPU's row-order `f64` chains, one GPU thread per (block, feature) on
+dense storage and per block on CSR. A non-exact node the CPU sums as one
+chain of 8,192 or more rows runs on the CPU (on scoped threads, as many as
+`nthread` allows and at most one per 8,192 rows, overlapping the GPU's work
+on the rest of its level), as do trees with non-finite gradients and every
+tree after a CUDA error. Split search chains each feature's prefixes on one
+lane in the CPU's order, or uses warp scans when the tree's gradients sum
+exactly over all its rows (then any association gives the chain's bits); a
+NaN score replays the node on the host. The kernels are built without
+contraction, flush-to-zero, or approximate division, and use no
+floating-point atomics.
+
+Complete dense input is reencoded on the device from the CPU's global bins
+into padded row-major and feature-major local bins. Sparse input, and dense
+input with missing cells, stays CSR, so device memory scales with the
+present entries rather than `rows × features`. Descriptors (tiles, rules,
+scan requests, leaf values) are written into a pinned arena and uploaded in
+one queued copy per operation, so the host waits only where it reads a
+result; large copies stream through pooled 1 MiB pinned pieces, and each
+device keeps up to 64 MiB of released page-locked memory for the next fit.
+The 512-thread histogram blocks and the shared-memory budget are starting
+configurations, not measured optima.
+
+`BoostedModel::to_cuda` uploads a compact forest (8 bytes per numeric
+node, 16 otherwise) to its own context; a call pipelines four row blocks
+through upload, walk, and readback, materializing CSR rows one block at a
+time. Trees add their host-weighted `f32` leaves in tree order, so margins
+match the CPU's bits; transforms run on the CPU.
+
+Run the CUDA tests and benches on a machine with an NVIDIA GPU, requiring
+the device so a missing one cannot pass vacuously:
+
+```sh
+HESSBOOST_REQUIRE_CUDA=1 cargo nextest run --release --features cuda --test cuda
+HESSBOOST_REQUIRE_CUDA=1 cargo nextest run --release --features cuda --lib backend::cuda tree::builder::hist::device
+cargo bench --features cuda --bench training -- cuda
+```
+
+The second command runs the `backend::cuda` unit tests (including
+`backend::cuda::predict`'s) and `tree::builder::hist::device`'s. To compare
+two builds, pass their bench executables to `scripts/compare_benchmarks.py`
+with `--threads 8 --filter '^cuda_' --warmup 1 --measurement 3 --samples 10`.
+
 ## Reproduce the measurements
 
 Benchmarks live in [`benches/training.rs`](../benches/training.rs). Run the

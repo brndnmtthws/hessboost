@@ -1,0 +1,4 @@
+/target
+# Committed: the lockfile pins cuda-oxide's device crates, so the PTX build is
+# reproducible.
+!/Cargo.lock

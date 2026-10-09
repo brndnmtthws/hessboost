@@ -1,6 +1,6 @@
 [package]
 name = "hessboost"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.93"
 license = "Apache-2.0"
@@ -23,8 +23,9 @@ include = [
 ]
 
 # docs.rs builds on Linux, where the `wgpu` backend compiles (its drivers
-# load at run time) and `metal` cannot (no Apple SDK), so the wgpu module's
-# real docs render there and Metal's stand-in does.
+# load at run time) and neither `metal` (no Apple SDK) nor `cuda` (no CUDA
+# toolkit headers for `cuda-bindings`) does, so wgpu's real docs render
+# there and the Metal and CUDA modules' stand-ins do.
 [package.metadata.docs.rs]
 features = ["wgpu"]
 
@@ -62,6 +63,17 @@ metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
 # histogram training (`device = wgpu`) and prediction
 # (`BoostedModel::to_wgpu`). Opt-in and off by default; see `src/backend/`.
 wgpu = ["dep:wgpu", "dep:bytemuck", "dep:parking_lot"]
+# NVIDIA CUDA acceleration for histogram training and prediction on Linux.
+# Opt-in and off by default. The kernels are embedded PTX (Rust compiled by
+# cuda-oxide, `cuda-kernels/`); the host side is cuda-oxide's `cuda-core`,
+# which loads `libcuda` (the driver, CUDA 12.8 or later) at run time.
+# Building it needs the CUDA 13 toolkit's `cuda.h` and `curand.h` and
+# libclang (`cuda-bindings` generates its bindings from them); see AGENTS.md
+# and `src/backend/`.
+cuda = ["dep:cuda-core", "dep:parking_lot"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cuda-core = { version = "0.4", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }

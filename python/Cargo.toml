@@ -1,7 +1,7 @@
 [package]
 name = "hessboost-python"
 # Must equal the root crate's version: the wheel version comes from here.
-version = "0.2.5"
+version = "0.3.0"
 authors = ["Brenden Matthews <brenden@brndn.io>"]
 description = "Python bindings for hessboost"
 edition = "2024"
@@ -52,6 +52,12 @@ self_cell = "1.2"
 # `device="metal"` in the macOS wheels.
 [target.'cfg(target_os = "macos")'.dependencies]
 hessboost = { path = "..", features = ["metal"] }
+
+[features]
+# `device="cuda"` and `Booster.to_gpu(device="cuda")`, on Linux only. Off by
+# default, so the default wheels and the sdist build without what the root
+# crate's `cuda` feature needs to build; without it CUDA is refused.
+cuda = ["hessboost/cuda"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

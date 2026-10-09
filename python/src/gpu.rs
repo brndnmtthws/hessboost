@@ -1,22 +1,23 @@
-//! `GpuModel`: a model laid out for GPU batch prediction, on Metal (macOS)
-//! or through wgpu (Vulkan, Metal, DirectX 12).
+//! `GpuModel`: Metal, wgpu or NVIDIA CUDA batch prediction.
 //!
-//! Built with [`Booster::to_gpu`](crate::booster::Booster::to_gpu); the
-//! forest, category pools, and per-tree weights are uploaded once, and each
-//! prediction call uploads its rows. Predictions are bit-identical to the
-//! CPU's. wgpu is compiled into every build and Metal into macOS builds
-//! only: elsewhere `"metal"` reports no device and building on it is
-//! refused.
+//! wgpu is compiled into every wheel, Metal into macOS wheels and CUDA
+//! only into Linux builds with this crate's opt-in `cuda` feature. Drivers
+//! are loaded at run time; absence never prevents importing the package.
+//! Forests upload once; prediction preserves CPU bits, with CPU objective
+//! transforms and model shrinkage.
 
 use crate::booster::{dense, iterations};
 use crate::data::{DMatrix, to_numpy};
 use crate::errors::{DetachExt, refuse};
 use hessboost::backend::wgpu;
+use hessboost::config::Device;
 use hessboost::error::Result;
 use hessboost::model::{BoostedModel, Iterations, Predictions};
 use numpy::PyArrayDyn;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use serde::Deserialize;
+use serde::de::value::StrDeserializer;
 
 /// A GPU backend, as the `device` argument names it.
 #[derive(Clone, Copy)]
@@ -25,18 +26,31 @@ enum Backend {
     Metal,
     /// wgpu over Vulkan, Metal, or DirectX 12.
     Wgpu,
+    /// NVIDIA CUDA (Linux, `cuda` feature), on the device `ordinal`
+    /// (`"cuda:<ordinal>"`).
+    Cuda { ordinal: usize },
 }
 
 impl Backend {
-    /// The backend `device` names; `None` is the platform's default, Metal
-    /// on macOS and wgpu elsewhere.
+    /// The backend `device` names, spelled as training's `device` spells it
+    /// (`"metal"`, `"wgpu"`, `"cuda"`, `"cuda:<ordinal>"`); `None` is the
+    /// platform's default, Metal on macOS and wgpu elsewhere.
     fn parse(device: Option<&str>) -> PyResult<Self> {
-        match device {
-            None if cfg!(target_os = "macos") => Ok(Self::Metal),
-            None | Some("wgpu") => Ok(Self::Wgpu),
-            Some("metal") => Ok(Self::Metal),
-            Some(other) => Err(refuse(format!(
-                "unknown GPU device {other:?}; expected \"metal\" or \"wgpu\""
+        let Some(device) = device else {
+            return Ok(if cfg!(target_os = "macos") {
+                Self::Metal
+            } else {
+                Self::Wgpu
+            });
+        };
+        let parsed = Device::deserialize(StrDeserializer::<serde::de::value::Error>::new(device));
+        match parsed {
+            Ok(Device::Metal) => Ok(Self::Metal),
+            Ok(Device::Wgpu) => Ok(Self::Wgpu),
+            Ok(Device::Cuda { ordinal }) => Ok(Self::Cuda { ordinal }),
+            _ => Err(refuse(format!(
+                "unknown GPU device {device:?}; expected \"metal\", \"wgpu\", \"cuda\" or \
+                 \"cuda:<ordinal>\""
             ))),
         }
     }
@@ -51,6 +65,10 @@ impl Backend {
             #[cfg(not(target_os = "macos"))]
             Self::Metal => false,
             Self::Wgpu => wgpu::prediction_available(),
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            Self::Cuda { ordinal } => hessboost::backend::cuda::prediction_available(ordinal),
+            #[cfg(not(all(target_os = "linux", feature = "cuda")))]
+            Self::Cuda { .. } => false,
         }
     }
 
@@ -62,6 +80,10 @@ impl Backend {
             #[cfg(not(target_os = "macos"))]
             Self::Metal => None,
             Self::Wgpu => wgpu::device_name(),
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            Self::Cuda { ordinal } => hessboost::backend::cuda::prediction_device_name(ordinal),
+            #[cfg(not(all(target_os = "linux", feature = "cuda")))]
+            Self::Cuda { .. } => None,
         }
     }
 }
@@ -71,6 +93,8 @@ enum Predictor {
     #[cfg(target_os = "macos")]
     Metal(hessboost::backend::metal::GpuModel),
     Wgpu(wgpu::GpuModel),
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    Cuda(hessboost::backend::cuda::GpuModel),
 }
 
 impl Predictor {
@@ -88,6 +112,14 @@ impl Predictor {
                 ))
             }
             Backend::Wgpu => py.detached(|| model.to_wgpu()).map(Self::Wgpu),
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            Backend::Cuda { ordinal } => py.detached(|| model.to_cuda(ordinal)).map(Self::Cuda),
+            #[cfg(not(all(target_os = "linux", feature = "cuda")))]
+            Backend::Cuda { ordinal } => Err(refuse(format!(
+                "CUDA GPU prediction (device \"cuda:{ordinal}\") is unavailable: this \
+                 hessboost extension was built without CUDA (hessboost-python's `cuda` \
+                 feature, Linux only)"
+            ))),
         }
     }
 
@@ -96,6 +128,8 @@ impl Predictor {
             #[cfg(target_os = "macos")]
             Self::Metal(gpu) => gpu.model(),
             Self::Wgpu(gpu) => gpu.model(),
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            Self::Cuda(gpu) => gpu.model(),
         }
     }
 
@@ -105,6 +139,8 @@ impl Predictor {
             #[cfg(target_os = "macos")]
             Self::Metal(_) => "metal",
             Self::Wgpu(_) => "wgpu",
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            Self::Cuda(_) => "cuda",
         }
     }
 
@@ -122,11 +158,15 @@ impl Predictor {
             Self::Metal(gpu) => gpu.predict(data, iterations),
             Self::Wgpu(gpu) if margin => gpu.predict_margin(data, iterations),
             Self::Wgpu(gpu) => gpu.predict(data, iterations),
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            Self::Cuda(gpu) if margin => gpu.predict_margin(data, iterations),
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            Self::Cuda(gpu) => gpu.predict(data, iterations),
         }
     }
 }
 
-/// A model laid out for GPU batch prediction, on Metal or through wgpu.
+/// A resident model for Metal, wgpu or CUDA batch prediction.
 #[pyclass(frozen, module = "hessboost._hessboost")]
 pub struct GpuModel {
     gpu: Predictor,
@@ -149,7 +189,9 @@ impl GpuModel {
     /// Whether `device` (`None`: the platform's default) predicts here: for
     /// Metal, a device with working compute pipelines (`false` off macOS);
     /// for wgpu, an adapter with 64-bit shader integers that passed the
-    /// addition-order probe.
+    /// addition-order probe; for CUDA, a driver and device that load the
+    /// prediction kernels (`false` unless built on Linux with the `cuda`
+    /// feature).
     #[staticmethod]
     fn available(py: Python<'_>, device: Option<&str>) -> PyResult<bool> {
         let backend = Backend::parse(device)?;
@@ -164,7 +206,7 @@ impl GpuModel {
         Ok(py.detach(|| backend.device_name()))
     }
 
-    /// The backend this model predicts on (`"metal"` or `"wgpu"`).
+    /// The backend this model predicts on (`"metal"`, `"wgpu"` or `"cuda"`).
     #[getter]
     fn device(&self) -> &'static str {
         self.gpu.device()

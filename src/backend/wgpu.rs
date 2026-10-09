@@ -98,8 +98,8 @@
 //!   bytes per row) and each prediction call uploads its rows.
 
 use crate::backend::shared::{
-    IndexShape, MAX_BUFFER_ENTRIES, MarginPlan, StagedSlice, ensure_forest_model, materialize_rows,
-    plan_margins,
+    IndexShape, MAX_BUFFER_ENTRIES, MarginPlan, StagedSlice, ensure_dense_copy_fits,
+    ensure_forest_model, materialize_rows, plan_margins, weighted_leaves,
 };
 use crate::data::DMatrix;
 use crate::data::ghist::{Bins, GHistIndex};
@@ -1785,6 +1785,7 @@ impl GpuModel {
             MarginPlan::Done(margins) => return Ok(margins),
             MarginPlan::Walk { trees, margins } => (trees, margins),
         };
+        ensure_dense_copy_fits(data)?;
         let k = self.model.n_outputs();
         let n = data.n_rows();
         let n_cols = data.n_cols();
@@ -1904,35 +1905,7 @@ impl BoostedModel {
         ensure_forest_model(self)?;
         let forest = self.compact_forest();
         let parts = forest.gpu_parts();
-        let mut nodes: Vec<[u32; 4]> = bytemuck::pod_collect_to_vec(parts.nodes);
-        let mut leaf_vectors = parts.leaf_vectors.to_vec();
-        let k = self.n_outputs();
-        // Weight each tree's leaves on the host: `weight * leaf` in `f32`
-        // is the product the CPU forms per row, and the GPU then only adds.
-        for (t, &root) in parts.roots.iter().enumerate() {
-            let weight = self.tree_weight(t);
-            if weight == 1.0 {
-                continue;
-            }
-            let end = parts
-                .roots
-                .get(t + 1)
-                .map_or(nodes.len(), |&next| next as usize);
-            let vector = self.tree_is_vector_leaf(t);
-            for (offset, node) in nodes[root as usize..end].iter_mut().enumerate() {
-                if node[2] as usize != root as usize + offset {
-                    continue;
-                }
-                if vector {
-                    let offset = node[3] as usize;
-                    for w in &mut leaf_vectors[offset..offset + k] {
-                        *w *= weight;
-                    }
-                } else {
-                    node[3] = (weight * f32::from_bits(node[3])).to_bits();
-                }
-            }
-        }
+        let (nodes, leaf_vectors) = weighted_leaves(self, &parts);
         let trees: Vec<PTree> = parts
             .roots
             .iter()

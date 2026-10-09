@@ -14,6 +14,9 @@ use crate::data::quantile::{BinSearch, HistCuts};
 use rayon::prelude::*;
 use std::ops::Range;
 
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Backing storage for bin indices, in the narrowest width that fits.
 #[derive(Debug, Clone)]
 enum BinStore {
@@ -96,6 +99,9 @@ pub enum Bins<'a> {
 /// checks. `from_dmatrix` is the only constructor and verifies this.
 #[derive(Debug, Clone)]
 pub struct GHistIndex {
+    /// Immutable content identity, retained by clones and across moves.
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    identity: u64,
     n_rows: usize,
     n_cols: usize,
     row_ptr: Vec<usize>,
@@ -210,6 +216,9 @@ impl GHistIndex {
         };
 
         GHistIndex {
+            // 2^64 indexes: never exhausted.
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             n_rows,
             n_cols,
             row_ptr,
@@ -218,6 +227,11 @@ impl GHistIndex {
             cuts,
             dense,
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
     }
 
     /// Number of rows.
@@ -396,15 +410,15 @@ fn rows_to_columns<B: Copy + Into<u32>>(
 }
 
 /// Feature-major copy of a dense row-major matrix (`n_rows * n_cols` entries,
-/// row `r` at `r * n_cols`). Features are handled in groups so each pass over
-/// the rows reads a short contiguous run per row and writes a few sequential
-/// column streams.
+/// row `r` at `r * n_cols`). Four-feature groups expose eight tasks for a
+/// 30-feature matrix while each pass reads a short contiguous run per row
+/// and writes sequential column streams.
 pub(crate) fn transpose_dense<B: Copy + Default + Send + Sync>(
     bins: &[B],
     n_rows: usize,
     n_cols: usize,
 ) -> Vec<B> {
-    const GROUP: usize = 8;
+    const GROUP: usize = 4;
     let mut columns = vec![B::default(); n_rows * n_cols];
     if n_rows == 0 || n_cols == 0 {
         return columns;

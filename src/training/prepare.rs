@@ -63,7 +63,8 @@ pub(super) enum Prepared {
         /// hold every category. A zero-weight row's value can lie beyond the
         /// last cut, where binning clamps it into the last bin while the tree
         /// routes it by its threshold, so linear leaves then route instead of
-        /// reading the builder's rows.
+        /// reading the builder's rows, and rounds stay off the device
+        /// ([`Prepared::device_backend`]).
         rows_route_like_trees: bool,
     },
     /// `tree_method=approx`: Hessian-weighted cuts. XGBoost regenerates them
@@ -79,6 +80,23 @@ pub(super) enum Prepared {
 }
 
 impl Prepared {
+    /// The binned index and backend of a histogram run whose backend keeps
+    /// the rows on a device (the CUDA backend), for device-resident rounds.
+    /// `None` unless the rows route like trees (`rows_route_like_trees`):
+    /// after a device failure the host rebuilds the margins by routing the
+    /// rows through the trees, which equals the binned partitions the
+    /// device's margins came from only then.
+    pub(super) fn device_backend(&self) -> Option<(&GHistIndex, &dyn HistogramBackend)> {
+        match self {
+            Prepared::Hist {
+                index,
+                backend,
+                rows_route_like_trees: true,
+            } if backend.row_engine().is_some() => Some((index, backend.as_ref())),
+            _ => None,
+        }
+    }
+
     /// Grow one tree on `sample`, with the rows that reached each leaf when
     /// `capture_rows` (histogram and exact methods; empty otherwise). With reuse
     /// penalties (`reuse` is `Some`) the split search is penalized by the
@@ -288,6 +306,10 @@ pub(super) fn prepare_builder(
     Ok(match method {
         TreeMethod::Hist => {
             let cuts = HistCuts::from_dmatrix(dtrain, params.max_bin);
+            // A host index is required for exact fallback. Uploading raw
+            // floats and reading global bins back costs more than CPU binning
+            // at the measured large-data shapes; CUDA still reencodes and
+            // transposes the compact global bins on device.
             let index = GHistIndex::from_dmatrix(dtrain, cuts);
             let backend = hist_backend(params, &index)?;
             let rows_route_like_trees = dtrain.weights().is_none_or(|w| !w.contains(&0.0));
@@ -347,6 +369,23 @@ fn hist_backend(params: &TrainingParams, index: &GHistIndex) -> Result<Box<dyn H
                 Err(HessboostError::invalid_param(
                     "device",
                     "`wgpu` requires building with the `wgpu` feature",
+                ))
+            }
+        }
+        Device::Cuda { ordinal } => {
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            {
+                let backend: Box<dyn HistogramBackend> =
+                    Box::new(crate::backend::cuda::CudaHistBackend::new(index, ordinal)?);
+                Ok(backend)
+            }
+            #[cfg(not(all(target_os = "linux", feature = "cuda")))]
+            {
+                // Unreachable in practice, as for `metal`.
+                let _ = (index, ordinal);
+                Err(HessboostError::invalid_param(
+                    "device",
+                    "`cuda` requires building with the `cuda` feature on Linux",
                 ))
             }
         }

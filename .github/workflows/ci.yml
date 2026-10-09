@@ -43,6 +43,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo fmt --all --check --manifest-path python/Cargo.toml
       - run: cargo fmt --all --check --manifest-path fuzz/Cargo.toml
+      - run: cargo fmt --all --check --manifest-path cuda-kernels/Cargo.toml
 
   clippy:
     name: clippy (${{ matrix.name }})
@@ -61,12 +62,22 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
+      # `--features cuda` (in --all-features) builds `cuda-bindings`, whose
+      # build script runs bindgen over CUDA 13's `cuda.h` and `curand.h`:
+      # the script installs them from NVIDIA's pip wheels with mise's uv,
+      # plus libclang, and sets CUDA_HOME. On macOS `cuda` enables nothing
+      # (its dependencies are Linux-only).
+      - if: runner.os == 'Linux'
+        run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: clippy-${{ matrix.name }}
       # Lint levels (pedantic) live in Cargo.toml's [lints] table.
       - run: mbx clippy --all-targets --all-features -- -D warnings
       - run: mbx clippy --manifest-path python/Cargo.toml --all-targets -- -D warnings
+      # hessboost-python's opt-in `cuda` feature (Linux only).
+      - if: runner.os == 'Linux'
+        run: mbx clippy --manifest-path python/Cargo.toml --all-targets --features cuda -- -D warnings
 
   test:
     name: test (${{ matrix.name }})
@@ -91,6 +102,10 @@ jobs:
       - if: runner.os == 'Linux'
         run: sh .github/scripts/install-lavapipe.sh
       - uses: jdx/mise-action@v4
+      # The CUDA 13 headers and libclang `--features cuda` builds with (see
+      # the clippy job).
+      - if: runner.os == 'Linux'
+        run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: test-ci
@@ -111,6 +126,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
+      # For `--features cuda` (see the clippy job).
+      - run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: docs
@@ -130,6 +147,8 @@ jobs:
         with:
           # Different tools from the other jobs' (same config files).
           cache_key_prefix: mise-v1-msrv
+      # For `--features cuda` (see the clippy job).
+      - run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: msrv
@@ -173,6 +192,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
+      # cargo-semver-checks builds the crate's rustdoc with `cuda` enabled
+      # (see the clippy job).
+      - run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: semver
@@ -212,6 +234,68 @@ jobs:
             echo "== $input"
             base64 -w0 "$input"
             echo
+          done
+
+  # The CUDA kernels are Rust (cuda-kernels/), compiled to PTX by cuda-oxide,
+  # and the two PTX modules src/backend/cuda/ embeds are committed. Rebuild
+  # them and fail if a committed file differs (the build is byte-for-byte
+  # reproducible on x86_64 Linux; on a mismatch the rebuilt files are
+  # uploaded), then assemble them for every architecture the backend
+  # supports with ptxas from NVIDIA's pip wheel: no GPU and no CUDA toolkit.
+  cuda-kernels:
+    name: CUDA kernels (cuda-oxide)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # cuda-kernels/mise.toml layers cuda-oxide's nightly Rust and
+      # cargo-oxide over mise.toml.
+      - uses: jdx/mise-action@v4
+        with:
+          cache_key_prefix: mise-v1-cuda-kernels
+          working_directory: cuda-kernels
+      # cargo-oxide builds its codegen backend on first use (about a
+      # minute) into ~/.cargo/cuda-oxide, from the git dependency's source;
+      # the cached library is reused while that revision and the nightly
+      # match (its build tree is not needed).
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/cuda-oxide
+            !~/.cargo/cuda-oxide/target
+            ~/.cargo/git/db
+          key: cuda-oxide-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cuda-kernels/Cargo.lock', 'cuda-kernels/rust-toolchain.toml') }}
+      # The root crate's lint policy (cuda-kernels/Cargo.toml's [lints]), on
+      # the host target: clippy type-checks the kernels without cuda-oxide's
+      # codegen backend, once per PTX module's feature.
+      - name: Lint the kernels
+        working-directory: cuda-kernels
+        run: |
+          mise exec -- cargo clippy --features train -- -D warnings
+          mise exec -- cargo clippy --features predict -- -D warnings
+      - name: Rebuild the PTX
+        working-directory: cuda-kernels
+        run: mise exec -- ./build.sh
+      - name: Check that the committed PTX is the source's
+        id: ptx-check
+        run: git diff --stat --exit-code -- 'src/backend/cuda/*.ptx'
+      # Only on a mismatch: `failure()` alone also covers a failed lint or
+      # build, which would upload the committed PTX.
+      - name: Upload the rebuilt PTX
+        if: failure() && steps.ptx-check.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cuda-ptx
+          path: src/backend/cuda/*.ptx
+      - name: Assemble the PTX for every supported architecture
+        run: |
+          uv pip install --quiet --target "$RUNNER_TEMP/nvcc" nvidia-cuda-nvcc==13.4.92
+          ptxas=$(find "$RUNNER_TEMP/nvcc" -name ptxas -type f | head -1)
+          for ptx in src/backend/cuda/*.ptx; do
+            for arch in 75 80 86 89 90 100 120; do
+              "$ptxas" --gpu-name "sm_$arch" --output-file /dev/null "$ptx"
+            done
           done
 
   # One abi3 wheel per platform, tested on the newest and oldest supported
@@ -338,6 +422,47 @@ jobs:
       - run: uv run --project python --no-sync ruff format --check
       - run: uv run --project python --no-sync ty check --output-format github
 
+  # hessboost-python's opt-in `cuda` feature, which the wheels above, the
+  # sdist, and publish.yml's wheels leave out. `uv sync` builds it into the
+  # project environment (no wheel file, so nothing here is uploaded); without
+  # a GPU, tests/test_gpu.py's CUDA tests skip after its guard checks the
+  # refusal.
+  python-cuda:
+    name: Python / ubuntu-26.04 / cuda feature
+    runs-on: ubuntu-26.04
+    env:
+      UV_MANAGED_PYTHON: "1"
+      # Read by maturin's PEP 517 build; pyproject.toml lists it in uv's
+      # cache keys.
+      MATURIN_PEP517_ARGS: "--features cuda"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Rust and uv from mise.toml: maturin's build runs cargo.
+      - uses: jdx/mise-action@v4
+      # For `--features cuda` (see the clippy job).
+      - run: bash .github/scripts/install-cuda-headers.sh
+      - name: Build the extension with CUDA
+        run: uv sync --locked
+        working-directory: python
+      - run: uv run --locked pytest
+        working-directory: python
+      # test_gpu.py accepts an extension built without CUDA too.
+      - name: Check that the extension was built with CUDA
+        run: |
+          uv run --locked python -c '
+          import numpy as np
+          import hessboost
+          x = np.random.default_rng(0).random((100, 3))
+          booster = hessboost.train({}, hessboost.DMatrix(x, x[:, 0]), 1, verbose_eval=False)
+          try:
+              booster.to_gpu("cuda")
+          except hessboost.HessboostError as refused:
+              assert "built without CUDA" not in str(refused), refused
+          '
+        working-directory: python
+
   python-sdist:
     name: Python sdist round-trip
     runs-on: ubuntu-latest
@@ -384,7 +509,7 @@ jobs:
 
   all-checks-passed:
     permissions: {}
-    needs: [fmt, clippy, test, docs, msrv, parity, semver, fuzz, python, python-lint, python-sdist]
+    needs: [fmt, clippy, test, docs, msrv, parity, semver, fuzz, cuda-kernels, python, python-lint, python-cuda, python-sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     # Run on upstream failure too (so branch protection sees a failure), but

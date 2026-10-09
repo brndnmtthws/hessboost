@@ -11,16 +11,22 @@
 //!   through [wgpu](https://wgpu.rs) over Vulkan, Metal, or DirectX 12
 //!   (`device = wgpu`; [`GpuModel`](wgpu::GpuModel), from
 //!   `BoostedModel::to_wgpu`).
+//! - [`cuda`] (Linux only, `cuda` feature): NVIDIA GPU training
+//!   (`device = cuda`) and batch prediction (`BoostedModel::to_cuda`).
 //!
 //! The backends keep the crate's determinism contract: a GPU run reproduces
 //! the CPU result bit for bit (work the GPU cannot compute exactly runs on
-//! the CPU; see [`metal`] and [`wgpu`]), and repeats itself exactly across
-//! runs and machines.
+//! the CPU; see [`metal`], [`wgpu`], and [`cuda`]), and repeats itself
+//! exactly across runs and machines.
 
 /// When a GPU backend's integer histogram sums reproduce the CPU's `f64`
 /// sums (platform-independent, so its proof is tested everywhere).
 #[cfg_attr(
-    not(any(all(target_os = "macos", feature = "metal"), feature = "wgpu")),
+    not(any(
+        all(target_os = "macos", feature = "metal"),
+        feature = "wgpu",
+        all(target_os = "linux", feature = "cuda")
+    )),
     allow(
         dead_code,
         reason = "only the GPU backends call it; its unit tests run on every platform"
@@ -28,9 +34,41 @@
 )]
 mod exact_sum;
 
-/// The host-side plumbing both GPU backends share.
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+/// Host-side plumbing shared by GPU backends.
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    feature = "wgpu",
+    all(target_os = "linux", feature = "cuda")
+))]
 mod shared;
+
+/// The CUDA backend (Linux, `cuda` feature).
+#[cfg(all(target_os = "linux", feature = "cuda"))]
+pub mod cuda;
+
+/// The CUDA backend's stand-in when it is not compiled in (any other
+/// platform, or the feature off): the module exists so `backend::cuda`
+/// paths and doc links resolve on every platform, but holds only the
+/// [`GpuModel`](self::cuda::GpuModel) handle, which
+/// [`BoostedModel::to_cuda`](crate::model::BoostedModel::to_cuda) then
+/// never constructs — it always returns an error naming the feature and
+/// platform requirement.
+///
+/// These docs are the stand-in (docs.rs cannot build the `cuda` feature:
+/// `cuda-bindings` needs the CUDA 13 headers and libclang). The CUDA API
+/// (device availability, the histogram backend, prediction) and the
+/// backend's design, exactness rules, and limitations are documented in
+/// the real module: run `cargo doc --features cuda --open` on Linux with
+/// those installed.
+#[cfg(not(all(target_os = "linux", feature = "cuda")))]
+pub mod cuda {
+    /// The CUDA predictor handle when the CUDA backend is not compiled in.
+    /// [`BoostedModel::to_cuda`](crate::model::BoostedModel::to_cuda) then
+    /// always returns an error, so this is never constructed.
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub struct GpuModel;
+}
 
 /// The native Metal backend (macOS, `metal` feature).
 #[cfg(all(target_os = "macos", feature = "metal"))]

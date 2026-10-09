@@ -922,12 +922,11 @@ class GpuModel:
         on it: for Metal, a device with working compute pipelines (``False``
         off macOS); for wgpu, an adapter with 64-bit shader integers whose
         float additions passed the backend's addition-order check; for
-        ``"cuda:<ordinal>"``, the CUDA runtime (``hessboost[cuda]``, Linux;
-        the plain package has no CUDA), a CUDA 12.8+ driver and that
-        NVIDIA device (compute capability 7.5 or newer). Training with
-        ``device`` needs the same GPU, except that wgpu also trains on an
-        adapter that fails the check. The first call per device sets its
-        backend up.
+        ``"cuda:<ordinal>"``, ``hessboost[cuda]`` on Linux, a CUDA 12.8+
+        driver and that NVIDIA device (compute capability 7.5 or newer).
+        Training with ``device`` needs the same GPU, except that wgpu also
+        trains on an adapter that fails the check. The first call per
+        device sets its backend up.
 
         Raises:
             HessboostError: ``device`` is not ``"metal"``, ``"wgpu"``,

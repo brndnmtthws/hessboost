@@ -223,11 +223,11 @@ histogram-accumulation controls (scalar loop and scheduling).
 Prediction transforms have no vector kernels: each value (each row for
 softmax) goes through XGBoost's scalar `expf`, sigmoid, and softmax, so a
 prediction never depends on the rows predicted with it, and `predict` is bit
-for bit the transform of `predict_margin`. The NEON transforms this replaced
-took 60–77% less time on these cases, but a value's rounding depended on its
-position in the batch: on Neoverse V3, a row predicted alone and inside a
-batch of 64 differed by one ULP in 8 of 64 logistic rows, 37 Poisson rows,
-and 55 Tweedie rows, and by up to two in 62 softprob rows. On that machine,
+for bit the transform of `predict_margin`. NEON transforms took 60–77% less
+time on these cases but made a value's rounding depend on its position in
+the batch: on Neoverse V3, a row predicted alone and inside a batch of 64
+differed by one ULP in 8 of 64 logistic rows, 37 Poisson rows, and 55
+Tweedie rows, and by up to two in 62 softprob rows. On that machine,
 scalar `expf` takes about 2.0 ns per value against 0.77 ns for the vector
 kernel, while walking 100 depth-six trees takes about 1.3 µs per row (below).
 
@@ -307,16 +307,16 @@ Prediction and SHAP run unchanged code; deltas are host noise.
 
 ### Hot-loop code generation
 
-Rewritten where codegen, not the algorithm, was the limit:
+Hand-tuned where codegen, not the algorithm, is the limit:
 
 - **Prediction:** lockstep walk steps each lane with `cmp` + `cinc`
-  (`simd::step_if_greater`) — LLVM had compiled the plain select to a
-  branch random rows mispredict ~25% of the time. Keys form branch-free,
+  (`simd::step_if_greater`) — LLVM compiles a plain select to a branch
+  random rows mispredict ~25% of the time. Keys form branch-free,
   one row at a time, then scatter to lane slots.
 - **SHAP:** eight rows walk each tree in lockstep, overlapping their `f32`
-  chains. Edge terms and child bases are NEON kernels (LLVM had scalarized
-  the divisions); subtrees return weighted values by value; paths and rows
-  sit feature-major; return edges sum two rows at a time.
+  chains. Edge terms and child bases are NEON kernels (LLVM otherwise
+  scalarizes the divisions); subtrees return weighted values by value;
+  paths and rows sit feature-major; return edges sum two rows at a time.
 - **Exact:** per-row scan keeps node stats in registers; precomputed
   incumbent test screens each candidate in ~10 flops; one loop per scan
   direction with direction as a constant; leaf rows update margins directly.
@@ -358,12 +358,10 @@ identical; values are the mean of the two run medians.
 | **Geometric mean (all 16)** | | **177.7** | **129.1** | **1.38×** |
 
 Hist training ~1.2× (Neoverse-V3 measured 1.15–1.30× on the same shapes),
-exact ~2.4–2.6× (was 1.94–2.73×), SHAP ~1.9–2.0× (was 2.00–2.05×).
+exact ~2.4–2.6×, SHAP ~1.9–2.0×.
 Prediction here is the `predict_100k_x30_100trees_depth6` bench shape
 (depthwise model, generic lockstep walk, ~1.03–1.08×) — unchanged within
 binary-layout noise per [Prediction and explanations](#prediction-and-explanations).
-The old 4× prediction row replayed the `step_if_greater` microbenchmark
-(random rows mispredicting the old branch).
 
 ### Model serialization
 
@@ -389,8 +387,7 @@ shape; the rest is `model_io_100trees_depth6`.
 `CompactModel::from_bytes`, compact prediction, native `to_bytes` /
 `from_bytes`, and the XGBoost exporters are unchanged within host noise
 (under 2%; `from_xgboost_json` +3.2%, at the edge of it). The native writer
-is zstd-bound. A shared-buffer writer variant measured 14% slower and was
-dropped.
+is zstd-bound. A shared-buffer writer variant measured 14% slower.
 
 ### Data preparation
 
@@ -413,14 +410,14 @@ Same host/method as serialization, vs the previous commit.
 
 Dense cuts repeat in both runs of each pair (+1.3%/+1.3% at 1 thread,
 +1.4%/+1.8% at 16). CSR cut construction, dense binning, and `read_libsvm`
-are within noise. Dropped as slower: one-pass CSR categorical validation
-(10% slower when categorical columns lead), a reused `(sum, count)` buffer
-for target stats (17% slower).
+are within noise. Measured slower and not used: one-pass CSR categorical
+validation (10% slower when categorical columns lead), a reused
+`(sum, count)` buffer for target stats (17% slower).
 
 ### Training rounds
 
 Under `approx` with a non-constant Hessian, every tree of an output's
-forest (`num_parallel_tree > 1`) now shares one row/gradient sample and one
+forest (`num_parallel_tree > 1`) shares one row/gradient sample and one
 per-round cut weighting per output — the gradient index builds once per
 round, not once per tree, and the weighted sketch reads Hessians in place.
 Models unchanged.
@@ -435,10 +432,10 @@ Same host/method vs the previous commit: 50,000 × 20, 20 rounds, depth 6,
 
 With `linear_tree` and no zero-weight rows, the builder's final partition
 feeds the linear-leaf fit (and the margin update through the leaf models)
-instead of re-routing every row through the new tree. Every value was
+instead of re-routing every row through the new tree. Every value is
 sketched, so each leaf sees the same rows in the same order; models
-unchanged. Zero weights keep the old routing (a zero-weight row can sit past
-the last cut, where builder and tree disagree).
+unchanged. With zero weights, every row re-routes through the tree (a
+zero-weight row can sit past the last cut, where builder and tree disagree).
 
 | Case | Threads | Before (ms) | After (ms) | Less time |
 |---|---:|---:|---:|---:|
@@ -447,16 +444,16 @@ the last cut, where builder and tree disagree).
 
 The other `train_variants_50k_x20_20rounds` cases (DART, CSR, `approx`
 forests, eval sets, vector leaves, one-tree-per-output) are within noise.
-Dropped as slower or flat: a dense CSR margin scratch row (+12% at 1
-thread), extending the cached prediction layout per tree (+2% everywhere),
-in-place gradient sampling (no gain).
+Measured slower or flat and not used: a dense CSR margin scratch row (+12%
+at 1 thread), extending the cached prediction layout per tree (+2%
+everywhere), in-place gradient sampling (no gain).
 
 ### EBM pair ranking
 
 FAST (`booster = ebm` with interactions) scores every feature pair: a 2D
 histogram of the pair's bins, its prefix sums, and every four-quadrant cut.
-The prefix sums were most of it (each cell waits on its left neighbor's
-three additions); they now run four rows at once, each a column behind the
+The prefix sums are a serial chain (each cell waits on its left neighbor's
+three additions), so they run four rows at once, each a column behind the
 row above, over one interleaved `[g, h]` grid (one cache line a row in the
 scatter). With every Hessian finite and non-negative and `lambda` past the
 prefix sums' worst rounding, every quadrant's `H + λ` is positive, so the
@@ -479,9 +476,9 @@ then FAST over all 190 pairs; `interactions_0` is the same EBM without it.
 
 Less the unchanged `interactions_0` times (within 1%), FAST itself takes
 3.2–3.9× less time; on 20,000 × 100 (4,950 pairs, 16 threads, throwaway
-harness) it went from 199 to 54 ms. Per pair at 256 bins (one core), the
-prefix sums went from 338 to 43 µs, the scatter from 2.3 to 1.6 ns a row,
-and the cut scan from 112 to 91 µs, still the largest fixed cost.
+harness) it takes 54 ms against the baseline's 199. Per pair at 256 bins
+(one core), baseline vs optimized: prefix sums 338 vs 43 µs, scatter 2.3
+vs 1.6 ns a row, and cut scan 112 vs 91 µs, the largest fixed cost.
 
 Both loops already compile to two-lane NEON `f64` code, and the scan is
 bound by its instruction count, not its divider: dropping every division
@@ -492,7 +489,7 @@ faster) and reciprocal-estimate or `f32` prefilters don't pay for their
 error bounds, and a branch-free prefix steady state ran no faster. x86-64
 builds get the same two lanes (SSE2); four-lane AVX2 is unmeasured. The
 interleaved grid costs the scan 7% against separate `g` and `h` grids.
-Dropped as well: skipping tiles of cuts whose interval bound cannot beat
+Also not used: skipping tiles of cuts whose interval bound cannot beat
 the best exact score (the bounds admitted 45–100% of the cuts, 20–85%
 slower), `u16` bins (up to 11% off the scatter at 200,000 rows, nothing at
 10,000), and a spare cell for missing rows (up to 18% slower).
@@ -519,9 +516,9 @@ gblinear on 100,000 × 30).
 
 Batch prediction, SHAP, single-threaded gblinear, and conformal calibration
 are unchanged — same hot loops, deltas within ±4% binary-layout noise (two
-builds of the old code differing only in unrelated training code measured
+builds of the baseline differing only in unrelated training code measured
 140.0 vs 132.8 ms). A shared block-tail walk for generic and symmetric
-kernels was dropped (+4.6% quantile, +2.2% symmetric).
+kernels measured slower (+4.6% quantile, +2.2% symmetric).
 
 ### Matrix storage and borrowed rows
 
@@ -530,7 +527,7 @@ A `DMatrix` shares its feature values behind an `Arc`, so a clone (Python's
 input is checked 256 values at a time without a branch, and from 2^22 values
 on, checked and copied in parallel 2^18-value blocks. `predict_rows` reads
 borrowed rows without building a matrix; `predict_row` writes one row's
-values without allocating. `select_rows` still copies rows: the copies take
+values without allocating. `select_rows` copies rows: the copies take
 0.15% of a cross-validation fold's time and 0.003% of EBM training's, too
 little for row views to pay off.
 
@@ -549,10 +546,10 @@ host (load 40–560), best of 7–15 runs; every 97th value `NaN`. Prediction:
 
 ### Categorical and sparse partitions
 
-Categorical splits and sub-half-full indexes used to partition serially
-through per-row lookups; both now use the branch-free partition loop
-([Implementation](#implementation)) keyed off the bin, so trees are
-unchanged (unit-tested vs per-row routing).
+Categorical splits and sub-half-full indexes use the branch-free partition
+loop ([Implementation](#implementation)) keyed off the bin, so trees match
+per-row routing (unit-tested). The baseline below partitions them serially
+through per-row lookups.
 
 192-core **AWS Neoverse-V3** (Rust 1.98.1, bench profile), 2026-09-25 UTC,
 `scripts/compare_benchmarks.py` (medians,
@@ -745,9 +742,9 @@ the kernel:
 | 16 | 8.63 | 6.57 | 1.03 | 6.4× |
 | 192 | 1.66 | 1.42 | 0.70 | 2.0× |
 
-Shared row loading and scheduling dominate at full width. The 10–20× figure
-vs per-node traversal is an informal spot check from another machine, not a
-recorded artifact.
+Shared row loading and scheduling dominate at full width. Against per-node
+traversal, an informal spot check on another machine (not a recorded
+artifact) measured 10–20×.
 
 SHAP is XGBoost 3.4's QuadratureTreeSHAP: one recursive walk per tree with
 an 8-lane `f32` quadrature basis, each return edge's contribution read off

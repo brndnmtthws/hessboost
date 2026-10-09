@@ -12,8 +12,8 @@ uv add 'hessboost[cuda]'        # or: pip install 'hessboost[cuda]'
 `device="cuda"` (or `"cuda:<ordinal>"`) trains and `Booster.to_gpu("cuda")`
 predicts on an NVIDIA GPU, bit for bit as on the CPU. Everything else,
 wgpu included, works as in the plain `hessboost` package. This package has
-no Python API of its own, and `hessboost` refuses to import beside one of
-another release.
+no Python API of its own. It must come from the same release as
+`hessboost`, which refuses to import beside one of another release.
 
 Running it needs no CUDA toolkit, only an NVIDIA GPU of compute capability
 7.5 (Turing) or newer and a driver supporting CUDA 12.8 or newer. Wheels

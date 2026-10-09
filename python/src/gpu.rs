@@ -1,9 +1,8 @@
 //! `GpuModel`: Metal, wgpu or NVIDIA CUDA batch prediction.
 //!
 //! wgpu is compiled into every build, Metal into macOS builds and CUDA only
-//! into Linux builds with this crate's `cuda` feature: the
-//! `hessboost-runtime-cuda` distribution (`hessboost[cuda]`), not
-//! `hessboost`'s own extension. Drivers are loaded at run time; absence
+//! into Linux builds with the `cuda` feature (`hessboost-runtime-cuda`, which
+//! `hessboost[cuda]` installs). Drivers are loaded at run time; absence
 //! never prevents importing the package. Forests upload once; prediction
 //! preserves CPU bits, with CPU objective transforms and model shrinkage.
 

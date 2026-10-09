@@ -2,3 +2,8 @@
 # which CRLF conversion on checkout would break (LightGBM refuses such files).
 tests/data/lightgbm-*.txt -text
 fuzz/fixed-seeds/lightgbm-model/* -text
+# The license copies the Python wheels ship: CRLF conversion on a Windows
+# checkout would make the Windows wheels' copy differ from LICENSE
+# (publish.yml's check-licenses.py compares the bytes).
+python/LICENSE.txt -text
+python/runtime-cuda/LICENSE.txt -text

@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - .gitattributes
       - .github/workflows/publish.yml
       - .github/scripts/check-licenses.py
       - .github/scripts/install-cuda-headers.sh

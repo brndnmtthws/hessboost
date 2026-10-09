@@ -7,6 +7,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/publish.yml
+      - .github/scripts/check-licenses.py
       - .github/scripts/install-cuda-headers.sh
       - .github/scripts/install-lavapipe.sh
       - .github/scripts/test-wheel.sh
@@ -320,6 +321,19 @@ jobs:
           uvx check-wheel-contents dist/hessboost-!(*musllinux*).whl
           uvx check-wheel-contents --toplevel hessboost,hessboost.libs --ignore W010 dist/hessboost-*musllinux*.whl
           uvx check-wheel-contents --toplevel _hessboost_runtime_cuda dist/hessboost_runtime_cuda-*.whl
+      # Apache-2.0 section 4(a): every distribution carries the license
+      # text, which the wheels take from python/LICENSE.txt and
+      # python/runtime-cuda/LICENSE.txt, copies of the root LICENSE.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            LICENSE
+            .github/scripts/check-licenses.py
+          sparse-checkout-cone-mode: false
+          path: repo
+      - name: Check license files
+        run: python3 repo/.github/scripts/check-licenses.py repo/LICENSE dist/*
 
   crates-publish:
     name: Publish crate to crates.io

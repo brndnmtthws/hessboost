@@ -9,6 +9,10 @@ description = "Fast, deterministic gradient boosting in Rust: conformal interval
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+# A copy of the repository's LICENSE: `license-files` cannot reach `..`, and
+# the sdist already holds the root crate's `LICENSE`. publish.yml checks
+# that every distribution carries it.
+license-files = ["LICENSE.txt"]
 authors = [{ name = "Brenden Matthews", email = "brenden@brndn.io" }]
 keywords = ["xgboost", "gradient-boosting", "gbdt", "machine-learning", "decision-trees", "rust"]
 classifiers = [

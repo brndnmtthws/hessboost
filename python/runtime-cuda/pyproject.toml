@@ -13,6 +13,8 @@ description = "hessboost's native extension with NVIDIA CUDA, for Linux: install
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+# A copy of the repository's LICENSE, as in `../pyproject.toml`.
+license-files = ["LICENSE.txt"]
 authors = [{ name = "Brenden Matthews", email = "brenden@brndn.io" }]
 keywords = ["hessboost", "gradient-boosting", "cuda", "gpu"]
 classifiers = [

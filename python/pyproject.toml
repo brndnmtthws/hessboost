@@ -9,6 +9,10 @@ description = "Fast, deterministic gradient boosting in Rust: conformal interval
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+# A copy of the repository's LICENSE: `license-files` cannot reach `..`, and
+# the sdist already holds the root crate's `LICENSE`. publish.yml checks
+# that every distribution carries it.
+license-files = ["LICENSE.txt"]
 authors = [{ name = "Brenden Matthews", email = "brenden@brndn.io" }]
 keywords = ["xgboost", "gradient-boosting", "gbdt", "machine-learning", "decision-trees", "rust"]
 classifiers = [
@@ -33,6 +37,10 @@ classifiers = [
 dependencies = ["numpy>=2"]
 
 [project.optional-dependencies]
+# The CUDA runtime: the extension built with CUDA, which the package then
+# loads in place of its own (`hessboost/_hessboost.py`). Linux only, and
+# always this release (release.py bumps the pin with the version).
+cuda = ["hessboost-runtime-cuda==0.3.0; sys_platform == 'linux'"]
 pandas = ["pandas>=2.2"]
 # 1.x and 2.x: uv.lock tests the latest, CI also the oldest and latest 1.x.
 polars = ["polars>=1.0"]
@@ -73,7 +81,7 @@ dev = [{ include-group = "lint" }, "maturin>=1.15,<2"]
 # Every build (maturin CLI, `uv sync`/`uv run`, pip from the sdist) uses the
 # committed Cargo.lock and fails instead of updating it.
 locked = true
-module-name = "hessboost._hessboost"
+module-name = "hessboost._native"
 python-source = "python"
 
 [tool.pytest.ini_options]
@@ -84,7 +92,6 @@ xfail_strict = true
 [tool.uv]
 # `uv sync` and `uv run` rebuild the extension when these change (by default
 # uv only watches pyproject.toml). The root crate is a path dependency.
-# `MATURIN_PEP517_ARGS="--features cuda"` builds it with CUDA.
 cache-keys = [
   { file = "pyproject.toml" },
   { file = "Cargo.toml" },
@@ -95,3 +102,16 @@ cache-keys = [
   { file = "../src/**/*.ptx" },
   { env = "MATURIN_PEP517_ARGS" },
 ]
+
+[tool.uv.sources]
+# `uv sync --extra cuda` builds the CUDA runtime from `runtime-cuda/` (which
+# needs the CUDA headers and libclang, see AGENTS.md) rather than fetching a
+# published wheel. uv ignores this table when hessboost is a dependency.
+hessboost-runtime-cuda = { path = "runtime-cuda" }
+
+# uv builds the CUDA runtime concurrently with `hessboost` from the same
+# crate, and maturin stages both extensions at one path in the Cargo target
+# directory; a separate `runtime-cuda/target` keeps each wheel from packaging
+# the other's extension.
+[tool.uv.extra-build-variables]
+hessboost-runtime-cuda = { CARGO_TARGET_DIR = "target" }

@@ -7,6 +7,12 @@
 //! and wraps the results. Every computation is hessboost's own; this crate
 //! converts arguments and results and releases the GIL around the work.
 //!
+//! Two distributions ship this module: `hessboost` as `hessboost._native`
+//! (without CUDA) and `hessboost-runtime-cuda` as
+//! `_hessboost_runtime_cuda._native` (with the `cuda` feature). The package
+//! imports it as `hessboost._hessboost`, which loads the CUDA runtime's when
+//! it is installed; the classes' `module` is that name.
+//!
 //! The module declares free-threading support (`gil_used = false`): it has no
 //! `unsafe` code, and every class is `frozen`. Its only global state is the
 //! rayon pool native work runs on (`pool`), which a forked child rebuilds.
@@ -38,7 +44,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 #[pymodule(gil_used = false)]
-fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // A forked child moves to a thread pool of its own (POSIX only).
     let os = m.py().import("os")?;
     if os.hasattr("register_at_fork")? {

@@ -23,7 +23,8 @@ libzstd needs a C compiler for every build target. The `cuda` feature (so
 `--all-features` on Linux) needs CUDA 13's driver and cuRAND headers
 (`CUDA_HOME` or `CUDA_TOOLKIT_PATH`) and libclang: `cuda-bindings`' build
 script runs bindgen over them. `.github/scripts/install-cuda-headers.sh`
-installs both as CI does (the headers from NVIDIA's pip wheels). docs.rs
+installs both as CI does, taking the headers from NVIDIA's pip wheels;
+given a directory, it runs inside maturin-action's manylinux container. docs.rs
 builds only Linux (no Apple SDK for `zstd-sys`) and without `cuda` (no
 CUDA headers), so the Metal and CUDA APIs render only in a local
 `cargo doc --features metal` (macOS) or `--features cuda` (Linux).
@@ -106,6 +107,8 @@ builds the root crate's `cuda` feature (clippy, test, docs, MSRV,
 `publish.yml`'s Rust test and `cargo publish --all-features`) first runs
 `.github/scripts/install-cuda-headers.sh`: apt's `libclang-dev`, NVIDIA's
 pinned CUDA 13 header wheels through uv, and `CUDA_HOME` in `GITHUB_ENV`.
+`publish.yml`'s CUDA runtime wheels run it with a directory in their
+manylinux container: dnf's `clang-devel`, `CUDA_HOME` exported.
 Its Python jobs build one abi3 wheel each on x86_64/aarch64 Linux, aarch64
 macOS, and x86_64 Windows (without the release profile's LTO and single
 codegen unit) and test it on CPython 3.11 and the latest 3.x with
@@ -115,10 +118,11 @@ check (which also fails on a public function or class without a docstring),
 a ruff/ty lint job over all of the repository's Python, and an sdist round
 trip (with the release profile). The Linux Python jobs install lavapipe too
 (`install-lavapipe.sh`), so `python/tests/test_gpu.py` runs its wgpu tests.
-The `python-cuda` job builds `python/` with hessboost-python's `cuda`
-feature (`MATURIN_PEP517_ARGS="--features cuda" uv sync --locked`, no
-wheel file, so nothing is uploaded), runs `uv run --locked pytest` (CUDA
-tests skip without a GPU), and checks that the extension has CUDA.
+The `python-cuda` job builds the CUDA runtime (`python/runtime-cuda/`)
+into the project environment (`uv sync --locked --extra cuda`; no wheel,
+so nothing is uploaded) and runs `uv run --locked --extra cuda pytest`,
+which fails unless the package runs on the runtime's extension (CUDA
+device tests skip without a GPU).
 `python/uv.lock` pins polars 2.x; the
 x86_64 Linux abi3 job also runs the polars tests with polars 1.0.0 and the
 latest 1.x (`uv run --with`), since `polars>=1.0` is supported.
@@ -127,7 +131,12 @@ musllinux, macOS, and Windows
 wheels and tests each with `.github/scripts/test-wheel.sh` (musllinux in
 Alpine, with Alpine's lavapipe and without scikit-learn, which has no musl
 wheels; free-threaded without polars, whose abi3-only wheels it cannot
-load). Root fmt also
+load). The manylinux jobs also build `hessboost-runtime-cuda`'s abi3 and
+free-threaded wheels and test each beside its `hessboost` wheel.
+`publish.yml` uploads `hessboost-runtime-cuda` before `hessboost`, so the
+release the `cuda` extra pins exists on PyPI, and its validation checks
+the pin (`release.check_manifests`).
+Root fmt also
 checks `python/Cargo.toml`; Python
 clippy runs in both the x86_64-linux and aarch64-macOS lint jobs (the
 latter checks the Metal feature; the former also `--features cuda`).
@@ -171,15 +180,22 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The default extension has no CUDA (so neither the wheels nor the sdist
-need CUDA headers to build); hessboost-python's `cuda` feature (Linux)
-adds it, with the root `cuda` feature's build requirements. From
-`python/`, with them installed:
+The `hessboost` distribution's extension has no CUDA, so its wheels and
+sdist build without CUDA headers. CUDA ships as a second distribution,
+`hessboost-runtime-cuda` (`runtime-cuda/pyproject.toml`: the same crate
+with its `cuda` feature, as `_hessboost_runtime_cuda._native`, Linux
+only), which the `cuda` extra pins to the same release. `release.py bump`
+updates the pin; uv cannot check it, because the lockfile takes the
+runtime from `runtime-cuda/` through `tool.uv.sources`. uv builds the
+runtime in `runtime-cuda/target` (`tool.uv.extra-build-variables`)
+because it runs both builds concurrently and maturin stages each build's
+extension at the same path of the target directory. From `python/`, with
+the root `cuda` feature's build requirements installed:
 
 ```sh
 cargo clippy --all-targets --features cuda -- -D warnings
-MATURIN_PEP517_ARGS="--features cuda" uv sync --locked   # rebuilds with CUDA (a cache key)
-MATURIN_PEP517_ARGS="--features cuda" uv run --locked pytest tests/test_gpu.py
+uv sync --locked --extra cuda   # builds the CUDA runtime into the environment
+uv run --locked --extra cuda pytest tests/test_gpu.py
 ```
 
 Python lint and types, for `python/`, `scripts/`, `release.py`, and
@@ -259,17 +275,23 @@ through its `GpuBackend` impl.
 `.json`, `.hbtd`, `.margins`); `tests/data/xgboost-3.4.2-categorical.*` are
 XGBoost saves for `model/xgboost/tests.rs`, and `tests/data/lightgbm-4.7.0-*`
 LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
-`gen_lightgbm_fixtures.py --test-data`) for `model/lightgbm.rs` tests. `benches/training.rs`
-(Criterion) results go in `docs/performance.md`.
+`gen_lightgbm_fixtures.py --test-data`) for `model/lightgbm.rs` tests.
+`docs/performance.md` records current comparisons only: hessboost against
+other libraries, the CPU against each GPU backend, and opt-in modes against
+the defaults (`benches/training.rs`, `scripts/bench_xgb.py`). A change's
+before/after timings (`scripts/compare_benchmarks.py`) go in its pull
+request, not the docs.
 
 ## Layout (`python/`)
 
 |Path|Non-obvious contents|
 |---|---|
-|`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `wgpu` in every build, `metal` on macOS, CUDA (Linux) only with its own `cuda` feature, off by default|
-|`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, `predict_rows` on a borrowed C-contiguous `float32` array (detached) and `predict_row_into`/`transform_margin` (plain `detach`) and `transform_margins_into` (detached) writing caller arrays through `try_readwrite`, `model_info` through `info`, `load`/`save` through `codec`, `to_gpu`, `to_compact`, `size_report`), `info` (`model_info`: the layout, `gblinear`/shrinkage records and node-indexed tree arrays as a dict, built without the GIL from the public model API; `int32` arrays refuse indices past their range), `compact` (`CompactModel`: bytes in and out, value/margin `predict`), `gpu` (`GpuModel`: the Metal, wgpu or CUDA predictor a `device` string (`metal`, `wgpu`, `cuda`, `cuda:<n>`, as training spells it) names, `None` being Metal on macOS and wgpu elsewhere; `available`/`device_name` per device, value/margin `predict`), `codec` (the `Format` trait: `ModelFormat` / `DiffusionFormat` by their Python names, `"auto"` through the crate's `detect` with `ModelFormatError` for unrecognized bytes; detached `encode` to `bytes` and `decode` shared by `Booster`, `DiffusionModel`, `ForestModel`; method configurations as serde JSON), `pool` (the process-local rayon pool `detached` and the training worker install, rebuilt in a forked child; plain `detach` for work without rayon; `on_pool_thread`, on which `interruptible` runs a callback's hooked call inline), `train` (`Trainer` on a signal-polled worker thread via `run_hooked`, `train_with_budget` (no round hook, so not interruptible), `cv`/`cv_refit` (a `CvRequest` dict configuring `CrossValidation`: optional `(encoder, columns)` for per-fold target statistics, `target_stats_label`, `init_model`), folds, Python callbacks), `target_stats` (`OrderedTargetEncoder`, `FittedTargetEncoder` with serde-JSON `encode`/`decode`), `conformal` (calibrators owning their model via `self_cell`), `inference` (`BoulevardInference` owning its model and holdout rows via `self_cell`, `honest_refit`), `ebm` (`TermShape`, `shape_functions`, `EbmInference`), `online` (`OnlineParams`: `exact()`/`approximate(tolerance)`; `OnlineModel`: the one mutable class, its state behind a mutex locked only detached; an update is admitted on its caller's thread (`updating`) before its work is scheduled, so a second update or a read fails fast from any thread instead of queueing behind it; updates through `run_hooked`), `dist`, `diffusion` (`DiffusionParams` from a request dict with the `Method` as its serde JSON, `DiffusionModel`, `SamplesView` summaries of draw arrays without copying; `fit` has no round hook, so it is not interruptible), `forest` (`ForestParams`/`ForestModel` the same way, `ForestMethod` and column kinds by serde name)|
-|`python/hessboost/`|the public API, pure Python: `_matrix` (`DMatrix`; `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through; `_matrix_for`: data as the models it is paired with read it, which prediction, conformal, inference, diffusion, forests, and target-statistics `transform` go through; its `unseen` columns code a category the reference lacks one past its categories instead of missing, so a target encoder maps it to the prior), `_booster` (`Booster` with `to_gpu` and `to_compact`; `predict` of values and margins on a plain non-empty 2-D numeric numpy array without `base_margin` skips the `DMatrix` (`_dense_rows`; a non-NaN `missing` maps to NaN on a copy, and data with a NaN it does not mark falls back to the `DMatrix` path, which refuses it); `predict_row`, `transform_margin(s)` with `out=` (`_out_array`); `model_info` → frozen dataclasses `ModelInfo`, `TreeInfo`, `LinearLeavesInfo`, `GbLinearInfo`, `ShrinkageInfo`; `GpuModel`, `CompactModel` (keeps the booster's feature schema), `ModelSizeReport`, `ModelFormat`), `_core` (`Uncertainty` only, kept there so its `__module__` and pickles stay `hessboost._core`), `_model_io` (`PathLike`, `read_bytes`/`write_bytes`, `_SchemaState`: the feature schema and pickle state of `Booster`, `CompactModel`, `DiffusionModel`, `ForestModel`, the model as its own bytes), `_data` (numpy/pandas/polars/scipy conversion, category re-coding; frame libraries are detected through `sys.modules`, never imported; polars 1.x and 2.x: a polars frame converts through one `select` of `Float32` expressions and `to_numpy(order="c")`, and a polars `Categorical`'s categories are its sorted values, never its physical codes, which index a shared pool; `take_metadata`: per-row metadata named by frame column (`label="y"`), which leaves the features, and the one place a polars `LazyFrame` is collected, refusing arrays alongside it since the streaming engine keeps no row order after a join or `group_by`), `_training` (`train`, `train_with_budget`, `cv` with `target_stats=`/`target_encoder=`/`target_stats_label=`/`xgb_model=`, and `refit=` (typed by `overload` on `Literal`) returning the frozen `CvRefit`, whose booster has `train`'s schema (`_trained`; with target statistics, the encoded one) and whose `target_encoder` holds `dtrain`'s), `sklearn` (the estimators; their shared base `_HessboostModel` in `_sklearn_common`), `conformal`, `diffusion/` (`__init__`: frozen dataclasses mirroring `hessboost::diffusion`, presets read from the crate, `DiffusionModel`, `mean`/`quantiles`/`crps`; `forest`: `ForestParams`, `ForestModel`, `ForestSamples`), `inference` (`BoulevardInference`, `BoulevardInfo`, `EbmInference`, `TermBands`, `honest_refit`), `ebm` (`shape_functions`, `TermShape`, axes, `EbmInfo`), `folds`, `online` (`OnlineModel`, `UpdateReport`, frozen dataclasses `Exact`/`Approximate` mirroring `OnlineMode`), `target_stats` (`OrderedTargetEncoder`, `FittedTargetEncoder` holding its training matrix's feature schema, pickled with it, `to_bytes`/`save` without it; encoded columns become `"q"` and lose their categories); `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
-|`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit; `test_stubs.py` pins the native classes public modules hand out unwrapped (`Distributions`) and requires their stub docstrings to equal the Rust docs; `test_gpu.py` runs per device (`metal`, `wgpu`, `cuda`), skipping one without a GPU, with guards that fail on a wgpu or CUDA initialization failure (and, under `HESSBOOST_REQUIRE_WGPU` or `HESSBOOST_REQUIRE_CUDA`, on a missing device)|
+|`Cargo.toml`|`hessboost-python`, version = root's (the wheels'); `include` is the sdist; `wgpu` in every build, `metal` on macOS, CUDA (Linux) only with its `cuda` feature, off by default and on in `runtime-cuda/`'s builds; `[lib] name = "_native"`|
+|`src/`|private extension `hessboost._native` (and `_hessboost_runtime_cuda._native` in `runtime-cuda/`), imported as `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`; a CUDA `device` without the `cuda` feature is refused naming `hessboost[cuda]`), `booster` (predict variants, `predict_rows` on a borrowed C-contiguous `float32` array (detached) and `predict_row_into`/`transform_margin` (plain `detach`) and `transform_margins_into` (detached) writing caller arrays through `try_readwrite`, `model_info` through `info`, `load`/`save` through `codec`, `to_gpu`, `to_compact`, `size_report`), `info` (`model_info`: the layout, `gblinear`/shrinkage records and node-indexed tree arrays as a dict, built without the GIL from the public model API; `int32` arrays refuse indices past their range), `compact` (`CompactModel`: bytes in and out, value/margin `predict`), `gpu` (`GpuModel`: the Metal, wgpu or CUDA predictor a `device` string (`metal`, `wgpu`, `cuda`, `cuda:<n>`, as training spells it) names, `None` being Metal on macOS and wgpu elsewhere; `available`/`device_name` per device, value/margin `predict`; `WITHOUT_CUDA`, the refusal both CUDA paths share), `codec` (the `Format` trait: `ModelFormat` / `DiffusionFormat` by their Python names, `"auto"` through the crate's `detect` with `ModelFormatError` for unrecognized bytes; detached `encode` to `bytes` and `decode` shared by `Booster`, `DiffusionModel`, `ForestModel`; method configurations as serde JSON), `pool` (the process-local rayon pool `detached` and the training worker install, rebuilt in a forked child; plain `detach` for work without rayon; `on_pool_thread`, on which `interruptible` runs a callback's hooked call inline), `train` (`Trainer` on a signal-polled worker thread via `run_hooked`, `train_with_budget` (no round hook, so not interruptible), `cv`/`cv_refit` (a `CvRequest` dict configuring `CrossValidation`: optional `(encoder, columns)` for per-fold target statistics, `target_stats_label`, `init_model`), folds, Python callbacks), `target_stats` (`OrderedTargetEncoder`, `FittedTargetEncoder` with serde-JSON `encode`/`decode`), `conformal` (calibrators owning their model via `self_cell`), `inference` (`BoulevardInference` owning its model and holdout rows via `self_cell`, `honest_refit`), `ebm` (`TermShape`, `shape_functions`, `EbmInference`), `online` (`OnlineParams`: `exact()`/`approximate(tolerance)`; `OnlineModel`: the one mutable class, its state behind a mutex locked only detached; an update is admitted on its caller's thread (`updating`) before its work is scheduled, so a second update or a read fails fast from any thread instead of queueing behind it; updates through `run_hooked`), `dist`, `diffusion` (`DiffusionParams` from a request dict with the `Method` as its serde JSON, `DiffusionModel`, `SamplesView` summaries of draw arrays without copying; `fit` has no round hook, so it is not interruptible), `forest` (`ForestParams`/`ForestModel` the same way, `ForestMethod` and column kinds by serde name)|
+|`python/hessboost/`|the public API, pure Python: `_hessboost` (replaces itself in `sys.modules` with the extension: `_hessboost_runtime_cuda._native` when the `hessboost-runtime-cuda` distribution is installed, raising `ImportError` for one of another release, else `hessboost._native`), `_matrix` (`DMatrix`; `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through; `_matrix_for`: data as the models it is paired with read it, which prediction, conformal, inference, diffusion, forests, and target-statistics `transform` go through; its `unseen` columns code a category the reference lacks one past its categories instead of missing, so a target encoder maps it to the prior), `_booster` (`Booster` with `to_gpu` and `to_compact`; `predict` of values and margins on a plain non-empty 2-D numeric numpy array without `base_margin` skips the `DMatrix` (`_dense_rows`; a non-NaN `missing` maps to NaN on a copy, and data with a NaN it does not mark falls back to the `DMatrix` path, which refuses it); `predict_row`, `transform_margin(s)` with `out=` (`_out_array`); `model_info` → frozen dataclasses `ModelInfo`, `TreeInfo`, `LinearLeavesInfo`, `GbLinearInfo`, `ShrinkageInfo`; `GpuModel`, `CompactModel` (keeps the booster's feature schema), `ModelSizeReport`, `ModelFormat`), `_core` (`Uncertainty` only, kept there so its `__module__` and pickles stay `hessboost._core`), `_model_io` (`PathLike`, `read_bytes`/`write_bytes`, `_SchemaState`: the feature schema and pickle state of `Booster`, `CompactModel`, `DiffusionModel`, `ForestModel`, the model as its own bytes), `_data` (numpy/pandas/polars/scipy conversion, category re-coding; frame libraries are detected through `sys.modules`, never imported; polars 1.x and 2.x: a polars frame converts through one `select` of `Float32` expressions and `to_numpy(order="c")`, and a polars `Categorical`'s categories are its sorted values, never its physical codes, which index a shared pool; `take_metadata`: per-row metadata named by frame column (`label="y"`), which leaves the features, and the one place a polars `LazyFrame` is collected, refusing arrays alongside it since the streaming engine keeps no row order after a join or `group_by`), `_training` (`train`, `train_with_budget`, `cv` with `target_stats=`/`target_encoder=`/`target_stats_label=`/`xgb_model=`, and `refit=` (typed by `overload` on `Literal`) returning the frozen `CvRefit`, whose booster has `train`'s schema (`_trained`; with target statistics, the encoded one) and whose `target_encoder` holds `dtrain`'s), `sklearn` (the estimators; their shared base `_HessboostModel` in `_sklearn_common`), `conformal`, `diffusion/` (`__init__`: frozen dataclasses mirroring `hessboost::diffusion`, presets read from the crate, `DiffusionModel`, `mean`/`quantiles`/`crps`; `forest`: `ForestParams`, `ForestModel`, `ForestSamples`), `inference` (`BoulevardInference`, `BoulevardInfo`, `EbmInference`, `TermBands`, `honest_refit`), `ebm` (`shape_functions`, `TermShape`, axes, `EbmInfo`), `folds`, `online` (`OnlineModel`, `UpdateReport`, frozen dataclasses `Exact`/`Approximate` mirroring `OnlineMode`), `target_stats` (`OrderedTargetEncoder`, `FittedTargetEncoder` holding its training matrix's feature schema, pickled with it, `to_bytes`/`save` without it; encoded columns become `"q"` and lose their categories); `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
+|`runtime-cuda/`|`hessboost-runtime-cuda`: `pyproject.toml` builds `../Cargo.toml` with `cuda` as `_hessboost_runtime_cuda._native` (version = the crate's), `python/_hessboost_runtime_cuda/` its empty package, `README.md` its PyPI page; no API of its own; `hessboost[cuda]` installs it|
+|`LICENSE.txt`, `runtime-cuda/LICENSE.txt`|copies of the root `LICENSE`, each distribution's `license-files` (PEP 639 globs cannot reach `..`, and a `LICENSE` would collide with the root crate's in the sdist), `-text` in `.gitattributes` so Windows builds ship the same bytes; publish.yml's `.github/scripts/check-licenses.py` checks that every wheel and sdist carries it|
+|`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit; `test_stubs.py` pins the native classes public modules hand out unwrapped (`Distributions`) and requires their stub docstrings to equal the Rust docs; `test_gpu.py` runs per device (`metal`, `wgpu`, `cuda`), skipping one without a GPU, with guards that fail on a wgpu or CUDA initialization failure, on an extension without CUDA while `hessboost-runtime-cuda` is installed, and (under `HESSBOOST_REQUIRE_WGPU` or `HESSBOOST_REQUIRE_CUDA`) on a missing device; it also checks that a CUDA runtime of another release fails `import hessboost`|
 
 ## Invariants
 
@@ -546,7 +568,9 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   re-exported as is; the extension is private, fully stubbed
   (`_hessboost.pyi`, which ty checks callers against; only the docstrings
   of re-exported native classes are checked against the built module, so
-  change both together), `unsafe`-free
+  change both together), loaded only through `hessboost._hessboost` (the
+  CUDA runtime's build when installed, which must be of the same release;
+  its classes' `module` is that name), `unsafe`-free
   (`forbid`), declares `gil_used = false`, keeps
   every class `frozen`, and releases the GIL around matrix construction,
   training, prediction, and model encode/decode. Native work that may use
@@ -638,7 +662,8 @@ and stored member.
 
 Bump releases with `./release.py bump major|minor|patch` (or an explicit
 SemVer such as `1.2.3-rc.1`). This creates a release branch, updates the crate
-and Python versions and lockfiles, refreshes current dependency snippets,
+and Python versions (with the `cuda` extra's `hessboost-runtime-cuda` pin)
+and lockfiles, refreshes current dependency snippets,
 saves `tests/data/saved/<version>/`, pushes the branch, and opens a PR. A
 manifest a PR already raised past the latest crates.io release (no saved
 models yet) counts as unreleased: the bump starts from that release, so
@@ -647,7 +672,8 @@ updates the snippets from the release's minor, and saves its models.
 Review and merge that PR; then, on `main`, run `./release.py --dry-run` and
 `./release.py` to create and push the annotated release tag. The tag runs
 `.github/workflows/publish.yml`, which verifies the Rust tests and Python
-wheels/sdist before publishing to crates.io and PyPI and creating a GitHub
+wheels/sdists before publishing to crates.io and PyPI
+(`hessboost-runtime-cuda`, then `hessboost`) and creating a GitHub
 release with a discussion and generated notes. The notes are seeded from PRs
 since the last tag and grouped by `.github/release.yml`; rewrite them by hand
 afterward.
@@ -658,4 +684,6 @@ a PR.
 
 One-time setup: configure PyPI's pending trusted publisher for owner
 `brndnmtthws`, repository `hessboost`, workflow `publish.yml`, environment
-`pypi`; create the GitHub `pypi` environment.
+`pypi`, for each project (`hessboost` and `hessboost-runtime-cuda`;
+`./release.py` names any project PyPI does not have yet); create the
+GitHub `pypi` environment.

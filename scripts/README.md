@@ -138,7 +138,7 @@ job `parity`). The generator refuses any XGBoost version other than 3.4.2, pinne
 `requirements-xgboost.txt` (a source build: 3.4.2 has no PyPI wheel; CI
 caches the built wheel in uv's cache).
 
-Fixture generators share deterministic seed, dtype-explicit JSON-float, dense-array, and compact JSON-writing helpers in `_fixture_common.py`; their case matrices and data distributions remain separate. `gen_lightgbm_fixtures.py --test-data` is parsed as a command-line option and regenerates the checked-in small models under `tests/data/`.
+Fixture generators share deterministic seed, dtype-explicit JSON-float, dense-array, and compact JSON-writing helpers in `_fixture_common.py`; each keeps its own case matrices and data distributions. `gen_lightgbm_fixtures.py --test-data` is parsed as a command-line option and regenerates the checked-in small models under `tests/data/`.
 
 ## LightGBM import parity
 
@@ -187,8 +187,9 @@ python3 scripts/compare_benchmarks.py \
 
 The output directory must not already exist. Build both executables with the
 same benchmark source, lockfile, compiler, and release settings before running
-the comparison. See [Performance](../docs/performance.md) for recorded results,
-workload definitions, and complete reproduction commands.
+the comparison. Its results document a change and belong in that change's
+pull request; [Performance](../docs/performance.md) records only comparisons
+between alternatives that exist side by side.
 
 The CUDA Criterion groups (`--filter '^cuda_'`, executables built with
 `--features cuda`) time the CPU and CUDA engines side by side: one-node

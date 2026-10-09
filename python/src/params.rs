@@ -11,6 +11,12 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyMapping, PyString, PyTuple};
 use serde_json::{Number, Value};
+#[cfg(not(all(target_os = "linux", feature = "cuda")))]
+use {
+    crate::gpu::WITHOUT_CUDA,
+    hessboost::config::Device,
+    serde::{Deserialize, de::value::StrDeserializer},
+};
 
 /// Validated training parameters.
 #[pyclass(frozen, module = "hessboost._hessboost")]
@@ -81,8 +87,28 @@ impl Params {
             let value = to_value(&key, &object)?;
             settings.push((key, value));
         }
+        #[cfg(not(all(target_os = "linux", feature = "cuda")))]
+        refuse_missing_cuda(&settings)?;
         TrainingParams::from_xgboost(settings).or_raise()
     }
+}
+
+/// Refuses a CUDA `device` in an extension built without CUDA, naming the
+/// distribution built with it (the crate's own refusal names its Rust
+/// feature, which an installed package cannot turn on).
+#[cfg(not(all(target_os = "linux", feature = "cuda")))]
+fn refuse_missing_cuda(settings: &[(String, Value)]) -> PyResult<()> {
+    for (key, value) in settings {
+        if let ("device", Value::String(device)) = (key.as_str(), value)
+            && let Ok(device @ Device::Cuda { .. }) =
+                Device::deserialize(StrDeserializer::<serde::de::value::Error>::new(device))
+        {
+            return Err(refuse(format!(
+                "invalid parameter `device`: `{device}` is unavailable: {WITHOUT_CUDA}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A Python object from a JSON value.

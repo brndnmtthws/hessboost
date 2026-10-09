@@ -650,15 +650,15 @@ class Booster(_SchemaState):
             device: ``"metal"`` (macOS; faster than the CPU from roughly a
                 few thousand row-trees upward), ``"wgpu"`` (Vulkan, Metal,
                 or DirectX 12), or ``"cuda"``/``"cuda:<ordinal>"`` (NVIDIA
-                on Linux, in a build with the ``cuda`` feature; ``"cuda"``
-                is device 0), spelled as training's ``device``. ``None``:
-                Metal on macOS, wgpu elsewhere.
+                on Linux, with ``hessboost[cuda]``; ``"cuda"`` is device 0),
+                spelled as training's ``device``. ``None``: Metal on macOS,
+                wgpu elsewhere.
 
         Raises:
             HessboostError: ``device`` is unknown or cannot predict here
                 (:meth:`GpuModel.available` is ``False``; the message says
-                why: no usable GPU, an extension built without CUDA, or a
-                wgpu adapter that reassociates float additions, which would
+                why: no usable GPU, no CUDA runtime installed, or a wgpu
+                adapter that reassociates float additions, which would
                 change the predictions), or the model is a ``gblinear`` or
                 ``linear_tree`` model (which do not predict through the
                 forest).
@@ -884,7 +884,7 @@ class Booster(_SchemaState):
 class GpuModel:
     """A model laid out for GPU batch prediction, from
     :meth:`Booster.to_gpu`: on Metal (macOS), wgpu (Vulkan, Metal, DirectX
-    12), or CUDA (NVIDIA on Linux, in a build with the ``cuda`` feature).
+    12), or CUDA (NVIDIA on Linux, with ``hessboost[cuda]``).
     Wraps ``hessboost._hessboost.GpuModel`` with the same feature-name checks
     as :meth:`Booster.predict`; unlike a booster it holds no file state and
     cannot be pickled.
@@ -922,12 +922,11 @@ class GpuModel:
         on it: for Metal, a device with working compute pipelines (``False``
         off macOS); for wgpu, an adapter with 64-bit shader integers whose
         float additions passed the backend's addition-order check; for
-        ``"cuda:<ordinal>"``, an extension built on Linux with the ``cuda``
-        feature (the default wheels are not), a CUDA 12.8+ driver and that
-        NVIDIA device (compute capability 7.5 or newer). Training with
-        ``device`` needs the same GPU, except that wgpu also trains on an
-        adapter that fails the check. The first call per device sets its
-        backend up.
+        ``"cuda:<ordinal>"``, ``hessboost[cuda]`` on Linux, a CUDA 12.8+
+        driver and that NVIDIA device (compute capability 7.5 or newer).
+        Training with ``device`` needs the same GPU, except that wgpu also
+        trains on an adapter that fails the check. The first call per
+        device sets its backend up.
 
         Raises:
             HessboostError: ``device`` is not ``"metal"``, ``"wgpu"``,

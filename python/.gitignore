@@ -4,6 +4,8 @@ __pycache__/
 *.so
 *.pyd
 /dist
+/runtime-cuda/dist
+/runtime-cuda/target
 .pytest_cache/
 .ruff_cache/
 /.python-version

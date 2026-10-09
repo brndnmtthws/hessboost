@@ -6,7 +6,10 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - .gitattributes
       - .github/workflows/publish.yml
+      - .github/scripts/check-licenses.py
+      - .github/scripts/install-cuda-headers.sh
       - .github/scripts/install-lavapipe.sh
       - .github/scripts/test-wheel.sh
       - python/**
@@ -45,6 +48,8 @@ jobs:
             echo "tag ${GITHUB_REF_NAME}, root version ${root_version}, and Python binding version ${python_version} must match" >&2
             exit 1
           fi
+          # hessboost's `cuda` extra must pin this release's CUDA runtime.
+          uv run --no-project --with 'tomlkit>=0.13' python -c 'import release, sys; print(release.check_manifests(sys.argv[1]))' "${root_version}"
           cargo metadata --locked --format-version 1 --manifest-path python/Cargo.toml > /dev/null
           uv lock --check --directory python
       - name: Verify crate package contents
@@ -88,8 +93,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: manylinux x86_64, slug: manylinux-x86_64, runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: "2_28", ft_interpreter: /opt/python/cp314-cp314t/bin/python3.14t }
-          - { name: manylinux aarch64, slug: manylinux-aarch64, runner: ubuntu-26.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28", ft_interpreter: /opt/python/cp314-cp314t/bin/python3.14t }
+          # `cuda`: also hessboost-runtime-cuda, the extension with CUDA,
+          # which `hessboost[cuda]` installs (NVIDIA's Linux driver is
+          # glibc's, so manylinux only).
+          - { name: manylinux x86_64, slug: manylinux-x86_64, runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: "2_28", ft_interpreter: /opt/python/cp314-cp314t/bin/python3.14t, cuda: true }
+          - { name: manylinux aarch64, slug: manylinux-aarch64, runner: ubuntu-26.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28", ft_interpreter: /opt/python/cp314-cp314t/bin/python3.14t, cuda: true }
           # Alpine and other musl distributions cannot load manylinux wheels.
           # maturin-action's default musllinux image (rust-musl-cross) has no
           # /opt/python interpreters, so both musl builds use the pypa images.
@@ -117,15 +125,36 @@ jobs:
           container: ${{ matrix.container }}
           args: --release --locked --out dist
           working-directory: python
+      # Building the `cuda` feature needs CUDA 13's headers and libclang in
+      # maturin-action's manylinux container (install-cuda-headers.sh); the
+      # wheel loads the driver at run time and links nothing of CUDA's.
+      - name: Build CUDA runtime abi3 wheel
+        if: matrix.cuda
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+          working-directory: python/runtime-cuda
+          before-script-linux: |
+            CUDA_HOME="$(bash "$GITHUB_WORKSPACE/.github/scripts/install-cuda-headers.sh" /tmp/cuda-headers)"
+            export CUDA_HOME
       # Lavapipe runs the wgpu tests without a GPU (see ci.yml); the
       # musllinux wheels' Alpine test container installs Alpine's own below.
       - if: runner.os == 'Linux' && !matrix.musl
         run: sh .github/scripts/install-lavapipe.sh
-      # The latest-Python test runs first: "3" matches any installed 3.x, so
+      # The latest-Python tests run first: "3" matches any installed 3.x, so
       # only on a runner without managed Pythons does it fetch the newest one.
       - name: Test abi3 wheel on latest Python
         if: ${{ !matrix.musl }}
         run: sh ../.github/scripts/test-wheel.sh 3 'dist/*cp311-abi3*.whl'
+        working-directory: python
+      # The suite fails if the package does not run on the runtime's
+      # extension (tests/test_gpu.py); without a GPU, CUDA's device tests
+      # skip.
+      - name: Test abi3 wheel with the CUDA runtime on latest Python
+        if: matrix.cuda
+        run: sh ../.github/scripts/test-wheel.sh 3 'dist/*cp311-abi3*.whl runtime-cuda/dist/*cp311-abi3*.whl'
         working-directory: python
       - name: Test abi3 wheel on Python 3.11
         if: ${{ !matrix.musl }}
@@ -144,9 +173,24 @@ jobs:
           container: ${{ matrix.container }}
           args: --release --locked --out dist -i "${{ matrix.ft_interpreter || steps.ft-python.outputs.python-path }}"
           working-directory: python
+      - name: Build CUDA runtime free-threaded wheel
+        if: matrix.cuda
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist -i "${{ matrix.ft_interpreter }}"
+          working-directory: python/runtime-cuda
+          before-script-linux: |
+            CUDA_HOME="$(bash "$GITHUB_WORKSPACE/.github/scripts/install-cuda-headers.sh" /tmp/cuda-headers)"
+            export CUDA_HOME
       - name: Test free-threaded wheel
         if: ${{ !matrix.musl }}
         run: sh ../.github/scripts/test-wheel.sh 3.14t 'dist/*cp314-cp314t*.whl'
+        working-directory: python
+      - name: Test free-threaded wheel with the CUDA runtime
+        if: matrix.cuda
+        run: sh ../.github/scripts/test-wheel.sh 3.14t 'dist/*cp314-cp314t*.whl runtime-cuda/dist/*cp314-cp314t*.whl'
         working-directory: python
       # musllinux wheels do not install on the glibc runner: test both in
       # Alpine, against uv's musl builds of the same interpreters. The
@@ -174,6 +218,13 @@ jobs:
           path: python/dist/*.whl
           if-no-files-found: error
           retention-days: 7
+      - if: matrix.cuda
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-cuda-wheel-${{ matrix.slug }}
+          path: python/runtime-cuda/dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
 
   python-sdist:
     name: Python source distribution
@@ -189,10 +240,23 @@ jobs:
           command: sdist
           args: --out dist
           working-directory: python
+      # Building a wheel from it needs what the CUDA runtime wheels' builds
+      # install (install-cuda-headers.sh); making it needs nothing.
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: python/runtime-cuda
       - uses: actions/upload-artifact@v7
         with:
           name: python-sdist
           path: python/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-cuda-sdist
+          path: python/runtime-cuda/dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -215,28 +279,34 @@ jobs:
         run: |
           shopt -s nullglob
           files=(dist/*)
-          wheels=(dist/*.whl)
-          sdists=(dist/*.tar.gz)
-          [[ ${#wheels[@]} -eq 12 && ${#sdists[@]} -eq 1 && ${#files[@]} -eq 13 ]] || {
-            echo "Expected exactly twelve wheels and one sdist; found ${#wheels[@]} wheels, ${#sdists[@]} sdists, ${#files[@]} files." >&2
+          wheels=(dist/hessboost-*.whl)
+          cuda_wheels=(dist/hessboost_runtime_cuda-*.whl)
+          sdists=(dist/hessboost-*.tar.gz)
+          cuda_sdists=(dist/hessboost_runtime_cuda-*.tar.gz)
+          [[ ${#wheels[@]} -eq 12 && ${#cuda_wheels[@]} -eq 4 && ${#sdists[@]} -eq 1 && ${#cuda_sdists[@]} -eq 1 && ${#files[@]} -eq 18 ]] || {
+            echo "Expected exactly twelve hessboost wheels, four hessboost-runtime-cuda wheels, and an sdist of each; found ${#wheels[@]} and ${#cuda_wheels[@]} wheels, ${#sdists[@]} and ${#cuda_sdists[@]} sdists, ${#files[@]} files." >&2
             exit 1
           }
           expected=(
-            'cp311-abi3-manylinux_*_x86_64'
-            'cp311-abi3-manylinux_*_aarch64'
-            'cp311-abi3-musllinux_1_2_x86_64'
-            'cp311-abi3-musllinux_1_2_aarch64'
-            'cp311-abi3-macosx_*_arm64'
-            'cp311-abi3-win_amd64'
-            'cp314-cp314t-manylinux_*_x86_64'
-            'cp314-cp314t-manylinux_*_aarch64'
-            'cp314-cp314t-musllinux_1_2_x86_64'
-            'cp314-cp314t-musllinux_1_2_aarch64'
-            'cp314-cp314t-macosx_*_arm64'
-            'cp314-cp314t-win_amd64'
+            'hessboost-*cp311-abi3-manylinux_*_x86_64'
+            'hessboost-*cp311-abi3-manylinux_*_aarch64'
+            'hessboost-*cp311-abi3-musllinux_1_2_x86_64'
+            'hessboost-*cp311-abi3-musllinux_1_2_aarch64'
+            'hessboost-*cp311-abi3-macosx_*_arm64'
+            'hessboost-*cp311-abi3-win_amd64'
+            'hessboost-*cp314-cp314t-manylinux_*_x86_64'
+            'hessboost-*cp314-cp314t-manylinux_*_aarch64'
+            'hessboost-*cp314-cp314t-musllinux_1_2_x86_64'
+            'hessboost-*cp314-cp314t-musllinux_1_2_aarch64'
+            'hessboost-*cp314-cp314t-macosx_*_arm64'
+            'hessboost-*cp314-cp314t-win_amd64'
+            'hessboost_runtime_cuda-*cp311-abi3-manylinux_*_x86_64'
+            'hessboost_runtime_cuda-*cp311-abi3-manylinux_*_aarch64'
+            'hessboost_runtime_cuda-*cp314-cp314t-manylinux_*_x86_64'
+            'hessboost_runtime_cuda-*cp314-cp314t-manylinux_*_aarch64'
           )
           for tag in "${expected[@]}"; do
-            compgen -G "dist/*${tag}*.whl" > /dev/null || { echo "Missing wheel matching ${tag}" >&2; exit 1; }
+            compgen -G "dist/${tag}*.whl" > /dev/null || { echo "Missing wheel matching ${tag}" >&2; exit 1; }
           done
       - uses: astral-sh/setup-uv@v10.2.0
         with:
@@ -249,8 +319,22 @@ jobs:
       - name: Check wheel contents
         run: |
           shopt -s extglob
-          uvx check-wheel-contents dist/!(*musllinux*).whl
-          uvx check-wheel-contents --toplevel hessboost,hessboost.libs --ignore W010 dist/*musllinux*.whl
+          uvx check-wheel-contents dist/hessboost-!(*musllinux*).whl
+          uvx check-wheel-contents --toplevel hessboost,hessboost.libs --ignore W010 dist/hessboost-*musllinux*.whl
+          uvx check-wheel-contents --toplevel _hessboost_runtime_cuda dist/hessboost_runtime_cuda-*.whl
+      # Apache-2.0 section 4(a): every distribution carries the license
+      # text, which the wheels take from python/LICENSE.txt and
+      # python/runtime-cuda/LICENSE.txt, copies of the root LICENSE.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            LICENSE
+            .github/scripts/check-licenses.py
+          sparse-checkout-cone-mode: false
+          path: repo
+      - name: Check license files
+        run: python3 repo/.github/scripts/check-licenses.py repo/LICENSE dist/*
 
   crates-publish:
     name: Publish crate to crates.io
@@ -312,11 +396,24 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: python-*
-          path: dist
+          pattern: python-cuda-*
+          path: dist/cuda
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-{wheel-*,sdist}
+          path: dist/hessboost
+          merge-multiple: true
+      # The CUDA runtime first: hessboost's `cuda` extra pins this release
+      # of it, which is then on PyPI whenever hessboost is.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          packages-dir: dist/cuda
+          attestations: true
+          skip-existing: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/hessboost
           attestations: true
           skip-existing: true
 

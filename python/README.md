@@ -475,7 +475,8 @@ models save and load like `DiffusionModel`s.
 Three GPU backends reproduce the CPU's results bit for bit: native Metal
 (`"metal"`, macOS), wgpu (`"wgpu"`: Vulkan on Linux and Windows, Metal on
 macOS, DirectX 12 on Windows), and NVIDIA CUDA (`"cuda"` or
-`"cuda:<ordinal>"`, Linux). `Booster.to_gpu()` lays a model out for batch
+`"cuda:<ordinal>"`, Linux, in a build with the `cuda` feature; see below).
+`Booster.to_gpu()` lays a model out for batch
 prediction (on Metal on macOS and on wgpu elsewhere; `to_gpu("wgpu")` asks
 for wgpu, `to_gpu("cuda:1")` for the second NVIDIA GPU): the forest
 uploads once, and each call predicts bit-identically to `Booster.predict`
@@ -507,14 +508,18 @@ as Mesa's lavapipe (correct, but slower than the CPU) only when there is no
 other; `GpuModel.device_name("wgpu")` names the adapter it picked, and the
 `WGPU_ADAPTER_NAME` environment variable picks one by name.
 
-Linux wheels include CUDA support with its kernels compiled in (Rust,
-compiled to PTX by cuda-oxide), but do not bundle the NVIDIA driver.
-Building and importing a wheel needs no CUDA toolkit, and neither does
-running it: CUDA needs only an NVIDIA GPU of compute capability 7.5
-(Turing) or newer and a driver supporting CUDA 12.8 or newer, which
-compiles the kernels for the GPU on first use and caches them. A missing
-driver or device returns an error rather than silently predicting on the
-CPU.
+The published wheels and the source distribution leave CUDA out, so
+installing them never needs CUDA. CUDA support (kernels compiled in:
+Rust, compiled to PTX by cuda-oxide) comes from building hessboost-python
+from source on Linux with its `cuda` feature, e.g.
+`MATURIN_PEP517_ARGS="--features cuda" pip install --no-binary hessboost
+hessboost` or `maturin build --features cuda`; that build needs CUDA 13's
+driver and cuRAND headers and libclang. Running it needs no CUDA toolkit,
+only an NVIDIA GPU of compute capability 7.5 (Turing) or newer and a
+driver supporting CUDA 12.8 or newer, which compiles the kernels for the
+GPU on first use and caches them. A missing driver or device, or an
+extension built without CUDA, returns an error rather than silently
+predicting on the CPU.
 
 ```python
 if GpuModel.available("cuda"):
@@ -624,7 +629,8 @@ LightGBM's `rank_xendcg` stream.
   leaf ranges start at iteration 0; `pred_leaf` defaults to every iteration
   instead, and returns `int32`.
 - GPUs: besides XGBoost's `device="cuda"`/`"cuda:<ordinal>"` (NVIDIA on
-  Linux), `device="metal"` (macOS) and `device="wgpu"` train on a GPU.
+  Linux, in a build with the `cuda` feature), `device="metal"` (macOS) and
+  `device="wgpu"` train on a GPU.
   Prediction does not follow the training device: `Booster.to_gpu(device)`
   lays the model out for GPU batch prediction (`GpuModel.predict`,
   bit-identical to `Booster.predict`), taking the same GPU `device` strings.

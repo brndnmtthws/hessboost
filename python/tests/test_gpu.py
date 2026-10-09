@@ -1,9 +1,12 @@
 """GPU training and batch prediction: Metal, wgpu and CUDA. Device tests
 skip without a usable backend; HESSBOOST_REQUIRE_WGPU/CUDA forbid skips.
-CUDA is dynamically loaded on Linux and needs only a driver and a GPU."""
+CUDA needs an extension built on Linux with hessboost-python's ``cuda``
+feature (off by default); it loads the driver at run time and needs only a
+driver and a GPU."""
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -19,12 +22,34 @@ from hessboost import Booster, DMatrix, GpuModel, HessboostError, IncompatibleMo
 Device: TypeAlias = Literal["metal", "wgpu", "cuda"]
 DEVICES: list[Device] = ["metal", "wgpu", "cuda"]
 
+# Part of the refusal of an extension built without the `cuda` feature.
+BUILT_WITHOUT_CUDA = "extension was built without CUDA"
+
+
+@functools.cache
+def refusal(device: Device) -> str | None:
+    """Why ``device`` cannot predict here (``to_gpu``'s refusal of a forest
+    model), or ``None`` when it can."""
+    if GpuModel.available(device):
+        return None
+    x, y = regression(rows=100)
+    booster = hessboost.train({}, DMatrix(x, y), 1, verbose_eval=False)
+    with pytest.raises(HessboostError) as refused:
+        booster.to_gpu(device)
+    return str(refused.value)
+
 
 def needs(device: Device) -> None:
-    """Skips the calling test when ``device`` cannot predict here (the guard
-    below fails on a wgpu adapter that only trains)."""
-    if not GpuModel.available(device):
-        pytest.skip(f"no {device} GPU here")
+    """Skips the calling test, with the reason, when ``device`` cannot
+    predict here (the guards below fail on a wgpu adapter that only trains
+    and on a CUDA kernel-load error); under ``HESSBOOST_REQUIRE_CUDA``, an
+    unavailable CUDA fails instead."""
+    reason = refusal(device)
+    if reason is None:
+        return
+    if device == "cuda" and "HESSBOOST_REQUIRE_CUDA" in os.environ:
+        pytest.fail(f"HESSBOOST_REQUIRE_CUDA is set but CUDA cannot predict here: {reason}")
+    pytest.skip(f"{device} cannot predict here: {reason}")
 
 
 @pytest.fixture(scope="module")
@@ -60,14 +85,23 @@ def test_wgpu_is_available_or_the_machine_has_no_adapter(
         hessboost.train({"device": "wgpu"}, DMatrix(x, y), 1)
 
 
-def test_cuda_is_available_or_missing_runtime(trained: tuple[Booster, np.ndarray]) -> None:
-    """A kernel-load error is never a valid device-test skip."""
-    if GpuModel.available("cuda"):
+def test_cuda_is_available_or_missing_runtime() -> None:
+    """A kernel-load error is never a valid device-test skip, and under
+    ``HESSBOOST_REQUIRE_CUDA`` nothing is. An extension built without the
+    ``cuda`` feature (the default) refuses CUDA prediction and training,
+    saying so."""
+    reason = refusal("cuda")
+    if reason is None:
         return
-    with pytest.raises(HessboostError) as refused:
-        trained[0].to_gpu("cuda")
-    reason = str(refused.value)
-    assert "HESSBOOST_REQUIRE_CUDA" not in os.environ, reason
+    assert "HESSBOOST_REQUIRE_CUDA" not in os.environ, (
+        f"HESSBOOST_REQUIRE_CUDA is set but CUDA prediction is unavailable: {reason}"
+    )
+    assert GpuModel.device_name("cuda") is None
+    if BUILT_WITHOUT_CUDA in reason:
+        x, y = regression(rows=100)
+        with pytest.raises(HessboostError, match="requires building with the `cuda` feature"):
+            hessboost.train({"device": "cuda"}, DMatrix(x, y), 1)
+        return
     assert any(
         expected in reason
         for expected in (
@@ -75,10 +109,8 @@ def test_cuda_is_available_or_missing_runtime(trained: tuple[Booster, np.ndarray
             "the NVIDIA driver supports CUDA",
             "has compute capability",
             "no CUDA device",
-            "only available on Linux",
         )
-    ), reason
-    assert GpuModel.device_name("cuda") is None
+    ), f"CUDA prediction is unavailable: {reason}"
 
 
 def test_cuda_ordinals_are_spelled_as_in_training(trained: tuple[Booster, np.ndarray]) -> None:

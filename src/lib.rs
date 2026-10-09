@@ -223,8 +223,9 @@
 //!     prediction ([`to_cuda`](model::BoostedModel::to_cuda)) and training
 //!     ([`device`](config::TrainingParams::device) = `cuda`/`cuda:<n>`;
 //!     exact integer sums or the CPU's ordered `f64` sums, CPU fallback
-//!     for the rest), with the driver loaded at run time and no CUDA
-//!     toolkit needed ([`backend::cuda`]).
+//!     for the rest), with the driver loaded at run time; building the
+//!     feature needs CUDA 13's headers and libclang, running it no CUDA
+//!     toolkit ([`backend::cuda`]).
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,

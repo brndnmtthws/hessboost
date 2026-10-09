@@ -374,10 +374,10 @@ impl Booster {
     }
 
     /// Lays this model out for GPU batch prediction on `device` (`"metal"`
-    /// on macOS, `"wgpu"` anywhere, `"cuda"`/`"cuda:<ordinal>"` on Linux;
-    /// `None`: Metal on macOS, wgpu elsewhere). `gblinear` and
-    /// `linear_tree` models are refused, as they do not predict through
-    /// the forest.
+    /// on macOS, `"wgpu"` anywhere, `"cuda"`/`"cuda:<ordinal>"` on Linux
+    /// with the `cuda` feature; `None`: Metal on macOS, wgpu elsewhere).
+    /// `gblinear` and `linear_tree` models are refused, as they do not
+    /// predict through the forest.
     fn to_gpu(&self, py: Python<'_>, device: Option<&str>) -> PyResult<GpuModel> {
         GpuModel::build(py, &self.model, device)
     }

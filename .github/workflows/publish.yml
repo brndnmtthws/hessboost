@@ -69,6 +69,10 @@ jobs:
       - if: runner.os == 'Linux'
         run: sh .github/scripts/install-lavapipe.sh
       - uses: jdx/mise-action@v4
+      # The CUDA 13 headers and libclang `--features cuda` builds with (see
+      # ci.yml).
+      - if: runner.os == 'Linux'
+        run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: publish-test-${{ matrix.name }}
@@ -264,6 +268,9 @@ jobs:
       # No compiler cache: the published crate must not depend on restored
       # build outputs.
       - uses: jdx/mise-action@v4
+      # `cargo publish --all-features` verifies the package with `cuda`
+      # (see ci.yml's clippy job).
+      - run: bash .github/scripts/install-cuda-headers.sh
       - name: Select crates.io authentication method
         id: auth-mode
         env:

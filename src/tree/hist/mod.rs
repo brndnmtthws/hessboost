@@ -94,15 +94,59 @@ pub trait HistogramBackend: Send + Sync {
 /// `offset` of the engine's row buffer; `contiguous` when they are one run
 /// of consecutive rows (which, on a column-major index, chooses the CPU's
 /// order: [`sum_order`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Only an engine issues segments: [`RowEngine::begin_tree`] the root, and
+/// [`RowEngine::partition`] the two children of each segment it consumes.
+/// A segment is neither `Copy` nor `Clone`, and [`RowEngine::add_leaf_values`]
+/// consumes the leaves', so the segments a caller holds never overlap: no
+/// two splits partition one row, and no two leaves add to one margin. Each
+/// carries its tree's stamp, so one from a tree the engine has since
+/// replaced is refused.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Segment {
-    pub(crate) offset: usize,
-    pub(crate) len: usize,
-    #[cfg_attr(
-        not(all(target_os = "linux", feature = "cuda")),
-        allow(dead_code, reason = "only the CUDA row engine reads the contiguity")
-    )]
-    pub(crate) contiguous: bool,
+    offset: usize,
+    len: usize,
+    contiguous: bool,
+    tree: u64,
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "cuda")),
+    allow(
+        dead_code,
+        reason = "only the CUDA row engine issues and reads segments"
+    )
+)]
+impl Segment {
+    /// A segment of tree `tree`'s rows (row engines only).
+    pub(crate) fn issue(offset: usize, len: usize, contiguous: bool, tree: u64) -> Self {
+        Self {
+            offset,
+            len,
+            contiguous,
+            tree,
+        }
+    }
+
+    /// The first row's position in the engine's row buffer.
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// The number of rows.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the rows are one run of consecutive rows.
+    pub(crate) fn contiguous(&self) -> bool {
+        self.contiguous
+    }
+
+    /// The stamp of the tree the segment belongs to.
+    pub(crate) fn tree(&self) -> u64 {
+        self.tree
+    }
 }
 
 /// Where a split sends a row's present bin of the split feature; a missing
@@ -119,8 +163,9 @@ pub enum RowRule<'a> {
     Table(&'a [bool]),
 }
 
-/// One node to partition: its rows and how its split routes them.
-#[derive(Debug, Clone, Copy)]
+/// One node to partition: its rows (consumed) and how its split routes
+/// them.
+#[derive(Debug)]
 #[cfg_attr(
     not(all(target_os = "linux", feature = "cuda")),
     allow(dead_code, reason = "only the CUDA row engine reads the split")
@@ -135,7 +180,7 @@ pub struct RowSplit<'a> {
 /// A partitioned node: the left child holds the segment's first rows, the
 /// right child the rest, both in ascending order, each segment recording
 /// whether its rows are a run of consecutive rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Partitioned {
     pub(crate) left: Segment,
     pub(crate) right: Segment,
@@ -147,13 +192,15 @@ pub struct Partitioned {
 /// histogram equals [`CpuBackend::build`]'s of the same rows bit for bit,
 /// and partitions are stable, so the tree is the host builder's.
 ///
-/// Every method returns `None` after a device failure; the builder then
-/// regrows the tree on the host (or, when the device also holds the
-/// gradients, the trainer redoes the round on the host).
+/// Every method returns `None` when the device does not run the call (it
+/// refused it, an allocation did not fit, or the device failed); the
+/// builder then regrows the tree on the host (or, when the device also
+/// holds the gradients, the trainer redoes the round on the host).
 pub trait RowEngine: Sync {
-    /// Start a tree over `rows` (ascending, distinct), with the gradients
-    /// staged ([`HistogramBackend::prepare`], or [`Self::gradients`]):
-    /// the root's segment.
+    /// Start a tree over `rows` (ascending, distinct; refused otherwise),
+    /// with the gradients staged ([`HistogramBackend::prepare`], or
+    /// [`Self::gradients`]): the root's segment. Segments of earlier trees
+    /// are refused from then on.
     fn begin_tree(&self, ghist: &GHistIndex, rows: &[u32]) -> Option<Segment>;
 
     /// The statistics of `seg`'s rows (`rows`, their host copy), the host
@@ -165,11 +212,12 @@ pub trait RowEngine: Sync {
         &self,
         gpair: Option<&[GradPair]>,
         rows: &[u32],
-        seg: Segment,
+        seg: &Segment,
     ) -> Option<GradStats>;
 
-    /// Partition each split's segment in place (stable), in one batch.
-    fn partition(&self, ghist: &GHistIndex, splits: &[RowSplit<'_>]) -> Option<Vec<Partitioned>>;
+    /// Partition each split's segment in place (stable), in one batch,
+    /// consuming the segments: the children replace them.
+    fn partition(&self, ghist: &GHistIndex, splits: Vec<RowSplit<'_>>) -> Option<Vec<Partitioned>>;
 
     /// The histograms of the nodes, in one batch. `gpair` is the host copy
     /// of the staged gradients, `None` when only the device has them.
@@ -177,11 +225,11 @@ pub trait RowEngine: Sync {
         &self,
         ghist: &GHistIndex,
         gpair: Option<&[GradPair]>,
-        nodes: &[Segment],
+        nodes: &[&Segment],
     ) -> Option<Vec<Histogram>>;
 
     /// The row ids of each segment.
-    fn rows(&self, segs: &[Segment]) -> Option<Vec<Vec<u32>>>;
+    fn rows(&self, segs: &[&Segment]) -> Option<Vec<Vec<u32>>>;
 
     /// Start a margin run, invalidating any cached labels and weights.
     fn load_margins(&self, margins: &[f32]) -> Option<()>;
@@ -193,8 +241,9 @@ pub trait RowEngine: Sync {
     /// until the next [`Self::load_margins`] call.
     fn gradients(&self, loss: DeviceLoss, labels: &[f32], weights: Option<&[f32]>) -> Option<bool>;
 
-    /// Add each leaf's value to the device margins of its rows.
-    fn add_leaf_values(&self, leaves: &[(Segment, f32)]) -> Option<()>;
+    /// Add each leaf's value to the device margins of its rows, consuming
+    /// the leaves' segments.
+    fn add_leaf_values(&self, leaves: Vec<(Segment, f32)>) -> Option<()>;
 
     /// Copy the device margins into `out`.
     fn read_margins(&self, out: &mut [f32]) -> Option<()>;
@@ -212,7 +261,7 @@ pub trait RowEngine: Sync {
         &self,
         ghist: &GHistIndex,
         gpair: Option<&[GradPair]>,
-        nodes: &[(Segment, HistSlot)],
+        nodes: &[(&Segment, HistSlot)],
         siblings: &[(HistSlot, HistSlot)],
     ) -> Option<()>;
 

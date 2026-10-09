@@ -1,9 +1,10 @@
 //! `GpuModel`: Metal, wgpu or NVIDIA CUDA batch prediction.
 //!
 //! wgpu is compiled into every wheel, Metal into macOS wheels and CUDA
-//! into Linux wheels. Drivers are loaded at run time; absence never
-//! prevents importing the package. Forests upload once; prediction
-//! preserves CPU bits, with CPU objective transforms and model shrinkage.
+//! only into Linux builds with this crate's opt-in `cuda` feature. Drivers
+//! are loaded at run time; absence never prevents importing the package.
+//! Forests upload once; prediction preserves CPU bits, with CPU objective
+//! transforms and model shrinkage.
 
 use crate::booster::{dense, iterations};
 use crate::data::{DMatrix, to_numpy};
@@ -25,7 +26,8 @@ enum Backend {
     Metal,
     /// wgpu over Vulkan, Metal, or DirectX 12.
     Wgpu,
-    /// NVIDIA CUDA on Linux, on the device `ordinal` (`"cuda:<ordinal>"`).
+    /// NVIDIA CUDA (Linux, `cuda` feature), on the device `ordinal`
+    /// (`"cuda:<ordinal>"`).
     Cuda { ordinal: usize },
 }
 
@@ -63,9 +65,9 @@ impl Backend {
             #[cfg(not(target_os = "macos"))]
             Self::Metal => false,
             Self::Wgpu => wgpu::prediction_available(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             Self::Cuda { ordinal } => hessboost::backend::cuda::prediction_available(ordinal),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", feature = "cuda")))]
             Self::Cuda { .. } => false,
         }
     }
@@ -78,9 +80,9 @@ impl Backend {
             #[cfg(not(target_os = "macos"))]
             Self::Metal => None,
             Self::Wgpu => wgpu::device_name(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             Self::Cuda { ordinal } => hessboost::backend::cuda::prediction_device_name(ordinal),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", feature = "cuda")))]
             Self::Cuda { .. } => None,
         }
     }
@@ -91,7 +93,7 @@ enum Predictor {
     #[cfg(target_os = "macos")]
     Metal(hessboost::backend::metal::GpuModel),
     Wgpu(wgpu::GpuModel),
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
     Cuda(hessboost::backend::cuda::GpuModel),
 }
 
@@ -110,11 +112,13 @@ impl Predictor {
                 ))
             }
             Backend::Wgpu => py.detached(|| model.to_wgpu()).map(Self::Wgpu),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             Backend::Cuda { ordinal } => py.detached(|| model.to_cuda(ordinal)).map(Self::Cuda),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", feature = "cuda")))]
             Backend::Cuda { ordinal } => Err(refuse(format!(
-                "CUDA GPU prediction (device \"cuda:{ordinal}\") is only available on Linux"
+                "CUDA GPU prediction (device \"cuda:{ordinal}\") is unavailable: this \
+                 hessboost extension was built without CUDA (hessboost-python's `cuda` \
+                 feature, Linux only)"
             ))),
         }
     }
@@ -124,7 +128,7 @@ impl Predictor {
             #[cfg(target_os = "macos")]
             Self::Metal(gpu) => gpu.model(),
             Self::Wgpu(gpu) => gpu.model(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             Self::Cuda(gpu) => gpu.model(),
         }
     }
@@ -135,7 +139,7 @@ impl Predictor {
             #[cfg(target_os = "macos")]
             Self::Metal(_) => "metal",
             Self::Wgpu(_) => "wgpu",
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             Self::Cuda(_) => "cuda",
         }
     }
@@ -154,9 +158,9 @@ impl Predictor {
             Self::Metal(gpu) => gpu.predict(data, iterations),
             Self::Wgpu(gpu) if margin => gpu.predict_margin(data, iterations),
             Self::Wgpu(gpu) => gpu.predict(data, iterations),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             Self::Cuda(gpu) if margin => gpu.predict_margin(data, iterations),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
             Self::Cuda(gpu) => gpu.predict(data, iterations),
         }
     }
@@ -186,7 +190,8 @@ impl GpuModel {
     /// Metal, a device with working compute pipelines (`false` off macOS);
     /// for wgpu, an adapter with 64-bit shader integers that passed the
     /// addition-order probe; for CUDA, a driver and device that load the
-    /// prediction kernels (`false` off Linux).
+    /// prediction kernels (`false` unless built on Linux with the `cuda`
+    /// feature).
     #[staticmethod]
     fn available(py: Python<'_>, device: Option<&str>) -> PyResult<bool> {
         let backend = Backend::parse(device)?;

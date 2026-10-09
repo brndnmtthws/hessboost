@@ -2,15 +2,15 @@
 //! one packed winner readback per node. Sorting workspaces are reused in
 //! waves; histograms and unchosen feature results never cross the device.
 
+use super::driver::{self, Error, LaunchConfig, StreamExt};
 use super::{
-    CudaHistBackend, CudaSlice, CudaStream, DriverError, LaunchConfig, Pinned, SCAN_WARPS, abi,
-    bytes_of, download_pinned, fit, pinned,
+    CudaHistBackend, CudaStream, DeviceBuffer, Pinned, SCAN_WARPS, abi, bytes_of, download_pinned,
+    fit, pinned,
 };
 use crate::backend::cuda::diagnostics::ScanDiagnostics;
 use crate::data::ghist::GHistIndex;
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::hist::{NodeScan, ScanFallback, ScanRequest};
-use cudarc::driver::PushKernelArg;
 use std::sync::Arc;
 
 /// Entries of the ordinary sorting workspace: keys plus two index buffers,
@@ -26,21 +26,21 @@ const HEADER_WORDS: usize = 7;
 /// Reused sorting scratch, device results and pinned output (descriptors
 /// travel in the backend's packed descriptor buffer).
 pub(super) struct ScanState {
-    numeric_meta: CudaSlice<u32>,
-    numeric_acc: CudaSlice<f64>,
-    categorical_tasks: CudaSlice<u64>,
-    keys: CudaSlice<f32>,
-    order: [CudaSlice<u32>; 2],
-    categorical_meta: CudaSlice<u32>,
-    categorical_children: CudaSlice<f64>,
-    categorical_sets: CudaSlice<u32>,
-    out: CudaSlice<u64>,
+    numeric_meta: DeviceBuffer<u32>,
+    numeric_acc: DeviceBuffer<f64>,
+    categorical_tasks: DeviceBuffer<u64>,
+    keys: DeviceBuffer<f32>,
+    order: [DeviceBuffer<u32>; 2],
+    categorical_meta: DeviceBuffer<u32>,
+    categorical_children: DeviceBuffer<f64>,
+    categorical_sets: DeviceBuffer<u32>,
+    out: DeviceBuffer<u64>,
     pin: Option<Pinned<u64>>,
     diagnostics: ScanDiagnostics,
 }
 
 impl ScanState {
-    pub(super) fn new(stream: &Arc<CudaStream>) -> std::result::Result<Self, DriverError> {
+    pub(super) fn new(stream: &Arc<CudaStream>) -> driver::Result<Self> {
         Ok(Self {
             numeric_meta: stream.alloc_zeros(4)?,
             numeric_acc: stream.alloc_zeros(2)?,
@@ -89,17 +89,20 @@ impl CudaHistBackend {
         slot: u32,
         hist: &[GradStats],
     ) -> Option<()> {
+        use super::driver::Slice;
         let mut state = self.lock()?;
         if slot as usize >= state.pool_slots || hist.len() != self.total_bins {
             return None;
         }
         let flat: Vec<_> = hist.iter().flat_map(|s| [s.grad, s.hess]).collect();
         let offset = slot as usize * self.total_bins * 2;
-        let copied = super::copy_host(
-            &self.device.stream,
-            &flat,
-            &mut state.pool.slice_mut(offset..offset + flat.len()),
-        );
+        let copied = match state.pool.as_mut() {
+            Some(pool) => self
+                .device
+                .stream
+                .write_sync(&flat, &mut pool.slice_mut(offset..offset + flat.len())),
+            None => Err(Error::Refused("no histogram slots reserved")),
+        };
         self.ok(copied)
     }
 
@@ -185,7 +188,11 @@ impl CudaHistBackend {
             max_delta_step: reg.max_delta_step,
             min_child_weight: reg.min_child_weight,
         };
-        let scanned = (|| {
+        let scanned = (|| -> driver::Result<Vec<NodeScan>> {
+            let hists = state
+                .pool
+                .as_ref()
+                .ok_or(Error::Refused("no histogram slots reserved"))?;
             let scan = &mut state.scan;
             let staging = &mut state.staging;
             let pool = &device.pinned;
@@ -211,8 +218,8 @@ impl CudaHistBackend {
                 fit(stream, &mut scan.numeric_acc, 2 * n_numeric)?;
             }
             let numeric_out = abi::NumericResults {
-                meta: abi::ptr_mut(&mut scan.numeric_meta, stream),
-                acc: abi::ptr_mut(&mut scan.numeric_acc, stream),
+                meta: abi::ptr_mut(&mut scan.numeric_meta),
+                acc: abi::ptr_mut(&mut scan.numeric_acc),
             };
             if n_numeric > 0 {
                 let work = abi::NumericTasks {
@@ -225,7 +232,7 @@ impl CudaHistBackend {
                 };
                 let mut launch = stream.launch_builder(&device.kernels.scan_splits);
                 launch
-                    .arg(&state.pool)
+                    .arg(hists)
                     .arg(&state.feature_first)
                     .arg(&total_bins)
                     .arg(&work)
@@ -278,7 +285,7 @@ impl CudaHistBackend {
                     }
                     let n_tasks = (next - begin) as u32;
                     let wave = abi::CategoryTasks {
-                        tasks: abi::ptr(&scan.categorical_tasks, stream),
+                        tasks: abi::ptr(&scan.categorical_tasks),
                         n_tasks,
                     };
                     let sort_config = LaunchConfig {
@@ -287,11 +294,11 @@ impl CudaHistBackend {
                         shared_mem_bytes: 0,
                     };
                     let sort = abi::SortWorkspace {
-                        keys: abi::ptr_mut(&mut scan.keys, stream),
-                        order: abi::ptr_mut(&mut scan.order[0], stream),
+                        keys: abi::ptr_mut(&mut scan.keys),
+                        order: abi::ptr_mut(&mut scan.order[0]),
                     };
                     let mut keys = stream.launch_builder(&device.kernels.category_keys);
-                    keys.arg(&state.pool)
+                    keys.arg(hists)
                         .arg(&state.feature_first)
                         .arg(&total_bins)
                         .arg(&wave)
@@ -326,20 +333,20 @@ impl CudaHistBackend {
                         width *= 2;
                     }
                     let work = abi::CategoricalTasks {
-                        tasks: abi::ptr(&scan.categorical_tasks, stream),
+                        tasks: abi::ptr(&scan.categorical_tasks),
                         n_tasks: u64::from(n_tasks),
                         totals: d_totals,
                         params: d_params,
                         exact,
                     };
                     let out = abi::CategoricalResults {
-                        meta: abi::ptr_mut(&mut scan.categorical_meta, stream),
-                        children: abi::ptr_mut(&mut scan.categorical_children, stream),
-                        sets: abi::ptr_mut(&mut scan.categorical_sets, stream),
+                        meta: abi::ptr_mut(&mut scan.categorical_meta),
+                        children: abi::ptr_mut(&mut scan.categorical_children),
+                        sets: abi::ptr_mut(&mut scan.categorical_sets),
                     };
                     let mut search = stream.launch_builder(&device.kernels.scan_categorical);
                     search
-                        .arg(&state.pool)
+                        .arg(hists)
                         .arg(&state.feature_first)
                         .arg(&total_bins)
                         .arg(&work)
@@ -352,9 +359,9 @@ impl CudaHistBackend {
                 }
             }
             let categorical_out = abi::CategoricalResults {
-                meta: abi::ptr_mut(&mut scan.categorical_meta, stream),
-                children: abi::ptr_mut(&mut scan.categorical_children, stream),
-                sets: abi::ptr_mut(&mut scan.categorical_sets, stream),
+                meta: abi::ptr_mut(&mut scan.categorical_meta),
+                children: abi::ptr_mut(&mut scan.categorical_children),
+                sets: abi::ptr_mut(&mut scan.categorical_sets),
             };
             let count = requests.len() as u64;
             let mut merge = stream.launch_builder(&device.kernels.merge_scans);
@@ -370,7 +377,7 @@ impl CudaHistBackend {
             // disjoint spans large enough for their maximum chosen set; one
             // warp per node (the kernel strides over nodes).
             unsafe { merge.launch(scan_config(requests.len())) }?;
-            let readback = pinned(pool, stream, &mut scan.pin, output_words, false)?;
+            let readback = pinned(pool, stream, &mut scan.pin, output_words)?;
             let packed = download_pinned(stream, readback, &scan.out, output_words)?;
             staging.synced();
             let counts = &mut scan.diagnostics;

@@ -1,23 +1,32 @@
 //! Host-side plumbing shared by GPU backends. Metal/wgpu share histogram
-//! staging and full-batch plans; all backends share forest validation and
-//! bounded row materialization.
+//! staging and the bound on a full-batch dense row copy; wgpu and CUDA share
+//! host-side leaf weighting; all backends share forest validation, the
+//! margin prediction prologue, and bounded row materialization.
 
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 use std::ops::Range;
 
 use rayon::prelude::*;
 
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    feature = "wgpu",
+    all(target_os = "linux", feature = "cuda")
+))]
 use crate::backend::exact_sum::SumDomain;
 use crate::data::DMatrix;
 #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 use crate::data::ghist::GHistIndex;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 use crate::model::{Iterations, Predictions, initial_margins};
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    feature = "wgpu",
+    all(target_os = "linux", feature = "cuda")
+))]
 use crate::objective::GradPair;
+#[cfg(any(feature = "wgpu", all(target_os = "linux", feature = "cuda")))]
+use crate::tree::compact::GpuForestParts;
 #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 use crate::tree::gain::GradStats;
 
@@ -63,7 +72,11 @@ impl IndexShape {
 /// histogram backend has staged: a node goes to the GPU only when the slice
 /// it is built from is the staged one and its sums are exact on both paths
 /// (see `backend::exact_sum`).
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    feature = "wgpu",
+    all(target_os = "linux", feature = "cuda")
+))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StagedSlice {
     /// (address, length) identity of the staged slice; length 0 when
@@ -74,9 +87,14 @@ pub(crate) struct StagedSlice {
     hess: SumDomain,
 }
 
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "metal"),
+    feature = "wgpu",
+    all(target_os = "linux", feature = "cuda")
+))]
 impl StagedSlice {
     /// Nothing staged.
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
     pub(crate) const NONE: Self = Self {
         addr: 0,
         len: 0,
@@ -84,7 +102,9 @@ impl StagedSlice {
         hess: SumDomain::EMPTY,
     };
 
-    /// The identity and statistics of `gpair`, about to be staged.
+    /// The identity and statistics of `gpair`, about to be staged (folded
+    /// on Rayon's pool for a long slice, so never under a lock that pool
+    /// work could need).
     pub(crate) fn of(gpair: &[GradPair]) -> Self {
         Self {
             addr: gpair.as_ptr().addr(),
@@ -99,20 +119,29 @@ impl StagedSlice {
         self.len != 0 && self.len == gpair.len() && self.addr == gpair.as_ptr().addr()
     }
 
+    /// The staged pairs' gradient and Hessian statistics.
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    pub(crate) fn domains(&self) -> (SumDomain, SumDomain) {
+        (self.grad, self.hess)
+    }
+
     /// Whether every sum of at most `n` staged gradient pairs is exact on
     /// both paths.
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
     pub(crate) fn sums_exact(&self, n: usize) -> bool {
         self.grad.sums_exact(n) && self.hess.sums_exact(n)
     }
 
     /// `p` in grains, the integers the kernels sum: integer multiples of
     /// each component's grain, exact whenever a node's sums can be.
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
     pub(crate) fn units(&self, p: GradPair) -> [i64; 2] {
         [self.grad.units(p.grad), self.hess.units(p.hess)]
     }
 
     /// A bin's GPU sums in grains back in value space, exactly (sums below
     /// `2^53` grains, scaled by a power of two).
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
     pub(crate) fn bin(&self, [grad, hess]: [i64; 2]) -> GradStats {
         GradStats {
             grad: self.grad.value(grad),
@@ -126,6 +155,7 @@ impl StagedSlice {
     /// each and sums inside a `u32`). Past it the node runs on the CPU
     /// backend (or, on Metal, the register kernels), whose sums are exact by
     /// the same argument.
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
     pub(crate) fn scatter_row_bound(&self) -> usize {
         let bound = |domain: &SumDomain| -> u64 {
             let max = domain.max_units();
@@ -166,7 +196,6 @@ pub(crate) fn ensure_forest_model(model: &BoostedModel) -> Result<()> {
 }
 
 /// What a GPU margin prediction leaves to the backend's forest walk.
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
 pub(crate) enum MarginPlan {
     /// The margins, computed without the GPU: on the CPU for a model with
     /// model shrinkage (whose per-iteration shrink-then-add arithmetic
@@ -182,10 +211,10 @@ pub(crate) enum MarginPlan {
 }
 
 /// Everything a GPU margin prediction of `data` from `iterations` does
-/// before the forest walk: the CPU path for shrunk models, the data and
-/// iteration checks, the base margins, and the bound on the dense row copy
-/// the backends upload ([`materialize_rows`]).
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+/// before the forest walk, the same for every backend: the CPU path for
+/// shrunk models, the data and iteration checks, the base margins, and the
+/// empty batch or tree range. Bounds on the backend's own buffers (Metal and
+/// wgpu: `ensure_dense_copy_fits`) come after it.
 pub(crate) fn plan_margins(
     model: &BoostedModel,
     data: &DMatrix,
@@ -197,7 +226,6 @@ pub(crate) fn plan_margins(
     model.validate_prediction_data(data)?;
     let trees = model.iteration_trees(model.resolve_iterations(iterations, "iterations")?);
     let n = data.n_rows();
-    let n_cols = data.n_cols();
     let margins = initial_margins(model.base_scores(), data.into());
     if trees.is_empty() || n == 0 {
         return Ok(MarginPlan::Done(Predictions::new(
@@ -206,6 +234,15 @@ pub(crate) fn plan_margins(
             model.n_outputs(),
         )));
     }
+    Ok(MarginPlan::Walk { trees, margins })
+}
+
+/// Refuse a batch whose dense row copy ([`materialize_rows`]), which Metal
+/// and wgpu upload whole, would not fit [`MAX_BUFFER_ENTRIES`].
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+pub(crate) fn ensure_dense_copy_fits(data: &DMatrix) -> Result<()> {
+    let n = data.n_rows();
+    let n_cols = data.n_cols();
     if n > MAX_BUFFER_ENTRIES || n.checked_mul(n_cols).is_none_or(|e| e > MAX_BUFFER_ENTRIES) {
         return Err(HessboostError::invalid_data(
             "data",
@@ -215,7 +252,58 @@ pub(crate) fn plan_margins(
             ),
         ));
     }
-    Ok(MarginPlan::Walk { trees, margins })
+    Ok(())
+}
+
+/// `parts`' node arena as `[u32; 4]` nodes (`slot, key, left, aux`, see
+/// [`GpuForestParts`]) and its leaf vectors, with every tree's leaves
+/// multiplied by the tree's weight on the host: `weight * leaf` in `f32` is
+/// the product the CPU forms per row, so the GPU only adds. A leaf is a node
+/// whose `left` is itself; a scalar leaf's value is its `aux` bits, a vector
+/// leaf's `aux` the offset of its `n_outputs` values. Trees of weight 1 are
+/// left as they are.
+#[cfg(any(feature = "wgpu", all(target_os = "linux", feature = "cuda")))]
+pub(crate) fn weighted_leaves(
+    model: &BoostedModel,
+    parts: &GpuForestParts<'_>,
+) -> (Vec<[u32; 4]>, Vec<f32>) {
+    let mut nodes: Vec<[u32; 4]> = parts
+        .nodes
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|node| {
+            let words = node.as_chunks::<4>().0;
+            std::array::from_fn(|i| u32::from_ne_bytes(words[i]))
+        })
+        .collect();
+    let mut leaf_vectors = parts.leaf_vectors.to_vec();
+    let k = model.n_outputs();
+    for (t, &root) in parts.roots.iter().enumerate() {
+        let weight = model.tree_weight(t);
+        if weight == 1.0 {
+            continue;
+        }
+        let end = parts
+            .roots
+            .get(t + 1)
+            .map_or(nodes.len(), |&next| next as usize);
+        let vector = model.tree_is_vector_leaf(t);
+        for (offset, node) in nodes[root as usize..end].iter_mut().enumerate() {
+            if node[2] as usize != root as usize + offset {
+                continue;
+            }
+            if vector {
+                let offset = node[3] as usize;
+                for w in &mut leaf_vectors[offset..offset + k] {
+                    *w *= weight;
+                }
+            } else {
+                node[3] = (weight * f32::from_bits(node[3])).to_bits();
+            }
+        }
+    }
+    (nodes, leaf_vectors)
 }
 
 /// Write `data`'s rows starting at row `begin` into `rows` as a dense

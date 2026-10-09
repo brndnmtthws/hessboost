@@ -1,21 +1,25 @@
 //! Resident compact forests and a bounded, pipelined prediction.
 //!
-//! Prediction owns an event-tracked context, separate from training's
-//! single-stream context. Each concurrent call owns its streams and staging
-//! buffers; only the immutable forest is shared. Numeric scalar forests use
-//! the shared 8-byte arena when it fits, otherwise the 16-byte arena handles
-//! categorical splits, multiclass and vector leaves. Leaf weighting happens
-//! once on the CPU in f32; the GPU adds in tree order without FMA or FTZ.
+//! Prediction loads its own module into the device's primary context (the
+//! one training uses) and runs on streams of its own. Each concurrent call
+//! owns its streams and staging buffers; only the immutable forest is
+//! shared. Numeric scalar forests use the shared 8-byte arena when it fits,
+//! otherwise the 16-byte arena handles categorical splits, multiclass and
+//! vector leaves. Leaf weighting happens once on the CPU in f32; the GPU
+//! adds in tree order without FMA or FTZ.
 
-use super::{Pinned, Plain, Unavailable, abi, failed, find_device, kernels, upload_pinned};
-use crate::backend::shared::{ensure_forest_model, materialize_rows};
+use super::driver::{self, LaunchConfig, Memory, StreamExt};
+use super::{
+    Pinned, Plain, Unavailable, abi, failed, find_device, kernels, memcpy_dtoh_async,
+    memcpy_htod_async, upload_pinned,
+};
+use crate::backend::shared::{
+    MarginPlan, ensure_forest_model, materialize_rows, plan_margins, weighted_leaves,
+};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Iterations, Predictions};
-use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
-    DriverError, LaunchConfig, PushKernelArg, result,
-};
+use cuda_core::{CudaContext, CudaEvent, CudaFunction, CudaStream, DeviceBuffer};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,10 +44,7 @@ static CONTEXTS: Mutex<Vec<(usize, Opened)>> = Mutex::new(Vec::new());
 impl Context {
     fn open(ordinal: usize) -> std::result::Result<Self, Unavailable> {
         find_device(ordinal)?;
-        // An independent context: training disables tracking on its own
-        // context, which must never govern this multi-stream pipeline.
-        let cuda = CudaContext::new_non_primary(ordinal, 0)
-            .map_err(|e| failed("prediction context", e))?;
+        let cuda = CudaContext::new(ordinal).map_err(|e| failed("prediction context", e))?;
         let module = kernels::load(&cuda, kernels::Module::Prediction)?;
         let predict8 = module
             .load_function("predict8")
@@ -51,7 +52,7 @@ impl Context {
         let predict16 = module
             .load_function("predict16")
             .map_err(|e| failed("predict16", e))?;
-        let name = cuda.name().map_err(|e| failed("device name", e))?;
+        let name = cuda.device_name().map_err(|e| failed("device name", e))?;
         Ok(Self {
             cuda,
             predict8,
@@ -80,8 +81,12 @@ impl Context {
         Ok(())
     }
 
-    fn error(&self, error: DriverError) -> HessboostError {
-        self.failed.store(true, Ordering::Release);
+    /// `error` as the call's error; one that leaves the context unusable
+    /// also disables prediction for every later call.
+    fn error(&self, error: driver::Error) -> HessboostError {
+        if error.poisons() {
+            self.failed.store(true, Ordering::Release);
+        }
         HessboostError::gpu(format!("CUDA prediction: {error}"))
     }
 }
@@ -115,14 +120,14 @@ pub fn prediction_device_name(ordinal: usize) -> Option<String> {
 
 enum Forest {
     Narrow {
-        nodes: CudaSlice<u32>,
-        roots: CudaSlice<u32>,
+        nodes: DeviceBuffer<u32>,
+        roots: DeviceBuffer<u32>,
     },
     Wide {
-        nodes: CudaSlice<u8>,
-        categories: CudaSlice<u32>,
-        vectors: CudaSlice<f32>,
-        trees: CudaSlice<u32>,
+        nodes: DeviceBuffer<u32>,
+        categories: DeviceBuffer<u32>,
+        vectors: DeviceBuffer<f32>,
+        trees: DeviceBuffer<u32>,
     },
 }
 
@@ -153,8 +158,8 @@ fn replaced(pooled: impl Iterator<Item = Shape>, call: Shape) -> Option<usize> {
 }
 
 struct Slot {
-    rows: CudaSlice<f32>,
-    out: CudaSlice<f32>,
+    rows: DeviceBuffer<f32>,
+    out: DeviceBuffer<f32>,
     host_rows: Pinned<f32>,
     host_base: Pinned<f32>,
     host_out: Pinned<f32>,
@@ -179,17 +184,17 @@ struct Call {
 }
 
 impl Call {
-    fn new(ctx: &Context, shape: Shape) -> std::result::Result<Self, DriverError> {
+    fn new(ctx: &Context, shape: Shape) -> driver::Result<Self> {
         let upload = ctx.cuda.new_stream()?;
         let compute = ctx.cuda.new_stream()?;
         let download = ctx.cuda.new_stream()?;
-        let make_slot = || -> std::result::Result<Slot, DriverError> {
+        let make_slot = || -> driver::Result<Slot> {
             Ok(Slot {
                 rows: upload.alloc_zeros(shape.rows * shape.cols)?,
                 out: upload.alloc_zeros(shape.rows * shape.outputs)?,
-                host_rows: Pinned::new(&upload, shape.rows * shape.cols, true)?,
-                host_base: Pinned::new(&upload, shape.rows * shape.outputs, true)?,
-                host_out: Pinned::new(&download, shape.rows * shape.outputs, false)?,
+                host_rows: Pinned::new(&upload, shape.rows * shape.cols)?,
+                host_base: Pinned::new(&upload, shape.rows * shape.outputs)?,
+                host_out: Pinned::new(&download, shape.rows * shape.outputs)?,
                 uploaded: ctx.cuda.new_event(None)?,
                 computed: ctx.cuda.new_event(None)?,
                 downloaded: ctx.cuda.new_event(None)?,
@@ -198,7 +203,7 @@ impl Call {
         };
         let slots = (0..SLOTS)
             .map(|_| make_slot())
-            .collect::<std::result::Result<_, _>>()?;
+            .collect::<driver::Result<_>>()?;
         Ok(Self {
             shape,
             upload,
@@ -208,11 +213,7 @@ impl Call {
         })
     }
 
-    fn finish(
-        slot: &mut Slot,
-        margins: &mut [f32],
-        outputs: usize,
-    ) -> std::result::Result<(), DriverError> {
+    fn finish(slot: &mut Slot, margins: &mut [f32], outputs: usize) -> driver::Result<()> {
         if let Some((begin, rows)) = slot.pending {
             slot.downloaded.synchronize()?;
             margins[begin * outputs..(begin + rows) * outputs]
@@ -228,7 +229,7 @@ impl Call {
         data: &DMatrix,
         trees: std::ops::Range<usize>,
         margins: &mut [f32],
-    ) -> std::result::Result<(), DriverError> {
+    ) -> driver::Result<()> {
         let cols = self.shape.cols;
         let outputs = self.shape.outputs;
         let mut begin = 0;
@@ -237,40 +238,34 @@ impl Call {
             let slot = &mut self.slots[batch % SLOTS];
             Self::finish(slot, margins, outputs)?;
             let rows = (data.n_rows() - begin).min(self.shape.rows);
-            materialize_rows(
-                data,
-                begin,
-                &mut slot.host_rows.as_mut_slice()[..rows * cols],
-            );
-            slot.host_base.as_mut_slice()[..rows * outputs]
+            materialize_rows(data, begin, slot.host_rows.range_mut(0..rows * cols));
+            slot.host_base
+                .range_mut(0..rows * outputs)
                 .copy_from_slice(&margins[begin * outputs..(begin + rows) * outputs]);
-            // Keep cudarc's per-slice tracking enabled. Raw copies use the
-            // tracked pointer guards, and pinned owners drain their stream
-            // on drop, including failures before event recording.
+            // Pinned owners drain their stream on drop, including failures
+            // before an event was recorded.
             self.upload.context().bind_to_thread()?;
-            {
-                let (dst, _record) = slot.rows.device_ptr_mut(&self.upload);
-                // SAFETY: initialized pinned rows, live through the download
-                // event; destination fits this block. Host reuse waits above.
-                unsafe {
-                    result::memcpy_htod_async(
-                        dst,
-                        &slot.host_rows.as_slice()[..rows * cols],
-                        self.upload.cu_stream(),
-                    )
-                }?;
-            }
-            {
-                let (dst, _record) = slot.out.device_ptr_mut(&self.upload);
-                // SAFETY: same lifetime and bounds as the feature upload.
-                unsafe {
-                    result::memcpy_htod_async(
-                        dst,
-                        &slot.host_base.as_slice()[..rows * outputs],
-                        self.upload.cu_stream(),
-                    )
-                }?;
-            }
+            let features = &slot.host_rows.as_slice()[..rows * cols];
+            // SAFETY: initialized pinned rows, live through the download
+            // event; destination fits this block. Host reuse waits above.
+            unsafe {
+                memcpy_htod_async(
+                    slot.rows.addr(),
+                    features.as_ptr(),
+                    size_of_val(features),
+                    self.upload.cu_stream(),
+                )
+            }?;
+            let base = &slot.host_base.as_slice()[..rows * outputs];
+            // SAFETY: same lifetime and bounds as the feature upload.
+            unsafe {
+                memcpy_htod_async(
+                    slot.out.addr(),
+                    base.as_ptr(),
+                    size_of_val(base),
+                    self.upload.cu_stream(),
+                )
+            }?;
             slot.uploaded.record(&self.upload)?;
             self.compute.wait(&slot.uploaded)?;
             let (n_rows, n_cols) = (rows as u32, cols as u32);
@@ -328,18 +323,17 @@ impl Call {
             }
             slot.computed.record(&self.compute)?;
             self.download.wait(&slot.computed)?;
-            {
-                let (src, _record) = slot.out.device_ptr(&self.download);
-                // SAFETY: pinned output fits and is not read or reused until
-                // `downloaded` completes. Drop drains the download stream.
-                unsafe {
-                    result::memcpy_dtoh_async(
-                        &mut slot.host_out.as_mut_slice()[..rows * outputs],
-                        src,
-                        self.download.cu_stream(),
-                    )
-                }?;
-            }
+            let out = slot.host_out.range_mut(0..rows * outputs);
+            // SAFETY: pinned output fits and is not read or reused until
+            // `downloaded` completes. Drop drains the download stream.
+            unsafe {
+                memcpy_dtoh_async(
+                    out.as_mut_ptr(),
+                    slot.out.addr(),
+                    size_of_val(out),
+                    self.download.cu_stream(),
+                )
+            }?;
             slot.downloaded.record(&self.download)?;
             slot.pending = Some((begin, rows));
             begin += rows;
@@ -410,65 +404,56 @@ impl GpuModel {
         iterations: impl Into<Iterations>,
     ) -> Result<Predictions> {
         self.ctx.check()?;
-        let iterations = iterations.into();
-        if self.model.shrinkage().is_some() {
-            return self.model.predict_margin(data, iterations);
-        }
-        self.model.validate_prediction_data(data)?;
-        let trees = self
-            .model
-            .iteration_trees(self.model.resolve_iterations(iterations, "iterations")?);
-        let mut margins = self.model.initial_margins(data.into());
+        let (trees, mut margins) = match plan_margins(&self.model, data, iterations.into())? {
+            MarginPlan::Done(margins) => return Ok(margins),
+            MarginPlan::Walk { trees, margins } => (trees, margins),
+        };
         let outputs = self.model.n_outputs();
-        if !trees.is_empty() && data.n_rows() != 0 {
-            let width = data.n_cols().checked_add(outputs).ok_or_else(|| {
-                HessboostError::invalid_data("data", "CUDA prediction row width overflows usize")
-            })?;
-            let rows = data
-                .n_rows()
-                .min(BLOCK_ROWS)
-                .min(SLOT_ENTRIES / width.max(1));
-            if rows == 0 || u32::try_from(data.n_cols()).is_err() || u32::try_from(outputs).is_err()
-            {
-                return Err(HessboostError::invalid_data(
-                    "data",
-                    "a feature/output row exceeds CUDA prediction's 32 MiB staging limit",
-                ));
-            }
-            let shape = Shape {
-                rows,
-                cols: data.n_cols(),
-                outputs,
-            };
-            let mut pool = self.pool.lock();
-            let cached = pool
-                .iter()
-                .position(|call| call.shape.serves(shape))
-                .map(|i| pool.swap_remove(i));
-            drop(pool);
-            let mut call = match cached {
-                Some(call) => call,
-                None => Call::new(&self.ctx, shape).map_err(|e| self.ctx.error(e))?,
-            };
-            call.run(self, data, trees, &mut margins)
-                .map_err(|e| self.ctx.error(e))?;
-            // Keep the call when the pool has room, or in place of a pooled
-            // call that cannot serve it, so later calls of its shape reuse
-            // its buffers instead of reallocating.
-            let evicted = {
-                let mut pool = self.pool.lock();
-                if pool.len() < POOL_CALLS {
-                    pool.push(call);
-                    None
-                } else if let Some(i) = replaced(pool.iter().map(|pooled| pooled.shape), call.shape)
-                {
-                    Some(std::mem::replace(&mut pool[i], call))
-                } else {
-                    Some(call)
-                }
-            };
-            drop(evicted);
+        let width = data.n_cols().checked_add(outputs).ok_or_else(|| {
+            HessboostError::invalid_data("data", "CUDA prediction row width overflows usize")
+        })?;
+        let rows = data
+            .n_rows()
+            .min(BLOCK_ROWS)
+            .min(SLOT_ENTRIES / width.max(1));
+        if rows == 0 || u32::try_from(data.n_cols()).is_err() || u32::try_from(outputs).is_err() {
+            return Err(HessboostError::invalid_data(
+                "data",
+                "a feature/output row exceeds CUDA prediction's 32 MiB staging limit",
+            ));
         }
+        let shape = Shape {
+            rows,
+            cols: data.n_cols(),
+            outputs,
+        };
+        let mut pool = self.pool.lock();
+        let cached = pool
+            .iter()
+            .position(|call| call.shape.serves(shape))
+            .map(|i| pool.swap_remove(i));
+        drop(pool);
+        let mut call = match cached {
+            Some(call) => call,
+            None => Call::new(&self.ctx, shape).map_err(|e| self.ctx.error(e))?,
+        };
+        call.run(self, data, trees, &mut margins)
+            .map_err(|e| self.ctx.error(e))?;
+        // Keep the call when the pool has room, or in place of a pooled
+        // call that cannot serve it, so later calls of its shape reuse
+        // its buffers instead of reallocating.
+        let evicted = {
+            let mut pool = self.pool.lock();
+            if pool.len() < POOL_CALLS {
+                pool.push(call);
+                None
+            } else if let Some(i) = replaced(pool.iter().map(|pooled| pooled.shape), call.shape) {
+                Some(std::mem::replace(&mut pool[i], call))
+            } else {
+                Some(call)
+            }
+        };
+        drop(evicted);
         Ok(Predictions::new(margins, data.n_rows(), outputs))
     }
 
@@ -498,9 +483,9 @@ impl GpuModel {
 fn upload_forest<T: Plain>(
     stream: &Arc<CudaStream>,
     values: &[T],
-) -> std::result::Result<CudaSlice<T>, DriverError> {
+) -> driver::Result<DeviceBuffer<T>> {
     let mut device = stream.alloc_zeros(values.len().max(1))?;
-    let mut staging = Pinned::new(stream, values.len(), true)?;
+    let mut staging = Pinned::new(stream, values.len())?;
     upload_pinned(stream, &mut staging, values, &mut device)?;
     stream.synchronize()?;
     Ok(device)
@@ -532,11 +517,11 @@ impl BoostedModel {
             Context::get(ordinal).map_err(|reason| HessboostError::gpu(reason.to_string()))?;
         ctx.check()?;
         let compact = self.compact_forest();
-        let stream = ctx.cuda.new_stream().map_err(|e| ctx.error(e))?;
+        let stream = ctx.cuda.new_stream().map_err(|e| ctx.error(e.into()))?;
         let narrow = (self.n_outputs() == 1)
             .then(|| compact.gpu_arena8(|t| self.tree_is_vector_leaf(t)))
             .flatten();
-        let uploaded = (|| -> std::result::Result<Forest, DriverError> {
+        let uploaded = (|| -> driver::Result<Forest> {
             let forest = if let Some(mut arena) = narrow {
                 for (t, &root) in arena.roots.iter().enumerate() {
                     let end = arena
@@ -559,42 +544,22 @@ impl BoostedModel {
                 }
             } else {
                 let parts = compact.gpu_parts();
-                let mut nodes = parts.nodes.to_vec();
-                let mut vectors = parts.leaf_vectors.to_vec();
-                let mut trees = Vec::with_capacity(parts.roots.len() * 4);
-                for (t, &root) in parts.roots.iter().enumerate() {
-                    let end = parts
-                        .roots
-                        .get(t + 1)
-                        .map_or(nodes.len() / 16, |&r| r as usize);
-                    let weight = self.tree_weight(t);
-                    let vector = self.tree_is_vector_leaf(t);
-                    trees.extend([root, self.tree_output(t) as u32, u32::from(vector), 0]);
-                    for (offset, node) in nodes[root as usize * 16..end * 16]
-                        .as_chunks_mut::<16>()
-                        .0
-                        .iter_mut()
-                        .enumerate()
-                    {
-                        let left = u32::from_ne_bytes(node[8..12].try_into().expect("four bytes"));
-                        if left as usize != root as usize + offset {
-                            continue;
-                        }
-                        let aux = u32::from_ne_bytes(node[12..16].try_into().expect("four bytes"));
-                        if vector {
-                            for value in &mut vectors[aux as usize..aux as usize + self.n_outputs()]
-                            {
-                                *value *= weight;
-                            }
-                        } else {
-                            node[12..16].copy_from_slice(
-                                &(weight * f32::from_bits(aux)).to_bits().to_ne_bytes(),
-                            );
-                        }
-                    }
-                }
+                let (nodes, vectors) = weighted_leaves(self, &parts);
+                let trees: Vec<u32> = parts
+                    .roots
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(t, &root)| {
+                        [
+                            root,
+                            self.tree_output(t) as u32,
+                            u32::from(self.tree_is_vector_leaf(t)),
+                            0,
+                        ]
+                    })
+                    .collect();
                 Forest::Wide {
-                    nodes: upload_forest(&stream, &nodes)?,
+                    nodes: upload_forest(&stream, nodes.as_flattened())?,
                     categories: upload_forest(&stream, parts.categories)?,
                     vectors: upload_forest(&stream, &vectors)?,
                     trees: upload_forest(&stream, &trees)?,
@@ -621,8 +586,8 @@ mod tests {
     use crate::objective::{Objective, RegLoss};
     use crate::tree::{ChildLeaf, RegTree, SplitRule};
 
-    /// Whether device 0 predicts; a missing device skips (unless
-    /// `HESSBOOST_REQUIRE_CUDA` is set), and any other reason fails.
+    /// Whether device 0 predicts; a missing device skips, printing why
+    /// (unless `HESSBOOST_REQUIRE_CUDA` is set), and any other reason fails.
     fn available() -> bool {
         match prediction_unavailable_reason(0) {
             None => true,
@@ -631,6 +596,7 @@ mod tests {
                     reason.is_environment() && std::env::var_os("HESSBOOST_REQUIRE_CUDA").is_none(),
                     "{reason}"
                 );
+                eprintln!("skipping CUDA prediction test: {reason}");
                 false
             }
         }
@@ -653,11 +619,16 @@ mod tests {
         )
     }
 
+    /// Builds `model` on device 0 and checks its margins against the CPU's
+    /// bit for bit over several iteration ranges, including `0..1` alone:
+    /// a range reaching a large-magnitude tree can round away tree 0's
+    /// small leaves and the base margins, hiding a misrouted row.
     fn parity(model: &BoostedModel, data: &DMatrix) -> GpuModel {
         let gpu = model.to_cuda(0).unwrap();
         for iterations in [
             Iterations::Best,
             Iterations::from(..),
+            Iterations::from(0..1),
             Iterations::from(0..0),
         ] {
             let cpu = model.predict_margin(data, iterations).unwrap();

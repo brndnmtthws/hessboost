@@ -53,10 +53,11 @@ self_cell = "1.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 hessboost = { path = "..", features = ["metal"] }
 
-# The CUDA driver is opened dynamically and the kernels are embedded PTX; no
-# toolkit is needed to build or run a wheel.
-[target.'cfg(target_os = "linux")'.dependencies]
-hessboost = { path = "..", features = ["cuda"] }
+[features]
+# `device="cuda"` and `Booster.to_gpu(device="cuda")`, on Linux only. Off by
+# default, so the default wheels and the sdist build without what the root
+# crate's `cuda` feature needs to build; without it CUDA is refused.
+cuda = ["hessboost/cuda"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

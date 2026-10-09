@@ -5,8 +5,7 @@
 //! source's.
 
 use super::{Unavailable, failed};
-use cudarc::driver::{CudaContext, CudaModule};
-use cudarc::nvrtc::Ptx;
+use cuda_core::{CudaContext, CudaModule};
 use std::sync::Arc;
 
 /// The oldest compute capability the PTX targets (`sm_75`, Turing); the
@@ -34,8 +33,7 @@ impl Module {
 }
 
 /// Load `module` into `ctx`, refusing a device older than the PTX's
-/// target. Only the PTX container comes from cudarc's `nvrtc` module; NVRTC
-/// itself is never loaded.
+/// target.
 pub(super) fn load(
     ctx: &Arc<CudaContext>,
     module: Module,
@@ -50,6 +48,6 @@ pub(super) fn load(
             minor,
         });
     }
-    ctx.load_module(Ptx::from_src(module.ptx()))
+    ctx.load_module_from_ptx_src(module.ptx())
         .map_err(|e| failed(&format!("module load (sm_{major}{minor})"), e))
 }

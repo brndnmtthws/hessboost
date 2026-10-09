@@ -36,19 +36,40 @@
 //! `build.sh` rejects PTX holding an approximate, flush-to-zero or
 //! contractible floating-point instruction.
 //!
+//! # Safety model
+//!
+//! The kernels follow cuda-oxide's tiers. Those with one output element
+//! per thread (`stage_units`, `iota_rows`, `squared_error`, `logistic`,
+//! `reduce_chains`, `route_runs`) are safe: `&[T]` inputs (bounds-checked
+//! reads), a [`DisjointSlice`] output written through
+//! `thread::index_1d()`, launched 1-D with one thread per element.
+//! `grad_domain` is safe too: it reads a `&[T]` and publishes through
+//! atomics on a `&[DeviceAtomicU32]`. The slot-scatter reductions
+//! (`finalize_exact`, `finalize_exact_sub`, `reduce_chunks`,
+//! `subtract_hists`) read `&[T]`s, but write output slots drawn from data:
+//! they are `unsafe` (the host guarantees the slots are distinct) and write
+//! through [`scatter`], which traps on an index past the slice. The rest
+//! (shared memory, warp collectives, atomics, scatter through data) are
+//! `unsafe fn`s over raw device pointers: each `# Safety` section states
+//! what the host's launch guarantees, and each `unsafe` block what it
+//! relies on. An index past a `&[T]` traps (cuda-oxide's bounds check), so
+//! a host bug fails the launch, which the backend treats as a context
+//! error, rather than corrupting memory.
+//!
 //! # ABI
 //!
-//! Kernels are `extern "C"` and take raw pointers, scalars, and `#[repr(C)]`
-//! parameter structs by value (one PTX `.param .align N .b8` array each,
-//! read with `ld.param` at the fields' offsets), one PTX parameter per
-//! argument in the order the host's launch builders push them
-//! (`src/backend/cuda/{mod,categorical,predict}.rs`); their entry names are
-//! the function names. Record and parameter types are `#[repr(C)]` in the
-//! host's layouts. Pointers a kernel's inner loop dereferences stay direct
+//! A slice parameter (`&[T]`, [`DisjointSlice<T>`]) is two PTX parameters,
+//! the address and the element count (cuda-oxide's slice ABI); scalars,
+//! raw pointers and `#[repr(C)]` parameter structs (one PTX `.param .align
+//! N .b8` array each, read with `ld.param` at the fields' offsets) are one
+//! each. The host's launch builders push them in order
+//! (`src/backend/cuda/{mod,categorical,predict}.rs`: `Launch::slice`,
+//! `pairs` for slices of pair types over flat buffers, `raw_slice` for
+//! staged descriptors, `arg` for the rest); entry names are the function
+//! names. Record and parameter types are `#[repr(C)]` in the host's
+//! layouts. Pointers a kernel's inner loop dereferences stay direct
 //! parameters, which the backend lowers to global-space accesses; a
-//! struct's pointers are generic. Each kernel is `unsafe`: the host
-//! guarantees that every buffer holds the elements the documented layout
-//! addresses for the launch's arguments.
+//! struct's pointers are generic.
 //!
 //! Layouts (row ids `u32`, element offsets 64-bit):
 //! - bins: row-major ELLPACK, `n_cols` feature-local bins per row (`u8`,
@@ -76,7 +97,7 @@ mod predict;
 #[cfg(feature = "train")]
 mod train;
 
-use cuda_device::thread;
+use cuda_device::{DisjointSlice, debug, thread};
 
 /// Every lane of a warp, for the warp-synchronous intrinsics.
 const FULL: u32 = u32::MAX;
@@ -191,6 +212,24 @@ unsafe fn ld<T: Copy>(p: *const T, i: u64) -> T {
 unsafe fn st<T>(p: *mut T, i: u64, value: T) {
     // SAFETY: the caller's.
     unsafe { *p.add(i as usize) = value }
+}
+
+/// `out[i]` for a thread whose element comes from data (a histogram slot
+/// the host assigned), not from its thread index: traps past `out`'s end,
+/// so a bad slot fails the launch instead of writing outside the buffer.
+///
+/// # Safety
+///
+/// No other thread of the launch accesses element `i` while the returned
+/// reference lives.
+#[inline(always)]
+unsafe fn scatter<'s, T>(out: &'s mut DisjointSlice<'_, T>, i: usize) -> &'s mut T {
+    if i >= out.len() {
+        debug::trap();
+    }
+    // SAFETY: `i < out.len()` (checked above); the exclusivity is the
+    // caller's.
+    unsafe { out.get_unchecked_mut(i) }
 }
 
 /// This thread's index in a one-dimensional grid.

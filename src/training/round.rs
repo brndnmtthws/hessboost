@@ -130,10 +130,10 @@ fn device_round(
     let (mut tree, leaves) = builder.build_device_staged(index, &state.all_rows, &mut sampler)?;
     tree.scale_leaves(tree_eta(params));
     let values: Vec<(Segment, f32)> = leaves
-        .iter()
-        .map(|&(node, seg)| (seg, tree.node(node).leaf_value))
+        .into_iter()
+        .map(|(node, seg)| (seg, tree.node(node).leaf_value))
         .collect();
-    engine.add_leaf_values(&values)?;
+    engine.add_leaf_values(values)?;
     state
         .margins
         .add_tree_to_evals(&tree, TreeOutput::Scalar(0));

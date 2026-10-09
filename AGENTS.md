@@ -4,10 +4,11 @@ hessboost reimplements XGBoost in Rust as one library crate. No C/C++ or FFI
 besides `zstd` (libzstd, for native model files), with the macOS-only
 `metal` feature `objc2-metal`, with the `wgpu` feature `wgpu` (whose
 Vulkan, Metal, and DirectX 12 backends load the drivers at run time), and
-with the Linux-only `cuda` feature `cudarc` (the CUDA driver, opened at run
-time). The CUDA kernels are Rust too: `cuda-kernels/`, compiled to PTX by
+with the Linux-only `cuda` feature cuda-oxide's host crate `cuda-core`
+(the CUDA driver, opened at run time). The CUDA kernels are Rust too:
+`cuda-kernels/`, compiled to PTX by
 [cuda-oxide](https://nvidia.github.io/cuda-rust/cuda-oxide/) and committed,
-so building the crate needs neither cuda-oxide nor a CUDA toolkit. User docs:
+so building the crate needs no cuda-oxide or CUDA compiler. User docs:
 `README.md` (overview only; details belong in rustdoc), rustdoc
 (`src/lib.rs`, module docs), `examples/`, `docs/performance.md`. No
 changelog: release notes are written at release time.
@@ -18,10 +19,15 @@ changelog: release notes are written at release time.
 shellcheck, and ruff at the versions `mise.toml` pins; after changing one,
 refresh `mise.lock` with `mise lock`. MSRV 1.93. `Cargo.lock` is
 gitignored: never pass `--locked`.
-libzstd needs a C compiler for every build target. docs.rs builds only
-Linux (no Apple SDK for `zstd-sys`), so the Metal API renders only in a
-local macOS `cargo doc --features metal`. `include` in `Cargo.toml` lists
-what the published crate ships.
+libzstd needs a C compiler for every build target. The `cuda` feature (so
+`--all-features` on Linux) needs CUDA 13's driver and cuRAND headers
+(`CUDA_HOME` or `CUDA_TOOLKIT_PATH`) and libclang: `cuda-bindings`' build
+script runs bindgen over them. `.github/scripts/install-cuda-headers.sh`
+installs both as CI does (the headers from NVIDIA's pip wheels). docs.rs
+builds only Linux (no Apple SDK for `zstd-sys`) and without `cuda` (no
+CUDA headers), so the Metal and CUDA APIs render only in a local
+`cargo doc --features metal` (macOS) or `--features cuda` (Linux).
+`include` in `Cargo.toml` lists what the published crate ships.
 
 ## Commands
 
@@ -94,7 +100,12 @@ the Linux runners also install Mesa's lavapipe and set
 `tests/wgpu.rs` and the `backend::wgpu` unit tests run the GPU paths there)
 under the `ci` Cargo profile (`Cargo.toml`: `dev` at opt-level 1, debug
 assertions and overflow checks on; about ten times faster than opt-level
-0). The parity job caches uv's XGBoost source build.
+0). The parity job caches uv's XGBoost source build. Every Linux job that
+builds the root crate's `cuda` feature (clippy, test, docs, MSRV,
+`semver compatibility` (cargo-semver-checks enables `cuda`), and
+`publish.yml`'s Rust test and `cargo publish --all-features`) first runs
+`.github/scripts/install-cuda-headers.sh`: apt's `libclang-dev`, NVIDIA's
+pinned CUDA 13 header wheels through uv, and `CUDA_HOME` in `GITHUB_ENV`.
 Its Python jobs build one abi3 wheel each on x86_64/aarch64 Linux, aarch64
 macOS, and x86_64 Windows (without the release profile's LTO and single
 codegen unit) and test it on CPython 3.11 and the latest 3.x with
@@ -104,6 +115,10 @@ check (which also fails on a public function or class without a docstring),
 a ruff/ty lint job over all of the repository's Python, and an sdist round
 trip (with the release profile). The Linux Python jobs install lavapipe too
 (`install-lavapipe.sh`), so `python/tests/test_gpu.py` runs its wgpu tests.
+The `python-cuda` job builds `python/` with hessboost-python's `cuda`
+feature (`MATURIN_PEP517_ARGS="--features cuda" uv sync --locked`, no
+wheel file, so nothing is uploaded), runs `uv run --locked pytest` (CUDA
+tests skip without a GPU), and checks that the extension has CUDA.
 `python/uv.lock` pins polars 2.x; the
 x86_64 Linux abi3 job also runs the polars tests with polars 1.0.0 and the
 latest 1.x (`uv run --with`), since `polars>=1.0` is supported.
@@ -115,7 +130,8 @@ wheels; free-threaded without polars, whose abi3-only wheels it cannot
 load). Root fmt also
 checks `python/Cargo.toml`; Python
 clippy runs in both the x86_64-linux and aarch64-macOS lint jobs (the
-latter checks the Metal feature). `all-checks-passed` gates merges. After
+latter checks the Metal feature; the former also `--features cuda`).
+`all-checks-passed` gates merges. After
 touching `simd/` or `cfg(target_arch)` code, lint the architecture your
 host is not:
 
@@ -153,6 +169,17 @@ uv run --locked pytest
 uv run --locked pyright --verifytypes hessboost --ignoreexternal
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+```
+
+The default extension has no CUDA (so neither the wheels nor the sdist
+need CUDA headers to build); hessboost-python's `cuda` feature (Linux)
+adds it, with the root `cuda` feature's build requirements. From
+`python/`, with them installed:
+
+```sh
+cargo clippy --all-targets --features cuda -- -D warnings
+MATURIN_PEP517_ARGS="--features cuda" uv sync --locked   # rebuilds with CUDA (a cache key)
+MATURIN_PEP517_ARGS="--features cuda" uv run --locked pytest tests/test_gpu.py
 ```
 
 Python lint and types, for `python/`, `scripts/`, `release.py`, and
@@ -198,7 +225,7 @@ Fix findings rather than suppress them.
 |`ebm/`|public: `EbmInfo` (terms, tree→term map, term means; crate-private `stages`, the Boulevard stage layout validation, inference, and refit share), `shape_functions`, `term_shape`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds and category sets, leaves as boxes, difference arrays)|
 |`model/`|`mod.rs` (`BoostedModel`, accessors incl. the public metadata `tree_weights`/`num_class`/`linear`/`shrinkage`, `TreeWeights`, the public `LinearModel`; XGBoost interchange docs), `io` (`ModelFormat`, its detection, the four codec verbs), `embed` (`EmbeddedModel`: `include_bytes!` in a `static`, decoded on first successful `get`), `serde` (native JSON mirror `UncheckedBoostedModel`), `validate` (`validate_structure`, prediction-data and objective-width checks), `predict` (`Iterations`, prediction dispatch, `accumulate_forest`, shrunk and multi-prefix margins, `RowBlock` traversal, borrowed-row `predict_rows`, the single-row methods and their output-range `margin_row`, which serves `multi:softmax`'s class 64 classes at a time on the stack), `transform` (`Transform`: the objective's prediction transform, built lazily per model, row-parallel for large batches, `multi:softmax`'s `FindMaxIndex`), `slice` (`slice`, `shrunk_prefix`), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `container` (`ContainerSpec`: the magic/version/checksum framing, zstd packing and expansion bound shared by `HBM`, `HBDM` and `HBFF`; embedded-model blobs), `native`, `sections` (shared by every container and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (public `Shrinkage` record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact/` (public, `HBTD`; `mod.rs` model and layout docs, `bitstream`, `decode`, `encode`), `xgboost/` (JSON/UBJSON schema: `document` model mapping, `tree` node columns, `objective` objective and `base_score`, `parse` scalar parsers), `categories` (`CategoryPool`, shared by the XGBoost and LightGBM importers), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `SampleOptions`, `Samples`, the borrowed `SamplesView`, `Quantiles`), `io` (`DiffusionFormat`, shared with `forest`), `format` (`HBDM` container embedding native GBDT containers; JSON), `forest/` (public, ForestFlow/ForestDiffusion: per-level GBDTs, generation, RePaint imputation; `fit`: table preparation and per-level training; `encoding`: column ranges, one-hot encoding, scaling; `format`: `HBFF`)|
-|`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `wgpu.rs` (the portable sibling over wgpu: WGSL kernels with a host-generated constant prelude, adapter selection, `WgpuHistBackend`, `GpuModel`/`to_wgpu`), `shared.rs` (the host plumbing Metal and wgpu share: `IndexShape` input checks, `StagedSlice` staging identity, exactness and `scatter_row_bound`, `plan_margins`, unit-test helpers; with CUDA prediction: `ensure_forest_model`, `materialize_rows`), `cuda/` (`mod.rs`: availability (`Unavailable`), the exact histogram strategies in the CPU's `sum_order`, CSR storage, device bin encoding from the CPU's global bins, the row engine, and transfer staging (`Staging` descriptor arena, `Ring` of bounded pieces, the device's `PinnedPool`); `categorical.rs`: stable category sorting and resident node winners; `predict.rs`: compact forests and bounded three-stream prediction; `abi.rs`: the kernels' by-value parameter structs, field for field `cuda-kernels/`'s `#[repr(C)]` layouts, with a unit test checking each layout against the embedded PTX; `kernels.rs`: the embedded `training.ptx`/`prediction.ptx`, built from `cuda-kernels/`, one loaded per context; `diagnostics.rs`: the test and bench counters `NodeCounts`/`ScanDiagnostics`, public only through `#[doc(hidden)] internals`), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
+|`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `wgpu.rs` (the portable sibling over wgpu: WGSL kernels with a host-generated constant prelude, adapter selection, `WgpuHistBackend`, `GpuModel`/`to_wgpu`), `shared.rs` (the host plumbing the GPU backends share: `IndexShape` input checks, `StagedSlice` staging identity, exactness and `scatter_row_bound`, `plan_margins` (every GPU predictor's margin prologue), `ensure_dense_copy_fits` (Metal and wgpu), `weighted_leaves` (wgpu and CUDA), `ensure_forest_model`, `materialize_rows`, unit-test helpers), `cuda/` (`mod.rs`: availability (`Unavailable`), the exact histogram strategies in the CPU's `sum_order`, CSR storage, device bin encoding from the CPU's global bins, the row engine (engine-issued `Segment`s, stamped per tree), and transfer staging (`Staging` descriptor arena, `Ring` of bounded pieces, the device's `PinnedPool`); `driver.rs`: the layer over `cuda-core`: `Error` (a refused call vs. a driver error; only context-corrupting ones disable the device), borrowed device views, `Launch` (by-value parameters, slices as pointer and length), stream-ordered copies; `categorical.rs`: stable category sorting and resident node winners; `predict.rs`: compact forests and bounded three-stream prediction; `abi.rs`: the kernels' by-value parameter structs, field for field `cuda-kernels/`'s `#[repr(C)]` layouts, with unit tests checking each layout and the slice kernels' parameter lists against the embedded PTX; `kernels.rs`: the embedded `training.ptx`/`prediction.ptx`, built from `cuda-kernels/`, one loaded per context; `diagnostics.rs`: the test and bench counters `NodeCounts`/`ScanDiagnostics`, public only through `#[doc(hidden)] internals`), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
 The CUDA kernels live outside `src/`, in `cuda-kernels/src/` (not part of
@@ -207,12 +234,22 @@ the crate's build or package): `lib.rs` (exactness and ABI rules, the
 histograms, partitions, reductions, numeric split search; per-width entries
 from `per_width!`) and `categorical.rs` (category keys, merge sort,
 partition scan, `merge_scans`) behind the `train` feature, `predict.rs`
-(compact-forest walks) behind `predict`. Entries take raw pointers,
-scalars and `#[repr(C)]` parameter structs by value (mirrored field for
-field in `src/backend/cuda/abi.rs`), one PTX parameter each, in the order
-the host's launch builders push them; a kernel's signature and its launch
-change together. The crate has the root's lint policy (CI runs its clippy
-on the pinned nightly).
+(compact-forest walks) behind `predict`. Kernels with one output element
+per thread are safe `fn`s in cuda-oxide's model: `&[T]` inputs, a
+`DisjointSlice<T>` output written through `thread::index_1d()`. The
+slot-scatter reductions (`finalize_exact*`, `reduce_chunks`,
+`subtract_hists`) also take `&[T]` inputs but are `unsafe fn`s (their
+slots' distinctness is the host's guarantee) writing through the
+bounds-checked `crate::scatter`; the rest (shared memory, warp
+collectives, atomics, data-dependent scatter) are `unsafe fn`s over raw
+device pointers whose `# Safety` states what the host guarantees, with
+scoped `unsafe` blocks.
+A slice is two PTX parameters (pointer, length: the host's
+`Launch::slice`, `pairs` or `raw_slice`), scalars and `#[repr(C)]`
+parameter structs one each (mirrored field for field in
+`src/backend/cuda/abi.rs`), in the order the host's launch builders push
+them; a kernel's signature and its launch change together. The crate has
+the root's lint policy (CI runs its clippy on the pinned nightly).
 
 Tests: `tests/parity.rs` and `tests/lightgbm_parity.rs` are ignored without fixtures; `properties.rs` is
 proptest; shared helpers are in `tests/common/` and `examples/common/`;
@@ -229,7 +266,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 
 |Path|Non-obvious contents|
 |---|---|
-|`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `wgpu` in every build, `metal` on macOS, dynamically loaded `cuda` on Linux|
+|`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `wgpu` in every build, `metal` on macOS, CUDA (Linux) only with its own `cuda` feature, off by default|
 |`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, `predict_rows` on a borrowed C-contiguous `float32` array (detached) and `predict_row_into`/`transform_margin` (plain `detach`) and `transform_margins_into` (detached) writing caller arrays through `try_readwrite`, `model_info` through `info`, `load`/`save` through `codec`, `to_gpu`, `to_compact`, `size_report`), `info` (`model_info`: the layout, `gblinear`/shrinkage records and node-indexed tree arrays as a dict, built without the GIL from the public model API; `int32` arrays refuse indices past their range), `compact` (`CompactModel`: bytes in and out, value/margin `predict`), `gpu` (`GpuModel`: the Metal, wgpu or CUDA predictor a `device` string (`metal`, `wgpu`, `cuda`, `cuda:<n>`, as training spells it) names, `None` being Metal on macOS and wgpu elsewhere; `available`/`device_name` per device, value/margin `predict`), `codec` (the `Format` trait: `ModelFormat` / `DiffusionFormat` by their Python names, `"auto"` through the crate's `detect` with `ModelFormatError` for unrecognized bytes; detached `encode` to `bytes` and `decode` shared by `Booster`, `DiffusionModel`, `ForestModel`; method configurations as serde JSON), `pool` (the process-local rayon pool `detached` and the training worker install, rebuilt in a forked child; plain `detach` for work without rayon; `on_pool_thread`, on which `interruptible` runs a callback's hooked call inline), `train` (`Trainer` on a signal-polled worker thread via `run_hooked`, `train_with_budget` (no round hook, so not interruptible), `cv`/`cv_refit` (a `CvRequest` dict configuring `CrossValidation`: optional `(encoder, columns)` for per-fold target statistics, `target_stats_label`, `init_model`), folds, Python callbacks), `target_stats` (`OrderedTargetEncoder`, `FittedTargetEncoder` with serde-JSON `encode`/`decode`), `conformal` (calibrators owning their model via `self_cell`), `inference` (`BoulevardInference` owning its model and holdout rows via `self_cell`, `honest_refit`), `ebm` (`TermShape`, `shape_functions`, `EbmInference`), `online` (`OnlineParams`: `exact()`/`approximate(tolerance)`; `OnlineModel`: the one mutable class, its state behind a mutex locked only detached; an update is admitted on its caller's thread (`updating`) before its work is scheduled, so a second update or a read fails fast from any thread instead of queueing behind it; updates through `run_hooked`), `dist`, `diffusion` (`DiffusionParams` from a request dict with the `Method` as its serde JSON, `DiffusionModel`, `SamplesView` summaries of draw arrays without copying; `fit` has no round hook, so it is not interruptible), `forest` (`ForestParams`/`ForestModel` the same way, `ForestMethod` and column kinds by serde name)|
 |`python/hessboost/`|the public API, pure Python: `_matrix` (`DMatrix`; `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through; `_matrix_for`: data as the models it is paired with read it, which prediction, conformal, inference, diffusion, forests, and target-statistics `transform` go through; its `unseen` columns code a category the reference lacks one past its categories instead of missing, so a target encoder maps it to the prior), `_booster` (`Booster` with `to_gpu` and `to_compact`; `predict` of values and margins on a plain non-empty 2-D numeric numpy array without `base_margin` skips the `DMatrix` (`_dense_rows`; a non-NaN `missing` maps to NaN on a copy, and data with a NaN it does not mark falls back to the `DMatrix` path, which refuses it); `predict_row`, `transform_margin(s)` with `out=` (`_out_array`); `model_info` → frozen dataclasses `ModelInfo`, `TreeInfo`, `LinearLeavesInfo`, `GbLinearInfo`, `ShrinkageInfo`; `GpuModel`, `CompactModel` (keeps the booster's feature schema), `ModelSizeReport`, `ModelFormat`), `_core` (`Uncertainty` only, kept there so its `__module__` and pickles stay `hessboost._core`), `_model_io` (`PathLike`, `read_bytes`/`write_bytes`, `_SchemaState`: the feature schema and pickle state of `Booster`, `CompactModel`, `DiffusionModel`, `ForestModel`, the model as its own bytes), `_data` (numpy/pandas/polars/scipy conversion, category re-coding; frame libraries are detected through `sys.modules`, never imported; polars 1.x and 2.x: a polars frame converts through one `select` of `Float32` expressions and `to_numpy(order="c")`, and a polars `Categorical`'s categories are its sorted values, never its physical codes, which index a shared pool; `take_metadata`: per-row metadata named by frame column (`label="y"`), which leaves the features, and the one place a polars `LazyFrame` is collected, refusing arrays alongside it since the streaming engine keeps no row order after a join or `group_by`), `_training` (`train`, `train_with_budget`, `cv` with `target_stats=`/`target_encoder=`/`target_stats_label=`/`xgb_model=`, and `refit=` (typed by `overload` on `Literal`) returning the frozen `CvRefit`, whose booster has `train`'s schema (`_trained`; with target statistics, the encoded one) and whose `target_encoder` holds `dtrain`'s), `sklearn` (the estimators; their shared base `_HessboostModel` in `_sklearn_common`), `conformal`, `diffusion/` (`__init__`: frozen dataclasses mirroring `hessboost::diffusion`, presets read from the crate, `DiffusionModel`, `mean`/`quantiles`/`crps`; `forest`: `ForestParams`, `ForestModel`, `ForestSamples`), `inference` (`BoulevardInference`, `BoulevardInfo`, `EbmInference`, `TermBands`, `honest_refit`), `ebm` (`shape_functions`, `TermShape`, axes, `EbmInfo`), `folds`, `online` (`OnlineModel`, `UpdateReport`, frozen dataclasses `Exact`/`Approximate` mirroring `OnlineMode`), `target_stats` (`OrderedTargetEncoder`, `FittedTargetEncoder` holding its training matrix's feature schema, pickled with it, `to_bytes`/`save` without it; encoded columns become `"q"` and lose their categories); `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
 |`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit; `test_stubs.py` pins the native classes public modules hand out unwrapped (`Distributions`) and requires their stub docstrings to equal the Rust docs; `test_gpu.py` runs per device (`metal`, `wgpu`, `cuda`), skipping one without a GPU, with guards that fail on a wgpu or CUDA initialization failure (and, under `HESSBOOST_REQUIRE_WGPU` or `HESSBOOST_REQUIRE_CUDA`, on a missing device)|
@@ -307,8 +344,9 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 - **Unsafe:** only in `simd/`, hot loops of `tree/compact.rs`, `tree/hist/`,
   `tree/builder/partition.rs`, `backend/metal.rs`, and `backend/cuda/`
   (`backend/wgpu.rs` has none: `bytemuck` casts), and in the
-  `cuda-kernels/` crate (every kernel is an `unsafe fn` over device
-  pointers). Each block needs `// SAFETY:`.
+  `cuda-kernels/` crate (the raw-pointer kernels and the slot scatters;
+  the elementwise kernels are safe, see above). Each block needs
+  `// SAFETY:`.
 - **SIMD:** covers objective gradients (with their exponentials, sigmoids,
   and softmax), metric sums, cut search (`count_le`), and SHAP's per-lane
   kernels (return-edge terms `shap_edge_terms`, child basis
@@ -601,7 +639,11 @@ and stored member.
 Bump releases with `./release.py bump major|minor|patch` (or an explicit
 SemVer such as `1.2.3-rc.1`). This creates a release branch, updates the crate
 and Python versions and lockfiles, refreshes current dependency snippets,
-saves `tests/data/saved/<version>/`, pushes the branch, and opens a PR.
+saves `tests/data/saved/<version>/`, pushes the branch, and opens a PR. A
+manifest a PR already raised past the latest crates.io release (no saved
+models yet) counts as unreleased: the bump starts from that release, so
+`bump minor` or `bump <manifest version>` targets the manifest version,
+updates the snippets from the release's minor, and saves its models.
 Review and merge that PR; then, on `main`, run `./release.py --dry-run` and
 `./release.py` to create and push the annotated release tag. The tag runs
 `.github/workflows/publish.yml`, which verifies the Rust tests and Python

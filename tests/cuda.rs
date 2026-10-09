@@ -192,22 +192,47 @@ fn exact_pairs(n: usize) -> Vec<GradPair> {
         .collect()
 }
 
-/// Gradients of magnitude 1 with one value of `2^-38`: `M = 2^38` grains,
-/// so a chunk of up to 8,191 rows sums exactly but a node of more than
-/// `2^15` rows does not.
+/// Gradients of 1 but for row 16's `2^-40`: `M = 2^40` grains, so a block
+/// of up to 8,192 rows sums exactly but a node of more rows does not. A
+/// bin of 8,192 or more of the node's rows, row 16 among them, is where
+/// the CPU's blocked `f64` reduction rounds
+/// ([`assert_cpu_rounds_exact_chunk_bins`]).
 fn chunk_exact_pairs(n: usize) -> Vec<GradPair> {
     (0..n)
-        .map(|i| {
-            let g = if i == 17 {
-                2f32.powi(-38)
-            } else if i % 3 == 0 {
-                -1.0
-            } else {
-                1.0
-            };
-            GradPair::new(g, 1.0)
-        })
+        .map(|i| GradPair::new(if i == 16 { 2f32.powi(-40) } else { 1.0 }, 1.0))
         .collect()
+}
+
+/// Asserts that the CPU backend's histogram of the blocked node `rows`
+/// under [`chunk_exact_pairs`] differs from the exact sum (in `2^-40`
+/// grains, added in `i64`) in some bin's gradient: each block's partial is
+/// exact, but once a bin's running total of partials reaches 8,192 (`2^53`
+/// grains) row 16's odd grain rounds away. Then only the CPU's own order
+/// (exact chunks reduced in block order) reproduces the bin, not a
+/// whole-node integer sum in any order.
+fn assert_cpu_rounds_exact_chunk_bins(index: &GHistIndex, rows: &[u32], what: &str) {
+    assert!(rows.contains(&16), "{what}: the node must hold row 16");
+    let gpair = chunk_exact_pairs(index.n_rows());
+    let grains = 2f64.powi(40);
+    let cuts = index.cuts();
+    let mut exact = vec![0i64; index.total_bins()];
+    for f in 0..cuts.n_features() {
+        let (fs, fe) = cuts.feature_bins(f);
+        for &r in rows {
+            let r = r as usize;
+            if let Some(bin) = index.feature_bin_at(r, f, fs, fe) {
+                exact[bin as usize] += (f64::from(gpair[r].grad) * grains) as i64;
+            }
+        }
+    }
+    // Scaling by a power of two is exact, and every CPU partial is a whole
+    // number of grains below 2^63.
+    let rounded = histogram(&CpuBackend, index, rows, &gpair)
+        .iter()
+        .zip(&exact)
+        .filter(|&(&(grad, _), &sum)| (f64::from_bits(grad) * grains) as i64 != sum)
+        .count();
+    assert!(rounded > 0, "{what}: the CPU's blocked sums are all exact");
 }
 
 /// Gradients spanning `1e-30` to `1e30` (and Hessians to `1e38`): no sum of
@@ -242,9 +267,53 @@ enum Built {
 /// sums fixed blocks. CUDA sums exact nodes as integers anywhere, blocked
 /// nodes as exact chunks or chains, and chains below 8,192 rows with its
 /// chain kernel; a non-exact chain of 8,192 rows or more, and a non-finite
-/// gradient, are built on the CPU. The node counts show each strategy ran.
+/// gradient, are built on the CPU. The exact-chunk nodes have bins whose
+/// CPU sums round (checked without a device), so a whole-node integer sum
+/// would fail them. The node counts show each strategy ran.
 #[test]
 fn histograms_match_cpu_for_every_strategy() {
+    let value = |r: usize, f: usize| ((r * 2_654_435_761 + f * 97) % 1009) as f32 / 7.0;
+    // Feature 0 is 0 in three rows of four, so one of its bins holds more
+    // of a blocked node's rows than any of the node's blocks.
+    let skewed = |r: usize, f: usize| {
+        if f == 0 && r % 4 != 3 {
+            0.0
+        } else {
+            value(r, f)
+        }
+    };
+    let with_missing = |r: usize, f: usize| {
+        if (r + f).is_multiple_of(5) {
+            f32::NAN
+        } else {
+            skewed(r, f)
+        }
+    };
+    let sparse = |r: usize, f: usize| {
+        if (r + f).is_multiple_of(4) {
+            skewed(r, f)
+        } else {
+            f32::NAN
+        }
+    };
+
+    // A dense index above 2^18 rows: a row range is a chain, a subset of
+    // 8,192 rows or more is blocked.
+    let large = index(300_000, 4, 64, skewed);
+    let range: Vec<u32> = (0..300_000).collect();
+    let half: Vec<u32> = (0..300_000).step_by(2).collect();
+    // Missing values (a mostly full index, and a CSR-only one): a node of
+    // 8,192 rows or more is blocked, a smaller one a chain.
+    let sparse_indexes = [
+        ("missing", index(40_000, 7, 128, with_missing)),
+        ("csr", index(40_000, 7, 128, sparse)),
+    ];
+    let sparse_rows: Vec<u32> = (0..40_000).filter(|r| r % 7 != 3).collect();
+    assert_cpu_rounds_exact_chunk_bins(&large, &half, "dense blocked");
+    for (name, idx) in &sparse_indexes {
+        assert_cpu_rounds_exact_chunk_bins(idx, &sparse_rows, name);
+    }
+
     if !gpu::available::<Cuda>() {
         return;
     }
@@ -268,21 +337,6 @@ fn histograms_match_cpu_for_every_strategy() {
             seen.exact_chunk_nodes += counts.exact_chunk_nodes;
             seen.chain_nodes += counts.chain_nodes;
         };
-    let value = |r: usize, f: usize| ((r * 2_654_435_761 + f * 97) % 1009) as f32 / 7.0;
-    let with_missing = |r: usize, f: usize| {
-        if (r + f).is_multiple_of(5) {
-            f32::NAN
-        } else {
-            value(r, f)
-        }
-    };
-    let sparse = |r: usize, f: usize| {
-        if (r + f).is_multiple_of(4) {
-            value(r, f)
-        } else {
-            f32::NAN
-        }
-    };
 
     // A dense index of at most 2^18 rows: every node is a chain.
     let small = index(60_000, 6, 256, value);
@@ -311,11 +365,6 @@ fn histograms_match_cpu_for_every_strategy() {
         "dense subset, long chain, cpu",
     );
 
-    // A dense index above 2^18 rows: a row range is a chain, a subset of
-    // 8,192 rows or more is blocked.
-    let large = index(300_000, 4, 64, value);
-    let range: Vec<u32> = (0..300_000).collect();
-    let half: Vec<u32> = (0..300_000).step_by(2).collect();
     check(
         &large,
         &range,
@@ -345,37 +394,31 @@ fn histograms_match_cpu_for_every_strategy() {
         "dense blocked, chains",
     );
 
-    // Missing values (a mostly full index, and a CSR-only one): a node of
-    // 8,192 rows or more is blocked, a smaller one a chain.
-    for (name, cells) in [
-        ("missing", &with_missing as &dyn Fn(usize, usize) -> f32),
-        ("csr", &sparse),
-    ] {
-        let idx = index(40_000, 7, 128, cells);
-        let rows: Vec<u32> = (0..40_000).filter(|r| r % 7 != 3).collect();
+    for (name, idx) in &sparse_indexes {
+        let rows = &sparse_rows;
         check(
-            &idx,
-            &rows,
+            idx,
+            rows,
             &exact_pairs(40_000),
             Built::Gpu,
             &format!("{name}, exact"),
         );
         check(
-            &idx,
-            &rows,
+            idx,
+            rows,
             &chunk_exact_pairs(40_000),
             Built::Gpu,
             &format!("{name}, exact chunks"),
         );
         check(
-            &idx,
-            &rows,
+            idx,
+            rows,
             &wide_pairs(40_000),
             Built::Gpu,
             &format!("{name}, blocked chains"),
         );
         check(
-            &idx,
+            idx,
             &rows[..3000],
             &wide_pairs(40_000),
             Built::Gpu,

@@ -153,7 +153,7 @@ impl HistTreeBuilder<'_> {
     ) -> Option<DeviceTree> {
         let seg = engine.begin_tree(ghist, row_subset)?;
         // The root's statistics, the host's `sum_rows` bit for bit.
-        let root_stats = engine.root_total(gpair, row_subset, seg)?;
+        let root_stats = engine.root_total(gpair, row_subset, &seg)?;
         let on = Device {
             engine,
             ghist,
@@ -169,7 +169,7 @@ impl HistTreeBuilder<'_> {
             });
         let root = if let Some(slots) = &mut slots {
             let slot = slots.take()?;
-            engine.build_resident(ghist, gpair, &[(seg, slot)], &[])?;
+            engine.build_resident(ghist, gpair, &[(&seg, slot)], &[])?;
             let (features, ctx) = self.root_context(sampler, root_stats, row_subset.len());
             let node = ResidentNode {
                 slot,
@@ -185,7 +185,7 @@ impl HistTreeBuilder<'_> {
             }
         } else {
             let root_hist = engine
-                .histograms(ghist, gpair, &[seg])?
+                .histograms(ghist, gpair, &[&seg])?
                 .into_iter()
                 .next()?;
             NodeEntry {
@@ -202,7 +202,7 @@ impl HistTreeBuilder<'_> {
         }
         self.finish_tree(&mut tree, &store, root_stats);
         let leaf_rows = if report == LeafReport::Rows {
-            let segs: Vec<_> = store.device_leaves.iter().map(|&(_, seg)| seg).collect();
+            let segs: Vec<&Segment> = store.device_leaves.iter().map(|(_, seg)| seg).collect();
             let rows = engine.rows(&segs)?;
             store
                 .device_leaves
@@ -333,8 +333,9 @@ impl HistTreeBuilder<'_> {
         Some(())
     }
 
-    /// One device partition of every split of `pending`, in order.
-    fn partition_pending(on: Device<'_>, pending: &[PendingSplit]) -> Option<Vec<Partitioned>> {
+    /// One device partition of every split of `pending`, in order, taking
+    /// their segments.
+    fn partition_pending(on: Device<'_>, pending: &mut [PendingSplit]) -> Option<Vec<Partitioned>> {
         let cuts = on.ghist.cuts();
         let tables: Vec<Option<Vec<bool>>> = pending
             .iter()
@@ -346,7 +347,7 @@ impl HistTreeBuilder<'_> {
             })
             .collect();
         let splits: Option<Vec<RowSplit<'_>>> = pending
-            .iter()
+            .iter_mut()
             .zip(&tables)
             .map(|(split, table)| {
                 let best = &split.entry.best;
@@ -361,14 +362,14 @@ impl HistTreeBuilder<'_> {
                     (SplitLocation::Categories(_), None) => return None,
                 };
                 Some(RowSplit {
-                    seg: split.entry.seg?,
+                    seg: split.entry.seg.take()?,
                     feature: best.feature,
                     rule,
                     default_left: best.default_left,
                 })
             })
             .collect();
-        on.engine.partition(on.ghist, &splits?)
+        on.engine.partition(on.ghist, splits?)
     }
 
     /// The children of every split of `pending`: one device partition of
@@ -387,39 +388,39 @@ impl HistTreeBuilder<'_> {
         if pending.is_empty() {
             return Some(Vec::new());
         }
-        let parts = Self::partition_pending(on, &pending)?;
+        let parts = Self::partition_pending(on, &mut pending)?;
 
         // The smaller child of every non-terminal split is built; its
         // sibling is the parent minus it, as the host builder does.
-        let built: Vec<Segment> = pending
+        let built: Vec<&Segment> = pending
             .iter()
             .zip(&parts)
             .filter(|(split, _)| !split.terminal)
             .map(|(_, part)| smaller(part))
             .collect();
         let mut hists = engine.histograms(ghist, gpair, &built)?.into_iter();
+        let rows: usize = parts.iter().map(|p| p.left.len() + p.right.len()).sum();
         let mut items = Vec::with_capacity(pending.len());
-        for (split, part) in pending.iter_mut().zip(&parts) {
+        for (split, part) in pending.iter_mut().zip(parts) {
             let parent = std::mem::take(&mut split.entry.hist);
             let (left_hist, right_hist) = if split.terminal {
                 (Vec::new(), Vec::new())
             } else {
-                let left_smaller = part.left.len <= part.right.len;
+                let left_smaller = part.left.len() <= part.right.len();
                 with_sibling(parent, hists.next()?, left_smaller)
             };
             items.push((part, left_hist, right_hist));
         }
-        let finish = |(split, (part, left_hist, right_hist)): (PendingSplit, (&_, _, _))| {
-            let part: &Partitioned = part;
-            self.finish_children(
-                ghist,
-                split,
-                device_child(part.left, left_hist),
-                device_child(part.right, right_hist),
-                None,
-            )
-        };
-        let rows: usize = parts.iter().map(|p| p.left.len + p.right.len).sum();
+        let finish =
+            |(split, (part, left_hist, right_hist)): (PendingSplit, (Partitioned, _, _))| {
+                self.finish_children(
+                    ghist,
+                    split,
+                    device_child(part.left, left_hist),
+                    device_child(part.right, right_hist),
+                    None,
+                )
+            };
         let pairs = pending.into_iter().zip(items);
         Some(
             if pairs.len() > 1 && rows >= PARALLEL_FINISH_ROWS && rayon_available() {
@@ -440,13 +441,13 @@ impl HistTreeBuilder<'_> {
     fn resident_children(
         &self,
         on: Device<'_>,
-        pending: Vec<PendingSplit>,
+        mut pending: Vec<PendingSplit>,
         slots: &mut Slots,
     ) -> Option<Vec<(NodeEntry, NodeEntry)>> {
         if pending.is_empty() {
             return Some(Vec::new());
         }
-        let parts = Self::partition_pending(on, &pending)?;
+        let parts = Self::partition_pending(on, &mut pending)?;
         // Release all terminal parents before borrowing any child slot:
         // terminal splits can appear after non-terminal ones in node order.
         for split in &pending {
@@ -467,7 +468,7 @@ impl HistTreeBuilder<'_> {
             let built = slots.take()?;
             build.push((smaller(part), built));
             siblings.push((parent, built));
-            child_slots.push(Some(if part.left.len <= part.right.len {
+            child_slots.push(Some(if part.left.len() <= part.right.len() {
                 (built, parent)
             } else {
                 (parent, built)
@@ -478,7 +479,7 @@ impl HistTreeBuilder<'_> {
         let contexts: Vec<_> = pending
             .iter()
             .zip(&parts)
-            .map(|(split, part)| self.child_contexts(split, part.left.len, part.right.len))
+            .map(|(split, part)| self.child_contexts(split, part.left.len(), part.right.len()))
             .collect();
         let mut nodes = Vec::new();
         for ((split, (allowed, left_ctx, right_ctx)), slots) in
@@ -503,7 +504,7 @@ impl HistTreeBuilder<'_> {
         let mut out = Vec::with_capacity(pending.len());
         for (((split, part), slots), (allowed, _, _)) in pending
             .into_iter()
-            .zip(&parts)
+            .zip(parts)
             .zip(child_slots)
             .zip(contexts)
         {
@@ -606,18 +607,18 @@ impl HistTreeBuilder<'_> {
 
 /// The child of a partition with fewer rows (the left one on a tie), whose
 /// histogram is built.
-fn smaller(part: &Partitioned) -> Segment {
-    if part.left.len <= part.right.len {
-        part.left
+fn smaller(part: &Partitioned) -> &Segment {
+    if part.left.len() <= part.right.len() {
+        &part.left
     } else {
-        part.right
+        &part.right
     }
 }
 
 /// A child whose rows are the device segment `seg`.
 fn device_child(seg: Segment, hist: Vec<GradStats>) -> Child {
     Child {
-        len: seg.len,
+        len: seg.len(),
         rows: Vec::new(),
         seg: Some(seg),
         hist,
@@ -771,9 +772,9 @@ mod tests {
             let seg = backend.begin_tree(&index, &rows).unwrap();
             assert_eq!(backend.reserve_hists(&index, 1), Some(true));
             backend
-                .build_resident(&index, Some(&gradients), &[(seg, 0)], &[])
+                .build_resident(&index, Some(&gradients), &[(&seg, 0)], &[])
                 .unwrap();
-            let total = backend.root_total(Some(&gradients), &rows, seg).unwrap();
+            let total = backend.root_total(Some(&gradients), &rows, &seg).unwrap();
             let mut hist = zeroed(index.total_bins());
             CpuBackend.build(&index, &rows, &gradients, &mut hist);
             for direction in [Monotone::None, Monotone::Increasing, Monotone::Decreasing] {
@@ -853,7 +854,12 @@ mod tests {
                     .build()
                     .unwrap();
                 let rows: Vec<u32> = (0..index.n_rows() as u32).collect();
-                let mut sampler = ColumnSampler::new(3, None, 1.0, 1.0, 1.0, 71);
+                // Every node draws two of the three features (the root
+                // both categorical ones, its left child the numeric one),
+                // so the RNG moves per node: the final draw below differs
+                // unless both builders sampled the same number of times.
+                let mut sampler = ColumnSampler::new(3, None, 1.0, 1.0, 0.7, 71);
+                assert!(sampler.fixed_features().is_none());
                 let mut expected_sampler = sampler.clone();
                 let expected = HistTreeBuilder::new(&params).build(
                     &index,
@@ -950,14 +956,14 @@ mod tests {
         let seg = backend.begin_tree(&index, &rows).unwrap();
         assert_eq!(backend.reserve_hists(&index, 1), Some(true));
         backend
-            .build_resident(&index, Some(&gradients), &[(seg, 0)], &[])
+            .build_resident(&index, Some(&gradients), &[(&seg, 0)], &[])
             .unwrap();
         let params = TrainingParams::builder()
             .min_child_weight(0.0)
             .build()
             .unwrap();
         let builder = HistTreeBuilder::new(&params);
-        let total = backend.root_total(Some(&gradients), &rows, seg).unwrap();
+        let total = backend.root_total(Some(&gradients), &rows, &seg).unwrap();
         let (_, ctx) = builder.root_context(&mut ColumnSampler::all(3), total, rows.len());
         let node = ResidentNode {
             slot: 0,
@@ -1050,10 +1056,10 @@ mod tests {
         let backend = CudaHistBackend::new(&index, 0).unwrap();
         let check = |gpair: Option<&[GradPair]>, feature: u32, limit: u32, runs: bool| {
             let root = backend.begin_tree(&index, &rows).unwrap();
-            assert!(root.contiguous);
-            let total = backend.root_total(gpair, &rows, root).unwrap();
+            assert!(root.contiguous());
+            let total = backend.root_total(gpair, &rows, &root).unwrap();
             assert_eq!(stats_bits(total), stats_bits(sum_rows(&gradients, &rows)));
-            let root_hist = backend.histograms(&index, gpair, &[root]).unwrap().pop();
+            let root_hist = backend.histograms(&index, gpair, &[&root]).unwrap().pop();
             let mut expected = zeroed(index.total_bins());
             CpuBackend.build(&index, &rows, &gradients, &mut expected);
             assert_eq!(hist_bits(&root_hist.unwrap()), hist_bits(&expected));
@@ -1063,10 +1069,15 @@ mod tests {
                 rule: RowRule::Below(limit),
                 default_left: false,
             };
-            let part = backend.partition(&index, &[split]).unwrap()[0];
-            assert!(part.left.len > 8_192 && part.right.len > 8_192);
-            assert_eq!((part.left.contiguous, part.right.contiguous), (runs, runs));
-            let children = [part.left, part.right];
+            let [part] =
+                <[Partitioned; 1]>::try_from(backend.partition(&index, vec![split]).unwrap())
+                    .unwrap();
+            assert!(part.left.len() > 8_192 && part.right.len() > 8_192);
+            assert_eq!(
+                (part.left.contiguous(), part.right.contiguous()),
+                (runs, runs)
+            );
+            let children = [&part.left, &part.right];
             let hists = backend.histograms(&index, gpair, &children).unwrap();
             for (hist, rows) in hists.iter().zip(backend.rows(&children).unwrap()) {
                 CpuBackend.build(&index, &rows, &gradients, &mut expected);

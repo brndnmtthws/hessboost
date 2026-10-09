@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "cuda-device"
 version = "0.2.1"
-source = "git+https://github.com/NVIDIA/cuda-rust?rev=6921d3ee07e28ec62895ea40fc2fef39977ca411#6921d3ee07e28ec62895ea40fc2fef39977ca411"
+source = "git+https://github.com/NVIDIA/cuda-rust?rev=a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760#a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760"
 dependencies = [
  "cuda-macros",
 ]
@@ -13,7 +13,7 @@ dependencies = [
 [[package]]
 name = "cuda-macros"
 version = "0.2.1"
-source = "git+https://github.com/NVIDIA/cuda-rust?rev=6921d3ee07e28ec62895ea40fc2fef39977ca411#6921d3ee07e28ec62895ea40fc2fef39977ca411"
+source = "git+https://github.com/NVIDIA/cuda-rust?rev=a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760#a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -49,7 +49,7 @@ dependencies = [
 [[package]]
 name = "reserved-oxide-symbols"
 version = "0.2.1"
-source = "git+https://github.com/NVIDIA/cuda-rust?rev=6921d3ee07e28ec62895ea40fc2fef39977ca411#6921d3ee07e28ec62895ea40fc2fef39977ca411"
+source = "git+https://github.com/NVIDIA/cuda-rust?rev=a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760#a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760"
 
 [[package]]
 name = "syn"

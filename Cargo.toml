@@ -22,12 +22,12 @@ include = [
     "/LICENSE",
 ]
 
-# docs.rs builds on Linux, where the `wgpu` and `cuda` backends compile
-# (their drivers load at run time) and `metal` cannot (no Apple SDK), so
-# the wgpu and CUDA modules' real docs render there and Metal's stand-in
-# does.
+# docs.rs builds on Linux, where the `wgpu` backend compiles (its drivers
+# load at run time) and neither `metal` (no Apple SDK) nor `cuda` (no CUDA
+# toolkit headers for `cuda-bindings`) does, so wgpu's real docs render
+# there and the Metal and CUDA modules' stand-ins do.
 [package.metadata.docs.rs]
-features = ["wgpu", "cuda"]
+features = ["wgpu"]
 
 [dependencies]
 rayon = "1.12"
@@ -65,23 +65,15 @@ metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
 wgpu = ["dep:wgpu", "dep:bytemuck", "dep:parking_lot"]
 # NVIDIA CUDA acceleration for histogram training and prediction on Linux.
 # Opt-in and off by default. The kernels are embedded PTX (Rust compiled by
-# cuda-oxide, `cuda-kernels/`) and `libcuda` (the driver, CUDA 12.8 or
-# later) is loaded at run time, so building needs no CUDA toolkit. See
-# `src/backend/`.
-cuda = ["dep:cudarc", "dep:parking_lot"]
+# cuda-oxide, `cuda-kernels/`); the host side is cuda-oxide's `cuda-core`,
+# which loads `libcuda` (the driver, CUDA 12.8 or later) at run time.
+# Building it needs the CUDA 13 toolkit's `cuda.h` and `curand.h` and
+# libclang (`cuda-bindings` generates its bindings from them); see AGENTS.md
+# and `src/backend/`.
+cuda = ["dep:cuda-core", "dep:parking_lot"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# `cuda-12080`: the oldest driver API the backend needs (CUDA 12.8), so any
-# newer driver loads it; `dynamic-loading` opens the driver at run time.
-# `nvrtc` only provides the PTX container `CudaContext::load_module` takes;
-# NVRTC itself is never loaded.
-cudarc = { version = "0.19.10", default-features = false, features = [
-    "std",
-    "driver",
-    "nvrtc",
-    "dynamic-loading",
-    "cuda-12080",
-], optional = true }
+cuda-core = { version = "0.4", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }

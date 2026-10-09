@@ -46,13 +46,25 @@ mod shared;
 #[cfg(all(target_os = "linux", feature = "cuda"))]
 pub mod cuda;
 
-/// The CUDA backend's stand-in when it is not compiled in. The module and
-/// predictor type remain available for documentation and return types;
+/// The CUDA backend's stand-in when it is not compiled in (any other
+/// platform, or the feature off): the module exists so `backend::cuda`
+/// paths and doc links resolve on every platform, but holds only the
+/// [`GpuModel`](self::cuda::GpuModel) handle, which
 /// [`BoostedModel::to_cuda`](crate::model::BoostedModel::to_cuda) then
-/// returns an error naming the feature and platform requirement.
+/// never constructs — it always returns an error naming the feature and
+/// platform requirement.
+///
+/// These docs are the stand-in (docs.rs cannot build the `cuda` feature:
+/// `cuda-bindings` needs the CUDA 13 headers and libclang). The CUDA API
+/// (device availability, the histogram backend, prediction) and the
+/// backend's design, exactness rules, and limitations are documented in
+/// the real module: run `cargo doc --features cuda --open` on Linux with
+/// those installed.
 #[cfg(not(all(target_os = "linux", feature = "cuda")))]
 pub mod cuda {
-    /// The CUDA predictor handle when the backend is not compiled in.
+    /// The CUDA predictor handle when the CUDA backend is not compiled in.
+    /// [`BoostedModel::to_cuda`](crate::model::BoostedModel::to_cuda) then
+    /// always returns an error, so this is never constructed.
     #[derive(Debug)]
     #[non_exhaustive]
     pub struct GpuModel;

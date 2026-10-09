@@ -13,7 +13,7 @@ path = "src/lib.rs"
 # cuda-oxide's device crate. `build.sh` builds the codegen backend from this
 # same revision (cargo-oxide resolves it through Cargo.lock), so the pin here,
 # `rust-toolchain.toml`'s nightly, and mise.toml's cargo-oxide move together.
-cuda-device = { git = "https://github.com/NVIDIA/cuda-rust", rev = "6921d3ee07e28ec62895ea40fc2fef39977ca411" }
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760" }
 
 # cuda-oxide writes one PTX module per crate build: `build.sh` builds the
 # training kernels and the prediction kernels separately, so that a
@@ -50,3 +50,9 @@ missing_panics_doc = "allow"
 must_use_candidate = "allow"
 # Hot prediction/histogram/SIMD helpers; forced inlining is measured.
 inline_always = "allow"
+# `#[kernel]` exports each entry with `#[no_mangle]`; cuda-oxide's codegen,
+# not rustc, lowers its parameters (slices as pointer and length, structs
+# by value: `lib.rs`'s ABI section), so the Rust ABI never reaches a caller.
+# `extern "C"` would make rustc flag the safe kernels' `&[T]` parameters as
+# not FFI-safe.
+no_mangle_with_rust_abi = "allow"

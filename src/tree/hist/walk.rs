@@ -348,7 +348,9 @@ pub(super) fn by_features<E: Bucket, V: RowValue<E>>(
 /// [`by_features`] on `threads` scoped threads instead of Rayon's pool,
 /// with the same bits (each bin still has one writer adding its rows in
 /// ascending order), for a caller holding a lock that work stealing could
-/// re-enter: the CUDA backend's state.
+/// re-enter: the CUDA backend's state. A group whose thread the OS cannot
+/// create (a process or container thread limit) is built on the calling
+/// thread instead, with the same bits, since each group owns its features.
 #[cfg(all(target_os = "linux", feature = "cuda"))]
 pub(super) fn by_features_scoped<E: Bucket, V: RowValue<E>>(
     ghist: &GHistIndex,
@@ -358,22 +360,38 @@ pub(super) fn by_features_scoped<E: Bucket, V: RowValue<E>>(
     out: &mut [E],
     threads: usize,
 ) {
+    /// One thread's features: `(task, features)` pairs as in [`by_features`].
+    type Group<'a, 'b, E> = Vec<(usize, &'a mut [(usize, &'b mut [E])])>;
     let n_rows = ghist.n_rows();
     let per_task = ghist.n_cols().div_ceil(threads).clamp(1, 4);
     let mut slices = feature_slices(ghist, out, 1);
-    let mut tasks: Vec<_> = slices.chunks_mut(per_task).enumerate().collect();
+    let tasks: Vec<_> = slices.chunks_mut(per_task).enumerate().collect();
     let per_thread = tasks.len().div_ceil(threads.max(1)).max(1);
+    let build = |group: Group<'_, '_, E>| {
+        for (task, features) in group {
+            let f = task * per_task;
+            match columns {
+                Bins::U16(c) => feature_group(c, n_rows, f, features, rows, values),
+                Bins::U32(c) => feature_group(c, n_rows, f, features, rows, values),
+            }
+        }
+    };
+    // Each group sits behind its own lock, so a failed spawn (which drops
+    // the closure unrun) leaves the group for the calling thread to build.
+    let mut groups = Vec::new();
+    let mut tasks = tasks.into_iter().peekable();
+    while tasks.peek().is_some() {
+        groups.push(parking_lot::Mutex::new(
+            tasks.by_ref().take(per_thread).collect(),
+        ));
+    }
+    let take = |group: &parking_lot::Mutex<Vec<_>>| std::mem::take(&mut *group.lock());
     std::thread::scope(|scope| {
-        for group in tasks.chunks_mut(per_thread) {
-            scope.spawn(move || {
-                for (task, features) in group {
-                    let f = *task * per_task;
-                    match columns {
-                        Bins::U16(c) => feature_group(c, n_rows, f, features, rows, values),
-                        Bins::U32(c) => feature_group(c, n_rows, f, features, rows, values),
-                    }
-                }
-            });
+        for group in &groups {
+            let spawned = std::thread::Builder::new().spawn_scoped(scope, || build(take(group)));
+            if spawned.is_err() {
+                build(take(group));
+            }
         }
     });
 }

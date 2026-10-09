@@ -4,29 +4,27 @@
 //! array the driver copies from the pushed value. Device pointers are
 //! `CUdeviceptr`s (`u64`), the kernels' 8-byte pointers.
 
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, sys};
+use super::driver::{LaunchArg, Memory, MemoryMut, Params, by_value};
+use cuda_core::sys;
 
-/// `slice`'s device address (training contexts disable cudarc's event
-/// tracking, so the access guard records nothing).
-pub(super) fn ptr<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> sys::CUdeviceptr {
-    slice.device_ptr(stream).0
+/// `memory`'s device address, for a kernel that reads it.
+pub(super) fn ptr<T>(memory: &impl Memory<T>) -> sys::CUdeviceptr {
+    memory.addr()
 }
 
-/// `slice`'s device address, for a kernel that writes it.
-pub(super) fn ptr_mut<T>(slice: &mut CudaSlice<T>, stream: &CudaStream) -> sys::CUdeviceptr {
-    slice.device_ptr_mut(stream).0
+/// `memory`'s device address, for a kernel that writes it.
+pub(super) fn ptr_mut<T>(memory: &mut impl MemoryMut<T>) -> sys::CUdeviceptr {
+    memory.addr()
 }
 
 /// The `logistic` kernel's scalars.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct LogisticParams {
-    pub weighted: i32,
     pub scale_pos_weight: f32,
     pub min_hess: f32,
     pub max_input: f32,
     pub lanes: u32,
-    pub n: u64,
 }
 
 /// A dense integer histogram launch's tiles, feature groups, bin layout
@@ -170,38 +168,26 @@ pub(super) struct Batch8 {
     pub tree_end: u32,
 }
 
-// SAFETY: each is `#[repr(C)]` of plain integers, floats and device
-// addresses, with the size and alignment of the kernel parameter it is
-// pushed as (the kernels' layouts above).
-unsafe impl DeviceRepr for LogisticParams {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for TileWork {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for Chunks {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for ChainWork {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for SparseTiles {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for PartTiles {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for Regularization {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for NumericTasks {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for NumericResults {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for CategoryTasks {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for SortWorkspace {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for CategoricalTasks {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for CategoricalResults {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for Batch16 {}
-// SAFETY: as above.
-unsafe impl DeviceRepr for Batch8 {}
+// Each is `#[repr(C)]` of plain integers, floats and device addresses, with
+// the size and alignment of the kernel parameter it is pushed as (the
+// kernels' layouts above; `tests` checks them against the PTX).
+by_value!(
+    LogisticParams,
+    TileWork,
+    Chunks,
+    ChainWork,
+    SparseTiles,
+    PartTiles,
+    Regularization,
+    NumericTasks,
+    NumericResults,
+    CategoryTasks,
+    SortWorkspace,
+    CategoricalTasks,
+    CategoricalResults,
+    Batch16,
+    Batch8,
+);
 
 #[cfg(test)]
 mod tests {
@@ -241,7 +227,7 @@ mod tests {
             (align_of::<T>(), size_of::<T>())
         }
         let training = [
-            ("logistic", 3, of::<LogisticParams>()),
+            ("logistic", 6, of::<LogisticParams>()),
             ("scan_splits", 3, of::<NumericTasks>()),
             ("scan_splits", 4, of::<Regularization>()),
             ("scan_splits", 5, of::<NumericResults>()),
@@ -274,5 +260,63 @@ mod tests {
         }
         assert_eq!(param(Module::Prediction, "predict16", 6), of::<Batch16>());
         assert_eq!(param(Module::Prediction, "predict8", 4), of::<Batch8>());
+    }
+
+    /// The PTX type of each parameter of `entry`: `u64`, `f64`, ..., or
+    /// `b8` for a by-value struct.
+    fn param_types(module: Module, entry: &str) -> Vec<String> {
+        let ptx = module.ptx();
+        let start = ptx
+            .find(&format!(".visible .entry {entry}("))
+            .unwrap_or_else(|| panic!("no entry {entry}"));
+        ptx[start..]
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with(')'))
+            .map(|line| {
+                // `.param .u64 [.ptr .align 8] name,` or, for a by-value
+                // struct, `.param .align 8 .b8 name[size],`.
+                let ty = line
+                    .trim()
+                    .trim_start_matches(".param")
+                    .split_whitespace()
+                    .next()
+                    .expect("parameter type");
+                if ty == ".align" { "b8" } else { &ty[1..] }.to_owned()
+            })
+            .collect()
+    }
+
+    /// The kernels that take slices have the parameters their launches push
+    /// (`Launch::slice`, `pairs` and `raw_slice`: a pointer and a length
+    /// each, `S` here), in order.
+    #[test]
+    fn slice_kernels_take_the_pushed_parameters() {
+        let kernels = [
+            ("stage_units", "S S f64 f64"),
+            ("iota_rows", "S u32"),
+            ("squared_error", "S S S f32 S"),
+            ("logistic", "S S S b8 S"),
+            ("grad_domain", "S S"),
+            ("finalize_exact", "S S u64 f64 f64 S"),
+            ("finalize_exact_sub", "S S u64 f64 f64 S"),
+            ("reduce_chunks", "S S u64 f64 f64 S"),
+            ("reduce_chains", "S u64 u32 S"),
+            ("subtract_hists", "S S u64"),
+            ("route_runs", "S S S S"),
+        ];
+        for (entry, signature) in kernels {
+            let expected: Vec<&str> = signature
+                .split(' ')
+                .flat_map(|p| {
+                    if p == "S" {
+                        vec!["u64", "u64"]
+                    } else {
+                        vec![p]
+                    }
+                })
+                .collect();
+            assert_eq!(param_types(Module::Training, entry), expected, "{entry}");
+        }
     }
 }

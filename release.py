@@ -8,6 +8,9 @@
 `./release.py bump {major|minor|patch|X.Y.Z[-alpha.N|-beta.N|-rc.N]}` prepares,
 pushes, and opens the release-bump PR. After merging it, `./release.py` creates
 and pushes the annotated release tag. The no-subcommand flow remains tagging.
+
+A bump starts from the manifest version, or from the latest crates.io release
+when the manifest is an unreleased bump made by hand (see `bump_base`).
 """
 
 import argparse
@@ -128,11 +131,11 @@ def check_manifests(version: str) -> str:
     return f"Cargo.toml and python/Cargo.toml are {version}"
 
 
-def check_newer(version: str) -> str:
-    key, wheel = semver_key(version), pep440(version)
+def latest_release() -> str | None:
+    """Return the newest SemVer version of hessboost on crates.io, or None if there is none."""
     status, body = http_get("https://crates.io/api/v1/crates/hessboost")
     if status == 404:
-        return f"{version} (PyPI {wheel}); hessboost is not on crates.io yet"
+        return None
     if status != 200:
         raise CheckError(f"crates.io returned HTTP {status}")
     published = [
@@ -140,8 +143,15 @@ def check_newer(version: str) -> str:
         for item in json.loads(body)["versions"]
         if SEMVER.fullmatch(item["num"].split("+", 1)[0])
     ]
-    newest = max(published, key=semver_key, default="none")
-    if newest != "none" and key <= semver_key(newest):
+    return max(published, key=semver_key, default=None)
+
+
+def check_newer(version: str) -> str:
+    key, wheel = semver_key(version), pep440(version)
+    newest = latest_release()
+    if newest is None:
+        return f"{version} (PyPI {wheel}); hessboost has no release on crates.io yet"
+    if key <= semver_key(newest):
         raise CheckError(f"{version} is not greater than {newest} on crates.io")
     return f"{version} (PyPI {wheel}) > {newest} on crates.io"
 
@@ -283,9 +293,32 @@ VERSION_REFERENCE_FILES = (
 DEPENDENCY_VERSION = re.compile(r'(hessboost\s*=\s*")([0-9]+\.[0-9]+)(")')
 
 
-def bumped_version(current: str, part: str) -> str:
-    major, minor, patch, _, _ = semver_key(current)
-    match = SEMVER.fullmatch(current)
+def saved_models_dir(version: str) -> Path:
+    return ROOT / "tests" / "data" / "saved" / version
+
+
+def bump_base(current: str, latest: str | None) -> str:
+    """Return the version a bump of manifest version `current` starts from.
+
+    That is `current`, unless the manifest is an unreleased bump: newer than
+    `latest`, the newest crates.io release, with no saved models (a version bumped
+    by hand, not by `bump`). Then it is `latest`: `major|minor|patch` count from
+    it, an explicit target may equal `current`, and the dependency snippets
+    still name its minor.
+    """
+    if (
+        latest is not None
+        and semver_key(current) > semver_key(latest)
+        and not saved_models_dir(current).exists()
+    ):
+        return latest
+    return current
+
+
+def bumped_version(base: str, part: str) -> str:
+    """Return `base` bumped by `part`, or `part` itself if it is an explicit version."""
+    major, minor, patch, _, _ = semver_key(base)
+    match = SEMVER.fullmatch(base)
     assert match is not None
     if part == "major":
         return f"{major + 1}.0.0"
@@ -300,19 +333,32 @@ def bumped_version(current: str, part: str) -> str:
     return part
 
 
-def check_bump_version(version: str, current: str) -> str:
-    semver_key(version)
+def check_bump_version(version: str, current: str, base: str, latest: str | None) -> str:
+    """Check `version` against manifest `current`, its `bump_base`, and crates.io's `latest`.
+
+    The target must be newer than the manifest, or at least the manifest if that is
+    an unreleased bump, and newer than the latest release.
+    """
+    key = semver_key(version)
     wheel = pep440(version)
-    if semver_key(version) <= semver_key(current):
-        raise CheckError(f"{version} is not newer than current version {current}")
-    check_newer(version)
-    return f"{version} (PyPI {wheel}) > current {current} and newest crates.io release"
+    unreleased = base != current
+    if key < semver_key(current) or (key == semver_key(current) and not unreleased):
+        raise CheckError(
+            f"{version} is older than unreleased manifest version {current}"
+            if unreleased
+            else f"{version} is not newer than current version {current}"
+        )
+    if latest is not None and key <= semver_key(latest):
+        raise CheckError(f"{version} is not greater than {latest} on crates.io")
+    manifest = f">= unreleased manifest {current}" if unreleased else f"> current {current}"
+    release = f"> {latest} on crates.io" if latest else "no crates.io release yet"
+    return f"{version} (PyPI {wheel}) {manifest}; {release}"
 
 
 def check_bump_targets(version: str) -> str:
     tag = f"v{version}"
     check_tag(tag)
-    saved = ROOT / "tests" / "data" / "saved" / version
+    saved = saved_models_dir(version)
     if saved.exists():
         raise CheckError(f"{saved.relative_to(ROOT)}/ already exists")
     branch = f"release/v{version}"
@@ -330,10 +376,16 @@ def replace_package_version(manifest: str, version: str) -> None:
     path.write_text(tomlkit.dumps(document))
 
 
-def update_version_references(current: str, version: str) -> list[str]:
-    old_minor = ".".join(current.split(".")[:2])
-    new_minor = ".".join(version.split(".")[:2])
-    changed = []
+def dependency_minor(version: str) -> str:
+    """Return the `MAJOR.MINOR` the dependency snippets name for `version`."""
+    return ".".join(version.split(".")[:2])
+
+
+def version_reference_updates(base: str, version: str) -> dict[str, str]:
+    """Map each reference file whose dependency snippets name `base`'s minor to its
+    text naming `version`'s minor instead."""
+    old_minor, new_minor = dependency_minor(base), dependency_minor(version)
+    updates = {}
     for name in VERSION_REFERENCE_FILES:
         path = ROOT / name
         if not path.is_file():
@@ -344,9 +396,15 @@ def update_version_references(current: str, version: str) -> list[str]:
             text,
         )
         if updated != text:
-            path.write_text(updated)
-            changed.append(name)
-    return changed
+            updates[name] = updated
+    return updates
+
+
+def update_version_references(base: str, version: str) -> list[str]:
+    updates = version_reference_updates(base, version)
+    for name, text in updates.items():
+        (ROOT / name).write_text(text)
+    return list(updates)
 
 
 def step(name: str, check: Callable[[], str]) -> bool:
@@ -403,7 +461,7 @@ def save_and_verify_models(version: str) -> str:
         "only",
         "save_models_of_this_version",
     )
-    saved = ROOT / "tests" / "data" / "saved" / version
+    saved = saved_models_dir(version)
     after = run("git", "status", "--porcelain", "--", "tests/data/saved")
     if not saved.is_dir() or not any(saved.iterdir()):
         raise CheckError(f"{saved.relative_to(ROOT)}/ was not created with files")
@@ -445,8 +503,10 @@ def commit_and_push(branch: str, version: str, no_pr: bool) -> None:
 def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
     try:
         current = package_version("Cargo.toml")
-        version = bumped_version(current, version_arg)
-    except (CheckError, OSError, tomllib.TOMLDecodeError, KeyError) as err:
+        latest = latest_release()
+        base = bump_base(current, latest)
+        version = bumped_version(base, version_arg)
+    except (CheckError, OSError, tomllib.TOMLDecodeError, KeyError, ValueError) as err:
         print(f"error: cannot compute release version: {err}", file=sys.stderr)
         return 1
     branch = f"release/v{version}"
@@ -458,14 +518,23 @@ def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
             ),
         ),
         ("git state", check_git),
-        ("version", lambda: check_bump_version(version, current)),
+        ("version", lambda: check_bump_version(version, current, base, latest)),
         ("release targets", lambda: check_bump_targets(version)),
     ]
-    print(f"Checking release bump hessboost {current} → {version}")
+    source = current if base == current else f"{base} (unreleased manifest {current})"
+    print(f"Checking release bump hessboost {source} → {version}")
     if not run_checks(checks, "Preconditions failed; no changes made."):
         return 1
+    old_minor, new_minor = dependency_minor(base), dependency_minor(version)
+    snippets = f'hessboost = "{old_minor}" → "{new_minor}" in ' + (
+        ", ".join(version_reference_updates(base, version)) or "no files"
+    )
     print(
-        f"\nPlan: hessboost {current} → {version}\n  PyPI:   {pep440(version)}\n  branch: {branch}"
+        f"\nPlan: hessboost {source} → {version}\n"
+        f"  PyPI:         {pep440(version)}\n"
+        f"  branch:       {branch}\n"
+        f"  snippets:     {snippets if old_minor != new_minor else 'unchanged'}\n"
+        f"  saved models: {saved_models_dir(version).relative_to(ROOT)}/"
     )
     if dry_run:
         print("\nDry run: preconditions passed; no changes made.")
@@ -483,7 +552,7 @@ def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
             raise CheckError("manifest update failed")
         if not step("lockfiles", refresh_lockfiles):
             raise CheckError("lockfile refresh failed")
-        references = update_version_references(current, version)
+        references = update_version_references(base, version)
         print(
             "  ✓ version references: "
             + (", ".join(references) if references else "no current-release snippets found")

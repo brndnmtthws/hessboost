@@ -187,8 +187,9 @@ python3 scripts/compare_benchmarks.py \
 
 The output directory must not already exist. Build both executables with the
 same benchmark source, lockfile, compiler, and release settings before running
-the comparison. See [Performance](../docs/performance.md) for recorded results,
-workload definitions, and complete reproduction commands.
+the comparison. Its results document a change and belong in that change's
+pull request; [Performance](../docs/performance.md) records only comparisons
+between alternatives that exist side by side.
 
 The CUDA Criterion groups (`--filter '^cuda_'`, executables built with
 `--features cuda`) time the CPU and CUDA engines side by side: one-node

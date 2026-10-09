@@ -275,8 +275,12 @@ through its `GpuBackend` impl.
 `.json`, `.hbtd`, `.margins`); `tests/data/xgboost-3.4.2-categorical.*` are
 XGBoost saves for `model/xgboost/tests.rs`, and `tests/data/lightgbm-4.7.0-*`
 LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
-`gen_lightgbm_fixtures.py --test-data`) for `model/lightgbm.rs` tests. `benches/training.rs`
-(Criterion) results go in `docs/performance.md`.
+`gen_lightgbm_fixtures.py --test-data`) for `model/lightgbm.rs` tests.
+`docs/performance.md` records current comparisons only: hessboost against
+other libraries, the CPU against each GPU backend, and opt-in modes against
+the defaults (`benches/training.rs`, `scripts/bench_xgb.py`). A change's
+before/after timings (`scripts/compare_benchmarks.py`) go in its pull
+request, not the docs.
 
 ## Layout (`python/`)
 

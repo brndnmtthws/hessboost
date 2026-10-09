@@ -104,3 +104,10 @@ cache-keys = [
 # needs the CUDA headers and libclang, see AGENTS.md) rather than fetching a
 # published wheel. uv ignores this table when hessboost is a dependency.
 hessboost-runtime-cuda = { path = "runtime-cuda" }
+
+# uv builds the CUDA runtime alongside `hessboost`, concurrently and from the
+# same crate, and maturin stages each build's extension at one path in the
+# Cargo target directory: a target directory of its own (`runtime-cuda/target`)
+# keeps either wheel from packaging the other's extension.
+[tool.uv.extra-build-variables]
+hessboost-runtime-cuda = { CARGO_TARGET_DIR = "target" }

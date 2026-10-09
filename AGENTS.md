@@ -185,7 +185,10 @@ distribution, `hessboost-runtime-cuda` (`runtime-cuda/pyproject.toml`: the
 same crate with its `cuda` feature, as `_hessboost_runtime_cuda._native`,
 Linux only), which the `cuda` extra pins to the same release
 (`release.py bump` updates the pin; uv cannot check it, as the lockfile
-takes the runtime from `runtime-cuda/` through `tool.uv.sources`). From
+takes the runtime from `runtime-cuda/` through `tool.uv.sources`). uv
+builds it in `runtime-cuda/target` (`tool.uv.extra-build-variables`):
+maturin stages both builds' extension at one path of the target directory,
+and uv runs the two builds concurrently. From
 `python/`, with the root `cuda` feature's build requirements installed:
 
 ```sh

@@ -1,10 +1,11 @@
 //! `GpuModel`: Metal, wgpu or NVIDIA CUDA batch prediction.
 //!
-//! wgpu is compiled into every wheel, Metal into macOS wheels and CUDA
-//! only into Linux builds with this crate's opt-in `cuda` feature. Drivers
-//! are loaded at run time; absence never prevents importing the package.
-//! Forests upload once; prediction preserves CPU bits, with CPU objective
-//! transforms and model shrinkage.
+//! wgpu is compiled into every build, Metal into macOS builds and CUDA only
+//! into Linux builds with this crate's `cuda` feature: the
+//! `hessboost-runtime-cuda` distribution (`hessboost[cuda]`), not
+//! `hessboost`'s own extension. Drivers are loaded at run time; absence
+//! never prevents importing the package. Forests upload once; prediction
+//! preserves CPU bits, with CPU objective transforms and model shrinkage.
 
 use crate::booster::{dense, iterations};
 use crate::data::{DMatrix, to_numpy};
@@ -18,6 +19,12 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::Deserialize;
 use serde::de::value::StrDeserializer;
+
+/// Why an extension built without CUDA refuses it, and where to get one
+/// built with it.
+#[cfg(not(all(target_os = "linux", feature = "cuda")))]
+pub(crate) const WITHOUT_CUDA: &str = "this hessboost extension was built without CUDA (on \
+                                       Linux, hessboost[cuda] installs one built with it)";
 
 /// A GPU backend, as the `device` argument names it.
 #[derive(Clone, Copy)]
@@ -116,9 +123,7 @@ impl Predictor {
             Backend::Cuda { ordinal } => py.detached(|| model.to_cuda(ordinal)).map(Self::Cuda),
             #[cfg(not(all(target_os = "linux", feature = "cuda")))]
             Backend::Cuda { ordinal } => Err(refuse(format!(
-                "CUDA GPU prediction (device \"cuda:{ordinal}\") is unavailable: this \
-                 hessboost extension was built without CUDA (hessboost-python's `cuda` \
-                 feature, Linux only)"
+                "CUDA GPU prediction (device \"cuda:{ordinal}\") is unavailable: {WITHOUT_CUDA}"
             ))),
         }
     }

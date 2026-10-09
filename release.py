@@ -35,6 +35,13 @@ _ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
 SEMVER = re.compile(rf"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-({_ID}(?:\.{_ID})*))?")
 PEP440_PRE = {"alpha": "a", "beta": "b", "rc": "rc"}
 SemverKey = tuple[int, int, int, int, tuple[tuple[int, int, str], ...]]
+# The second PyPI distribution, published from the same tag: hessboost's
+# extension built with CUDA. python/pyproject.toml's `cuda` extra pins it to
+# the release (`hessboost-runtime-cuda==VERSION; MARKER`), which uv cannot
+# check: the lockfile takes it from its directory whatever the pin says.
+CUDA_RUNTIME = "hessboost-runtime-cuda"
+CUDA_EXTRA = re.compile(rf"({re.escape(CUDA_RUNTIME)}==)([^;\s]+)(\s*;.+)")
+PYPI_PROJECTS = ("hessboost", CUDA_RUNTIME)
 
 
 class CheckError(Exception):
@@ -101,6 +108,18 @@ def package_version(manifest: str) -> str:
         return str(tomllib.load(manifest_file)["package"]["version"])
 
 
+def cuda_runtime_pin() -> str:
+    """Return the version python/pyproject.toml's `cuda` extra pins the CUDA runtime to."""
+    with (ROOT / "python" / "pyproject.toml").open("rb") as pyproject:
+        extra = tomllib.load(pyproject)["project"]["optional-dependencies"]["cuda"]
+    match = CUDA_EXTRA.fullmatch(extra[0]) if len(extra) == 1 else None
+    if match is None:
+        raise CheckError(
+            f"python/pyproject.toml's cuda extra is not one `{CUDA_RUNTIME}==VERSION; MARKER`"
+        )
+    return match[2]
+
+
 def require_tools(names: tuple[str, ...]) -> str:
     missing = [tool for tool in names if shutil.which(tool) is None]
     if missing:
@@ -128,7 +147,10 @@ def check_manifests(version: str) -> str:
     root, python = package_version("Cargo.toml"), package_version("python/Cargo.toml")
     if not root == python == version:
         raise CheckError(f"Cargo.toml {root}, python/Cargo.toml {python}, release {version}")
-    return f"Cargo.toml and python/Cargo.toml are {version}"
+    pin, wheel = cuda_runtime_pin(), pep440(version)
+    if pin != wheel:
+        raise CheckError(f"python/pyproject.toml pins {CUDA_RUNTIME}=={pin}, release {wheel}")
+    return f"Cargo.toml and python/Cargo.toml are {version}; the cuda extra pins {wheel}"
 
 
 def latest_release() -> str | None:
@@ -206,16 +228,22 @@ def check_unpublished(version: str) -> str:
         raise CheckError(f"hessboost {version} is already on crates.io")
     if status != 404:
         raise CheckError(f"crates.io returned HTTP {status} for hessboost {version}")
-    status, body = http_get("https://pypi.org/pypi/hessboost/json")
-    if status == 404:
+    pending = []
+    for project in PYPI_PROJECTS:
+        status, body = http_get(f"https://pypi.org/pypi/{project}/json")
+        if status == 404:
+            pending.append(project)
+            continue
+        if status != 200:
+            raise CheckError(f"PyPI returned HTTP {status} for {project}")
+        if wheel in json.loads(body)["releases"]:
+            raise CheckError(f"{project} {wheel} is already on PyPI")
+    if pending:
         return (
-            "not on crates.io; PyPI project does not exist yet, configure pending trusted "
-            f"publisher ({REPO}, publish.yml, environment pypi)"
+            f"not on crates.io or PyPI ({wheel}); PyPI project(s) {', '.join(pending)} do not "
+            f"exist yet, configure a pending trusted publisher for each ({REPO}, publish.yml, "
+            "environment pypi)"
         )
-    if status != 200:
-        raise CheckError(f"PyPI returned HTTP {status}")
-    if wheel in json.loads(body)["releases"]:
-        raise CheckError(f"hessboost {wheel} is already on PyPI")
     return f"hessboost {version} is on neither crates.io nor PyPI ({wheel})"
 
 
@@ -376,6 +404,14 @@ def replace_package_version(manifest: str, version: str) -> None:
     path.write_text(tomlkit.dumps(document))
 
 
+def replace_cuda_runtime_pin(version: str) -> None:
+    path = ROOT / "python" / "pyproject.toml"
+    document = tomlkit.parse(path.read_text())
+    extra = document["project"]["optional-dependencies"]["cuda"]
+    extra[0] = CUDA_EXTRA.sub(lambda match: match[1] + pep440(version) + match[3], str(extra[0]))
+    path.write_text(tomlkit.dumps(document))
+
+
 def dependency_minor(version: str) -> str:
     """Return the `MAJOR.MINOR` the dependency snippets name for `version`."""
     return ".".join(version.split(".")[:2])
@@ -438,9 +474,8 @@ def confirm(prompt: str) -> bool:
 def refresh_manifest_versions(version: str) -> str:
     replace_package_version("Cargo.toml", version)
     replace_package_version("python/Cargo.toml", version)
-    if package_version("Cargo.toml") != version or package_version("python/Cargo.toml") != version:
-        raise CheckError("manifest version verification failed")
-    return f"Cargo.toml and python/Cargo.toml are {version}"
+    replace_cuda_runtime_pin(version)
+    return check_manifests(version)
 
 
 def refresh_lockfiles() -> str:

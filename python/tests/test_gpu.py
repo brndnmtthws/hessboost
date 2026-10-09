@@ -1,15 +1,18 @@
 """GPU training and batch prediction: Metal, wgpu and CUDA. Device tests
 skip without a usable backend; HESSBOOST_REQUIRE_WGPU/CUDA forbid skips.
-CUDA needs an extension built on Linux with hessboost-python's ``cuda``
-feature (off by default); it loads the driver at run time and needs only a
-driver and a GPU."""
+CUDA needs the CUDA runtime (``hessboost-runtime-cuda``, which
+``hessboost[cuda]`` installs on Linux; the package's own extension has no
+CUDA); it loads the driver at run time and needs only a driver and a GPU."""
 
 from __future__ import annotations
 
 import functools
 import os
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from importlib import metadata
+from pathlib import Path
 from typing import Literal, TypeAlias
 
 import numpy as np
@@ -24,6 +27,16 @@ DEVICES: list[Device] = ["metal", "wgpu", "cuda"]
 
 # Part of the refusal of an extension built without the `cuda` feature.
 BUILT_WITHOUT_CUDA = "extension was built without CUDA"
+
+
+def cuda_runtime_installed() -> bool:
+    """Whether ``hessboost-runtime-cuda`` is installed, so the package runs
+    on its extension."""
+    try:
+        metadata.version("hessboost-runtime-cuda")
+    except metadata.PackageNotFoundError:
+        return False
+    return True
 
 
 @functools.cache
@@ -87,9 +100,10 @@ def test_wgpu_is_available_or_the_machine_has_no_adapter(
 
 def test_cuda_is_available_or_missing_runtime() -> None:
     """A kernel-load error is never a valid device-test skip, and under
-    ``HESSBOOST_REQUIRE_CUDA`` nothing is. An extension built without the
-    ``cuda`` feature (the default) refuses CUDA prediction and training,
-    saying so."""
+    ``HESSBOOST_REQUIRE_CUDA`` nothing is. The package's own extension (no
+    CUDA runtime installed) refuses CUDA prediction and training, saying
+    so; with the CUDA runtime installed, the package runs on that
+    runtime's extension, which never does."""
     reason = refusal("cuda")
     if reason is None:
         return
@@ -98,9 +112,13 @@ def test_cuda_is_available_or_missing_runtime() -> None:
     )
     assert GpuModel.device_name("cuda") is None
     if BUILT_WITHOUT_CUDA in reason:
+        assert not cuda_runtime_installed(), (
+            f"hessboost-runtime-cuda is installed but its extension is not loaded: {reason}"
+        )
         x, y = regression(rows=100)
-        with pytest.raises(HessboostError, match="requires building with the `cuda` feature"):
-            hessboost.train({"device": "cuda"}, DMatrix(x, y), 1)
+        for device in ["cuda", "gpu:1"]:
+            with pytest.raises(HessboostError, match=BUILT_WITHOUT_CUDA):
+                hessboost.train({"device": device}, DMatrix(x, y), 1)
         return
     assert any(
         expected in reason
@@ -111,6 +129,31 @@ def test_cuda_is_available_or_missing_runtime() -> None:
             "no CUDA device",
         )
     ), f"CUDA prediction is unavailable: {reason}"
+
+
+def test_a_cuda_runtime_of_another_release_is_refused(tmp_path: Path) -> None:
+    """``import hessboost`` refuses a ``hessboost-runtime-cuda`` of another
+    release (as a partial upgrade leaves behind) rather than run this
+    release's Python layer on its extension."""
+    info = tmp_path / "hessboost_runtime_cuda-0.0.1.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: hessboost-runtime-cuda\nVersion: 0.0.1\n"
+    )
+    path = os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))
+    done = subprocess.run(
+        [sys.executable, "-c", "import hessboost"],
+        env={**os.environ, "PYTHONPATH": path},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode != 0
+    assert "ImportError" in done.stderr, done.stderr
+    assert f"hessboost {hessboost.__version__} cannot load hessboost-runtime-cuda 0.0.1" in (
+        done.stderr
+    ), done.stderr
 
 
 def test_cuda_ordinals_are_spelled_as_in_training(trained: tuple[Booster, np.ndarray]) -> None:

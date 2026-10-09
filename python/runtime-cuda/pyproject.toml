@@ -1,0 +1,58 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+# hessboost's extension (`../Cargo.toml`) with its `cuda` feature, which
+# `hessboost` loads in place of its own extension when this is installed
+# (`hessboost[cuda]`, see `../python/hessboost/_hessboost.py`). It holds no
+# Python API of its own and must be the same release as `hessboost`.
+[project]
+name = "hessboost-runtime-cuda"
+dynamic = ["version"]
+description = "hessboost's native extension with NVIDIA CUDA, for Linux: install it as hessboost[cuda]"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Brenden Matthews", email = "brenden@brndn.io" }]
+keywords = ["hessboost", "gradient-boosting", "cuda", "gpu"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: GPU :: NVIDIA CUDA",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: Free Threading :: 3 - Stable",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/brndnmtthws/hessboost"
+Documentation = "https://github.com/brndnmtthws/hessboost/tree/main/python#gpu-training-and-prediction"
+Repository = "https://github.com/brndnmtthws/hessboost"
+Issues = "https://github.com/brndnmtthws/hessboost/issues"
+Changelog = "https://github.com/brndnmtthws/hessboost/releases"
+
+[tool.maturin]
+manifest-path = "../Cargo.toml"
+features = ["cuda"]
+# As `../pyproject.toml`: the committed `../Cargo.lock`, never updated.
+locked = true
+module-name = "_hessboost_runtime_cuda._native"
+python-source = "python"
+
+[tool.uv]
+# As `../pyproject.toml`: rebuild when the extension's sources change.
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "python/**/*.py" },
+  { file = "../Cargo.toml" },
+  { file = "../Cargo.lock" },
+  { file = "../src/**/*.rs" },
+  { file = "../../Cargo.toml" },
+  { file = "../../src/**/*.rs" },
+  { file = "../../src/**/*.ptx" },
+]

@@ -139,7 +139,8 @@ LazyFrames, with labels taken from the frame's columns by name) categorical
 input, and the conformal, distributional, tree-diffusion, ForestFlow,
 in-place update, ordered target statistics, budget training, and compact
 model extras, with GPU training and batch prediction (`device="wgpu"` on
-every platform, `device="metal"` on macOS; `Booster.to_gpu()`):
+every platform, `device="metal"` on macOS, and `device="cuda"` on Linux with
+`pip install 'hessboost[cuda]'`; `Booster.to_gpu()`):
 
 ```python
 import hessboost

@@ -1,10 +1,12 @@
 #!/bin/sh
-# Test a prebuilt wheel against the Python test suite. Run from python/.
+# Test prebuilt wheels against the Python test suite. Run from python/.
 #
-# Usage: test-wheel.sh PYTHON WHEEL_GLOB
+# Usage: test-wheel.sh PYTHON WHEEL_GLOBS
 #
+# WHEEL_GLOBS is hessboost's wheel, optionally followed by
+# hessboost-runtime-cuda's (space-separated globs, one wheel each).
 # Recreates the project environment for PYTHON with only the locked test
-# group, installs the wheel into it (`--no-sync` keeps uv from building the
+# group, installs the wheels into it (`--no-sync` keeps uv from building the
 # project) and checks that the tests import the installed package, not the
 # sources in the checkout. On a free-threaded interpreter, importing
 # hessboost must leave the GIL disabled.
@@ -32,9 +34,9 @@ if uv run --no-project --python "$python" python -c "import sys, sysconfig; sys.
   pytest_args="$pytest_args --ignore=tests/test_polars.py"
 fi
 
-# The argument lists and the glob are unquoted on purpose: the lists split
-# into their arguments, and the glob expands to the one matching wheel (a
-# glob without a match stays literal and uv reports the missing file).
+# The argument lists and the globs are unquoted on purpose: the lists split
+# into their arguments, and each glob expands to its matching wheel (a glob
+# without a match stays literal and uv reports the missing file).
 # shellcheck disable=SC2086
 uv sync --locked --only-group test --python "$python" $sync_args
 # shellcheck disable=SC2086

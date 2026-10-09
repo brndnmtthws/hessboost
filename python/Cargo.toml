@@ -25,7 +25,11 @@ include = [
 ]
 
 [lib]
-name = "_hessboost"
+# `hessboost._native` in the `hessboost` wheels and
+# `_hessboost_runtime_cuda._native` in `hessboost-runtime-cuda`'s
+# (`runtime-cuda/`); `hessboost._hessboost` (`python/hessboost/_hessboost.py`)
+# loads one of them.
+name = "_native"
 crate-type = ["cdylib"]
 # An extension module has no Rust test harness; the Python tests exercise it.
 test = false
@@ -54,9 +58,11 @@ self_cell = "1.2"
 hessboost = { path = "..", features = ["metal"] }
 
 [features]
-# `device="cuda"` and `Booster.to_gpu(device="cuda")`, on Linux only. Off by
-# default, so the default wheels and the sdist build without what the root
-# crate's `cuda` feature needs to build; without it CUDA is refused.
+# `device="cuda"` and `Booster.to_gpu(device="cuda")`, on Linux only. Off in
+# the `hessboost` distribution, so its wheels and sdist build without what
+# the root crate's `cuda` feature needs to build (without it CUDA is
+# refused); on in `hessboost-runtime-cuda` (`runtime-cuda/pyproject.toml`),
+# which `hessboost[cuda]` installs.
 cuda = ["hessboost/cuda"]
 
 [lints.clippy]

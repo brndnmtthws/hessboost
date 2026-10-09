@@ -422,19 +422,17 @@ jobs:
       - run: uv run --project python --no-sync ruff format --check
       - run: uv run --project python --no-sync ty check --output-format github
 
-  # hessboost-python's opt-in `cuda` feature, which the wheels above, the
-  # sdist, and publish.yml's wheels leave out. `uv sync` builds it into the
-  # project environment (no wheel file, so nothing here is uploaded); without
-  # a GPU, tests/test_gpu.py's CUDA tests skip after its guard checks the
-  # refusal.
+  # hessboost-runtime-cuda (python/runtime-cuda/): the extension with CUDA,
+  # which `hessboost[cuda]` installs and the wheels above leave out. `uv
+  # sync --extra cuda` builds it from the checkout into the project
+  # environment (no wheel file, so nothing here is uploaded; publish.yml
+  # builds its wheels). tests/test_gpu.py fails unless the package runs on
+  # the runtime's extension; without a GPU, its CUDA device tests skip.
   python-cuda:
-    name: Python / ubuntu-26.04 / cuda feature
+    name: Python / ubuntu-26.04 / CUDA runtime
     runs-on: ubuntu-26.04
     env:
       UV_MANAGED_PYTHON: "1"
-      # Read by maturin's PEP 517 build; pyproject.toml lists it in uv's
-      # cache keys.
-      MATURIN_PEP517_ARGS: "--features cuda"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -443,24 +441,10 @@ jobs:
       - uses: jdx/mise-action@v4
       # For `--features cuda` (see the clippy job).
       - run: bash .github/scripts/install-cuda-headers.sh
-      - name: Build the extension with CUDA
-        run: uv sync --locked
+      - name: Build the CUDA runtime
+        run: uv sync --locked --extra cuda
         working-directory: python
-      - run: uv run --locked pytest
-        working-directory: python
-      # test_gpu.py accepts an extension built without CUDA too.
-      - name: Check that the extension was built with CUDA
-        run: |
-          uv run --locked python -c '
-          import numpy as np
-          import hessboost
-          x = np.random.default_rng(0).random((100, 3))
-          booster = hessboost.train({}, hessboost.DMatrix(x, x[:, 0]), 1, verbose_eval=False)
-          try:
-              booster.to_gpu("cuda")
-          except hessboost.HessboostError as refused:
-              assert "built without CUDA" not in str(refused), refused
-          '
+      - run: uv run --locked --extra cuda pytest
         working-directory: python
 
   python-sdist:
@@ -493,9 +477,15 @@ jobs:
           mv "${sdist_dir[0]}" extracted/sdist
           cd extracted/sdist
           uvx --from 'maturin>=1.15,<2' maturin build --release --locked --out "$GITHUB_WORKSPACE/python/dist"
-      # The source distribution carries no uv.lock, so resolve the test group afresh.
-      - name: Install test dependencies from extracted project
-        run: uv sync --only-group test
+      # The source distribution carries no uv.lock, and its pyproject.toml
+      # names the CUDA runtime's directory (`tool.uv.sources`), which it
+      # leaves out: install the checkout's locked test group instead of
+      # syncing the extracted project.
+      - name: Install test dependencies
+        run: |
+          uv export --locked --only-group test --no-hashes --directory "$GITHUB_WORKSPACE/python" --output-file "$RUNNER_TEMP/test-requirements.txt"
+          uv venv
+          uv pip install -r "$RUNNER_TEMP/test-requirements.txt"
         working-directory: extracted/sdist
       - name: Install built wheel
         run: uv pip install "$GITHUB_WORKSPACE"/python/dist/*.whl

@@ -40,7 +40,7 @@ dependencies = ["numpy>=2"]
 # The CUDA runtime: the extension built with CUDA, which the package then
 # loads in place of its own (`hessboost/_hessboost.py`). Linux only, and
 # always this release (release.py bumps the pin with the version).
-cuda = ["hessboost-runtime-cuda==0.3.0; sys_platform == 'linux'"]
+cuda = ["hessboost-runtime-cuda==0.3.1; sys_platform == 'linux'"]
 pandas = ["pandas>=2.2"]
 # 1.x and 2.x: uv.lock tests the latest, CI also the oldest and latest 1.x.
 polars = ["polars>=1.0"]

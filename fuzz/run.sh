@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs every fuzz target for a fixed wall time: a smoke test, not a fuzzing
-# campaign. Seeds come from the models each release saved
+# campaign. Seeds come from the saved-model corpus
 # (tests/data/saved/*/) and the XGBoost and LightGBM saves the importer tests
 # use, so new formats and releases are picked up without checked-in copies,
 # plus the inputs in fixed-seeds/ that reach paths the fuzzer is slow to find

@@ -14,8 +14,8 @@ from numpy.typing import NDArray
 from hessboost.diffusion import DiffusionModel
 from hessboost.diffusion.forest import ForestModel
 
-# Models saved by each release of the Rust crate, with the margins it
-# recorded (repository checkout only).
+# Models the Rust crate's releases saved, with the margins they recorded: one
+# directory per distinguishable writer output (repository checkout only).
 SAVED_MODELS = Path(__file__).resolve().parents[2] / "tests" / "data" / "saved"
 
 

@@ -8,6 +8,11 @@
 //! `cargo nextest run --test native_format --run-ignored only save_models_of_this_version`
 //! and commit the files it writes. Directories of earlier versions are never
 //! regenerated: they are what later versions must keep reading.
+//!
+//! The forest and diffusion JSON mirrors (`.hbff.json`, `.hbdm.json`) are the
+//! corpus's bulk — a forest document is megabytes of pretty-printed JSON where
+//! its binary form is under 100 KB — so they are stored as zstd frames,
+//! `<name>.json.zst`. [`saved_bytes`] reads either form.
 
 use hessboost::config::{BoosterKind, Dart, LinearTree, MultiStrategy};
 use hessboost::data::FeatureType;
@@ -709,6 +714,33 @@ fn saved_dir(version: &str) -> PathBuf {
         .join(version)
 }
 
+/// The zstd level a compacted fixture is written at: the maximum, since these
+/// bytes are committed once and read back by every later release.
+const MIRROR_LEVEL: i32 = 19;
+
+/// Where a compacted fixture is stored: `a.hbdm.json` → `a.hbdm.json.zst`.
+fn compacted(path: &Path) -> PathBuf {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    path.with_extension(format!("{extension}.zst"))
+}
+
+/// A saved fixture's bytes: the file itself, or the zstd frame a compacted
+/// one is stored as (see the module docs). `None` when neither exists.
+fn saved_bytes(path: &Path) -> Option<Vec<u8>> {
+    std::fs::read(path)
+        .ok()
+        .or_else(|| zstd::stream::decode_all(std::fs::File::open(compacted(path)).ok()?).ok())
+}
+
+/// Write a JSON mirror compacted, as [`saved_bytes`] reads it back.
+fn save_mirror(path: &Path, json: &[u8]) {
+    let frame = zstd::stream::encode_all(json, MIRROR_LEVEL).unwrap();
+    std::fs::write(compacted(path), frame).unwrap();
+}
+
 /// A file-name form of a [`feature_models`] case name.
 fn slug(name: &str) -> String {
     name.chars()
@@ -766,7 +798,11 @@ fn saved_models_keep_loading_with_their_margins() {
             }
             let expected = std::fs::read(file("hbdm.probe")).unwrap();
             let binary = DiffusionModel::load(file("hbdm"), DiffusionFormat::Binary).unwrap();
-            let json = DiffusionModel::load(file("hbdm.json"), DiffusionFormat::Json).unwrap();
+            let json = DiffusionModel::decode(
+                saved_bytes(&file("hbdm.json")).expect("a saved hbdm.json"),
+                DiffusionFormat::Json,
+            )
+            .unwrap();
             for (format, model) in [("hbdm", binary), ("hbdm.json", json)] {
                 assert_eq!(model.method(), case.method(), "{name} ({format})");
                 let margins = regressor_margins(&model);
@@ -787,7 +823,11 @@ fn saved_models_keep_loading_with_their_margins() {
             }
             let expected = std::fs::read(file("hbff.probe")).unwrap();
             let binary = ForestModel::load(file("hbff"), DiffusionFormat::Binary).unwrap();
-            let json = ForestModel::load(file("hbff.json"), DiffusionFormat::Json).unwrap();
+            let json = ForestModel::decode(
+                saved_bytes(&file("hbff.json")).expect("a saved hbff.json"),
+                DiffusionFormat::Json,
+            )
+            .unwrap();
             for (format, model) in [("hbff", binary), ("hbff.json", json)] {
                 assert_eq!(model.method(), case.method(), "{name} ({format})");
                 assert_eq!(model.classes(), case.classes(), "{name} ({format})");
@@ -899,17 +939,19 @@ fn save_models_of_this_version() {
     for (name, model) in diffusion_models() {
         let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
         model.save(file("hbdm"), DiffusionFormat::Binary).unwrap();
-        model
-            .save(file("hbdm.json"), DiffusionFormat::Json)
-            .unwrap();
+        save_mirror(
+            &file("hbdm.json"),
+            &model.encode(DiffusionFormat::Json).unwrap(),
+        );
         std::fs::write(file("hbdm.probe"), regressor_margins(&model)).unwrap();
     }
     for (name, model) in forest_models() {
         let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
         model.save(file("hbff"), DiffusionFormat::Binary).unwrap();
-        model
-            .save(file("hbff.json"), DiffusionFormat::Json)
-            .unwrap();
+        save_mirror(
+            &file("hbff.json"),
+            &model.encode(DiffusionFormat::Json).unwrap(),
+        );
         std::fs::write(file("hbff.probe"), forest_margins(&model)).unwrap();
     }
 }

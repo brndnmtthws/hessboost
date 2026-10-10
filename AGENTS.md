@@ -272,7 +272,9 @@ proptest; shared helpers are in `tests/common/` and `examples/common/`;
 `tests/common/gpu.rs` is the suite every GPU backend's test file runs
 through its `GpuBackend` impl.
 `tests/data/saved/<version>/` holds each release's saved models (`.bin`,
-`.json`, `.hbtd`, `.margins`); `tests/data/xgboost-3.4.2-categorical.*` are
+`.json`, `.hbtd`, `.margins`; the forest and diffusion JSON mirrors, the
+corpus's bulk, are stored zstd-compressed as `.json.zst`);
+`tests/data/xgboost-3.4.2-categorical.*` are
 XGBoost saves for `model/xgboost/tests.rs`, and `tests/data/lightgbm-4.7.0-*`
 LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 `gen_lightgbm_fixtures.py --test-data`) for `model/lightgbm.rs` tests.

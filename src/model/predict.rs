@@ -957,9 +957,20 @@ pub(crate) fn initial_margins(base_score: &[f32], rows: Rows<'_>) -> Vec<f32> {
         Some(bm) if bm.len() == n * k => bm.to_vec(),
         Some(bm) if bm.len() == n => bm.iter().flat_map(|&m| std::iter::repeat_n(m, k)).collect(),
         _ => {
+            // Broadcast by doubling: `log2(n)` bulk copies instead of one
+            // tiny copy per row (100k `extend_from_slice` calls on the big
+            // dense cases, paid by every margin pass). Bit-identical: the
+            // same values land in the same slots.
             let mut out = Vec::with_capacity(n * k);
-            for _ in 0..n {
+            if n > 0 {
                 out.extend_from_slice(base_score);
+                let mut filled = 1;
+                while filled < n {
+                    let take = (n - filled).min(filled);
+                    let len = out.len();
+                    out.extend_from_within(len - take * k..len);
+                    filled += take;
+                }
             }
             out
         }

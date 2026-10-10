@@ -42,6 +42,9 @@ for version in "$data"/saved/*/; do
     # Leading 0: the raw, compressed file.
     { printf '\x00'; cat "$file"; } > "seeds/native-model/$v-$(basename "$file" .bin)-raw"
   done
+  # The GBDT JSON saves. The forest and diffusion JSON mirrors are stored
+  # zstd-compressed (`.json.zst`) and are not documents this target parses;
+  # the forest and diffusion targets take their JSON seeds from fixed-seeds.
   for file in "$version"*.json; do
     cp "$file" "seeds/json-model/$v-$(basename "$file")"
   done

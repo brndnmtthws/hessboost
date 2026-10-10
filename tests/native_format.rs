@@ -13,6 +13,13 @@
 //! corpus's bulk — a forest document is megabytes of pretty-printed JSON where
 //! its binary form is under 100 KB — so they are stored as zstd frames,
 //! `<name>.json.zst`. [`saved_bytes`] reads either form.
+//!
+//! A directory is kept only while it holds something this writer does not
+//! reproduce. After `save_models_of_this_version` writes the new directory,
+//! every older one whose files the current writer writes back unchanged (the
+//! version its containers record aside) is deleted: the reader sees nothing
+//! else in it. `git` still holds those files, so the working tree carries one
+//! directory per distinguishable writer output rather than one per release.
 
 use hessboost::config::{BoosterKind, Dart, LinearTree, MultiStrategy};
 use hessboost::data::FeatureType;
@@ -741,6 +748,57 @@ fn save_mirror(path: &Path, json: &[u8]) {
     std::fs::write(compacted(path), frame).unwrap();
 }
 
+/// A saved fixture's bytes as the reader sees them: a container re-encoded by
+/// this writer (the version it records is provenance, not content), a JSON
+/// mirror decompressed, anything else as stored. `None` when it cannot be read.
+fn readable_bytes(path: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("bin") => BoostedModel::decode(&bytes, ModelFormat::Binary)
+            .and_then(|model| model.encode(ModelFormat::Binary))
+            .ok(),
+        Some("hbdm") => DiffusionModel::decode(&bytes, DiffusionFormat::Binary)
+            .and_then(|model| model.encode(DiffusionFormat::Binary))
+            .ok(),
+        Some("hbff") => ForestModel::decode(&bytes, DiffusionFormat::Binary)
+            .and_then(|model| model.encode(DiffusionFormat::Binary))
+            .ok(),
+        Some("zst") => zstd::stream::decode_all(bytes.as_slice()).ok(),
+        _ => Some(bytes),
+    }
+}
+
+/// Whether `written`'s files are everything `stored` says: the same case set,
+/// and each file the writer produces from the stored one. Such a directory
+/// holds nothing a later release needs to keep reading, so the saver drops it.
+fn reproduced_by_this_writer(stored: &Path, written: &Path) -> bool {
+    let (Ok(stored_entries), Ok(written_entries)) =
+        (std::fs::read_dir(stored), std::fs::read_dir(written))
+    else {
+        return false;
+    };
+    let names = |entries: std::fs::ReadDir| -> Vec<String> {
+        entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+    let (mut stored_names, mut written_names) = (names(stored_entries), names(written_entries));
+    stored_names.sort();
+    written_names.sort();
+    if stored_names != written_names {
+        return false;
+    }
+    written_names.iter().all(|name| {
+        matches!(
+            (
+                readable_bytes(&stored.join(name)),
+                readable_bytes(&written.join(name))
+            ),
+            (Some(stored_bytes), Some(written_bytes)) if stored_bytes == written_bytes
+        )
+    })
+}
+
 /// A file-name form of a [`feature_models`] case name.
 fn slug(name: &str) -> String {
     name.chars()
@@ -789,8 +847,8 @@ fn saved_models_keep_loading_with_their_margins() {
                 assert!(margins == expected, "{}: {name} (compact)", dir.display());
             }
         }
-        // Diffusion models are saved from the release after 0.2.0 on; its and
-        // later directories hold every case.
+        // Diffusion models came after 0.2.0: the directories that hold them
+        // hold every case.
         for (name, case) in diffusion_models() {
             let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
             if !file("hbdm").exists() {
@@ -914,8 +972,9 @@ fn saved_models_re_save_byte_identically() {
     assert!(versions > 0, "no saved model versions");
 }
 
-/// Write this version's saved models (see the module docs). Refuses to
-/// overwrite a version's existing directory.
+/// Write this version's saved models (see the module docs), then drop the
+/// older directories this writer reproduces in full. Refuses to overwrite a
+/// version's existing directory.
 #[test]
 #[ignore = "run once per release, then commit tests/data/saved/<version>"]
 fn save_models_of_this_version() {
@@ -954,9 +1013,20 @@ fn save_models_of_this_version() {
         );
         std::fs::write(file("hbff.probe"), forest_margins(&model)).unwrap();
     }
+    for entry in std::fs::read_dir(saved_dir("")).unwrap() {
+        let older = entry.unwrap().path();
+        if older == dir || !reproduced_by_this_writer(&older, &dir) {
+            continue;
+        }
+        println!(
+            "{} holds nothing this writer does not write back; removing it",
+            older.display()
+        );
+        std::fs::remove_dir_all(&older).unwrap();
+    }
 }
 
-/// One small diffusion model per method, as saved for each release.
+/// One small diffusion model per method, as saved in the corpus.
 fn diffusion_models() -> Vec<(&'static str, DiffusionModel)> {
     let tiny = |mut params: DiffusionParams| {
         params.n_repeats = std::num::NonZeroUsize::new(2).unwrap();
@@ -1009,7 +1079,7 @@ fn regressor_margins(model: &DiffusionModel) -> Vec<u8> {
     )
 }
 
-/// One small forest model per structure, as saved for each release: an
+/// One small forest model per structure, as saved in the corpus: an
 /// unconditional flow model with a categorical column (one multi-output GBDT
 /// per level) and a class-conditional diffusion model with missing values
 /// (one GBDT per level and column).

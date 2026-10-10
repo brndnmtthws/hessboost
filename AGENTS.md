@@ -271,9 +271,14 @@ Tests: `tests/parity.rs` and `tests/lightgbm_parity.rs` are ignored without fixt
 proptest; shared helpers are in `tests/common/` and `examples/common/`;
 `tests/common/gpu.rs` is the suite every GPU backend's test file runs
 through its `GpuBackend` impl.
-`tests/data/saved/<version>/` holds each release's saved models (`.bin`,
-`.json`, `.hbtd`, `.margins`; the forest and diffusion JSON mirrors, the
-corpus's bulk, are stored zstd-compressed as `.json.zst`);
+`tests/data/saved/<version>/` holds the models `release.py bump` saved for a
+release (`.bin`, `.json`, `.hbtd`, `.margins`; the forest and diffusion JSON
+mirrors, the corpus's bulk, are stored zstd-compressed as `.json.zst`). The
+saver keeps one directory per distinguishable writer output: after writing the
+new one it drops every older one whose files the current writer writes back
+unchanged (only the version a container records then differs), so the corpus
+does not grow with releases while every generation a later release must still
+read stays; `git` holds the dropped files.
 `tests/data/xgboost-3.4.2-categorical.*` are
 XGBoost saves for `model/xgboost/tests.rs`, and `tests/data/lightgbm-4.7.0-*`
 LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by

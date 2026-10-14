@@ -7,7 +7,7 @@ name = "hessboost"
 dynamic = ["version"]
 description = "Fast, deterministic gradient boosting in Rust: conformal intervals, explainable boosting machines, distributional boosting, and tree-based diffusion"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "Apache-2.0"
 # A copy of the repository's LICENSE: `license-files` cannot reach `..`, and
 # the sdist already holds the root crate's `LICENSE`. publish.yml checks
@@ -24,17 +24,22 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Programming Language :: Python :: Free Threading :: 3 - Stable",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Rust",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Typing :: Typed",
 ]
-dependencies = ["numpy>=2"]
+dependencies = [
+  "numpy>=2; python_version < '3.15'",
+  # The abi3t extension, which CPython 3.15 and newer install, uses NumPy
+  # 2.5's C API.
+  "numpy>=2.5; python_version >= '3.15'",
+]
 
 [project.optional-dependencies]
 # The CUDA runtime: the extension built with CUDA, which the package then

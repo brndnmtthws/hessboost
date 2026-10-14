@@ -24,7 +24,7 @@ test row's label into its own encoding.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal, Self, TypeAlias
+from typing import Literal, Self
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -36,11 +36,11 @@ from hessboost._model_io import PathLike, _SchemaState, read_bytes, write_bytes
 
 __all__ = ["Column", "FittedTargetEncoder", "OrderedTargetEncoder", "TargetKind"]
 
-TargetKind: TypeAlias = Literal["regression", "binary"]
+type TargetKind = Literal["regression", "binary"]
 """The labels an encoder accepts: any finite values (``"regression"``) or
 0/1 (``"binary"``). Both encode the smoothed target mean."""
 
-Column: TypeAlias = int | str
+type Column = int | str
 """A feature by index, or by name on a matrix with feature names."""
 
 

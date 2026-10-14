@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-from typing import Any, TypeAlias
+from typing import Any
 
 from hessboost import _data
 
-PathLike: TypeAlias = str | os.PathLike[str]
+type PathLike = str | os.PathLike[str]
 
 
 def read_bytes(path: PathLike) -> bytes:

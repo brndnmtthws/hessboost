@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Generic, Protocol, Self, TypeAlias, TypeVar
+from typing import Any, Protocol, Self
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -104,9 +104,7 @@ class _InferenceCore(Protocol):
     ) -> NDArray[np.float64]: ...
 
 
-_CoreT = TypeVar("_CoreT", bound=_InferenceCore)
-
-_NativeFit: TypeAlias = Callable[
+type _NativeFit[CoreT: _InferenceCore] = Callable[
     [
         _hessboost.Booster,
         _hessboost.DMatrix,
@@ -115,23 +113,23 @@ _NativeFit: TypeAlias = Callable[
         int | None,
         int,
     ],
-    _CoreT,
+    CoreT,
 ]
 """A native inference class's ``fit``: model, training rows, holdout rows,
 noise variance, landmarks, seed."""
 
 
-class _IntervalQueries(Generic[_CoreT]):
+class _IntervalQueries[CoreT: _InferenceCore]:
     """The fitting and the interval queries of an inference over one
     model's training rows."""
 
-    _core: _CoreT
+    _core: CoreT
     _models: tuple[tuple[Booster, str], ...]
 
     @classmethod
     def _fit(
         cls,
-        native: _NativeFit[_CoreT],
+        native: _NativeFit[CoreT],
         booster: Booster,
         data: object,
         label: ArrayLike | None,

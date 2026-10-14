@@ -52,7 +52,7 @@ import dataclasses
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Self, TypeAlias
+from typing import Any, Literal, Self
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -196,23 +196,23 @@ class LogNoiseNormal:
         _number(self, "std")
 
 
-Sde: TypeAlias = VarianceExploding | VariancePreserving | SubVariancePreserving
+type Sde = VarianceExploding | VariancePreserving | SubVariancePreserving
 """The noising SDE of :class:`Score`."""
 
-Parameterization: TypeAlias = Literal["noise"] | Edm
+type Parameterization = Literal["noise"] | Edm
 """The score GBDT's target: ``"noise"`` (Treeffuser's negated noise) or
 :class:`Edm` preconditioning."""
 
-TimeSampling: TypeAlias = Literal["uniform"] | LogNoiseNormal
+type TimeSampling = Literal["uniform"] | LogNoiseNormal
 """Distribution of the training times: ``"uniform"`` on ``[1e-5, 1]``
 (Treeffuser) or :class:`LogNoiseNormal`."""
 
-FlowPath: TypeAlias = Literal["linear", "trigonometric"] | VariancePreserving
+type FlowPath = Literal["linear", "trigonometric"] | VariancePreserving
 """The Gaussian path ``y_t = a(t) y_0 + b(t) z`` of :class:`FlowMatching`:
 ``"linear"`` (rectified flow), ``"trigonometric"``, or
 :class:`VariancePreserving`."""
 
-OdeSolver: TypeAlias = Literal["euler", "heun"]
+type OdeSolver = Literal["euler", "heun"]
 """The reverse-ODE integrator of :class:`FlowMatching`."""
 
 _SDES = (VarianceExploding, VariancePreserving, SubVariancePreserving)
@@ -273,7 +273,7 @@ class FlowMatching:
         _choice("solver", self.solver, ("euler", "heun"), ())
 
 
-Method: TypeAlias = Score | FlowMatching
+type Method = Score | FlowMatching
 """Score diffusion or flow matching, with its settings."""
 
 _TAGS: dict[type, str] = {
@@ -288,7 +288,7 @@ _TAGS: dict[type, str] = {
 _VARIANTS: dict[str, type] = {tag: cls for cls, tag in _TAGS.items()}
 
 
-_Variant: TypeAlias = (
+type _Variant = (
     VarianceExploding | VariancePreserving | SubVariancePreserving | Edm | LogNoiseNormal
 )
 

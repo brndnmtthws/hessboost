@@ -3,6 +3,7 @@
 #
 # Usage: test-wheel.sh PYTHON WHEEL_GLOBS
 #
+# PYTHON is a CPython version, with a `t` suffix for the free-threaded build.
 # WHEEL_GLOBS is hessboost's wheel, optionally followed by
 # hessboost-runtime-cuda's (space-separated globs, one wheel each).
 # Recreates the project environment for PYTHON with only the locked test
@@ -14,6 +15,16 @@ set -eu
 
 python="$1"
 wheel_glob="$2"
+
+# Without the suffix, the GIL-enabled build: uv takes an installed
+# free-threaded 3.14+ for a plain "3.14" (and keeps an environment of one),
+# so the request says "+gil". uv downloads only the plain version, which is
+# the GIL-enabled build, so install it first.
+case "$python" in
+  *t) request="$python" ;;
+  *) request="$python+gil" ;;
+esac
+uv python install --no-bin "$python"
 
 # scikit-learn publishes no musllinux wheels, and building it from source
 # for every interpreter would dominate the job. On musl, test without it and
@@ -29,7 +40,7 @@ fi
 # polars publishes only abi3 wheels, which free-threaded interpreters cannot
 # load (and building it from source would dominate the job), so test
 # without it and its tests there; its conversion is pure Python.
-if uv run --no-project --python "$python" python -c "import sys, sysconfig; sys.exit(not sysconfig.get_config_var('Py_GIL_DISABLED'))"; then
+if uv run --no-project --python "$request" python -c "import sys, sysconfig; sys.exit(not sysconfig.get_config_var('Py_GIL_DISABLED'))"; then
   sync_args="$sync_args --no-install-package polars --no-install-package polars-runtime-32"
   pytest_args="$pytest_args --ignore=tests/test_polars.py"
 fi
@@ -38,7 +49,7 @@ fi
 # into their arguments, and each glob expands to its matching wheel (a glob
 # without a match stays literal and uv reports the missing file).
 # shellcheck disable=SC2086
-uv sync --locked --only-group test --python "$python" $sync_args
+uv sync --locked --only-group test --python "$request" $sync_args
 # shellcheck disable=SC2086
 uv pip install $wheel_glob
 uv run --no-sync python -c "import hessboost; assert 'site-packages' in hessboost.__file__, hessboost.__file__"

@@ -9,7 +9,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -21,10 +21,10 @@ if TYPE_CHECKING:
     import pandas as pd
     import polars as pl
 
-FeatureTypes: TypeAlias = list[str]
+type FeatureTypes = list[str]
 """Per-feature types: ``"q"`` (numerical) or ``"c"`` (categorical)."""
 
-Categories: TypeAlias = dict[int, list[Any]]
+type Categories = dict[int, list[Any]]
 """The categories of each categorical frame column, by column index."""
 
 _NUMERICAL_TYPES = frozenset({"q", "float", "int", "i"})

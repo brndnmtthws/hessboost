@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Self, TypeAlias, overload
+from typing import Any, Self, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -51,7 +51,7 @@ from hessboost._training import _params
 
 __all__ = ["Approximate", "Exact", "OnlineMode", "OnlineModel", "UpdateCallback", "UpdateReport"]
 
-UpdateCallback: TypeAlias = Callable[[int], bool]
+type UpdateCallback = Callable[[int], bool]
 """A per-iteration hook of :meth:`OnlineModel.update`: ``callback(iteration)``
 runs after each updated boosting iteration, on the update's thread with the
 GIL held; returning ``True`` abandons the update."""
@@ -96,7 +96,7 @@ class Approximate:
         object.__setattr__(self, "tolerance", float(tolerance))
 
 
-OnlineMode: TypeAlias = Exact | Approximate
+type OnlineMode = Exact | Approximate
 """How an :class:`OnlineModel` updates: :class:`Exact` or :class:`Approximate`."""
 
 

@@ -27,7 +27,7 @@ When ``alpha < 1 / (n + 1)`` the set is too small and every interval is
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Self, TypeAlias
+from typing import Self
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -39,7 +39,7 @@ from hessboost._matrix import _check_schema, _matrix_for
 __all__ = ["ConformalizedQuantile", "SplitConformal"]
 
 
-_Models: TypeAlias = tuple[tuple[Booster, str], ...]
+type _Models = tuple[tuple[Booster, str], ...]
 """The models reading one matrix, each with its name in errors
 (``"the model's"``)."""
 

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import numbers
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Literal, Self, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, Self
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -26,14 +26,14 @@ else:
 
 # The values the selector parameters accept (``TrainingParams::from_xgboost``
 # spellings).
-_GrowPolicy: TypeAlias = Literal["depthwise", "lossguide", "symmetric"]
-_BoosterName: TypeAlias = Literal["gbtree", "dart", "gblinear", "boulevard", "ebm"]
-_TreeMethod: TypeAlias = Literal["auto", "exact", "approx", "hist"]
-_SamplingMethod: TypeAlias = Literal["uniform", "gradient_based"]
+type _GrowPolicy = Literal["depthwise", "lossguide", "symmetric"]
+type _BoosterName = Literal["gbtree", "dart", "gblinear", "boulevard", "ebm"]
+type _TreeMethod = Literal["auto", "exact", "approx", "hist"]
+type _SamplingMethod = Literal["uniform", "gradient_based"]
 # Python typing cannot express numeric-suffix string patterns. Runtime
 # validation remains authoritative for cuda:<ordinal>/gpu:<ordinal>.
-_Device: TypeAlias = str
-_MultiStrategy: TypeAlias = Literal["one_output_per_tree", "multi_output_tree"]
+type _Device = str
+type _MultiStrategy = Literal["one_output_per_tree", "multi_output_tree"]
 
 EvalSet = Sequence[tuple[Any, ArrayLike]]
 """``(X, y)`` pairs evaluated after every round."""

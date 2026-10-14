@@ -5,7 +5,7 @@
 # checked-in `_hessboost.pyi`).
 [environment]
 python = "python/.venv"
-python-version = "3.11"
+python-version = "3.12"
 # Import roots: the package source, the tests (`conftest`), the scripts.
 root = ["python/python", "python/tests", "scripts"]
 

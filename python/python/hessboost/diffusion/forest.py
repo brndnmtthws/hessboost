@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, Self, TypeAlias
+from typing import Any, Literal, Self
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -78,11 +78,11 @@ class Diffusion:
         _number(self, "beta_max")
 
 
-ForestMethod: TypeAlias = Literal["flow"] | Diffusion
+type ForestMethod = Literal["flow"] | Diffusion
 """``"flow"`` (ForestFlow: flow matching on the straight path from noise to
 data, generation only) or :class:`Diffusion`."""
 
-ColumnKind: TypeAlias = Literal["continuous", "integer", "categorical"]
+type ColumnKind = Literal["continuous", "integer", "categorical"]
 """How a column is encoded and decoded: a real value; an ordinal or binary
 value (rounded); or categories (dummy-coded against the smallest, decoded
 to the most likely one)."""

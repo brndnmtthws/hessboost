@@ -32,11 +32,13 @@ and `hessboost[cuda]` for NVIDIA GPUs on Linux (see
 only required dependency.
 
 Prebuilt wheels are published for Linux x86_64 and aarch64 (glibc
-manylinux and musl/Alpine musllinux), macOS arm64, and Windows x86_64: one
-`abi3` wheel per platform for CPython 3.11 and newer, plus a wheel for
-free-threaded CPython 3.14t. Every wheel trains and predicts on a GPU
-through wgpu (Vulkan, Metal, DirectX 12), and the macOS wheels also through
-native Metal; CUDA comes only with the `cuda` extra. Elsewhere the
+manylinux and musl/Alpine musllinux), macOS arm64, and Windows x86_64,
+three per platform: an `abi3` wheel for CPython 3.12 and newer, an `abi3t`
+wheel ([PEP 803](https://peps.python.org/pep-0803/)) for both the
+GIL-enabled and the free-threaded builds of CPython 3.15 and newer, and a
+wheel for free-threaded CPython 3.14t. Every wheel trains and predicts on
+a GPU through wgpu (Vulkan, Metal, DirectX 12), and the macOS wheels also
+through native Metal; CUDA comes only with the `cuda` extra. Elsewhere the
 installer builds from the source distribution, which needs Rust 1.93 or
 newer and a C compiler (for libzstd).
 

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, TypeAlias
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -80,7 +80,7 @@ class CategoricalAxis:
         return len(self.categories) + 2
 
 
-TermAxis: TypeAlias = NumericAxis | CategoricalAxis
+type TermAxis = NumericAxis | CategoricalAxis
 """The cells along one feature of a term."""
 
 

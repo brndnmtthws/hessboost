@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, TypeAlias, cast, overload
+from typing import Any, Literal, Protocol, cast, overload
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -32,12 +32,12 @@ __all__ = [
     "train_with_budget",
 ]
 
-Objective: TypeAlias = Callable[[NDArray[np.float32], DMatrix], tuple[ArrayLike, ArrayLike]]
+type Objective = Callable[[NDArray[np.float32], DMatrix], tuple[ArrayLike, ArrayLike]]
 """A custom objective, as XGBoost's ``obj``: ``obj(margins, dtrain)``
 returns ``(grad, hess)`` for the raw ``margins`` (``(rows,)`` or ``(rows,
 outputs)``), each with one value per margin."""
 
-CustomMetric: TypeAlias = Callable[
+type CustomMetric = Callable[
     [NDArray[np.float32], NDArray[np.float32], NDArray[np.float32] | None], float
 ]
 """A custom evaluation metric: ``metric(predictions, labels, weights)``
@@ -45,7 +45,7 @@ returns one number for an eval set. ``predictions`` are post-transform
 (raw margins with a custom objective); its name is the callable's
 ``__name__``."""
 
-EvalsResult: TypeAlias = dict[str, dict[str, list[float]]]
+type EvalsResult = dict[str, dict[str, list[float]]]
 """``{eval name: {metric: per-round values}}``."""
 
 
@@ -382,7 +382,7 @@ def train_with_budget(
     )
 
 
-CvHistory: TypeAlias = dict[str, NDArray[np.float64]]
+type CvHistory = dict[str, NDArray[np.float64]]
 """``{"test-<metric>-mean": ..., "test-<metric>-std": ...}``: what :func:`cv`
 returns, one value per round."""
 

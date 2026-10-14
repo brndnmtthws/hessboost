@@ -2,7 +2,7 @@
 # bindings (python/), scripts/, release.py, and the Python snippets in
 # Markdown. CI runs `ruff check` and `ruff format --check` from the root.
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 # First-party import roots, for import sorting.
 src = ["python/python", "python/tests", "scripts"]
 

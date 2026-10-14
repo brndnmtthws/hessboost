@@ -13,7 +13,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from importlib import metadata
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import Literal
 
 import numpy as np
 import pytest
@@ -22,7 +22,7 @@ import hessboost
 from conftest import regression
 from hessboost import Booster, DMatrix, GpuModel, HessboostError, IncompatibleModelError
 
-Device: TypeAlias = Literal["metal", "wgpu", "cuda"]
+type Device = Literal["metal", "wgpu", "cuda"]
 DEVICES: list[Device] = ["metal", "wgpu", "cuda"]
 
 # Part of the refusal of an extension built without the `cuda` feature.

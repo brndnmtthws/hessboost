@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -39,7 +39,7 @@ __all__ = [
 Distributions = _hessboost.Distributions
 
 
-ModelFormat: TypeAlias = Literal["binary", "json", "xgboost-json", "xgboost-ubjson"]
+type ModelFormat = Literal["binary", "json", "xgboost-json", "xgboost-ubjson"]
 """A model file format:
 
 * ``"binary"``: hessboost's native binary format (compressed, checksummed,
@@ -51,11 +51,11 @@ ModelFormat: TypeAlias = Literal["binary", "json", "xgboost-json", "xgboost-ubjs
   custom objectives).
 """
 
-ImportanceType: TypeAlias = Literal["weight", "gain", "total_gain", "cover", "total_cover"]
+type ImportanceType = Literal["weight", "gain", "total_gain", "cover", "total_cover"]
 """XGBoost's ``importance_type``: split counts, average or total gain,
 average or total cover (Hessian)."""
 
-_GpuDevice: TypeAlias = Literal["metal", "wgpu", "cuda"]
+type _GpuDevice = Literal["metal", "wgpu", "cuda"]
 
 
 def _format_for(path: PathLike, format: ModelFormat | None) -> ModelFormat:

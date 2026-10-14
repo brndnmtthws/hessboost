@@ -38,8 +38,14 @@ doctest = false
 # loads its Vulkan, Metal, and DirectX 12 drivers at run time, so a machine
 # without them still imports the package and reports no adapter.
 hessboost = { path = "..", features = ["wgpu"] }
-numpy = "0.29"
-pyo3 = { version = "0.29", features = ["abi3-py311"] }
+# The abi3t extension (PEP 803) needs rust-numpy's abi3t support, merged
+# after its latest release (0.29.0); move back to a release that has it.
+numpy = { git = "https://github.com/PyO3/rust-numpy", rev = "aca95e97fac773b055f81c35216146984c2f0cdf" }
+# One stable-ABI extension per interpreter family: a GIL-enabled CPython 3.12
+# to 3.14 builds `abi3` (GIL-enabled 3.12 and newer), any CPython 3.15 or
+# newer builds `abi3t` (both builds of 3.15 and newer), and free-threaded 3.14,
+# which has no stable ABI, a version-specific `cp314t` extension.
+pyo3 = { version = "0.29", features = ["abi3-py312", "abi3t-py315"] }
 # The extension's own pool, which a forked child rebuilds (`src/pool.rs`).
 rayon = "1.12"
 # Method configurations cross the boundary as their serde JSON.

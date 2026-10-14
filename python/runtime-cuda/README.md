@@ -17,8 +17,9 @@ no Python API of its own. It must come from the same release as
 
 Running it needs no CUDA toolkit, only an NVIDIA GPU of compute capability
 7.5 (Turing) or newer and a driver supporting CUDA 12.8 or newer. Wheels
-cover x86_64 and aarch64 glibc Linux (manylinux_2_28): one `abi3` wheel for
-CPython 3.11 and newer and one for free-threaded CPython 3.14t. Building
+cover x86_64 and aarch64 glibc Linux (manylinux_2_28): an `abi3` wheel for
+CPython 3.12 and newer, an `abi3t` wheel for both builds of CPython 3.15 and
+newer, and one for free-threaded CPython 3.14t. Building
 from the source distribution needs Rust 1.93 or newer, a C compiler,
 CUDA 13's `cuda.h` and `curand.h` (`CUDA_HOME` or `CUDA_TOOLKIT_PATH`), and
 libclang.

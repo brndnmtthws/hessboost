@@ -1,7 +1,7 @@
 """Native extension module. Import from :mod:`hessboost` instead."""
 
 from collections.abc import Callable, Mapping
-from typing import Any, Literal, TypeAlias, final
+from typing import Any, Literal, final
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -120,13 +120,13 @@ class Distributions:
     def __len__(self) -> int:
         """The number of rows."""
 
-_ModelFormat: TypeAlias = Literal["binary", "json", "xgboost-json", "xgboost-ubjson"]
-_LoadFormat: TypeAlias = _ModelFormat | Literal["auto", "lightgbm"]
-_PredictKind: TypeAlias = Literal["value", "margin", "contribs", "interactions"]
-_ImportanceType: TypeAlias = Literal["weight", "gain", "total_gain", "cover", "total_cover"]
-_DiffusionPreset: TypeAlias = Literal["default", "treeffuser", "flow_matching"]
-_ForestPreset: TypeAlias = Literal["forest_flow", "forest_diffusion"]
-_GpuDevice: TypeAlias = Literal["metal", "wgpu", "cuda"]
+type _ModelFormat = Literal["binary", "json", "xgboost-json", "xgboost-ubjson"]
+type _LoadFormat = _ModelFormat | Literal["auto", "lightgbm"]
+type _PredictKind = Literal["value", "margin", "contribs", "interactions"]
+type _ImportanceType = Literal["weight", "gain", "total_gain", "cover", "total_cover"]
+type _DiffusionPreset = Literal["default", "treeffuser", "flow_matching"]
+type _ForestPreset = Literal["forest_flow", "forest_diffusion"]
+type _GpuDevice = Literal["metal", "wgpu", "cuda"]
 
 @final
 class Booster:
@@ -459,7 +459,7 @@ def train_with_budget(
     stopping_rounds: int | None = None,
 ) -> Booster: ...
 
-_CvHistory: TypeAlias = list[tuple[str, list[float], list[float]]]
+type _CvHistory = list[tuple[str, list[float], list[float]]]
 
 def cv(request: Mapping[str, object]) -> _CvHistory: ...
 def cv_refit(

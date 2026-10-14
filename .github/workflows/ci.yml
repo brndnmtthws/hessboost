@@ -298,9 +298,13 @@ jobs:
             done
           done
 
-  # One abi3 wheel per platform, tested on the newest and oldest supported
-  # CPython, plus the free-threaded wheel on Linux: the wheels publish.yml
-  # builds, through the same test-wheel.sh.
+  # The wheels publish.yml builds, through the same test-wheel.sh: on every
+  # platform the abi3 wheel (GIL-enabled CPython 3.12 to 3.14; 3.15 and newer
+  # install abi3t) on its oldest and newest CPython and the abi3t wheel (both
+  # builds of CPython 3.15 and newer) on GIL-enabled and free-threaded 3.15,
+  # plus on Linux the version-specific wheel of free-threaded 3.14, which has
+  # no abi3t. Each builds with its family's oldest CPython. The tests name
+  # every version: uv's "3" also matches the free-threaded build interpreter.
   python:
     name: Python / ${{ matrix.os }} / ${{ matrix.wheel }}
     runs-on: ${{ matrix.os }}
@@ -317,10 +321,11 @@ jobs:
           - ubuntu-26.04-arm
           - macos-latest
           - windows-latest
-        wheel: [abi3]
+        wheel: [abi3, abi3t]
         include:
-          - os: ubuntu-26.04
-            wheel: free-threaded
+          - { wheel: abi3, build-python: "3.12" }
+          - { wheel: abi3t, build-python: "3.15t" }
+          - { os: ubuntu-26.04, wheel: cp314t, build-python: "3.14t" }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -333,12 +338,11 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           working-directory: python
-      - name: Install free-threaded Python
-        if: matrix.wheel == 'free-threaded'
-        id: ft-python
+      - name: Install the build interpreter
+        id: build-python
         run: |
-          uv python install 3.14t
-          echo "path=$(uv python find 3.14t)" >> "$GITHUB_OUTPUT"
+          uv python install ${{ matrix.build-python }}
+          echo "path=$(uv python find ${{ matrix.build-python }})" >> "$GITHUB_OUTPUT"
       # Without the release profile's LTO and single codegen unit, which
       # change neither behavior nor results but serialize the build (over
       # a minute of it). python-sdist and publish.yml build with them.
@@ -349,25 +353,43 @@ jobs:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         with:
           command: build
-          manylinux: ${{ matrix.wheel == 'free-threaded' && 'off' || '' }}
-          args: --release --locked --out dist ${{ matrix.wheel == 'free-threaded' && format('-i {0}', steps.ft-python.outputs.path) || '' }}
+          manylinux: ${{ matrix.wheel == 'cp314t' && 'off' || '' }}
+          args: --release --locked --out dist -i "${{ steps.build-python.outputs.path }}"
           working-directory: python
-      # Latest Python first: "3" matches any installed 3.x, so it must run
-      # before 3.11 is installed to fetch the newest one.
-      - name: Test abi3 wheel on latest Python
+      - name: Test abi3 wheel on Python 3.14
         if: matrix.wheel == 'abi3'
-        run: sh ../.github/scripts/test-wheel.sh 3 'dist/*cp311-abi3*.whl'
+        run: sh ../.github/scripts/test-wheel.sh 3.14 'dist/*cp312-abi3*.whl'
         working-directory: python
-      # In the latest-Python environment the step above left, with the wheel
-      # installed.
-      - name: Check public types
+      - name: Test abi3 wheel on Python 3.12
+        if: matrix.wheel == 'abi3'
+        run: sh ../.github/scripts/test-wheel.sh 3.12 'dist/*cp312-abi3*.whl'
+        working-directory: python
+      # uv.lock pins polars 2.x; hessboost also supports 1.x (polars>=1.0).
+      # The polars tests also run with the oldest and the latest 1.x
+      # release, layered over the Python 3.12 environment the step above
+      # left (the layer's polars shadows the locked one).
+      - name: Test polars 1.x (oldest and latest)
         if: matrix.os == 'ubuntu-26.04' && matrix.wheel == 'abi3'
+        run: |
+          for polars in 'polars==1.0.0' 'polars<2'; do
+            uv run --no-sync --with "$polars" python -c 'import polars; print("polars", polars.__version__)'
+            uv run --no-sync --with "$polars" pytest -p no:cacheprovider tests/test_polars.py tests/test_target_stats.py
+          done
+        working-directory: python
+      - name: Test abi3t wheel on Python 3.15
+        if: matrix.wheel == 'abi3t'
+        run: sh ../.github/scripts/test-wheel.sh 3.15 'dist/*cp315-abi3.abi3t*.whl'
+        working-directory: python
+      # In the newest Python's environment the step above left, with the
+      # wheel installed.
+      - name: Check public types
+        if: matrix.os == 'ubuntu-26.04' && matrix.wheel == 'abi3t'
         run: uv run --no-sync pyright --verifytypes hessboost --ignoreexternal
         working-directory: python
       # Editors show these docstrings on hover; pyright counts the public
       # functions and classes without one but does not fail on them.
       - name: Check public docstrings
-        if: matrix.os == 'ubuntu-26.04' && matrix.wheel == 'abi3'
+        if: matrix.os == 'ubuntu-26.04' && matrix.wheel == 'abi3t'
         run: |
           uv run --no-sync pyright --verifytypes hessboost --ignoreexternal --outputjson |
             uv run --no-sync python -c '
@@ -378,24 +400,12 @@ jobs:
           sys.exit(f"{missing} public symbols without a docstring: {undocumented}" if missing else 0)
           '
         working-directory: python
-      - name: Test abi3 wheel on Python 3.11
-        if: matrix.wheel == 'abi3'
-        run: sh ../.github/scripts/test-wheel.sh 3.11 'dist/*cp311-abi3*.whl'
+      - name: Test abi3t wheel on free-threaded Python 3.15t
+        if: matrix.wheel == 'abi3t'
+        run: sh ../.github/scripts/test-wheel.sh 3.15t 'dist/*cp315-abi3.abi3t*.whl'
         working-directory: python
-      # uv.lock pins polars 2.x; hessboost also supports 1.x (polars>=1.0).
-      # The polars tests also run with the oldest and the latest 1.x
-      # release, layered over the Python 3.11 environment the step above
-      # left (the layer's polars shadows the locked one).
-      - name: Test polars 1.x (oldest and latest)
-        if: matrix.os == 'ubuntu-26.04' && matrix.wheel == 'abi3'
-        run: |
-          for polars in 'polars==1.0.0' 'polars<2'; do
-            uv run --no-sync --with "$polars" python -c 'import polars; print("polars", polars.__version__)'
-            uv run --no-sync --with "$polars" pytest -p no:cacheprovider tests/test_polars.py tests/test_target_stats.py
-          done
-        working-directory: python
-      - name: Test free-threaded wheel
-        if: matrix.wheel == 'free-threaded'
+      - name: Test cp314t wheel on free-threaded Python 3.14t
+        if: matrix.wheel == 'cp314t'
         run: sh ../.github/scripts/test-wheel.sh 3.14t 'dist/*cp314-cp314t*.whl'
         working-directory: python
 
@@ -410,7 +420,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           working-directory: python
       # The lint group without the project: ty reads the extension's stub,
       # so nothing is compiled. ruff.toml and ty.toml at the root cover
@@ -461,7 +471,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           working-directory: python
       - name: Build source distribution
         uses: PyO3/maturin-action@v1

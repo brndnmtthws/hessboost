@@ -202,8 +202,8 @@ jobs:
       - if: runner.os == 'Linux' && !matrix.musl
         run: sh .github/scripts/install-lavapipe.sh
       # Each wheel on its oldest and newest CPython (3.14 is the abi3 wheel's
-      # newest: 3.15 and newer install abi3t). The tests name every version:
-      # uv's "3" would also match a free-threaded interpreter.
+      # newest: 3.15 and newer install abi3t). The tests name each version:
+      # uv's "3" would take any installed CPython.
       - name: Test abi3 wheel on Python 3.14
         if: ${{ !matrix.musl }}
         run: sh ../.github/scripts/test-wheel.sh 3.14 'dist/*cp312-abi3*.whl'

@@ -304,7 +304,7 @@ jobs:
   # builds of CPython 3.15 and newer) on GIL-enabled and free-threaded 3.15,
   # plus on Linux the version-specific wheel of free-threaded 3.14, which has
   # no abi3t. Each builds with its family's oldest CPython. The tests name
-  # every version: uv's "3" also matches the free-threaded build interpreter.
+  # each version: uv's "3" would take any installed CPython.
   python:
     name: Python / ${{ matrix.os }} / ${{ matrix.wheel }}
     runs-on: ${{ matrix.os }}

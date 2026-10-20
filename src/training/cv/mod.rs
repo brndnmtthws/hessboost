@@ -189,9 +189,39 @@ impl CvReport {
     ///
     /// [`HessboostError::InvalidParameter`] (`folds`) when two folds hold
     /// out the same row, which then has no single out-of-fold margin (each
-    /// fold's own margins stay in [`folds`](Self::folds)).
+    /// fold's own margins stay in [`folds`](Self::folds)), or (in a report
+    /// edited through its public fields) a test row is out of bounds;
+    /// [`HessboostError::DimensionMismatch`] when a fold's margins do not
+    /// hold one row per test row, or not as many outputs as fold 0's.
     pub fn out_of_fold(&self) -> Result<OutOfFold> {
         let width = self.folds.first().map_or(1, |fold| fold.margins.width());
+        // The fields are public: check what the report's own folds always
+        // satisfy before indexing by them.
+        for (f, fold) in self.folds.iter().enumerate() {
+            if fold.margins.n_rows() != fold.test.len() {
+                return Err(HessboostError::dimension_mismatch(
+                    "fold margin rows (one per test row)",
+                    fold.test.len(),
+                    fold.margins.n_rows(),
+                ));
+            }
+            if fold.margins.width() != width {
+                return Err(HessboostError::dimension_mismatch(
+                    "fold margin width (fold 0's)",
+                    width,
+                    fold.margins.width(),
+                ));
+            }
+            if let Some(&row) = fold.test.iter().find(|&&row| row >= self.n_rows) {
+                return Err(HessboostError::invalid_param(
+                    "folds",
+                    format!(
+                        "fold {f}: test row {row} is out of bounds for {} rows",
+                        self.n_rows
+                    ),
+                ));
+            }
+        }
         let mut margins = vec![f32::NAN; self.n_rows * width];
         let mut fold_of = vec![None; self.n_rows];
         for (f, fold) in self.folds.iter().enumerate() {

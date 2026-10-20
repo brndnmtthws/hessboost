@@ -5,6 +5,7 @@
 use hessboost::data::FeatureType;
 use hessboost::data::target_stats::OrderedTargetEncoder;
 use hessboost::model::{Iterations, ModelFormat};
+use hessboost::objective::{Objective, Quantiles};
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams};
 use hessboost::training::{CrossValidation, CvResult, CvStopping, Fold, PurgedTail};
 use std::num::NonZeroUsize;
@@ -411,6 +412,30 @@ fn out_of_fold_margins_account_for_every_row() {
     ]);
     assert_eq!(invalid_param(overlapping.out_of_fold()), "folds");
     assert_eq!(overlapping.folds[1].margins.n_rows(), 1);
+
+    // An edited report is refused, not indexed out of bounds.
+    let mut edited = report.clone();
+    edited.folds[0].test[0] = usize::MAX;
+    assert_eq!(invalid_param(edited.out_of_fold()), "folds");
+    let mut edited = report.clone();
+    edited.folds[0].test.pop();
+    assert!(matches!(
+        edited.out_of_fold(),
+        Err(HessboostError::DimensionMismatch { .. })
+    ));
+    let mut edited = report.clone();
+    let two_outputs = TrainingParams::builder()
+        .objective(Objective::Quantile(Quantiles::new(vec![0.2, 0.8]).unwrap()))
+        .build()
+        .unwrap();
+    edited.folds[1].margins = hessboost::training::train(&two_outputs, &data, 1)
+        .unwrap()
+        .predict_margin(&data.select_rows(&[102]).unwrap(), Iterations::Best)
+        .unwrap();
+    assert!(matches!(
+        edited.out_of_fold(),
+        Err(HessboostError::DimensionMismatch { .. })
+    ));
 }
 
 /// Per-fold stopping needs times for every row and a tail split with rows

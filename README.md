@@ -161,9 +161,11 @@ See [`python/README.md`](python/README.md).
   binary/multiclass classification, ranking (LambdaMART, XE-NDCG), count, and survival (Cox, AFT),
   plus typed objective and metric APIs and custom loss hooks.
 - **Validation & workflow:** Cross-validation (including purged and forward time-series folds,
-  whole-query ranking folds, per-fold target statistics, continuing a model, and refitting on all
-  rows at the chosen round count), early stopping, feature importance,
-  SHAP values and interactions, model slicing, and iteration ranges.
+  leakage-safe per-fold early stopping on a purged tail of each fold's training rows, out-of-fold
+  margins and per-fold round counts, whole-query ranking folds, per-fold target statistics,
+  continuing a model, and refitting on all rows at the chosen round count), early stopping,
+  feature importance, SHAP values and interactions, model slicing and averaging (bagged
+  models as one), and iteration ranges.
 - **Prediction & inspection:** Batch, in-place (borrowed rows), and allocation-free single-row
   prediction, bit-identical in every batch; read-only model metadata (tree weights and nodes,
   `gblinear` weights, model-shrinkage records).

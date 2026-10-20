@@ -373,6 +373,18 @@ impl Booster {
         Ok(Self::new(model))
     }
 
+    /// One model whose margin is the mean of `models`' margins
+    /// (`BoostedModel::average`).
+    #[staticmethod]
+    fn average(py: Python<'_>, models: Vec<Py<Booster>>) -> PyResult<Self> {
+        let members: Vec<Arc<BoostedModel>> = models
+            .iter()
+            .map(|booster| Arc::clone(&booster.get().model))
+            .collect();
+        let model = py.detached(|| BoostedModel::average(members.iter().map(Arc::as_ref)))?;
+        Ok(Self::new(model))
+    }
+
     /// Lays this model out for GPU batch prediction on `device` (`"metal"`
     /// on macOS, `"wgpu"` anywhere, `"cuda"`/`"cuda:<ordinal>"` on Linux
     /// with the `cuda` feature; `None`: Metal on macOS, wgpu elsewhere).

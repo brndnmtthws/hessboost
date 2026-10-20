@@ -11,6 +11,7 @@ __all__ = [
     "BoulevardInference",
     "CompactModel",
     "ConformalizedQuantile",
+    "CvReport",
     "DMatrix",
     "DiffusionModel",
     "DiffusionParams",
@@ -26,12 +27,13 @@ __all__ = [
     "Params",
     "SplitConformal",
     "TermShape",
-    "cv",
-    "cv_refit",
+    "check_purged_tail",
+    "cross_validate",
     "forward_chaining",
     "honest_refit",
     "k_fold",
     "purged_forward",
+    "purged_tail_split",
     "samples_crps",
     "samples_mean",
     "samples_quantiles",
@@ -172,6 +174,8 @@ class Booster:
     ]: ...
     def feature_importance(self, importance_type: _ImportanceType) -> dict[int, float]: ...
     def slice(self, begin: int, end: int, step: int) -> Booster: ...
+    @staticmethod
+    def average(models: list[Booster]) -> Booster: ...
     @property
     def objective(self) -> str: ...
     @property
@@ -461,10 +465,30 @@ def train_with_budget(
 
 type _CvHistory = list[tuple[str, list[float], list[float]]]
 
-def cv(request: Mapping[str, object]) -> _CvHistory: ...
-def cv_refit(
-    request: Mapping[str, object],
-) -> tuple[_CvHistory, Booster, int, FittedTargetEncoder | None]: ...
+type _TailStopping = tuple[int, int, int, float]
+type _Fold = tuple[NDArray[np.int64], int, list[float], NDArray[np.float32], _TailStopping | None]
+
+@final
+class CvReport:
+    def history(self) -> _CvHistory: ...
+    def metrics(self) -> list[str]: ...
+    def folds(self) -> list[_Fold]: ...
+    def out_of_fold(self) -> tuple[NDArray[np.float32], NDArray[np.int64]]: ...
+
+def cross_validate(
+    request: Mapping[str, object], refit: bool
+) -> tuple[
+    CvReport, tuple[Booster, int, FittedTargetEncoder | None, _TailStopping | None] | None
+]: ...
+def check_purged_tail(
+    decision_at: NDArray[np.int64], label_end: NDArray[np.int64], fraction: float
+) -> None: ...
+def purged_tail_split(
+    decision_at: NDArray[np.int64],
+    label_end: NDArray[np.int64],
+    fraction: float,
+    rows: NDArray[np.int64],
+) -> tuple[int, list[tuple[NDArray[np.int64], NDArray[np.int64]]]]: ...
 def k_fold(
     n_rows: int, nfold: int, seed: int
 ) -> list[tuple[NDArray[np.int64], NDArray[np.int64]]]: ...

@@ -499,19 +499,34 @@ impl RegTree {
     /// matching XGBoost's saved-model semantics. Leaf linear models are scaled
     /// with them.
     pub(crate) fn scale_leaves(&mut self, factor: f32) {
+        self.map_leaves(|w| w * factor, |v| v * f64::from(factor));
+    }
+
+    /// Divide every leaf weight by `divisor` (a whole number below `2^24`),
+    /// each quotient the `f32` nearest the exact one: the `f64` quotient of
+    /// two 24-bit values rounded to `f32` is correctly rounded (53 ≥ 2·24 +
+    /// 2). Leaf linear models' `f64` intercepts and slopes are divided in
+    /// `f64`.
+    pub(crate) fn divide_leaves(&mut self, divisor: f64) {
+        self.map_leaves(|w| (f64::from(w) / divisor) as f32, |v| v / divisor);
+    }
+
+    /// Apply `weight` to every leaf weight (vector leaves included) and
+    /// `linear` to every leaf linear model coefficient.
+    fn map_leaves(&mut self, weight: impl Fn(f32) -> f32, linear: impl Fn(f64) -> f64) {
         let k = self.size_leaf_vector;
         for (id, n) in self.nodes.iter_mut().enumerate() {
             if n.is_leaf() {
-                n.leaf_value *= factor;
+                n.leaf_value = weight(n.leaf_value);
                 if k > 1 {
                     for w in &mut self.leaf_vectors[id * k..(id + 1) * k] {
-                        *w *= factor;
+                        *w = weight(*w);
                     }
                 }
             }
         }
-        if let Some(linear) = &mut self.linear {
-            linear.scale(f64::from(factor));
+        if let Some(leaves) = &mut self.linear {
+            leaves.map_coefficients(linear);
         }
     }
 

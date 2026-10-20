@@ -3,14 +3,15 @@
 //!
 //! A [`DMatrix`](super::DMatrix) and its copies with other metadata
 //! (`with_labels`, `with_weights`, Python's `copy` with `set_info`) share
-//! their feature values, and with them this cache of their latest binning
-//! (its `max_bin`, sample weights, feature types and missing value): it is
+//! their feature values, and with them this cache of their binnings (each a
+//! `max_bin`, sample weights, feature types and missing value): each is
 //! computed once however many trainings, folds, or threads ask for it, and
-//! freed with the values or once a request for another binning replaces it
-//! (a training holding it keeps it until it finishes), so a matrix trained
-//! under many `max_bin`s or weightings keeps one index, not one for each. A
-//! hit is the very index a miss would build, so cached training is bit for
-//! bit uncached training.
+//! freed with the values. A request drops every other binning nothing
+//! besides the cache holds (no training or binned matrix uses it), so the
+//! cache keeps the latest binning asked for and those in use: a matrix
+//! trained under many `max_bin`s or weightings does not keep an index for
+//! each. A hit is the very index a miss would build, so cached training is
+//! bit for bit uncached training.
 //!
 //! The first request for a key builds its index; concurrent requests for
 //! the key wait for it. A parallel build runs on a pool of its own (of the
@@ -64,8 +65,8 @@ impl BinKey {
     }
 }
 
-/// The latest index built from one set of feature values, with any still
-/// being built.
+/// The indexes built from one set of feature values: the latest requested,
+/// and the others still in use or being built.
 #[derive(Debug)]
 pub(crate) struct BinCache {
     /// The process the cache was made in; any other one (a forked child)
@@ -142,8 +143,16 @@ impl Entry {
         matches!(*lock(&self.state), State::Abandoned)
     }
 
-    fn building(&self) -> bool {
-        matches!(*lock(&self.state), State::Building)
+    /// Whether a request for another key keeps this entry: while it is being
+    /// built (requests may be waiting for it), or once built while something
+    /// besides the cache (a training, a binned matrix) holds its index, so
+    /// that sharing it costs no memory.
+    fn in_use(&self) -> bool {
+        match &*lock(&self.state) {
+            State::Building => true,
+            State::Built(index) => Arc::strong_count(index) > 1,
+            State::Abandoned => false,
+        }
     }
 }
 
@@ -190,16 +199,21 @@ impl BinCache {
     }
 
     /// `key`'s entry, and whether this request claimed it (and must build
-    /// it). Abandoned entries are dropped first, and a new key's entry
-    /// replaces every built one: the cache keeps the latest binning (and
-    /// those still being built, which requests may be waiting for).
+    /// it). Every other key's entry not [in use](Entry::in_use) is dropped
+    /// first, and an abandoned one of `key`: the cache keeps the latest
+    /// binning requested, and the ones in use.
     fn claim(&self, key: &BinKey) -> (Arc<Entry>, bool) {
         let mut entries = lock(&self.entries);
-        entries.retain(|entry| !entry.abandoned());
+        entries.retain(|entry| {
+            if entry.key == *key {
+                !entry.abandoned()
+            } else {
+                entry.in_use()
+            }
+        });
         if let Some(entry) = entries.iter().find(|entry| entry.key == *key) {
             return (Arc::clone(entry), false);
         }
-        entries.retain(|entry| entry.building());
         let entry = Arc::new(Entry {
             key: key.clone(),
             state: Mutex::new(State::Building),
@@ -292,11 +306,12 @@ mod tests {
         assert!(!Arc::ptr_eq(&weighted, &indexes[0]));
     }
 
-    /// A new binning replaces the built ones: the cache keeps only the
-    /// latest, so ever new keys (a `max_bin` search, say) do not keep every
-    /// index alive, and a replaced key is built again.
+    /// A request drops the other binnings nothing else holds, keeping the
+    /// ones in use, whether it hits or builds: a `max_bin` search, even one
+    /// running trainings side by side, does not keep every index alive,
+    /// while concurrent trainings still share theirs.
     #[test]
-    fn a_new_binning_replaces_the_built_ones() {
+    fn requests_drop_the_binnings_nothing_else_holds() {
         let data = DMatrix::from_dense(&[0.0, 1.0, 2.0, 3.0], 2, 2).unwrap();
         let cache = BinCache::default();
         let builds = AtomicUsize::new(0);
@@ -304,13 +319,27 @@ mod tests {
             builds.fetch_add(1, Ordering::Relaxed);
             index_of(&data)
         };
-        let first = cache.get_or_build(&key(8, None), false, build);
+        // A finished training's binning goes with the next request's build.
+        let first = Arc::downgrade(&cache.get_or_build(&key(8, None), false, build));
         let second = cache.get_or_build(&key(16, None), false, build);
-        assert_eq!(Arc::strong_count(&first), 1, "the cache let the first go");
+        assert!(first.upgrade().is_none(), "the unused binning was freed");
+        // Binnings in use stay beside another, and are shared.
+        let third = cache.get_or_build(&key(32, None), false, build);
         let hit = cache.get_or_build(&key(16, None), false, build);
         assert!(Arc::ptr_eq(&second, &hit));
-        let again = cache.get_or_build(&key(8, None), false, build);
-        assert!(!Arc::ptr_eq(&first, &again));
+        assert_eq!(builds.load(Ordering::Relaxed), 3);
+        // Once their trainings finish, a hit drops the other one.
+        let (unused, latest) = (Arc::downgrade(&second), Arc::downgrade(&third));
+        drop((second, hit, third));
+        let again = cache.get_or_build(&key(32, None), false, build);
+        assert!(
+            unused.upgrade().is_none(),
+            "the hit dropped the unused binning"
+        );
+        assert!(Arc::ptr_eq(
+            &again,
+            &latest.upgrade().expect("the latest is kept")
+        ));
         assert_eq!(builds.load(Ordering::Relaxed), 3);
     }
 

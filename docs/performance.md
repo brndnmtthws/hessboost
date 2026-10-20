@@ -369,14 +369,15 @@ are bit-identical at any thread count.
 A `DMatrix` shares its feature values behind an `Arc`: a copy with other
 metadata (Python's `copy` and `set_info`) copies only metadata, and a row
 selection (`select_rows`, Python's `slice`, every cross-validation fold) is
-a view, its row map plus gathered metadata. The latest `hist` index binned
-from the values is cached with them, keyed by `max_bin`, weights, feature
+a view, its row map plus gathered metadata. The `hist` index binned from
+the values is cached with them, keyed by `max_bin`, weights, feature
 types, and missing value: built once, even for trainings that start
 together (later ones wait for the first build), reused by every training
-of a matrix sharing the values, and freed with them or once another
-binning replaces it. A view bins its own rows by default, bit-identical to
-binning a copy of them; `ViewCuts::Source` gathers its rows of the
-source's index instead, so a source and its views share one binning pass.
+of a matrix sharing the values, and kept while in use or the latest asked
+for (a request drops the others), until freed with the values. A view
+bins its own rows by default, bit-identical to binning a copy of them;
+`ViewCuts::Source` gathers its rows of the source's index instead, so a
+source and its views share one binning pass.
 A `BinnedMatrix` keeps just that index and the metadata, so its training
 holds no feature values at all (the index of a 4M x 173 panel with 42%
 missing values takes 1.4 GiB resident, against 2.6 GiB of `f32` values).

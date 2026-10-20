@@ -413,7 +413,7 @@ use crate::ebm::EbmInfo;
 use crate::error::{HessboostError, Result};
 use crate::inference::BoulevardInfo;
 use crate::objective::{Loss, LossContext};
-use crate::tree::compact::CompactForest;
+use crate::tree::compact::{CompactForest, RowForest, RowWalk};
 use crate::tree::{RegTree, scalar_tree_output};
 use ::serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -512,12 +512,23 @@ pub struct BoostedModel {
     /// The terms of a `booster = ebm` model ([`crate::ebm`]); `None` for
     /// every other model. Predictions do not depend on it.
     ebm: Option<EbmInfo>,
-    /// Prediction layout of `trees` ([`CompactForest`]), derived lazily and
-    /// never serialized. Reset whenever `trees` changes.
-    compact: OnceLock<CompactForest>,
+    /// Prediction layouts of `trees`, derived lazily and never serialized.
+    /// Reset whenever `trees` changes.
+    layouts: TreeLayouts,
     /// The prediction transform of `objective` ([`Transform`]), derived
     /// lazily and never serialized. Reset whenever `objective` changes.
     transform: OnceLock<Transform>,
+}
+
+/// The prediction layouts of a [`BoostedModel`]'s trees, each built on
+/// first use: they depend on the trees alone (not on the tree weights),
+/// and are replaced by a default whenever the trees change.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TreeLayouts {
+    /// Every tree's arena ([`CompactForest`]): batch and GPU prediction.
+    compact: OnceLock<CompactForest>,
+    /// The single-row methods' layout ([`RowForest`]).
+    rows: OnceLock<RowForest>,
 }
 
 /// Per-tree contribution weights of a [`BoostedModel`]. Every format stores
@@ -708,7 +719,7 @@ impl BoostedModel {
             shrinkage: None,
             boulevard: None,
             ebm: None,
-            compact: OnceLock::new(),
+            layouts: TreeLayouts::default(),
             transform: self.transform.clone(),
         }
     }
@@ -719,14 +730,27 @@ impl BoostedModel {
     pub(crate) fn push_tree_weighted(&mut self, tree: RegTree, weight: f32) {
         self.tree_weights.push(self.trees.len(), weight);
         self.trees.push(tree);
-        self.compact = OnceLock::new();
+        self.layouts = TreeLayouts::default();
     }
 
     /// The prediction layout of the ensemble, built on first use and dropped
     /// whenever a tree is appended.
     pub(crate) fn compact_forest(&self) -> &CompactForest {
-        self.compact
+        self.layouts
+            .compact
             .get_or_init(|| CompactForest::from_trees(&self.trees))
+    }
+
+    /// The single-row methods' walk of the ensemble: its [`RowForest`], built
+    /// on first use and dropped whenever a tree is appended, over the
+    /// [`CompactForest`] when the layout leaves trees on it.
+    pub(crate) fn row_walk(&self) -> RowWalk<'_> {
+        let layout = self
+            .layouts
+            .rows
+            .get_or_init(|| RowForest::from_trees(&self.trees));
+        let arena = layout.needs_arena().then(|| self.compact_forest());
+        RowWalk::new(layout, &self.trees, arena)
     }
 
     /// The prediction transform of the model's objective, built on first use
@@ -870,7 +894,7 @@ impl BoostedModel {
             shrinkage: None,
             boulevard: None,
             ebm: None,
-            compact: OnceLock::new(),
+            layouts: TreeLayouts::default(),
             transform: OnceLock::new(),
         }
     }
@@ -1088,7 +1112,7 @@ impl BoostedModel {
     /// `process_type=update`, which re-appends the refreshed trees.
     pub(crate) fn take_trees(&mut self) -> Vec<RegTree> {
         self.tree_weights = TreeWeights::Unit;
-        self.compact = OnceLock::new();
+        self.layouts = TreeLayouts::default();
         std::mem::take(&mut self.trees)
     }
 
@@ -1103,7 +1127,7 @@ impl BoostedModel {
     /// The trees, for in-place edits of their values (the prediction layout
     /// is rebuilt on next use).
     pub(crate) fn trees_mut(&mut self) -> &mut [RegTree] {
-        self.compact = OnceLock::new();
+        self.layouts = TreeLayouts::default();
         &mut self.trees
     }
 

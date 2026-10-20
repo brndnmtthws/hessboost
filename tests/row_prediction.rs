@@ -1,7 +1,9 @@
 //! Single-row prediction and the prediction transform: a row's margins and
 //! predictions are bit for bit what every batch holding it gives, whatever
 //! the model (tree weights, forests, vector and linear leaves, model
-//! shrinkage, gblinear, categorical splits, missing values, early stopping).
+//! shrinkage, gblinear, categorical splits, missing values, early stopping),
+//! and whichever layout the row walk takes: numeric trees up to 8 levels
+//! deep walk as complete trees, the rest through the node arena.
 
 mod common;
 
@@ -9,6 +11,7 @@ use common::bits::bits;
 use common::{incompatible_model, invalid_data, lcg};
 use hessboost::data::FeatureType;
 use hessboost::prelude::*;
+use hessboost::tree::RegTree;
 use serde_json::{Value, json};
 
 /// Feature 0 of every row is categorical (codes `0..6`).
@@ -32,11 +35,13 @@ fn features(n: usize, n_cols: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// A dense matrix of `x` (NaN missing) with feature [`CATEGORICAL`]
-/// categorical.
-fn matrix(x: &[f32], n_cols: usize) -> DMatrix {
+/// A dense matrix of rows `x` (NaN missing) of `n_cols` features, with
+/// feature [`CATEGORICAL`] categorical unless `numeric`.
+fn matrix(x: &[f32], n_cols: usize, numeric: bool) -> DMatrix {
     let mut types = vec![FeatureType::Numerical; n_cols];
-    types[CATEGORICAL] = FeatureType::Categorical;
+    if !numeric {
+        types[CATEGORICAL] = FeatureType::Categorical;
+    }
     DMatrix::from_dense(x, x.len() / n_cols, n_cols)
         .unwrap()
         .with_feature_types(&types)
@@ -55,6 +60,9 @@ struct Case {
     /// Train with an eval set and early stopping, so `Iterations::Best` is
     /// a strict prefix.
     early_stopping: bool,
+    /// Every feature numeric, so the trees have no categorical split (and
+    /// shallow ones take the row methods' complete-tree layout).
+    numeric: bool,
 }
 
 fn signal(row: &[f32]) -> f32 {
@@ -91,6 +99,11 @@ fn cases() -> Vec<Case> {
         targets: 1,
         label,
         early_stopping: false,
+        numeric: false,
+    };
+    let numeric = |name, params: Vec<(&'static str, Value)>, label| Case {
+        numeric: true,
+        ..case(name, params, label)
     };
     vec![
         Case {
@@ -189,6 +202,76 @@ fn cases() -> Vec<Case> {
             rounds: 40,
             ..case("wide rows", vec![("max_depth", json!(3))], signal)
         },
+        numeric("numeric squared error", vec![], signal),
+        Case {
+            early_stopping: true,
+            rounds: 40,
+            ..numeric(
+                "numeric logistic, early stopping",
+                vec![("objective", json!("binary:logistic")), ("eta", json!(0.9))],
+                binary,
+            )
+        },
+        numeric(
+            "numeric quantiles, forest",
+            vec![
+                ("objective", json!("reg:quantileerror")),
+                ("quantile_alpha", json!([0.1, 0.5, 0.9])),
+                ("num_parallel_tree", json!(3)),
+                ("subsample", json!(0.7)),
+            ],
+            signal,
+        ),
+        Case {
+            targets: 2,
+            ..numeric(
+                "numeric vector leaves, two outputs",
+                vec![("multi_strategy", json!("multi_output_tree"))],
+                signal,
+            )
+        },
+        numeric(
+            "numeric vector leaves, three classes",
+            vec![
+                ("objective", json!("multi:softprob")),
+                ("num_class", json!(3)),
+                ("multi_strategy", json!("multi_output_tree")),
+                ("num_parallel_tree", json!(2)),
+            ],
+            three_classes,
+        ),
+        numeric(
+            "numeric softmax",
+            vec![
+                ("objective", json!("multi:softmax")),
+                ("num_class", json!(3)),
+            ],
+            three_classes,
+        ),
+        numeric(
+            "numeric dart",
+            vec![("booster", json!("dart")), ("rate_drop", json!(0.3))],
+            signal,
+        ),
+        numeric(
+            "numeric model shrinkage",
+            vec![("model_shrink_rate", json!(0.05))],
+            signal,
+        ),
+        numeric(
+            "numeric irregular trees",
+            vec![
+                ("grow_policy", json!("lossguide")),
+                ("max_leaves", json!(9)),
+                ("max_depth", json!(8)),
+            ],
+            signal,
+        ),
+        numeric(
+            "numeric deep trees",
+            vec![("max_depth", json!(12)), ("min_child_weight", json!(0))],
+            signal,
+        ),
     ]
 }
 
@@ -205,7 +288,7 @@ fn labels(case: &Case, x: &[f32]) -> Vec<f32> {
 
 fn train_case(case: &Case) -> (BoostedModel, Vec<f32>) {
     let x = features(400, case.n_cols, 7);
-    let mut dtrain = matrix(&x, case.n_cols);
+    let mut dtrain = matrix(&x, case.n_cols, case.numeric);
     let y = labels(case, &x);
     dtrain = if case.targets > 1 {
         dtrain.with_label_matrix(&y, case.targets).unwrap()
@@ -215,7 +298,7 @@ fn train_case(case: &Case) -> (BoostedModel, Vec<f32>) {
     let params = TrainingParams::from_xgboost(case.params.clone()).unwrap();
     let test = features(97, case.n_cols, 11);
     let model = if case.early_stopping {
-        let dvalid = matrix(&test, case.n_cols)
+        let dvalid = matrix(&test, case.n_cols, case.numeric)
             .with_labels(&labels(case, &test))
             .unwrap();
         Trainer::new(&params, &dtrain, case.rounds)
@@ -251,7 +334,14 @@ fn rows_predict_what_every_batch_predicts() {
         let name = case.name;
         let n_cols = case.n_cols;
         let (k, width) = (model.n_outputs(), model.prediction_width());
-        let data = matrix(&x, n_cols);
+        if case.numeric {
+            let trees = model.trees();
+            assert!(!trees.iter().any(RegTree::has_categorical_splits), "{name}");
+            // The deep case must reach past the complete layout's depth.
+            let deep = trees.iter().any(|tree| tree.depth() > 8);
+            assert_eq!(deep, name == "numeric deep trees", "{name}");
+        }
+        let data = matrix(&x, n_cols, case.numeric);
         for iterations in selections(&model) {
             let batch = model.predict(&data, iterations).unwrap();
             let margins = model.predict_margin(&data, iterations).unwrap();
@@ -281,7 +371,9 @@ fn rows_predict_what_every_batch_predicts() {
 
             let (mut row_margins, mut row_values) = (vec![0.0; k], vec![0.0; width]);
             for (r, row) in x.chunks(n_cols).enumerate() {
-                let one = model.predict(&matrix(row, n_cols), iterations).unwrap();
+                let one = model
+                    .predict(&matrix(row, n_cols, case.numeric), iterations)
+                    .unwrap();
                 let want = &batch.as_slice()[r * width..(r + 1) * width];
                 assert_eq!(bits(one.as_slice()), bits(want), "{name}: row {r} alone");
 
@@ -334,7 +426,9 @@ fn tree_metadata_recomputes_the_margins() {
         {
             continue;
         }
-        let margins = model.predict_margin(&matrix(&x, case.n_cols), ..).unwrap();
+        let margins = model
+            .predict_margin(&matrix(&x, case.n_cols, case.numeric), ..)
+            .unwrap();
         let weights: Vec<f32> = model.tree_weights().collect();
         for (row, want) in x.chunks(case.n_cols).zip(margins.rows()) {
             let mut margin = model.base_scores().to_vec();
@@ -358,7 +452,7 @@ fn tree_metadata_recomputes_the_margins() {
 fn softmax_ties_go_to_the_first_class() {
     let x = features(90, 6, 3);
     let y: Vec<f32> = (0..90).map(|i| (i % 3) as f32).collect();
-    let dtrain = matrix(&x, 6).with_labels(&y).unwrap();
+    let dtrain = matrix(&x, 6, false).with_labels(&y).unwrap();
     let params = TrainingParams::from_xgboost([
         ("objective", json!("multi:softmax")),
         ("num_class", json!(3)),

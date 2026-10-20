@@ -328,9 +328,9 @@ impl BoostedModel {
     /// margins are that row's [`Self::predict_margin`] in any batch, bit for
     /// bit (tree weights, model shrinkage, missing-value routing, linear
     /// leaves, and [`Iterations::Best`] included), computed without building
-    /// a matrix and, once the model's first prediction has laid out its
-    /// trees, without allocating. The intercepts are the model's: a row has
-    /// no `base_margin`.
+    /// a matrix and, once the model's first row prediction has laid out its
+    /// trees for rows, without allocating. The intercepts are the model's: a
+    /// row has no `base_margin`.
     ///
     /// # Errors
     ///
@@ -495,9 +495,23 @@ impl BoostedModel {
         let per = self.trees_per_iteration();
         if let Some(shrinkage) = &self.shrinkage {
             out.copy_from_slice(&shrinkage.base_scores()[outputs.clone()]);
-            for i in iterations {
-                shrink_margins(out, shrinkage.factors()[i]);
-                self.add_row_trees(row, i * per..(i + 1) * per, &outputs, |_| 1.0, out);
+            let factors = shrinkage.factors();
+            if outputs.len() == k {
+                // One walk: every iteration shrinks the margins before its
+                // first tree adds to them.
+                let shrink = |t: usize, out: &mut [f32]| {
+                    if t.is_multiple_of(per) {
+                        shrink_margins(out, factors[t / per]);
+                    }
+                };
+                let trees = self.iteration_trees(iterations);
+                self.add_row_trees(row, trees, &outputs, |_| 1.0, shrink, out);
+            } else {
+                for i in iterations {
+                    shrink_margins(out, factors[i]);
+                    let trees = i * per..(i + 1) * per;
+                    self.add_row_trees(row, trees, &outputs, |_| 1.0, |_, _| {}, out);
+                }
             }
             return;
         }
@@ -505,10 +519,11 @@ impl BoostedModel {
         let weight = |t| self.tree_weight(t);
         let trees = self.iteration_trees(iterations);
         if outputs.len() == k {
-            self.add_row_trees(row, trees, &outputs, weight, out);
+            self.add_row_trees(row, trees, &outputs, weight, |_, _| {}, out);
         } else {
             for i in trees.start / per..trees.end / per {
-                self.add_row_trees(row, i * per..(i + 1) * per, &outputs, weight, out);
+                let trees = i * per..(i + 1) * per;
+                self.add_row_trees(row, trees, &outputs, weight, |_, _| {}, out);
             }
         }
     }
@@ -516,22 +531,24 @@ impl BoostedModel {
     /// `out[o - outputs.start] += weight(t) * tree_t(row)[o]` for the outputs
     /// `o` in `outputs` and the trees `t` of `trees` (whole iterations, or
     /// one iteration when `outputs` is not every output) feeding them, in
-    /// tree order per output.
+    /// tree order per output, calling `before(t, out)` before tree `t` adds
+    /// its value, through the model's row walk ([`Self::row_walk`]).
     fn add_row_trees(
         &self,
         row: &[f32],
         trees: Range<usize>,
         outputs: &Range<usize>,
         weight: impl Fn(usize) -> f32,
+        mut before: impl FnMut(usize, &mut [f32]),
         out: &mut [f32],
     ) {
-        let forest = self.compact_forest();
+        let walk = self.row_walk();
         let k = self.n_outputs;
         if self.has_vector_leaves() {
-            forest.walk_row(row, trees, |t, leaf| {
+            walk.walk_vector(row, trees, |t, values| {
+                before(t, out);
                 let w = weight(t);
-                let values = &forest.leaf_vector(leaf, k)[outputs.clone()];
-                for (o, &v) in out.iter_mut().zip(values) {
+                for (o, &v) in out.iter_mut().zip(&values[outputs.clone()]) {
                     *o += w * v;
                 }
             });
@@ -545,17 +562,20 @@ impl BoostedModel {
         } else {
             trees.start + outputs.start * parallel..trees.start + outputs.end * parallel
         };
-        let slot = |t: usize| scalar_tree_output(t, parallel, k) - outputs.start;
-        if self.trees[trees.clone()]
-            .iter()
-            .any(|tree| tree.linear_leaves().is_some())
-        {
-            for t in trees {
-                out[slot(t)] += weight(t) * self.trees[t].predict_dense(row);
-            }
+        if let [margin] = out {
+            // Every tree of `trees` feeds the one output, summed in a
+            // register rather than through memory.
+            let mut sum = *margin;
+            walk.walk_scalar(row, trees, |t, v| {
+                before(t, std::slice::from_mut(&mut sum));
+                sum += weight(t) * v;
+            });
+            *margin = sum;
         } else {
-            forest.walk_row(row, trees, |t, leaf| {
-                out[slot(t)] += weight(t) * forest.leaf_value(leaf);
+            let slot = |t: usize| scalar_tree_output(t, parallel, k) - outputs.start;
+            walk.walk_scalar(row, trees, |t, v| {
+                before(t, out);
+                out[slot(t)] += weight(t) * v;
             });
         }
     }

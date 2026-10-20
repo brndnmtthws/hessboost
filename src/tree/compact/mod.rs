@@ -38,6 +38,14 @@
 //! Symmetric trees (one split per level) are additionally indexed by
 //! [`SymmetricTables`], whose bit-pattern walk replaces the per-node walk for
 //! full lane groups and reaches the same arena leaves.
+//!
+//! The single-row methods walk [`RowForest`] instead: shallow numeric trees
+//! as complete binary trees in heap order (see [`row`]), with this arena
+//! for the trees that layout cannot hold.
+
+mod row;
+
+pub(crate) use row::{RowForest, RowWalk};
 
 use crate::tree::oblivious::{ArenaNode, SymmetricTables};
 use crate::tree::{Node, RegTree, in_category_set, scalar_tree_output};
@@ -187,6 +195,45 @@ fn next_below(c: f32) -> f32 {
         -f32::from_bits(1)
     } else {
         f32::from_bits(c.to_bits() + 1)
+    }
+}
+
+/// A numeric split in the walks' "second child when greater" form (see the
+/// module docs).
+#[derive(Debug, Clone, Copy)]
+struct NumericTest {
+    /// [`key`] of the threshold the (sign-adjusted) value is compared with.
+    key: u32,
+    /// Whether the split reads the negated value: its missing values go
+    /// right, so its children are stored mirrored.
+    mirrored: bool,
+}
+
+impl NumericTest {
+    fn of(n: &Node) -> Self {
+        if n.default_left {
+            // go right iff v >= cond  <=>  v > next_below(cond)
+            NumericTest {
+                key: key(next_below(n.split_cond)),
+                mirrored: false,
+            }
+        } else {
+            // go left iff v < cond  <=>  -v > -cond
+            NumericTest {
+                key: key(-n.split_cond),
+                mirrored: true,
+            }
+        }
+    }
+
+    /// `n`'s children as `(first, second)`: the one a false compare (and
+    /// a missing value) selects, then the one a true compare selects.
+    fn children(self, n: &Node) -> (i32, i32) {
+        if self.mirrored {
+            (n.right, n.left)
+        } else {
+            (n.left, n.right)
+        }
     }
 }
 
@@ -546,21 +593,14 @@ impl CompactForest {
                 left: new_id[n.left as usize],
                 aux,
             }
-        } else if n.default_left {
-            // go right (to `right`) iff v >= cond  <=>  v > next_below(cond)
-            CNode {
-                slot: n.split_feature * FEATURE_LANES as u32,
-                key: key(next_below(n.split_cond)),
-                left: new_id[n.left as usize],
-                aux: 0,
-            }
         } else {
-            // children mirrored: go to `left` (second) iff v < cond
-            //   <=>  -v > -cond, read from the negated key half
+            let test = NumericTest::of(n);
+            let (first, _) = test.children(n);
+            let mirror = if test.mirrored { LANES as u32 } else { 0 };
             CNode {
-                slot: n.split_feature * FEATURE_LANES as u32 + LANES as u32,
-                key: key(-n.split_cond),
-                left: new_id[n.right as usize],
+                slot: n.split_feature * FEATURE_LANES as u32 + mirror,
+                key: test.key,
+                left: new_id[first as usize],
                 aux: 0,
             }
         }
@@ -912,16 +952,37 @@ impl CompactForest {
         &self,
         row: &[f32],
         trees: std::ops::Range<usize>,
+        sink: impl FnMut(usize, u32),
+    ) {
+        let mut inline = [0u32; INLINE_KEYS];
+        let len = 2 * row.len();
+        // Only a lockstep group reads the keys.
+        let keys = (len <= INLINE_KEYS && trees.len() >= LANES).then(|| {
+            let keys = &mut inline[..len];
+            for (pair, &v) in keys.as_chunks_mut::<2>().0.iter_mut().zip(row) {
+                *pair = [key(v), key(-v)];
+            }
+            &*keys
+        });
+        self.walk_row_keyed(row, keys, trees, sink);
+    }
+
+    /// [`Self::walk_row`] given the row's keys: `keys`, when present, holds
+    /// `[key(v), key(-v)]` for the row's first `keys.len() / 2` features
+    /// (every feature a lockstep tree splits on, which the walk checks);
+    /// without them, a step keys the value it reads.
+    #[inline(always)]
+    pub(crate) fn walk_row_keyed(
+        &self,
+        row: &[f32],
+        keys: Option<&[u32]>,
+        trees: std::ops::Range<usize>,
         mut sink: impl FnMut(usize, u32),
     ) {
         assert!(trees.end <= self.trees.len());
         let begin = trees.start;
         let groups = trees.len() / LANES;
         let full = begin + groups * LANES;
-        // The row's keys, filled when the first lockstep group needs them.
-        let mut inline = [0u32; INLINE_KEYS];
-        let len = 2 * row.len();
-        let mut keyed = false;
         for g in 0..groups {
             let first = begin + g * LANES;
             let group = &self.trees[first..first + LANES];
@@ -934,17 +995,13 @@ impl CompactForest {
             for meta in group {
                 meta.check_width(row.len());
             }
-            let leaves = if len <= INLINE_KEYS {
-                let keys = &mut inline[..len];
-                if !keyed {
-                    for (pair, &v) in keys.as_chunks_mut::<2>().0.iter_mut().zip(row) {
-                        *pair = [key(v), key(-v)];
-                    }
-                    keyed = true;
+            let leaves = if let Some(keys) = keys {
+                for meta in group {
+                    meta.check_width(keys.len() / 2);
                 }
-                let keys = &*keys;
-                // SAFETY: `check_width` ran for every tree in the group, and
-                // `keys` holds two keys per feature, indexed by `slot / LANES`.
+                // SAFETY: `check_width` ran for every tree in the group
+                // against the keyed features, and `keys` holds two keys per
+                // feature, indexed by `slot / LANES`.
                 self.lockstep_leaves(group, |node| unsafe {
                     *keys.get_unchecked(node.slot as usize / LANES)
                 })

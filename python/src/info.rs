@@ -167,13 +167,11 @@ struct ModelArrays {
 
 impl ModelArrays {
     fn of(model: &BoostedModel) -> Result<Self, String> {
-        let tree_outputs = (0..model.trees().len())
-            .map(|t| {
-                // The first output tree `t` feeds (`0` for a vector-leaf
-                // tree, which feeds every output).
-                let outputs = model.tree_outputs(t);
-                int32(outputs.start, "an output index")
-            })
+        // Every tree's first output (`0` for a vector-leaf tree, which feeds
+        // every output).
+        let tree_outputs = model
+            .tree_outputs()
+            .map(|outputs| int32(outputs.start, "an output index"))
             .collect::<Result<_, _>>()?;
         Ok(ModelArrays {
             tree_weights: model.tree_weights().collect(),

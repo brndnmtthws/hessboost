@@ -430,13 +430,13 @@ fn tree_metadata_recomputes_the_margins() {
             .predict_margin(&matrix(&x, case.n_cols, case.numeric), ..)
             .unwrap();
         let weights: Vec<f32> = model.tree_weights().collect();
+        let outputs: Vec<_> = model.tree_outputs().collect();
         for (row, want) in x.chunks(case.n_cols).zip(margins.rows()) {
             let mut margin = model.base_scores().to_vec();
             for (t, tree) in model.trees().iter().enumerate() {
                 let leaf = tree.leaf_vector(tree.leaf_id_dense(row, f32::NAN));
-                let outputs = model.tree_outputs(t);
-                assert_eq!(outputs.len(), leaf.len(), "{name}: tree {t}");
-                for (m, &v) in margin[outputs].iter_mut().zip(leaf) {
+                assert_eq!(outputs[t].len(), leaf.len(), "{name}: tree {t}");
+                for (m, &v) in margin[outputs[t].clone()].iter_mut().zip(leaf) {
                     *m += weights[t] * v;
                 }
             }

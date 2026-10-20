@@ -779,6 +779,23 @@ impl BoostedModel {
         (0..self.trees.len()).map(|t| self.tree_weights.get(t))
     }
 
+    /// The outputs (margin columns) every tree adds to, in [`Self::trees`]
+    /// order (one range per tree, as [`Self::tree_weights`]): the one output
+    /// `(t / num_parallel_tree) % n_outputs` of scalar-leaf tree `t` (see the
+    /// type docs' tree layout; XGBoost's `tree_info[t]` is its start), every
+    /// output for a vector-leaf tree, whose leaves hold one value per output.
+    pub fn tree_outputs(&self) -> impl ExactSizeIterator<Item = Range<usize>> + '_ {
+        let width = if self.has_vector_leaves() {
+            self.n_outputs
+        } else {
+            1
+        };
+        (0..self.trees.len()).map(move |t| {
+            let output = self.tree_output(t);
+            output..output + width
+        })
+    }
+
     /// Whether tree `t` stores a weight vector per leaf (vector-leaf trees).
     #[cfg(any(
         all(target_os = "macos", feature = "metal"),
@@ -1178,27 +1195,14 @@ impl BoostedModel {
         Ok(())
     }
 
-    /// The outputs (margin columns) tree `t` adds to: the one output
-    /// `(t / num_parallel_tree) % n_outputs` of a scalar-leaf tree (see the
-    /// type docs' tree layout; XGBoost's `tree_info[t]` is its start), every
-    /// output for a vector-leaf tree, whose leaves hold one value per output.
-    ///
-    /// # Panics
-    ///
-    /// When `t` is not a tree of the model (`t >= num_trees()`), as
-    /// [`RegTree::node`] does for a node id.
+    /// The output tree `t` contributes to (XGBoost `tree_info[t]`): `0` for
+    /// every vector-leaf tree, whose leaves carry all outputs.
     #[inline]
-    pub fn tree_outputs(&self, t: usize) -> Range<usize> {
-        assert!(
-            t < self.trees.len(),
-            "tree {t} of a model of {} trees",
-            self.trees.len()
-        );
+    pub(crate) fn tree_output(&self, t: usize) -> usize {
         if self.has_vector_leaves() {
-            0..self.n_outputs
+            0
         } else {
-            let output = scalar_tree_output(t, self.num_parallel_tree, self.n_outputs);
-            output..output + 1
+            scalar_tree_output(t, self.num_parallel_tree, self.n_outputs)
         }
     }
 

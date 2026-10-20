@@ -134,7 +134,7 @@ pub(super) fn model_to_value(model: &BoostedModel) -> Result<Value> {
     // groups in order, and every vector-leaf tree in group 0), so the ids and
     // iteration boundaries carry over.
     let tree_info: Vec<Value> = (0..n_trees)
-        .map(|t| json!(model.tree_outputs(t).start as i32))
+        .map(|t| json!(model.tree_output(t) as i32))
         .collect();
     let iteration_indptr: Vec<Value> = (0..=n_trees / per_iteration)
         .map(|i| json!(i * per_iteration))

@@ -94,9 +94,8 @@ impl BoostedModel {
         out
     }
 
-    /// Sum `weight(t) * leaf(row, t)` into
-    /// `out[row * k + tree_outputs(t).start]` for the trees in `trees`, where
-    /// `k` is the output count. Rows are traversed
+    /// Sum `weight(t) * leaf(row, t)` into `out[row * k + tree_output(t)]` for
+    /// the trees in `trees`, where `k` is the output count. Rows are traversed
     /// in cache-friendly blocks (parallel across blocks); per (row, output)
     /// slot the trees are still summed in ascending order, so the result is
     /// bit-identical to the sequential tree-outer loop. Ensembles with linear
@@ -132,7 +131,7 @@ impl BoostedModel {
             crate::tree::linear::accumulate_forest(
                 &self.trees,
                 trees,
-                |t| self.tree_outputs(t).start,
+                |t| self.tree_output(t),
                 rows,
                 out,
                 k,
@@ -155,7 +154,7 @@ impl BoostedModel {
                     ti,
                     rows,
                     weight(ti),
-                    &mut out_block[self.tree_outputs(ti).start..],
+                    &mut out_block[self.tree_output(ti)..],
                     stride,
                 );
             },
@@ -824,7 +823,7 @@ impl BoostedModel {
                 crate::tree::linear::accumulate_forest(
                     &self.trees,
                     i * per..(i + 1) * per,
-                    |t| self.tree_outputs(t).start,
+                    |t| self.tree_output(t),
                     rows,
                     out,
                     n_out,
@@ -857,7 +856,7 @@ impl BoostedModel {
                     if vector {
                         block.accumulate_vector(forest, ti, rows, 1.0, out_block, stride);
                     } else {
-                        let out = &mut out_block[self.tree_outputs(ti).start..];
+                        let out = &mut out_block[self.tree_output(ti)..];
                         block.accumulate(forest, ti, rows, 1.0, out, stride);
                     }
                 },

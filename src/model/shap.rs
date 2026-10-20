@@ -885,7 +885,7 @@ struct ShapForest {
     /// Per output: `Σ weight · E[f_tree]`, summed in `f64`, rounded once.
     root_mean_sums: Vec<f32>,
     /// Per output: the ids (into `trees`) of the trees feeding it, ascending
-    /// (`BoostedModel::tree_outputs`; a vector-leaf tree contributes one
+    /// (`BoostedModel::tree_output`; a vector-leaf tree contributes one
     /// per-output view to every list).
     by_output: Vec<Vec<usize>>,
 }
@@ -920,12 +920,7 @@ impl BoostedModel {
                 }
             } else {
                 let shap = ShapTree::from_tree(tree, |id| tree.node(id).leaf_value)?;
-                push(
-                    shap,
-                    self.tree_outputs(ti).start,
-                    root_mean_value(tree, 0),
-                    weight,
-                );
+                push(shap, self.tree_output(ti), root_mean_value(tree, 0), weight);
             }
         }
         Ok(ShapForest {

@@ -1912,7 +1912,7 @@ impl BoostedModel {
             .enumerate()
             .map(|(t, &root)| PTree {
                 root,
-                output: self.tree_outputs(t).start as u32,
+                output: self.tree_output(t) as u32,
                 vector: u32::from(self.tree_is_vector_leaf(t)),
                 pad: 0,
             })

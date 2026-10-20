@@ -482,6 +482,7 @@ fn per_fold_stopping_encodes_the_trial_on_its_fit_rows() {
             .unwrap()
             .model;
         assert_eq!(got.num_boost_round, rounds);
+        assert_eq!(got.stopping.unwrap().best_score, trial.best_score.unwrap());
         assert_eq!(
             got.margins,
             model.predict_margin(&dtest, Iterations::Best).unwrap()
@@ -508,4 +509,39 @@ fn per_fold_stopping_refuses_boulevard() {
     let cv = CrossValidation::new(&params, &data, 5, folds())
         .early_stopping(CvStopping::per_fold(NonZeroUsize::new(2).unwrap(), tail));
     assert_eq!(invalid_param(cv.run()), "early_stopping");
+}
+
+/// DART rescales earlier trees every round, so a fold stopped early on the
+/// fold means is the fold retrained for the chosen rounds, not a prefix of
+/// its full run: its margins equal that retrained fold's bit for bit.
+#[test]
+fn fold_mean_margins_of_dart_are_the_retrained_folds() {
+    use hessboost::config::{BoosterKind, Dart};
+    let data = regression();
+    let params = TrainingParams::builder()
+        .booster(BoosterKind::Dart(
+            Dart::builder().rate_drop(0.3).build().unwrap(),
+        ))
+        .max_depth(6)
+        .eta(0.8)
+        .subsample(0.8)
+        .seed(3)
+        .build()
+        .unwrap();
+    let report = CrossValidation::new(&params, &data, 30, folds())
+        .early_stopping(CvStopping::fold_mean(NonZeroUsize::new(3).unwrap()))
+        .run()
+        .unwrap();
+    let rounds = report.results[0].rounds.len();
+    assert!(rounds < 30, "stopped after {rounds} rounds");
+    for (fold, got) in folds().iter().zip(&report.folds) {
+        let (model, scores) = trained(&params, &data, &fold.train, &fold.test, rounds);
+        let dtest = data.select_rows(&fold.test).unwrap();
+        assert_eq!(got.num_boost_round, rounds);
+        assert_eq!(got.scores, scores);
+        assert_eq!(
+            got.margins,
+            model.predict_margin(&dtest, Iterations::Best).unwrap()
+        );
+    }
 }

@@ -27,10 +27,10 @@ __all__ = [
     "CustomMetric",
     "CvRefit",
     "CvReport",
+    "CvReportRefit",
     "FoldReport",
     "Objective",
     "OutOfFold",
-    "Refit",
     "TailStopping",
     "TrainingCallback",
     "cross_validate",
@@ -434,7 +434,7 @@ class CvRefit:
 
 
 @dataclass(frozen=True)
-class Refit:
+class CvReportRefit:
     """The booster ``cross_validate(..., refit=True)`` retrained on every
     row (:attr:`CvReport.refit`; the history is the report's)."""
 
@@ -507,7 +507,7 @@ class CvReport:
     folds run different round counts."""
     folds: list[FoldReport]
     """One report per fold, in fold order."""
-    refit: Refit | None
+    refit: CvReportRefit | None
     """With ``refit=True``, the booster retrained on every row; else
     ``None``."""
     _core: _hessboost.CvReport = field(repr=False)
@@ -628,11 +628,13 @@ def _cross_validate(
     if refitted is not None:
         booster, rounds, fitted, stopping = refitted
         if encoding is None or fitted is None:
-            retrained = Refit(_trained(booster, dtrain, init), rounds, None, _stopping(stopping))
+            retrained = CvReportRefit(
+                _trained(booster, dtrain, init), rounds, None, _stopping(stopping)
+            )
         else:
             # The refit trained on dtrain encoded by `fitted`, its columns numerical.
             encoded = _encoded(dtrain, dtrain._core, encoding[1])
-            retrained = Refit(
+            retrained = CvReportRefit(
                 _trained(booster, encoded, None),
                 rounds,
                 FittedTargetEncoder._wrap(fitted, dtrain),

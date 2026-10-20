@@ -4,7 +4,7 @@ every pairing of data with a model or a training matrix goes through."""
 from __future__ import annotations
 
 from collections.abc import Collection, Sequence
-from typing import Protocol
+from typing import Literal, Protocol
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -241,13 +241,21 @@ class DMatrix:
         if info:
             self._core = self._core.with_info({**info, "categorical": None})
 
-    def slice(self, rindex: ArrayLike) -> DMatrix:
-        """A new matrix of the rows ``rindex`` (in that order), with their
-        labels, weights, margins and bounds. On ranking data ``rindex`` must
-        list whole query groups, each group's rows together and in row
-        order; they stay the result's groups."""
+    def slice(self, rindex: ArrayLike, *, cuts: Literal["own", "source"] = "own") -> DMatrix:
+        """A view of the rows ``rindex`` (in that order, repeats allowed),
+        with their labels, weights, margins and bounds, sharing this
+        matrix's feature values: nothing is copied but the metadata. On
+        ranking data ``rindex`` must list whole query groups, each group's
+        rows together and in row order; they stay the result's groups.
+
+        ``cuts`` decides where the view's histogram bins come from:
+        ``"own"`` cuts its own rows, so training on it is training on a copy
+        of them, bit for bit; ``"source"`` gathers this matrix's bins for the
+        rows (no quantile cuts computed, nothing binned again), so every
+        such view shares this matrix's split thresholds and its binned
+        index."""
         rows = np.ascontiguousarray(np.asarray(rindex).reshape(-1), dtype=np.int64)
-        return self._with_core(self._core.select_rows(rows))
+        return self._with_core(self._core.select_rows(rows, cuts))
 
     def _with_core(self, core: _hessboost.DMatrix) -> DMatrix:
         """A matrix of ``core`` with this one's features."""

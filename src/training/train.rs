@@ -289,11 +289,16 @@ fn train_trees<'a>(
             shrink_factors.push(factor);
         }
         match &mut plan {
-            RoundPlan::Grow(Prepared::Hist { index: ghist, .. }) if vector_leaf => {
+            RoundPlan::Grow(Prepared::Hist {
+                index: ghist,
+                sketched,
+                ..
+            }) if vector_leaf => {
                 multi_output::boost_round(
                     &multi_output::VectorRound {
                         run: run.ctx,
                         ghist,
+                        sketched: *sketched,
                         all_rows: &state.all_rows,
                     },
                     &mut state.model,

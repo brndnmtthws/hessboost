@@ -357,6 +357,134 @@ impl GHistIndex {
         }
     }
 
+    /// The index of only `rows` (in order, repeats allowed) under the same
+    /// cuts: their bins gathered, never binned again. It is the index
+    /// [`from_dmatrix`](Self::from_dmatrix) builds from a copy of those rows
+    /// with these cuts, layout rules included (columns kept from half full,
+    /// the missing bitmap only with missing entries, `is_dense` for
+    /// complete rows in feature order).
+    pub(crate) fn select_rows(&self, rows: &[usize]) -> GHistIndex {
+        let n = rows.len();
+        let parallel = rayon::current_num_threads() > 1
+            && n.saturating_mul(self.n_cols) >= PARALLEL_BINNING_CELLS;
+        let mut row_ptr = Vec::with_capacity(n + 1);
+        row_ptr.push(0);
+        for &r in rows {
+            row_ptr.push(row_ptr[row_ptr.len() - 1] + self.row_ptr[r + 1] - self.row_ptr[r]);
+        }
+        let gathered = Gathered {
+            rows,
+            source_ptr: &self.row_ptr,
+            row_ptr: &row_ptr,
+            n_cols: self.n_cols,
+            parallel,
+        };
+        let (selected, dense) = match &self.rows {
+            RowStore::U16(bins) => {
+                let (selected, dense) = gathered.rows(bins);
+                (RowStore::U16(selected), dense)
+            }
+            RowStore::U32(bins) => {
+                let (selected, dense) = gathered.rows(bins);
+                (RowStore::U32(selected), dense)
+            }
+        };
+        let (cells, entries) = (n.saturating_mul(self.n_cols), row_ptr[n]);
+        let keep_columns = cells <= entries.saturating_mul(2);
+        let with_missing = entries < cells;
+        let columns = match self.columns() {
+            Some(source) if keep_columns => Some(gathered.columns(source, with_missing)),
+            _ => None,
+        };
+        let mut index = GHistIndex {
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            n_rows: n,
+            n_cols: self.n_cols,
+            row_ptr,
+            rows: selected,
+            columns,
+            cuts: self.cuts.clone(),
+            dense,
+        };
+        if keep_columns && index.columns.is_none() {
+            index.columns = Some(index.columns_from_rows(with_missing));
+        }
+        index
+    }
+
+    /// The feature-major columns of this index's rows (with the missing
+    /// bitmap when `with_missing`), scattered from them.
+    fn columns_from_rows(&self, with_missing: bool) -> ColumnStore {
+        fn scatter<R: BinIndex, C: BinIndex + Default>(
+            index: &GHistIndex,
+            bins: &[R],
+            with_missing: bool,
+        ) -> (Vec<C>, Option<Vec<u64>>) {
+            let (n, n_cols) = (index.n_rows, index.n_cols);
+            let words = n.div_ceil(64);
+            let owner = bin_features(&index.cuts);
+            let mut columns = vec![C::default(); n * n_cols];
+            // Every bit starts missing; each stored entry clears its own.
+            let mut missing = with_missing.then(|| {
+                let mut bits = vec![0u64; words * n_cols];
+                for column in bits.chunks_mut(words.max(1)) {
+                    for (w, word) in column.iter_mut().enumerate() {
+                        let valid = n.saturating_sub(w * 64).min(64);
+                        *word = if valid == 64 {
+                            u64::MAX
+                        } else {
+                            (1 << valid) - 1
+                        };
+                    }
+                }
+                bits
+            });
+            for r in 0..n {
+                for &bin in &bins[index.row_ptr[r]..index.row_ptr[r + 1]] {
+                    let f = owner[bin.index()] as usize;
+                    let local = bin.index() - index.cuts.feature_bins(f).0;
+                    columns[f * n + r] = C::from_bin(local as u32);
+                    if let Some(bits) = missing.as_mut() {
+                        bits[f * words + (r >> 6)] &= !(1 << (r & 63));
+                    }
+                }
+            }
+            (columns, missing)
+        }
+        let widest = (0..self.n_cols)
+            .map(|f| self.cuts.num_bins(f))
+            .max()
+            .unwrap_or(0);
+        let (bins, missing) = match (&self.rows, widest) {
+            (RowStore::U16(rows), w) if w <= u8::MAX_BINS => {
+                let (bins, missing) = scatter::<u16, u8>(self, rows, with_missing);
+                (ColumnBins::U8(bins), missing)
+            }
+            (RowStore::U32(rows), w) if w <= u8::MAX_BINS => {
+                let (bins, missing) = scatter::<u32, u8>(self, rows, with_missing);
+                (ColumnBins::U8(bins), missing)
+            }
+            (RowStore::U16(rows), w) if w <= u16::MAX_BINS => {
+                let (bins, missing) = scatter::<u16, u16>(self, rows, with_missing);
+                (ColumnBins::U16(bins), missing)
+            }
+            (RowStore::U32(rows), w) if w <= u16::MAX_BINS => {
+                let (bins, missing) = scatter::<u32, u16>(self, rows, with_missing);
+                (ColumnBins::U16(bins), missing)
+            }
+            (RowStore::U16(rows), _) => {
+                let (bins, missing) = scatter::<u16, u32>(self, rows, with_missing);
+                (ColumnBins::U32(bins), missing)
+            }
+            (RowStore::U32(rows), _) => {
+                let (bins, missing) = scatter::<u32, u32>(self, rows, with_missing);
+                (ColumnBins::U32(bins), missing)
+            }
+        };
+        ColumnStore { bins, missing }
+    }
+
     /// Every feature's column as local `u32` bins, `u32::MAX` where the row
     /// lacks the feature (EBM pair ranking): widened from the columns when
     /// the index keeps them, else scattered from one pass over the rows.
@@ -472,6 +600,129 @@ impl GHistIndex {
     }
 }
 
+/// A row gather ([`GHistIndex::select_rows`]): the selected rows, the
+/// source's row offsets, the gathered rows' offsets, and whether to gather
+/// in parallel.
+struct Gathered<'a> {
+    rows: &'a [usize],
+    source_ptr: &'a [usize],
+    row_ptr: &'a [usize],
+    n_cols: usize,
+    parallel: bool,
+}
+
+impl Gathered<'_> {
+    /// The selected rows' global bins, a block of rows per task, and whether
+    /// every one holds every feature in feature order.
+    fn rows<B: BinIndex + Default>(&self, bins: &[B]) -> (Vec<B>, bool) {
+        let n = self.rows.len();
+        let mut out = vec![B::default(); self.row_ptr[n]];
+        let mut parts = Vec::with_capacity(n.div_ceil(BIN_BLOCK_ROWS));
+        let mut rest = out.as_mut_slice();
+        for start in (0..n).step_by(BIN_BLOCK_ROWS) {
+            let end = (start + BIN_BLOCK_ROWS).min(n);
+            let (part, tail) = rest.split_at_mut(self.row_ptr[end] - self.row_ptr[start]);
+            parts.push((start..end, part));
+            rest = tail;
+        }
+        let copy = |(block, part): (Range<usize>, &mut [B])| {
+            let (mut at, mut dense) = (0, true);
+            for &r in &self.rows[block] {
+                let row = &bins[self.source_ptr[r]..self.source_ptr[r + 1]];
+                part[at..at + row.len()].copy_from_slice(row);
+                at += row.len();
+                // Global bins rise with the feature, so a complete row in
+                // feature order is one of strictly rising bins.
+                dense &=
+                    row.len() == self.n_cols && row.windows(2).all(|w| w[0].index() < w[1].index());
+            }
+            dense
+        };
+        let dense = if self.parallel {
+            parts
+                .into_par_iter()
+                .map(copy)
+                .reduce(|| true, |a, b| a && b)
+        } else {
+            // Every block must be copied, so no short-circuiting `all`.
+            let mut dense = true;
+            for part in parts {
+                dense &= copy(part);
+            }
+            dense
+        };
+        (out, dense)
+    }
+
+    /// The selected rows' columns gathered from the source's, with a
+    /// missing bitmap when `with_missing`.
+    fn columns(&self, source: Columns<'_>, with_missing: bool) -> ColumnStore {
+        match source {
+            Columns::U8(set) => {
+                let (bins, missing) = self.gather_columns(set, with_missing);
+                ColumnStore {
+                    bins: ColumnBins::U8(bins),
+                    missing,
+                }
+            }
+            Columns::U16(set) => {
+                let (bins, missing) = self.gather_columns(set, with_missing);
+                ColumnStore {
+                    bins: ColumnBins::U16(bins),
+                    missing,
+                }
+            }
+            Columns::U32(set) => {
+                let (bins, missing) = self.gather_columns(set, with_missing);
+                ColumnStore {
+                    bins: ColumnBins::U32(bins),
+                    missing,
+                }
+            }
+        }
+    }
+
+    /// [`Self::columns`] in the width `B`, a feature per task.
+    fn gather_columns<B: BinIndex + Default>(
+        &self,
+        set: ColumnSet<'_, B>,
+        with_missing: bool,
+    ) -> (Vec<B>, Option<Vec<u64>>) {
+        let n = self.rows.len();
+        let words = n.div_ceil(64);
+        let mut bins = vec![B::default(); n * self.n_cols];
+        let mut missing = with_missing.then(|| vec![0u64; words * self.n_cols]);
+        if n == 0 {
+            return (bins, missing);
+        }
+        let bit_parts: Vec<Option<&mut [u64]>> = match missing.as_mut() {
+            Some(bits) => bits.chunks_mut(words).map(Some).collect(),
+            None => (0..self.n_cols).map(|_| None).collect(),
+        };
+        let parts: Vec<(&mut [B], Option<&mut [u64]>)> =
+            bins.chunks_mut(n).zip(bit_parts).collect();
+        let fill = |(f, (column, bits)): (usize, (&mut [B], Option<&mut [u64]>))| {
+            let source = set.column(f);
+            for (slot, &r) in column.iter_mut().zip(self.rows) {
+                *slot = source.bins[r];
+            }
+            if let (Some(bits), Some(source_bits)) = (bits, source.missing) {
+                for (i, &r) in self.rows.iter().enumerate() {
+                    if missing_bit(source_bits, r) {
+                        bits[i >> 6] |= 1 << (i & 63);
+                    }
+                }
+            }
+        };
+        if self.parallel {
+            parts.into_par_iter().enumerate().for_each(fill);
+        } else {
+            parts.into_iter().enumerate().for_each(fill);
+        }
+        (bins, missing)
+    }
+}
+
 /// The feature owning each global bin.
 fn bin_features(cuts: &HistCuts) -> Vec<u32> {
     let mut owner = vec![0u32; cuts.total_bins()];
@@ -488,10 +739,10 @@ fn row_offsets(data: &DMatrix, parallel: bool) -> Vec<usize> {
     let mut row_ptr = vec![0usize; n + 1];
     let count = |(b, counts): (usize, &mut [usize])| {
         let first = b * BIN_BLOCK_ROWS;
-        if let Some(values) = data.dense_values() {
-            let (n_cols, missing) = (data.n_cols(), data.missing());
+        if let Some(rows) = data.dense_rows() {
+            let missing = data.missing();
             for (i, count) in counts.iter_mut().enumerate() {
-                let row = &values[(first + i) * n_cols..][..n_cols];
+                let row = rows.row(first + i);
                 *count = row.iter().filter(|&&v| !is_missing(v, missing)).count();
             }
         } else {
@@ -682,12 +933,20 @@ fn bin_block<R: BinIndex, C: BinIndex>(
     let n_cols = data.n_cols();
     let base = row_ptr[rows.start];
     let mut dense = true;
-    if let Some(values) = data.dense_values() {
+    if let Some(dense_rows) = data.dense_rows() {
         // Feature by feature, each feature's search tables stay hot across
         // the block's rows, which stay in cache across its features; each
-        // row's entries land in feature order at its own cursor.
+        // row's entries land in feature order at its own cursor. A whole
+        // matrix's block is one contiguous stretch; a view's rows are read
+        // through their slices.
         let missing = data.missing();
-        let block_values = &values[rows.start * n_cols..rows.end * n_cols];
+        let contiguous = dense_rows
+            .contiguous()
+            .map(|values| &values[rows.start * n_cols..rows.end * n_cols]);
+        let block_rows: Vec<&[f32]> = match contiguous {
+            Some(_) => Vec::new(),
+            None => rows.clone().map(|r| dense_rows.row(r)).collect(),
+        };
         let mut cursor: Vec<usize> = row_ptr[rows.clone()].iter().map(|&p| p - base).collect();
         for f in 0..n_cols {
             let feature = search.feature(f);
@@ -696,13 +955,13 @@ fn bin_block<R: BinIndex, C: BinIndex>(
                 let bits = c.missing.as_mut().map(|m| &mut *m[f]);
                 (&mut *c.bins[f], bits)
             });
-            for (i, &v) in block_values[f..].iter().step_by(n_cols).enumerate() {
+            let mut bin = |i: usize, v: f32| {
                 if is_missing(v, missing) {
                     dense = false;
                     if let Some((_, Some(bits))) = column.as_mut() {
                         bits[i >> 6] |= 1 << (i & 63);
                     }
-                    continue;
+                    return;
                 }
                 let local = feature.local_bin_of(v);
                 if let Some((bins, _)) = column.as_mut() {
@@ -710,6 +969,18 @@ fn bin_block<R: BinIndex, C: BinIndex>(
                 }
                 row_bins[cursor[i]] = R::from_bin(first + local);
                 cursor[i] += 1;
+            };
+            match contiguous {
+                Some(block) => {
+                    for (i, &v) in block[f..].iter().step_by(n_cols).enumerate() {
+                        bin(i, v);
+                    }
+                }
+                None => {
+                    for (i, row) in block_rows.iter().enumerate() {
+                        bin(i, row[f]);
+                    }
+                }
             }
         }
     } else {
@@ -752,12 +1023,12 @@ fn bin_block<R: BinIndex, C: BinIndex>(
     dense
 }
 
-/// Feature-major copy of a dense row-major matrix (`n_rows * n_cols` entries,
-/// row `r` at `r * n_cols`) into `columns`. Four-feature groups expose eight
-/// tasks for a 30-feature matrix while each pass reads a short contiguous
-/// run per row and writes sequential column streams.
-pub(crate) fn transpose_dense_into<B: Copy + Default + Send + Sync>(
-    values: &[B],
+/// Feature-major copy of `n_rows` dense rows (row `r` is `row(r)`, of
+/// `n_cols` values) into `columns`. Four-feature groups expose eight tasks
+/// for a 30-feature matrix while each pass reads a short contiguous run per
+/// row and writes sequential column streams.
+pub(crate) fn transpose_rows_into<'a, B: Copy + Default + Send + Sync + 'a>(
+    row: impl Fn(usize) -> &'a [B] + Sync,
     n_rows: usize,
     n_cols: usize,
     columns: &mut Vec<B>,
@@ -774,8 +1045,8 @@ pub(crate) fn transpose_dense_into<B: Copy + Default + Send + Sync>(
         let first = group * GROUP;
         let width = chunk.len() / n_rows;
         for r in 0..n_rows {
-            let row = &values[r * n_cols + first..r * n_cols + first + width];
-            for (j, &value) in row.iter().enumerate() {
+            let values = &row(r)[first..first + width];
+            for (j, &value) in values.iter().enumerate() {
                 chunk[j * n_rows + r] = value;
             }
         }
@@ -991,5 +1262,84 @@ mod tests {
                 assert_eq!(column, &want, "{name}, feature {f}");
             }
         }
+    }
+
+    /// Gathering rows equals binning a copy of them with the same cuts:
+    /// rows, columns, missing bitmap and dense flag alike (the layout rules
+    /// re-applied to the selection), for subsets that repeat, reorder, keep
+    /// only complete rows of a sparse table, or drop below half full,
+    /// serially and in parallel.
+    #[test]
+    fn gathered_rows_equal_binning_their_copy() {
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for (name, data, max_bin) in tables() {
+            let n = data.n_rows();
+            let complete: Vec<usize> = (0..n)
+                .filter(|&r| (0..data.n_cols()).all(|f| data.get(r, f).is_some()))
+                .collect();
+            let sparse_rows: Vec<usize> = (0..n)
+                .filter(|&r| {
+                    (0..data.n_cols())
+                        .filter(|&f| data.get(r, f).is_some())
+                        .count()
+                        <= 1
+                })
+                .collect();
+            let selections: Vec<Vec<usize>> = vec![
+                (0..n).rev().step_by(3).collect(),
+                (0..n).flat_map(|r| [r, r]).take(n + 7).collect(),
+                complete,
+                sparse_rows,
+            ];
+            let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, max_bin));
+            for rows in selections.into_iter().filter(|rows| !rows.is_empty()) {
+                let copy = copied_rows(&data, &rows);
+                let want = GHistIndex::from_dmatrix(&copy, index.cuts().clone());
+                for got in [
+                    index.select_rows(&rows),
+                    parallel.install(|| index.select_rows(&rows)),
+                ] {
+                    assert_eq!(got.row_ptr, want.row_ptr, "{name}, {} rows", rows.len());
+                    assert_eq!(
+                        format!("{:?}", got.rows),
+                        format!("{:?}", want.rows),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        format!("{:?}", got.columns),
+                        format!("{:?}", want.columns),
+                        "{name}"
+                    );
+                    assert_eq!(got.dense, want.dense, "{name}, {} rows", rows.len());
+                }
+            }
+        }
+    }
+
+    /// A fresh matrix of `data`'s `rows` (their values read one by one, a
+    /// CSR copy keeping each row's storage order), with its feature types.
+    fn copied_rows(data: &DMatrix, rows: &[usize]) -> DMatrix {
+        let n_cols = data.n_cols();
+        let copy = if data.dense_rows().is_some() {
+            let values: Vec<f32> = rows
+                .iter()
+                .flat_map(|&r| (0..n_cols).map(move |f| data.get(r, f).unwrap_or(f32::NAN)))
+                .collect();
+            DMatrix::from_dense_vec(values, rows.len(), n_cols).unwrap()
+        } else {
+            let (mut indptr, mut indices, mut values) = (vec![0], Vec::new(), Vec::new());
+            for &r in rows {
+                data.for_row_entry(r, |f, v| {
+                    indices.push(f);
+                    values.push(v);
+                });
+                indptr.push(values.len());
+            }
+            DMatrix::from_csr(indptr, indices, values, n_cols).unwrap()
+        };
+        copy.with_feature_types(data.feature_types()).unwrap()
     }
 }

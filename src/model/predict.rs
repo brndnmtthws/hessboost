@@ -1059,9 +1059,10 @@ impl<'a> RowBlock<'a> {
             Rows::Matrix(data) => data,
         };
         let n_cols = data.n_cols();
-        match data.dense_values() {
-            Some(dense) if data.missing().is_nan() => view(dense, n_cols),
-            None if matches!(densify, Densify::UpTo(max) if n_cols > max) => {
+        let dense = data.dense_rows();
+        match dense.and_then(crate::data::DenseRows::contiguous) {
+            Some(values) if data.missing().is_nan() => view(values, n_cols),
+            _ if dense.is_none() && matches!(densify, Densify::UpTo(max) if n_cols > max) => {
                 RowBlock::Wide { data, start: 0 }
             }
             _ => RowBlock::Scratch {
@@ -1119,28 +1120,24 @@ impl<'a> RowBlock<'a> {
                         scratch[(r - groups * LANES) * n_cols + f] = v;
                     }
                 };
-                if let Some(dense) = source.dense_values() {
+                if let Some(dense) = source.dense_rows() {
                     for r in 0..rows {
-                        let src = &dense[(start + r) * n_cols..(start + r + 1) * n_cols];
-                        for (f, &v) in src.iter().enumerate() {
+                        for (f, &v) in dense.row(start + r).iter().enumerate() {
                             put(r, f, if v == missing { f32::NAN } else { v });
                         }
                     }
-                } else {
-                    let (indptr, indices, values) =
-                        source.csr_parts().expect("scratch blocks are dense or CSR");
+                } else if let Some(csr) = source.csr_rows() {
                     for r in 0..rows {
-                        let row = start + r;
+                        let (indices, values) = csr.row(start + r);
                         // Reverse order so the first occurrence of a duplicated
                         // column wins, matching `DMatrix::get`.
-                        for k in (indptr[row]..indptr[row + 1]).rev() {
-                            let v = values[k];
+                        for (&index, &v) in indices.iter().zip(values).rev() {
                             let v = if crate::data::is_missing(v, missing) {
                                 f32::NAN
                             } else {
                                 v
                             };
-                            put(r, indices[k] as usize, v);
+                            put(r, index as usize, v);
                         }
                     }
                 }

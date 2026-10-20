@@ -12,6 +12,7 @@
 //! ([`HistCuts::from_dmatrix_weighted`]).
 
 use crate::data::DMatrix;
+use crate::data::dmatrix::DenseRows;
 use crate::data::meta::FeatureType;
 use crate::data::sketch::WQSketch;
 use crate::data::sort::{RadixScratch, sort_values};
@@ -131,9 +132,9 @@ impl HistCuts {
         let parallel = n_features > 1
             && n_rows.saturating_mul(n_features) >= crate::data::ghist::PARALLEL_BINNING_CELLS
             && rayon::current_num_threads() > 1;
-        let per_feature: Vec<Vec<f32>> = if let Some(values) = data.dense_values() {
+        let per_feature: Vec<Vec<f32>> = if let Some(rows) = data.dense_rows() {
             let missing = data.missing();
-            let present = present_counts(values, n_features, missing, parallel);
+            let present = present_counts(rows, n_rows, n_features, missing, parallel);
             let mut columns: Vec<ColumnCuts> = (0..n_features)
                 .map(|f| ColumnCuts::new(is_categorical[f], present[f], max_bin, ingest))
                 .collect();
@@ -145,8 +146,12 @@ impl HistCuts {
             for start in (0..n_rows).step_by(CUT_BLOCK_ROWS) {
                 let end = (start + CUT_BLOCK_ROWS).min(n_rows);
                 let len = end - start;
-                let rows = &values[start * n_features..end * n_features];
-                crate::data::ghist::transpose_dense_into(rows, len, n_features, &mut block);
+                crate::data::ghist::transpose_rows_into(
+                    |r| rows.row(start + r),
+                    len,
+                    n_features,
+                    &mut block,
+                );
                 let feed = |(f, column): (usize, &mut ColumnCuts)| {
                     column.push_column(&block[f * len..][..len], start, missing, &weight_of);
                 };
@@ -403,13 +408,19 @@ impl FeatureBins<'_> {
 /// features is 44 MiB transposed.
 const CUT_BLOCK_ROWS: usize = 1 << 16;
 
-/// Non-missing values per feature of the dense row-major `values` (rows of
-/// `n_features`).
-fn present_counts(values: &[f32], n_features: usize, missing: f32, parallel: bool) -> Vec<usize> {
-    let count = |block: &[f32]| {
+/// Non-missing values per feature of the first `n_rows` dense `rows` (of
+/// `n_features` each).
+fn present_counts(
+    rows: DenseRows<'_>,
+    n_rows: usize,
+    n_features: usize,
+    missing: f32,
+    parallel: bool,
+) -> Vec<usize> {
+    let count = |block: std::ops::Range<usize>| {
         let mut counts = vec![0usize; n_features];
-        for row in block.chunks_exact(n_features) {
-            for (count, &v) in counts.iter_mut().zip(row) {
+        for r in block {
+            for (count, &v) in counts.iter_mut().zip(rows.row(r)) {
                 *count += usize::from(!crate::data::dmatrix::is_missing(v, missing));
             }
         }
@@ -421,10 +432,9 @@ fn present_counts(values: &[f32], n_features: usize, missing: f32, parallel: boo
         }
         a
     };
-    if n_features == 0 {
-        return Vec::new();
-    }
-    let blocks = values.chunks(CUT_BLOCK_ROWS * n_features);
+    let blocks = (0..n_rows)
+        .step_by(CUT_BLOCK_ROWS)
+        .map(|start| start..(start + CUT_BLOCK_ROWS).min(n_rows));
     if parallel {
         blocks
             .collect::<Vec<_>>()

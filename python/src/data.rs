@@ -3,7 +3,7 @@
 
 use crate::errors::{DetachExt, refuse};
 use hessboost::conformal::Interval;
-use hessboost::data::{DMatrix as RustMatrix, FeatureType, GroupInfo};
+use hessboost::data::{DMatrix as RustMatrix, FeatureType, GroupInfo, ViewCuts};
 use numpy::ndarray::{ArrayD, IxDyn};
 use numpy::{
     IntoPyArray, PyArrayDyn, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
@@ -300,8 +300,24 @@ impl DMatrix {
     }
 
     /// The rows `rows`, in that order, with their metadata (query groups
-    /// only when `rows` lists whole groups, each in row order).
-    fn select_rows(&self, py: Python<'_>, rows: PyReadonlyArray1<'_, i64>) -> PyResult<Self> {
+    /// only when `rows` lists whole groups, each in row order): a view
+    /// sharing this matrix's feature values, cut by its own rows (`"own"`)
+    /// or binned with this matrix's cuts (`"source"`).
+    fn select_rows(
+        &self,
+        py: Python<'_>,
+        rows: PyReadonlyArray1<'_, i64>,
+        cuts: &str,
+    ) -> PyResult<Self> {
+        let cuts = match cuts {
+            "own" => ViewCuts::Own,
+            "source" => ViewCuts::Source,
+            other => {
+                return Err(refuse(format!(
+                    "cuts must be \"own\" or \"source\", got {other:?}"
+                )));
+            }
+        };
         let rows = row_major(&rows, "rows")?;
         let n = self.inner.n_rows();
         let rows = rows
@@ -313,7 +329,7 @@ impl DMatrix {
                     .ok_or_else(|| refuse(format!("row index {row} is out of range for {n} rows")))
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let inner = py.detached(|| self.inner.select_rows(&rows))?;
+        let inner = py.detached(|| self.inner.select_rows_with_cuts(&rows, cuts))?;
         Ok(Self { inner })
     }
 

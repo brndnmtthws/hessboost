@@ -101,6 +101,13 @@
 //!   growth; uniform or `gradient_based` row sampling; column sampling with
 //!   optional per-feature weights
 //!   ([`DMatrix::with_feature_weights`](data::DMatrix::with_feature_weights)).
+//! - **Data sharing:** a matrix's copies with other metadata share its
+//!   values and the `hist` index binned from them, built once for every
+//!   training (concurrent ones included) and freed with the values; row
+//!   selections are views of their source's values
+//!   ([`DMatrix::select_rows`](data::DMatrix::select_rows)), binned by
+//!   their own rows or by their source's cuts
+//!   ([`ViewCuts`](data::ViewCuts)).
 //! - **Objectives** ([`Objective`](objective::Objective), each with its
 //!   parameters): regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)

@@ -360,10 +360,19 @@ query groups, and AUC, AUCPR, ungrouped ranking metrics, and `cox-nloglik`
 sort with a stable parallel sort; each reduces in a fixed order, so values
 are bit-identical at any thread count.
 
-A `DMatrix` shares its feature values behind an `Arc`, so a clone (Python's
-`set_info`, the per-fold and per-sample matrices) copies only metadata.
-Dense input is checked 256 values at a time without a branch, and from 2^22
-values on, checked and copied in parallel 2^18-value blocks.
+A `DMatrix` shares its feature values behind an `Arc`: a copy with other
+metadata (Python's `copy` and `set_info`) copies only metadata, and a row
+selection (`select_rows`, Python's `slice`, every cross-validation fold) is
+a view, its row map plus gathered metadata. The `hist` index binned from the
+values is cached with them, keyed by `max_bin`, weights, feature types, and
+missing value: built once, even for trainings that start together (later
+ones wait for the first build), reused by every training of a matrix
+sharing the values, and freed with them. A view bins its own rows by
+default, bit-identical to binning a copy of them; `ViewCuts::Source`
+gathers its rows of the source's index instead, so a source and its views
+share one binning pass. Dense input is checked 256 values at a time without
+a branch, and from 2^22 values on, checked and copied in parallel
+2^18-value blocks.
 
 ### Prediction
 

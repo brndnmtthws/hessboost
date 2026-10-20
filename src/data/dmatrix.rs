@@ -6,6 +6,7 @@ use crate::data::meta::{FeatureType, GroupInfo, LabelBounds, Labels, MetaInfo};
 use crate::data::quantile::HistCuts;
 use crate::error::{HessboostError, Result};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -167,16 +168,61 @@ fn copy_dense(data: &[f32], parallel: bool) -> Vec<f32> {
 /// copies them first ([`Arc::make_mut`]), so a clone never changes its
 /// source. Each array is its own `Arc<Vec<_>>`, so wrapping an owned `Vec`
 /// copies nothing and a value-only rewrite keeps sharing the CSR structure.
+/// A row view ([`DMatrix::select_rows`]) shares its source's storage and
+/// reads it through its row map.
 #[derive(Debug, Clone)]
 enum Storage {
-    /// Row-major dense matrix of length `n_rows * n_cols`.
+    /// Row-major dense matrix of `n_cols` values per storage row.
     Dense(Arc<Vec<f32>>),
-    /// Compressed sparse row: `indptr` has `n_rows + 1` entries.
+    /// Compressed sparse row: `indptr` has one entry per storage row, plus one.
     Csr {
         indptr: Arc<Vec<usize>>,
         indices: Arc<Vec<u32>>,
         values: Arc<Vec<f32>>,
     },
+}
+
+/// Where a row view's histogram index takes its cuts
+/// ([`DMatrix::select_rows_with_cuts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ViewCuts {
+    /// The view's own rows, as a copy of them would be cut: training on the
+    /// view is training on such a copy, bit for bit.
+    #[default]
+    Own,
+    /// The cuts the source matrix bins with (its sample weights, feature
+    /// types and missing value): the view's rows are its source's bins,
+    /// gathered, with no cuts computed and no value binned again, and every
+    /// view of one source shares its splits' thresholds.
+    Source,
+}
+
+/// Which rows of a matrix the cuts of its `hist` index were sketched from
+/// ([`DMatrix::sketched_rows`]). A sketched row's values lie below their
+/// feature's last cut and each of its categories has a bin, so its bins
+/// route it through a tree split on those cuts as its values do. Binning
+/// clamps an unsketched value beyond the last cut into the last bin, and an
+/// unsketched category into bin 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SketchedRows {
+    /// Every row.
+    All,
+    /// Every row with a nonzero sample weight: the others add nothing to
+    /// the gradient sums, whatever leaf their margins come from.
+    Weighted,
+    /// Not every row with a nonzero weight: a [`ViewCuts::Source`] view of
+    /// rows its source weighs zero.
+    Partial,
+}
+
+/// The source a [`ViewCuts::Source`] view takes its cuts from: the source
+/// matrix (without the metadata its binning does not read) and the view's
+/// rows of it.
+#[derive(Debug)]
+struct CutSource {
+    matrix: DMatrix,
+    rows: Vec<usize>,
 }
 
 /// A dataset: features in dense or sparse form, plus labels (one or more
@@ -193,14 +239,22 @@ enum Storage {
 /// (labels, weights, and the rest), and no operation on a clone changes the
 /// matrix it was cloned from. They also share the histogram indexes binned
 /// from those values (`hist_index`), so a binning is computed once for
-/// every copy and freed with the values.
+/// every copy and freed with the values. A row selection
+/// ([`select_rows`](Self::select_rows)) is a view of its source's values,
+/// copying only the metadata.
 #[derive(Debug, Clone)]
 pub struct DMatrix {
     n_rows: usize,
     n_cols: usize,
     storage: Storage,
-    /// The histogram indexes binned from `storage`, shared exactly as it is:
-    /// new values (`map_values`, `dense_values_mut`) come with a new cache.
+    /// The storage row of each of this matrix's rows, in order (`None`:
+    /// storage row `r` is row `r`, for all `n_rows`).
+    rows: Option<Arc<[usize]>>,
+    /// A [`ViewCuts::Source`] view's source.
+    cut_source: Option<Arc<CutSource>>,
+    /// The histogram indexes binned from these rows of `storage`, shared
+    /// exactly as they are: new values (`map_values`, `dense_values_mut`)
+    /// and new row selections come with a new cache.
     bins: Arc<BinCache>,
     missing: f32,
     /// Row-major `[row][target]`, length `n_rows * n_targets`.
@@ -215,6 +269,50 @@ pub struct DMatrix {
     feature_weights: Option<Vec<f32>>,
 }
 
+/// A dense matrix's rows: its storage, read through its row map.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DenseRows<'a> {
+    values: &'a [f32],
+    n_cols: usize,
+    rows: Option<&'a [usize]>,
+}
+
+impl<'a> DenseRows<'a> {
+    /// Row `r`'s values (missing entries hold the matrix's sentinel).
+    #[inline(always)]
+    pub(crate) fn row(self, r: usize) -> &'a [f32] {
+        let at = self.rows.map_or(r, |rows| rows[r]);
+        &self.values[at * self.n_cols..][..self.n_cols]
+    }
+
+    /// Every row back to back, row-major, when the matrix holds its
+    /// storage's rows in order.
+    #[inline]
+    pub(crate) fn contiguous(self) -> Option<&'a [f32]> {
+        self.rows.is_none().then_some(self.values)
+    }
+}
+
+/// A CSR matrix's rows: its storage, read through its row map.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CsrRows<'a> {
+    indptr: &'a [usize],
+    indices: &'a [u32],
+    values: &'a [f32],
+    rows: Option<&'a [usize]>,
+}
+
+impl<'a> CsrRows<'a> {
+    /// Row `r`'s stored `(indices, values)` (entries equal to the missing
+    /// sentinel are stored but absent).
+    #[inline(always)]
+    pub(crate) fn row(self, r: usize) -> (&'a [u32], &'a [f32]) {
+        let at = self.rows.map_or(r, |rows| rows[r]);
+        let span = self.indptr[at]..self.indptr[at + 1];
+        (&self.indices[span.clone()], &self.values[span])
+    }
+}
+
 impl DMatrix {
     /// Shared constructor: validated storage plus default (empty) metadata.
     fn new(n_rows: usize, n_cols: usize, storage: Storage, missing: f32) -> Self {
@@ -222,6 +320,8 @@ impl DMatrix {
             n_rows,
             n_cols,
             storage,
+            rows: None,
+            cut_source: None,
             bins: Arc::default(),
             missing,
             labels: None,
@@ -233,6 +333,12 @@ impl DMatrix {
             feature_types: vec![FeatureType::Numerical; n_cols],
             feature_weights: None,
         }
+    }
+
+    /// The storage row holding row `r`.
+    #[inline(always)]
+    fn storage_row(&self, r: usize) -> usize {
+        self.rows.as_ref().map_or(r, |rows| rows[r])
     }
 
     /// Build a dense matrix from a row-major slice of length `n_rows * n_cols`,
@@ -622,119 +728,195 @@ impl DMatrix {
         if row >= self.n_rows || col >= self.n_cols {
             return None;
         }
-        let v = match &self.storage {
-            Storage::Dense(data) => data[row * self.n_cols + col],
-            Storage::Csr {
-                indptr,
-                indices,
-                values,
-            } => {
-                // Rows are not assumed sorted by column; linear scan of the row.
-                let k = (indptr[row]..indptr[row + 1]).find(|&k| indices[k] as usize == col)?;
-                values[k]
-            }
+        let v = if let Some(rows) = self.dense_rows() {
+            rows.row(row)[col]
+        } else {
+            let (indices, values) = self.csr_rows()?.row(row);
+            // Rows are not assumed sorted by column; linear scan of the row.
+            let k = indices.iter().position(|&index| index as usize == col)?;
+            values[k]
         };
         (!is_missing(v, self.missing)).then_some(v)
     }
 
-    /// Raw row-major storage of a dense matrix (missing entries hold the
-    /// sentinel), or `None` for sparse storage.
+    /// A dense matrix's rows (missing entries hold the sentinel), or `None`
+    /// for sparse storage.
     #[inline]
-    pub(crate) fn dense_values(&self) -> Option<&[f32]> {
+    pub(crate) fn dense_rows(&self) -> Option<DenseRows<'_>> {
         match &self.storage {
-            Storage::Dense(data) => Some(data.as_slice()),
+            Storage::Dense(values) => Some(DenseRows {
+                values,
+                n_cols: self.n_cols,
+                rows: self.rows.as_deref(),
+            }),
             Storage::Csr { .. } => None,
         }
     }
 
-    /// Raw `(indptr, indices, values)` of a CSR matrix, or `None` for dense storage.
-    /// Entries equal to the missing sentinel may be present and must be treated
-    /// as absent by callers.
+    /// A CSR matrix's rows, or `None` for dense storage. Entries equal to
+    /// the missing sentinel may be present and must be treated as absent by
+    /// callers.
     #[inline]
-    pub(crate) fn csr_parts(&self) -> Option<(&[usize], &[u32], &[f32])> {
+    pub(crate) fn csr_rows(&self) -> Option<CsrRows<'_>> {
         match &self.storage {
             Storage::Dense(_) => None,
             Storage::Csr {
                 indptr,
                 indices,
                 values,
-            } => Some((indptr.as_slice(), indices.as_slice(), values.as_slice())),
+            } => Some(CsrRows {
+                indptr,
+                indices,
+                values,
+                rows: self.rows.as_deref(),
+            }),
         }
     }
 
-    /// Mutable row-major storage of a dense matrix, or `None` for sparse
-    /// storage. Values shared with a clone are copied first, so the clone
-    /// keeps its own; either way the matrix's binned indexes no longer apply
-    /// and are dropped. Callers keep the constructors' invariant: every value
-    /// is finite or the missing sentinel.
+    /// Mutable row-major values of a dense matrix, or `None` for sparse
+    /// storage. Values shared with a clone (or a row view's source) are
+    /// copied first, a view's rows only, so the others keep their own;
+    /// either way the matrix's binned indexes no longer apply and are
+    /// dropped, and a [`ViewCuts::Source`] view cuts its own rows from then
+    /// on. Callers keep the constructors' invariant: every value is finite
+    /// or the missing sentinel.
     #[inline]
     pub(crate) fn dense_values_mut(&mut self) -> Option<&mut [f32]> {
-        match &mut self.storage {
-            Storage::Dense(data) => {
-                self.bins = Arc::default();
-                Some(Arc::make_mut(data).as_mut_slice())
+        let own = match (&self.storage, &self.rows) {
+            (Storage::Csr { .. }, _) => return None,
+            (Storage::Dense(values), Some(rows)) => {
+                let n_cols = self.n_cols;
+                let mut own = Vec::with_capacity(rows.len() * n_cols);
+                for &r in rows.iter() {
+                    own.extend_from_slice(&values[r * n_cols..(r + 1) * n_cols]);
+                }
+                Some(own)
             }
+            (Storage::Dense(_), None) => None,
+        };
+        if let Some(own) = own {
+            self.storage = Storage::Dense(Arc::new(own));
+            self.rows = None;
+        }
+        self.bins = Arc::default();
+        self.cut_source = None;
+        match &mut self.storage {
+            Storage::Dense(data) => Some(Arc::make_mut(data).as_mut_slice()),
             Storage::Csr { .. } => None,
         }
     }
 
     /// The histogram index of the feature values binned with `max_bin`
     /// cuts from this matrix's sample weights, feature types and missing
-    /// value ([`HistCuts::from_dmatrix`]): built on first use, then shared
+    /// value ([`HistCuts::from_dmatrix`]), or for a [`ViewCuts::Source`]
+    /// view its source's index, gathered: built on first use, then shared
     /// by every matrix sharing the values (clones and metadata copies,
     /// across threads), and freed with them. See
     /// [`bin_cache`](crate::data::bin_cache).
     pub(crate) fn hist_index(&self, max_bin: usize) -> Arc<GHistIndex> {
-        let key = BinKey::new(
+        if let Some(source) = &self.cut_source {
+            // The gather may wait on its source's own (parallel) build, so
+            // with threads to spare it always builds on a pool of its own.
+            let parallel = rayon::current_num_threads() > 1;
+            let key = source.matrix.bin_key(max_bin);
+            return self.bins.get_or_build(&key, parallel, || {
+                source.matrix.hist_index(max_bin).select_rows(&source.rows)
+            });
+        }
+        let parallel = rayon::current_num_threads() > 1
+            && self.n_rows.saturating_mul(self.n_cols) >= PARALLEL_BINNING_CELLS;
+        self.bins
+            .get_or_build(&self.bin_key(max_bin), parallel, || {
+                GHistIndex::from_dmatrix(self, HistCuts::from_dmatrix(self, max_bin))
+            })
+    }
+
+    /// Everything besides the values this matrix bins with under `max_bin`.
+    fn bin_key(&self, max_bin: usize) -> BinKey {
+        BinKey::new(
             max_bin,
             self.missing,
             &self.feature_types,
             self.weights.as_deref(),
-        );
-        let parallel = rayon::current_num_threads() > 1
-            && self.n_rows.saturating_mul(self.n_cols) >= PARALLEL_BINNING_CELLS;
-        self.bins.get_or_build(&key, parallel, || {
-            GHistIndex::from_dmatrix(self, HistCuts::from_dmatrix(self, max_bin))
-        })
+        )
+    }
+
+    /// Which of this matrix's rows the cuts of its `hist` index were
+    /// sketched from: those with a nonzero sample weight in the matrix the
+    /// cuts are computed on (this one, or a [`ViewCuts::Source`] view's
+    /// source).
+    pub(crate) fn sketched_rows(&self) -> SketchedRows {
+        let Some(source) = &self.cut_source else {
+            return match self.weights.as_deref() {
+                Some(w) if w.contains(&0.0) => SketchedRows::Weighted,
+                _ => SketchedRows::All,
+            };
+        };
+        // The view's rows in the matrix its cuts are computed on.
+        let mut rows = Cow::Borrowed(source.rows.as_slice());
+        let mut cut = &source.matrix;
+        while let Some(next) = &cut.cut_source {
+            rows = Cow::Owned(rows.iter().map(|&r| next.rows[r]).collect());
+            cut = &next.matrix;
+        }
+        let Some(cut_weights) = cut.weights.as_deref() else {
+            return SketchedRows::All;
+        };
+        let mut sketched = SketchedRows::All;
+        for (r, &row) in rows.iter().enumerate() {
+            if cut_weights[row] == 0.0 {
+                if self.weights.as_deref().is_none_or(|w| w[r] != 0.0) {
+                    return SketchedRows::Partial;
+                }
+                sketched = SketchedRows::Weighted;
+            }
+        }
+        sketched
     }
 
     /// Copy of this matrix, metadata included, with every non-missing stored
     /// value replaced by `f(row, col, value)`. Missing dense entries become NaN
     /// and the result's sentinel is NaN, so a mapped value can never collide
     /// with a non-NaN sentinel. Feature types are copied unchanged. The values
-    /// are written to new storage (a CSR result shares this matrix's
-    /// `indptr` and `indices`); this matrix is unchanged.
+    /// are written to new storage holding exactly this matrix's rows (a CSR
+    /// result of a whole matrix shares its `indptr` and `indices`); this
+    /// matrix is unchanged.
     pub(crate) fn map_values(&self, mut f: impl FnMut(usize, usize, f32) -> f32) -> Self {
-        let storage = match &self.storage {
-            Storage::Dense(data) => {
-                let mut mapped = Vec::with_capacity(data.len());
-                for (row, values) in data.chunks_exact(self.n_cols).enumerate() {
-                    mapped.extend(values.iter().enumerate().map(|(col, &v)| {
-                        if is_missing(v, self.missing) {
-                            f32::NAN
-                        } else {
-                            f(row, col, v)
-                        }
-                    }));
+        let mut map = |row: usize, col: usize, v: f32, missing: f32| {
+            if is_missing(v, self.missing) {
+                missing
+            } else {
+                f(row, col, v)
+            }
+        };
+        let storage = match (&self.storage, self.rows.is_some()) {
+            (Storage::Dense(_), _) => {
+                let rows = self.dense_rows().expect("dense storage has dense rows");
+                let mut mapped = Vec::with_capacity(self.n_rows * self.n_cols);
+                for row in 0..self.n_rows {
+                    let values = rows.row(row);
+                    mapped.extend(
+                        values
+                            .iter()
+                            .enumerate()
+                            .map(|(col, &v)| map(row, col, v, f32::NAN)),
+                    );
                 }
                 Storage::Dense(Arc::new(mapped))
             }
-            Storage::Csr {
-                indptr,
-                indices,
-                values,
-            } => {
+            (
+                Storage::Csr {
+                    indptr,
+                    indices,
+                    values,
+                },
+                false,
+            ) => {
                 let mut mapped = Vec::with_capacity(values.len());
                 for row in 0..self.n_rows {
-                    let (start, end) = (indptr[row], indptr[row + 1]);
-                    mapped.extend((start..end).map(|k| {
-                        let v = values[k];
-                        if is_missing(v, self.missing) {
-                            v
-                        } else {
-                            f(row, indices[k] as usize, v)
-                        }
-                    }));
+                    let span = indptr[row]..indptr[row + 1];
+                    mapped
+                        .extend(span.map(|k| map(row, indices[k] as usize, values[k], values[k])));
                 }
                 Storage::Csr {
                     indptr: Arc::clone(indptr),
@@ -742,9 +924,28 @@ impl DMatrix {
                     values: Arc::new(mapped),
                 }
             }
+            (Storage::Csr { .. }, true) => {
+                let rows = self.csr_rows().expect("sparse storage has CSR rows");
+                let (mut indptr, mut indices, mut values) = (vec![0], Vec::new(), Vec::new());
+                for row in 0..self.n_rows {
+                    let (row_indices, row_values) = rows.row(row);
+                    for (&index, &v) in row_indices.iter().zip(row_values) {
+                        indices.push(index);
+                        values.push(map(row, index as usize, v, v));
+                    }
+                    indptr.push(values.len());
+                }
+                Storage::Csr {
+                    indptr: Arc::new(indptr),
+                    indices: Arc::new(indices),
+                    values: Arc::new(values),
+                }
+            }
         };
         let mut out = self.clone();
         out.storage = storage;
+        out.rows = None;
+        out.cut_source = None;
         out.bins = Arc::default();
         out.missing = f32::NAN;
         out
@@ -754,27 +955,17 @@ impl DMatrix {
     /// order (ascending columns for dense storage). `row` must be in bounds.
     #[inline]
     pub(crate) fn for_row_entry(&self, row: usize, mut f: impl FnMut(u32, f32)) {
-        match &self.storage {
-            Storage::Dense(data) => {
-                let base = row * self.n_cols;
-                for c in 0..self.n_cols {
-                    let v = data[base + c];
-                    if !is_missing(v, self.missing) {
-                        f(c as u32, v);
-                    }
+        if let Some(rows) = self.dense_rows() {
+            for (c, &v) in rows.row(row).iter().enumerate() {
+                if !is_missing(v, self.missing) {
+                    f(c as u32, v);
                 }
             }
-            Storage::Csr {
-                indptr,
-                indices,
-                values,
-            } => {
-                let (s, e) = (indptr[row], indptr[row + 1]);
-                for k in s..e {
-                    let v = values[k];
-                    if !is_missing(v, self.missing) {
-                        f(indices[k], v);
-                    }
+        } else if let Some(rows) = self.csr_rows() {
+            let (indices, values) = rows.row(row);
+            for (&index, &v) in indices.iter().zip(values) {
+                if !is_missing(v, self.missing) {
+                    f(index, v);
                 }
             }
         }
@@ -813,72 +1004,43 @@ impl DMatrix {
         }
     }
 
-    /// Build a new matrix containing only `rows` (in the given order), carrying
-    /// over labels (every target of each row), label bounds, weights, base
-    /// margin, ranking groups, and feature metadata. Used for cross-validation
-    /// folds. A dense matrix stays dense and a sparse one sparse; either way
-    /// the result's missing sentinel is NaN.
+    /// The matrix of only `rows` (in the given order, repeats allowed), a
+    /// view sharing this matrix's feature values (nothing is copied but the
+    /// metadata: labels, every target of each row, label bounds, weights,
+    /// base margin, ranking groups, and feature metadata). Training on it
+    /// is training on a copy of those rows, bit for bit: the view cuts its
+    /// own rows ([`ViewCuts::Own`]; see
+    /// [`select_rows_with_cuts`](Self::select_rows_with_cuts)).
     ///
     /// On a matrix with query groups, `rows` must list whole groups back to
     /// back, each group's rows together and in row order (a group may repeat
     /// or be left out); the result has one group per listed group. A
     /// selection that splits a group, reorders its rows, or interleaves them
-    /// with another group's is refused.
+    /// with another group's is refused, as is an empty one.
     pub fn select_rows(&self, rows: &[usize]) -> Result<Self> {
+        self.select_rows_with_cuts(rows, ViewCuts::Own)
+    }
+
+    /// [`select_rows`](Self::select_rows) whose histogram index takes its
+    /// cuts as `cuts` says: [`ViewCuts::Source`] gathers this matrix's own
+    /// bins for the rows (computing no cuts and binning nothing again, and
+    /// sharing this matrix's index, built on first use, with its other
+    /// trainings and views).
+    pub fn select_rows_with_cuts(&self, rows: &[usize], cuts: ViewCuts) -> Result<Self> {
         if let Some(&row) = rows.iter().find(|&&row| row >= self.n_rows) {
             return Err(HessboostError::invalid_param(
                 "rows",
                 format!("row index {row} is out of bounds for {} rows", self.n_rows),
             ));
         }
+        if rows.is_empty() {
+            return Err(HessboostError::EmptyDataset(
+                "select_rows: no rows selected",
+            ));
+        }
         let group_sizes = self
             .selected_group_sizes(rows)
             .map_err(|reason| HessboostError::invalid_param("rows", format!("rows {reason}")))?;
-        let mut out = match &self.storage {
-            Storage::Dense(data) => {
-                if rows.is_empty() {
-                    return Err(HessboostError::EmptyDataset(
-                        "from_dense: zero rows or columns",
-                    ));
-                }
-                let n_cols = self.n_cols;
-                let mut selected = Vec::with_capacity(rows.len() * n_cols);
-                for &r in rows {
-                    selected.extend_from_slice(&data[r * n_cols..(r + 1) * n_cols]);
-                }
-                if !self.missing.is_nan() {
-                    for v in &mut selected {
-                        if *v == self.missing {
-                            *v = f32::NAN;
-                        }
-                    }
-                }
-                // The source's values are already validated.
-                Self::new(
-                    rows.len(),
-                    n_cols,
-                    Storage::Dense(Arc::new(selected)),
-                    f32::NAN,
-                )
-            }
-            Storage::Csr { .. } => {
-                let mut indptr = Vec::with_capacity(rows.len() + 1);
-                indptr.push(0usize);
-                let mut indices: Vec<u32> = Vec::new();
-                let mut values: Vec<f32> = Vec::new();
-                for &r in rows {
-                    self.for_row_entry(r, |index, value| {
-                        indices.push(index);
-                        values.push(value);
-                    });
-                    indptr.push(values.len());
-                }
-                DMatrix::from_csr(indptr, indices, values, self.n_cols)?
-            }
-        };
-        out.feature_types.clone_from(&self.feature_types);
-        out.feature_weights.clone_from(&self.feature_weights);
-        out.n_targets = self.n_targets;
         // Each row's `stride` consecutive values of `v`, in `rows` order.
         let gather = |v: &[f32], stride: usize| {
             let mut selected = Vec::with_capacity(rows.len() * stride);
@@ -887,23 +1049,64 @@ impl DMatrix {
             }
             selected
         };
-        out.labels = self
-            .labels
-            .as_deref()
-            .map(|l| gather(l, self.n_targets.get()));
-        out.label_bounds = self
-            .label_bounds
-            .as_ref()
-            .map(|(lo, hi)| (gather(lo, 1), gather(hi, 1)));
-        out.weights = self.weights.as_deref().map(|w| gather(w, 1));
-        out.base_margin = self
-            .base_margin
-            .as_deref()
-            .map(|bm| gather(bm, bm.len() / self.n_rows));
-        if let Some(sizes) = group_sizes.filter(|sizes| !sizes.is_empty()) {
-            out.group = Some(GroupInfo::from_sizes(&sizes));
+        let cut_source = match cuts {
+            ViewCuts::Own => None,
+            ViewCuts::Source => Some(Arc::new(CutSource {
+                matrix: self.binning_source(),
+                rows: rows.to_vec(),
+            })),
+        };
+        Ok(DMatrix {
+            n_rows: rows.len(),
+            n_cols: self.n_cols,
+            storage: self.storage.clone(),
+            rows: Some(rows.iter().map(|&r| self.storage_row(r)).collect()),
+            cut_source,
+            bins: Arc::default(),
+            missing: self.missing,
+            labels: self
+                .labels
+                .as_deref()
+                .map(|l| gather(l, self.n_targets.get())),
+            n_targets: self.n_targets,
+            label_bounds: self
+                .label_bounds
+                .as_ref()
+                .map(|(lo, hi)| (gather(lo, 1), gather(hi, 1))),
+            weights: self.weights.as_deref().map(|w| gather(w, 1)),
+            base_margin: self
+                .base_margin
+                .as_deref()
+                .map(|bm| gather(bm, bm.len() / self.n_rows)),
+            group: group_sizes
+                .filter(|sizes| !sizes.is_empty())
+                .map(|sizes| GroupInfo::from_sizes(&sizes)),
+            feature_types: self.feature_types.clone(),
+            feature_weights: self.feature_weights.clone(),
+        })
+    }
+
+    /// This matrix without the metadata binning does not read (labels,
+    /// bounds, base margins, groups, feature weights), sharing its values
+    /// and bin cache: what a [`ViewCuts::Source`] view keeps of its source.
+    fn binning_source(&self) -> DMatrix {
+        DMatrix {
+            n_rows: self.n_rows,
+            n_cols: self.n_cols,
+            storage: self.storage.clone(),
+            rows: self.rows.clone(),
+            cut_source: self.cut_source.clone(),
+            bins: Arc::clone(&self.bins),
+            missing: self.missing,
+            labels: None,
+            n_targets: NonZeroUsize::MIN,
+            label_bounds: None,
+            weights: self.weights.clone(),
+            base_margin: None,
+            group: None,
+            feature_types: self.feature_types.clone(),
+            feature_weights: None,
         }
-        Ok(out)
     }
 
     /// The query-group sizes of in-bounds `rows` selected from this matrix
@@ -1028,6 +1231,76 @@ mod tests {
         assert_eq!(changed_index.feature_bin(0, 0), Some(last as u32 - 1));
         assert!(Arc::ptr_eq(&index, &data.hist_index(16)));
         assert_ne!(index.feature_bin(0, 0), changed_index.feature_bin(0, 0));
+    }
+
+    /// A [`ViewCuts::Source`] view trains exactly as a copy of its rows
+    /// binned with the source's cuts, and reads the source's index (built
+    /// once, shared with the source's own trainings).
+    #[test]
+    fn source_cut_views_train_as_copies_with_the_sources_cuts() {
+        use crate::config::TrainingParams;
+        use crate::model::ModelFormat;
+        let (n, cols) = (4_000, 3);
+        let x: Vec<f32> = (0..n * cols)
+            .map(|i| {
+                if i % 11 == 0 {
+                    f32::NAN
+                } else {
+                    ((i * 7919) % 1013) as f32 / 9.0
+                }
+            })
+            .collect();
+        let y: Vec<f32> = (0..n).map(|r| ((r * 31) % 17) as f32).collect();
+        let data = DMatrix::from_dense(&x, n, cols)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap();
+        let rows: Vec<usize> = (0..n).filter(|r| r % 3 != 1).collect();
+        let view = data.select_rows_with_cuts(&rows, ViewCuts::Source).unwrap();
+        let copy = DMatrix::from_dense_vec(
+            rows.iter()
+                .flat_map(|&r| x[r * cols..(r + 1) * cols].iter().copied())
+                .collect(),
+            rows.len(),
+            cols,
+        )
+        .unwrap()
+        .with_labels(&rows.iter().map(|&r| y[r]).collect::<Vec<_>>())
+        .unwrap();
+        let params = TrainingParams::builder()
+            .max_depth(4)
+            .subsample(0.8)
+            .build()
+            .unwrap();
+        let source_index = data.hist_index(params.max_bin);
+        // Seed the copy's cache with its rows binned by the source's cuts.
+        let seeded = copy
+            .bins
+            .get_or_build(&copy.bin_key(params.max_bin), false, || {
+                GHistIndex::from_dmatrix(&copy, source_index.cuts().clone())
+            });
+        let fit = |data: &DMatrix| {
+            crate::training::train(&params, data, 8)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
+        };
+        assert_eq!(fit(&view), fit(&copy));
+        assert!(Arc::ptr_eq(&seeded, &copy.hist_index(params.max_bin)));
+        assert!(Arc::ptr_eq(&source_index, &data.hist_index(params.max_bin)));
+    }
+
+    /// Writing a view's values copies only its rows: its source keeps its
+    /// values, and the view bins its new ones.
+    #[test]
+    fn writing_a_view_leaves_its_source_unchanged() {
+        let data = DMatrix::from_dense(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 3, 2).unwrap();
+        let mut view = data.select_rows(&[2, 0]).unwrap();
+        assert_eq!(view.dense_values_mut().unwrap(), &[5.0, 6.0, 1.0, 2.0]);
+        view.dense_values_mut().unwrap()[0] = 50.0;
+        assert_eq!(view.get(0, 0), Some(50.0));
+        assert_eq!(data.get(2, 0), Some(5.0));
+        assert_eq!(view.select_rows(&[1, 0]).unwrap().get(1, 0), Some(50.0));
     }
 
     #[test]
@@ -1185,16 +1458,15 @@ mod tests {
         assert_eq!(s.feature_weights().unwrap(), &[0.25, 0.75]);
     }
 
-    /// A dense selection stays dense, and a non-NaN sentinel's missing
-    /// entries become NaN under the result's NaN sentinel.
+    /// A dense selection reads its source's dense values, missing entries
+    /// (under the source's non-NaN sentinel) staying missing, and an empty
+    /// one is refused.
     #[test]
     fn select_rows_keeps_dense_storage_and_missing_entries() {
         let d = DMatrix::from_dense_with_missing(&[1.0, -1.0, -1.0, 4.0, 5.0, 6.0], 3, 2, -1.0)
             .unwrap();
         let s = d.select_rows(&[1, 0, 1]).unwrap();
-        assert!(s.missing().is_nan());
-        let values = s.dense_values().unwrap();
-        assert_eq!(values.len(), 6);
+        assert!(s.dense_rows().is_some());
         let expected = [None, Some(4.0), Some(1.0), None, None, Some(4.0)];
         for (cell, &want) in expected.iter().enumerate() {
             assert_eq!(s.get(cell / 2, cell % 2), want, "cell {cell}");

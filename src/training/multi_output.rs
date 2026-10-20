@@ -10,6 +10,7 @@ use super::prepare::TrainContext;
 use super::round::tree_eta;
 use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
 use crate::config::{BoosterKind, Device, MultiStrategy, TrainingParams, TreeMethod};
+use crate::data::SketchedRows;
 use crate::data::ghist::GHistIndex;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
@@ -104,6 +105,9 @@ fn split_gradient(
 pub(super) struct VectorRound<'a> {
     pub(super) run: TrainContext<'a>,
     pub(super) ghist: &'a GHistIndex,
+    /// Which training rows `ghist`'s cuts were sketched from (see
+    /// [`Prepared::Hist`](super::prepare::Prepared::Hist)).
+    pub(super) sketched: SketchedRows,
     /// Every training row, ascending: the rows of an unsampled round.
     pub(super) all_rows: &'a [u32],
 }
@@ -152,10 +156,13 @@ pub(super) fn boost_round(
         // caches, which `finish_dart` recomputes.
         if dropped.is_none() {
             // Leaf row lists identify every training row's leaf when all
-            // rows took part in growing the tree, or exact leaves routed
+            // rows took part in growing the tree and the partitions route
+            // every weighted row as its values do, or exact leaves routed
             // them all.
-            let all_rows =
-                ctx.run.exact_leaves.is_some() || (rows.len() == n && !gradient_sampling(params));
+            let all_rows = ctx.run.exact_leaves.is_some()
+                || (rows.len() == n
+                    && !gradient_sampling(params)
+                    && ctx.sketched != SketchedRows::Partial);
             let captured = all_rows.then_some(leaf_rows.as_slice());
             margins.add_tree(&tree, TreeOutput::Vector, captured);
         }

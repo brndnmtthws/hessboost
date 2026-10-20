@@ -7,6 +7,7 @@ use super::margins::{MarginCaches, TreeOutput};
 use super::prepare::{Prepared, TrainContext, TreeSample, approx_index};
 use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
 use crate::config::{BoosterKind, Device, GrowPolicy, Refresh, SamplingMethod, TrainingParams};
+use crate::data::SketchedRows;
 use crate::data::ghist::GHistIndex;
 use crate::error::Result;
 use crate::model::BoostedModel;
@@ -274,23 +275,25 @@ pub(super) fn grow_round(
             // Retaining the final row partitions replaces per-row tree
             // traversals of the raw feature matrix with one sequential pass
             // per leaf: the training margin update's, when every row took
-            // part, and the linear-leaf fit's. Linear leaves use them only
-            // when they equal raw routing (see `rows_route_like_trees`).
-            let (routed, linear_rows) = match prepared {
-                Prepared::Hist {
-                    rows_route_like_trees,
-                    ..
-                } => (true, params.linear_tree.is_some() && *rows_route_like_trees),
+            // part, and the linear-leaf fit's. The margins read them when
+            // they route every weighted row as its values do, linear leaves
+            // only when they route every row so (see `SketchedRows`).
+            let (routed, margin_partitions, linear_rows) = match prepared {
+                Prepared::Hist { sketched, .. } => (
+                    true,
+                    *sketched != SketchedRows::Partial,
+                    params.linear_tree.is_some() && *sketched == SketchedRows::All,
+                ),
                 // The exact builder routes rows by their raw values, as
                 // prediction does.
-                Prepared::Exact(_) => (true, false),
-                Prepared::Approx { .. } => (false, false),
+                Prepared::Exact(_) => (true, true, false),
+                Prepared::Approx { .. } => (false, false, false),
             };
             // Exact leaves route every row through the finished tree, which
             // the margin update then reads instead of the builder's rows.
             let exact = run.exact_leaves.is_some();
             let margin_rows = exact
-                || routed
+                || margin_partitions
                     && dropped.is_none()
                     && row_subset.len() == n
                     && !gradient_sampling(params)

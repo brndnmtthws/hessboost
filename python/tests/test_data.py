@@ -108,6 +108,32 @@ def test_metadata_getters_and_set_info() -> None:
     assert repr(matrix) == "DMatrix(rows=10, features=5)"
 
 
+def test_slices_train_as_copies_or_on_their_sources_bins() -> None:
+    x, y = regression(rows=600)
+    x[::7, 1] = np.nan
+    matrix = DMatrix(x, y)
+    rows = np.r_[np.arange(599, 0, -3), np.repeat(np.arange(50, 90), 2)]
+    params = {"max_depth": 4, "subsample": 0.8, "seed": 3}
+    copy = hessboost.train(params, DMatrix(x[rows], y[rows]), 6)
+    view = hessboost.train(params, matrix.slice(rows), 6)
+    assert view.save_raw() == copy.save_raw()
+    with pytest.raises(HessboostError, match="cuts must be"):
+        matrix.slice(rows, cuts="parent")  # ty: ignore[invalid-argument-type]
+
+    # A step at 5 on a feature of the values 0..9: a view without the rows
+    # at 5 cuts at the next value it holds, a view with its source's cuts
+    # at 5 itself.
+    steps = np.repeat(np.arange(10, dtype=np.float32), 30)[:, None]
+    labels = (steps[:, 0] >= 5).astype(np.float32)
+    without_five = np.flatnonzero(steps[:, 0] != 5)
+    stepped = DMatrix(steps, labels)
+    stump = {"max_depth": 1}
+    own = hessboost.train(stump, stepped.slice(without_five), 1).model_info()
+    source = hessboost.train(stump, stepped.slice(without_five, cuts="source"), 1).model_info()
+    assert own.trees[0].threshold[0] == 6.0
+    assert source.trees[0].threshold[0] == 5.0
+
+
 def test_scipy_sparse_matrices_equal_dense_with_nan() -> None:
     rng = np.random.default_rng(2)
     dense = rng.normal(size=(300, 6))

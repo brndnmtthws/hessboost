@@ -308,21 +308,26 @@ pub(crate) fn weighted_leaves(
 
 /// Write `data`'s rows starting at row `begin` into `rows` as a dense
 /// `NaN`-for-missing matrix, the same materialization the CPU's row blocks
-/// use: dense NaN-sentinel matrices copy in place, a dense matrix with
-/// another sentinel maps sentinel values to `NaN`, and CSR rows materialize
-/// per entry. `rows` holds a whole number of rows; it is one prediction
-/// block of the batch.
+/// use: dense NaN-sentinel rows copy in place (one copy for a whole
+/// matrix's contiguous rows), a dense matrix with another sentinel maps
+/// sentinel values to `NaN`, and CSR rows materialize per entry. `rows`
+/// holds a whole number of rows; it is one prediction block of the batch.
 pub(crate) fn materialize_rows(data: &DMatrix, begin: usize, rows: &mut [f32]) {
     let n_cols = data.n_cols();
-    if let Some(dense) = data.dense_values()
-        && data.missing().is_nan()
-        && dense.len() == data.n_rows() * n_cols
+    let missing = data.missing();
+    if let Some(dense) = data.dense_rows()
+        && missing.is_nan()
     {
-        let start = begin * n_cols;
-        rows.copy_from_slice(&dense[start..start + rows.len()]);
+        if let Some(values) = dense.contiguous() {
+            let start = begin * n_cols;
+            rows.copy_from_slice(&values[start..start + rows.len()]);
+        } else {
+            rows.par_chunks_mut(n_cols)
+                .enumerate()
+                .for_each(|(i, row)| row.copy_from_slice(dense.row(begin + i)));
+        }
         return;
     }
-    let missing = data.missing();
     rows.par_chunks_mut(n_cols)
         .enumerate()
         .for_each(|(i, row)| {

@@ -21,6 +21,9 @@ gradients and second derivatives (Newton boosting).
 
 - **Fast.** Multi-core training with runtime-detected NEON and AVX2 kernels;
   see [`docs/performance.md`](docs/performance.md).
+- **Lean on memory.** A matrix, its copies with other labels or weights,
+  and every training of them share one compact binned index, built once
+  even for concurrent trainings; row selections are views of their source.
 - **Deterministic.** The same parameters, data, and seed produce the exact
   same model on any thread count.
 - **Strict.** Invalid parameters and unsupported combinations fail loudly;

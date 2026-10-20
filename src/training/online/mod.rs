@@ -807,7 +807,7 @@ fn compose(data: &DMatrix, deleted: &[bool], additions: Option<&DMatrix>) -> Res
                 .flat_map(|a| (0..a.n_rows()).map(move |r| (a, r))),
         );
     let mut labels = Vec::new();
-    let mut out = if data.dense_values().is_some() {
+    let mut out = if data.dense_rows().is_some() {
         let mut values = Vec::new();
         for (m, row) in rows {
             let start = values.len();

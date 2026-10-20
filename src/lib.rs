@@ -107,7 +107,10 @@
 //!   and multiclass, counts, LambdaMART and XE-NDCG ranking, survival (`survival:cox`,
 //!   `survival:aft` on censored bounds), plus custom losses
 //!   ([`Objective::Custom`](objective::Objective::Custom), e.g. a
-//!   [`CustomLoss`](objective::CustomLoss)).
+//!   [`CustomLoss`](objective::CustomLoss)). The quantile and absolute losses
+//!   can set every leaf to its rows' exact residual quantile instead of the
+//!   surrogate's Newton step
+//!   ([`LeafEstimation::Exact`](config::LeafEstimation::Exact)).
 //! - **Multi-output:** label matrices
 //!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)), one
 //!   tree per output or vector-leaf trees

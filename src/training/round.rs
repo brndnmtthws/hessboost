@@ -2,6 +2,7 @@
 //! (or `process_type=update`'s refresh of them).
 
 use super::dart::{dart_new_tree_weight, finish_dart, round_gradients, round_rng, round_salt};
+use super::exact_leaves::route_rows;
 use super::margins::{MarginCaches, TreeOutput};
 use super::prepare::{Prepared, TrainContext, TreeSample, approx_index};
 use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
@@ -259,6 +260,7 @@ pub(super) fn grow_round(
         prepared,
         gpair: structure,
         clean_gpair: &state.gpair,
+        margins: &state.margins.train,
         n_out,
         iteration,
         forest_indices: &forest_indices,
@@ -284,17 +286,22 @@ pub(super) fn grow_round(
                 Prepared::Exact(_) => (true, false),
                 Prepared::Approx { .. } => (false, false),
             };
-            let margin_rows = routed
-                && dropped.is_none()
-                && row_subset.len() == n
-                && !gradient_sampling(params)
-                && (params.linear_tree.is_none() || linear_rows);
+            // Exact leaves route every row through the finished tree, which
+            // the margin update then reads instead of the builder's rows.
+            let exact = run.exact_leaves.is_some();
+            let margin_rows = exact
+                || routed
+                    && dropped.is_none()
+                    && row_subset.len() == n
+                    && !gradient_sampling(params)
+                    && (params.linear_tree.is_none() || linear_rows);
             TreeSlot {
                 output: slot / parallel,
                 parallel: slot % parallel,
                 rows: row_subset,
                 // Leaf re-estimation (SGLB) reads the partitions too.
-                capture_rows: margin_rows || linear_rows || (routed && run.langevin.is_some()),
+                capture_rows: !exact
+                    && (margin_rows || linear_rows || (routed && run.langevin.is_some())),
                 margin_rows,
             }
         })
@@ -454,6 +461,9 @@ struct GrowRound<'a> {
     /// The noise-free gradients SGLB re-estimates the leaves from (the
     /// same as `gpair` otherwise).
     clean_gpair: &'a [GradPair],
+    /// The training margins the gradients came from, `[row][n_out]`: what
+    /// exact leaves take their residuals against.
+    margins: &'a [f32],
     n_out: usize,
     /// The model's absolute iteration index.
     iteration: usize,
@@ -486,10 +496,11 @@ struct TreeSlot<'a> {
 /// gradient-based row sampling when configured (per tree, as XGBoost's hist
 /// updater does, or once per output forest under `approx`, kept in
 /// `forest_sample` by the forest's first tree for the rest), derive its
-/// column sampler, build the tree, fit linear leaves when configured, and
-/// shrink its leaves by `eta / num_parallel_tree`. The caller owns the round
-/// RNG (already seeded and salted), the reuse dictionary, and what happens
-/// to the tree (margin updates, contribution weight).
+/// column sampler, build the tree, set exact or fit linear leaves when
+/// configured, and shrink its leaves by `eta / num_parallel_tree`. The
+/// caller owns the round RNG (already seeded and salted), the reuse
+/// dictionary, and what happens to the tree (margin updates, contribution
+/// weight).
 fn fit_output_tree(
     grow: &GrowRound,
     slot: &TreeSlot,
@@ -535,7 +546,9 @@ fn fit_output_tree(
 }
 
 /// The part of [`fit_output_tree`] after its RNG draws: build the tree on
-/// `sample`, fit linear leaves when configured, and shrink its leaves.
+/// `sample`, set exact or fit linear leaves when configured, and shrink its
+/// leaves. With exact leaves the returned rows are every training row's
+/// leaf.
 fn grow_sampled_tree(
     grow: &GrowRound,
     slot: &TreeSlot,
@@ -548,7 +561,7 @@ fn grow_sampled_tree(
     let TreeSample {
         gpair: gk, rows, ..
     } = sample;
-    let (mut tree, leaf_rows) = grow.prepared.build_tree(
+    let (mut tree, mut leaf_rows) = grow.prepared.build_tree(
         grow.run,
         sample,
         sampler,
@@ -556,6 +569,15 @@ fn grow_sampled_tree(
         rounding_seed,
         slot.capture_rows,
     );
+    if let Some(exact) = grow.run.exact_leaves {
+        leaf_rows = route_rows(&tree, dtrain);
+        exact.fit(
+            &mut tree,
+            TreeOutput::Scalar(slot.output),
+            &leaf_rows,
+            grow.margins,
+        );
+    }
     if let Some(langevin) = grow.run.langevin {
         let at = LeafRenewal {
             data: dtrain,

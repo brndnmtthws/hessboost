@@ -11,6 +11,7 @@ mod cv;
 mod dart;
 mod ebm;
 mod eval;
+mod exact_leaves;
 mod gblinear;
 mod margins;
 mod multi_output;

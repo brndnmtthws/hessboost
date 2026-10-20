@@ -26,5 +26,8 @@ mod train;
 mod validate;
 
 pub use api::{EvalHistory, RoundEval, TrainResult, Trainer, train};
-pub use cv::{CrossValidation, CvRefit, CvResult, CvRound, Fold, cv};
+pub use cv::{
+    CrossValidation, CvRefit, CvReport, CvResult, CvRound, CvStopping, Fold, FoldReport, OutOfFold,
+    PurgedTail, TailStopping, cv,
+};
 pub(crate) use multi_output::reject_split_gradient;

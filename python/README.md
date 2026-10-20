@@ -166,6 +166,47 @@ refit.history["test-rmse-mean"], refit.num_boost_round
 predictions = refit.booster.predict(X_test)
 ```
 
+`hessboost.cross_validate` takes the same arguments and returns a
+`CvReport`: the `history`, every fold's `FoldReport` (its round count, test
+scores, and test-row margins), and with `refit=True` its `CvReportRefit` (the
+retrained `booster`, `num_boost_round`, `target_encoder`, `stopping`).
+`report.out_of_fold()` combines the folds into one margin row per training
+row (NaN and fold `-1` for rows no fold tests; refused when two folds test
+the same row). With `per_fold_stopping=folds.PurgedTail(decision_at,
+label_end, fraction)`, early stopping is per fold and leakage-safe: each
+fold sizes its rounds, with `early_stopping_rounds` as the patience, on the
+purged chronological tail of its own training rows (the last `fraction` of
+their time span, starting at a decision time and purged as
+`purged_forward` purges), then trains on all of them. No forward fold uses
+rounds chosen with later labels, and the refit is sized the same way on
+every row:
+
+```python
+from hessboost import folds
+
+splits = folds.purged_forward(at, label_end, validation_fraction=0.3, blocks=4)
+tail = folds.PurgedTail(at, label_end, 0.2)
+report = hessboost.cross_validate(
+    params, dtrain, 500, folds=splits, early_stopping_rounds=20, per_fold_stopping=tail
+)
+oof = report.out_of_fold()
+residuals = y - oof.margins  # NaN where no fold held the row out
+rounds = [fold.num_boost_round for fold in report.folds]
+```
+
+`Booster.average(boosters)` combines bagged members (fits differing in seed
+or rows) into one booster whose margin is their mean margin: every member's
+trees with each leaf divided by the member count, and the intercepts
+averaged. Members must share the objective, features and layout, with no
+DART weights, model shrinkage, `gblinear` part, Boulevard or EBM record, or
+early stopping (slice those first). For log links the average predicts the
+geometric mean of the members' predictions:
+
+```python
+bag = [hessboost.train(params | {"seed": seed}, dtrain, 300) for seed in range(5)]
+averaged = hessboost.Booster.average(bag)
+```
+
 `hessboost.train_with_budget(params, dtrain, budget)` trains with one
 fitting budget in place of `eta`, tree limits, and a round count
 (PerpetualBooster's algorithm).
@@ -560,7 +601,9 @@ print(booster.size_report().compression_ratio)
 loops: shuffled `k_fold` (what `cv` uses by default), `forward_chaining`
 expanding windows with a purged `gap`, and `purged_forward` (timestamped
 rows, purged by each row's own label window, for overlapping or irregular
-horizons):
+horizons); `PurgedTail` is the purged early-stopping split of a fold's own
+training rows that `cross_validate(per_fold_stopping=...)` sizes each fold
+on:
 
 ```python
 from hessboost import folds

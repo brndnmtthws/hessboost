@@ -152,13 +152,13 @@ fn partition_numeric(
         let n_rows = ghist.n_rows();
         return match columns {
             Bins::U16(bins) => {
-                let missing = usize::from(u16::MAX);
+                let missing = u16::MISSING.index();
                 route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
                     (b < limit) | ((b == missing) & default_left)
                 })
             }
             Bins::U32(bins) => {
-                let missing = u32::MAX as usize;
+                let missing = u32::MISSING.index();
                 route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
                     (b < limit) | ((b == missing) & default_left)
                 })

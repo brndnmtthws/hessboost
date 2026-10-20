@@ -1,6 +1,7 @@
 //! Float sort keys and the stable LSD radix sort shared by cut
-//! construction (`quantile`), the weighted quantile sketch (`sketch`), and
-//! exact quantile leaves (`training::exact_leaves`).
+//! construction (`quantile`), the weighted quantile sketch (`sketch`), the
+//! quantile objective's intercept ([`stable_order`]), and exact quantile
+//! leaves (`training::exact_leaves`).
 
 /// Below this length the comparison sort beats the radix passes' fixed cost.
 const RADIX_MIN_LEN: usize = 2048;
@@ -135,6 +136,27 @@ pub(crate) fn sort_by_value<T: Copy + Default>(
     }
 }
 
+/// The rows of finite `values` in ascending order under `<`, rows of equal
+/// values (`-0.0` and `0.0` included) in row order: what a stable
+/// comparison sort by `partial_cmp` gives (XGBoost `StableSort` with
+/// `operator<`). Long inputs take [`radix_sort`] on [`sort_key`] with both
+/// zeros mapped to `0.0`'s key.
+pub(crate) fn stable_order(values: &[f32]) -> Vec<usize> {
+    let key = |value: f32| sort_key(if value == 0.0 { 0.0 } else { value });
+    if values.len() < RADIX_MIN_LEN || u32::try_from(values.len()).is_err() {
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.sort_by_key(|&row| key(values[row]));
+        return order;
+    }
+    // The length fits in `u32` (checked above).
+    let mut rows: Vec<(u32, u32)> = (0u32..)
+        .zip(values)
+        .map(|(row, &value)| (key(value), row))
+        .collect();
+    radix_sort(&mut rows, &mut RadixScratch::default(), |&(key, _)| key);
+    rows.into_iter().map(|(_, row)| row as usize).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +187,25 @@ mod tests {
             sort_values(&mut values, &mut RadixScratch::default());
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&values), bits(&expected));
+        }
+    }
+
+    /// Above and below the radix threshold, the order is the stable
+    /// `partial_cmp` sort's, with the two zeros tied and many duplicates.
+    #[test]
+    fn stable_order_matches_the_stable_comparison_sort() {
+        for n in [RADIX_MIN_LEN - 1, RADIX_MIN_LEN, 10_007] {
+            let values: Vec<f32> = (0..n)
+                .map(|i| match i % 7 {
+                    0 => -0.0,
+                    1 => 0.0,
+                    2 => -1.5,
+                    _ => ((i * 7919) % 97) as f32 - 48.0,
+                })
+                .collect();
+            let mut expected: Vec<usize> = (0..n).collect();
+            expected.sort_by(|&l, &r| values[l].partial_cmp(&values[r]).unwrap());
+            assert_eq!(stable_order(&values), expected, "{n} values");
         }
     }
 }

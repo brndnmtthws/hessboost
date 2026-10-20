@@ -75,18 +75,6 @@ fn quantile_pair(r: f32, s: f32, alpha: f32, w: f32) -> GradPair {
     GradPair::new(w * grad, w * hess)
 }
 
-/// Sort order of `labels` under `<`, stable for equal values (XGBoost
-/// `StableSort` with `operator<`).
-fn stable_order(labels: &[f32]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..labels.len()).collect();
-    order.sort_by(|&l, &r| {
-        labels[l]
-            .partial_cmp(&labels[r])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    order
-}
-
 /// XGBoost `common::Quantile`: linear interpolation on the `(n + 1)α` grid,
 /// clamped to the extremes, over the values already sorted ascending. `NaN`
 /// for no values. Also each exact leaf's quantile without sample weights
@@ -148,7 +136,7 @@ where
 }
 
 /// [`weighted_step_quantile`] of `labels` weighted by `weights`, in the
-/// ascending `order` of [`stable_order`].
+/// ascending `order` of [`stable_order`](crate::data::sort::stable_order).
 fn weighted_quantile(alpha: f32, labels: &[f32], weights: &[f32], order: &[usize]) -> f32 {
     weighted_step_quantile(alpha, order.iter().map(|&row| (labels[row], weights[row])))
 }
@@ -224,7 +212,7 @@ impl Loss for Quantile {
 
     fn base_margins_info(&self, info: &crate::data::MetaInfo) -> Vec<f32> {
         let (labels, weights) = (info.label_values(), info.weights);
-        let order = stable_order(labels);
+        let order = crate::data::sort::stable_order(labels);
         match weights {
             None => {
                 let sorted: Vec<f32> = order.iter().map(|&i| labels[i]).collect();

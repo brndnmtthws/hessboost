@@ -128,7 +128,9 @@
 //!   splits, early stopping, feature importance, QuadratureTreeSHAP values
 //!   and interactions
 //!   ([`predict_contribs`](model::BoostedModel::predict_contribs) /
-//!   [`predict_interactions`](model::BoostedModel::predict_interactions)).
+//!   [`predict_interactions`](model::BoostedModel::predict_interactions)),
+//!   one model predicting several models' mean margin (bagging,
+//!   [`BoostedModel::average`](model::BoostedModel::average)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON, XGBoost JSON and
 //!   UBJSON import/export ([XGBoost interchange](model#xgboost-interchange)),
 //!   LightGBM 4.x text model import
@@ -141,8 +143,13 @@
 //!   forward-chaining (time-ordered, purged by a row gap), or purged forward
 //!   (timestamped rows, purged by each label window,
 //!   [`Fold::purged_forward`](training::Fold::purged_forward))
-//!   [`Fold`](training::Fold)s with fold-mean early stopping
-//!   ([`CrossValidation`](training::CrossValidation)); whole-query folds of
+//!   [`Fold`](training::Fold)s with fold-mean or leakage-safe per-fold
+//!   early stopping on a purged tail of each fold's training rows
+//!   ([`CrossValidation`](training::CrossValidation),
+//!   [`CvStopping`](training::CvStopping),
+//!   [`PurgedTail`](training::PurgedTail)); each fold's round count and
+//!   every row's out-of-fold margins
+//!   ([`CvReport`](training::CvReport)); whole-query folds of
 //!   ranking data; ordered target statistics fitted inside each fold
 //!   ([`CrossValidation::target_stats`](training::CrossValidation::target_stats));
 //!   continuing a model in every fold; refitting on every row at the

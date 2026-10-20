@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast, overload
 
 import numpy as np
@@ -14,6 +14,7 @@ from hessboost import _hessboost
 from hessboost._booster import Booster
 from hessboost._exceptions import HessboostError
 from hessboost._matrix import DMatrix, _check_schema
+from hessboost.folds import PurgedTail
 from hessboost.target_stats import (
     Column,
     FittedTargetEncoder,
@@ -25,8 +26,14 @@ from hessboost.target_stats import (
 __all__ = [
     "CustomMetric",
     "CvRefit",
+    "CvReport",
+    "CvReportRefit",
+    "FoldReport",
     "Objective",
+    "OutOfFold",
+    "TailStopping",
     "TrainingCallback",
+    "cross_validate",
     "cv",
     "train",
     "train_with_budget",
@@ -388,6 +395,23 @@ returns, one value per round."""
 
 
 @dataclass(frozen=True)
+class TailStopping:
+    """How per-fold early stopping sized one model: its purged tail split
+    (:meth:`hessboost.folds.PurgedTail.split`) and the watched metric
+    there."""
+
+    split_at: int
+    """The split time."""
+    fit_rows: int
+    """The rows the early-stopping fit trained on."""
+    tail_rows: int
+    """The tail rows it was scored on."""
+    best_score: float
+    """The watched (last) metric on the tail at the best round (NaN for no
+    rounds)."""
+
+
+@dataclass(frozen=True)
 class CvRefit:
     """What ``cv(..., refit=True)`` returns: the cross-validation history
     and the booster retrained on every row at the chosen round count."""
@@ -401,12 +425,106 @@ class CvRefit:
     it was trained on ``dtrain`` encoded by :attr:`target_encoder`, so its
     encoded columns are numerical."""
     num_boost_round: int
-    """The chosen round count: through the best round under early stopping,
-    else every round the folds ran (the length of each history array)."""
+    """The chosen round count: through the best round under early stopping
+    (the length of each history array), else every round the folds ran."""
     target_encoder: FittedTargetEncoder | None
     """With ``target_stats``, the encoder fitted on every row of ``dtrain``:
     encode new data with its ``transform`` before predicting with
     :attr:`booster`. ``None`` otherwise."""
+
+
+@dataclass(frozen=True)
+class CvReportRefit:
+    """The booster ``cross_validate(..., refit=True)`` retrained on every
+    row (:attr:`CvReport.refit`; the history is the report's)."""
+
+    booster: Booster
+    """The booster trained on every row of ``dtrain`` for
+    :attr:`num_boost_round` rounds, as :attr:`CvRefit.booster`."""
+    num_boost_round: int
+    """The chosen round count: through the best fold-mean round under
+    fold-mean early stopping, the best round on the purged tail of every row
+    under per-fold early stopping, else every round the folds ran."""
+    target_encoder: FittedTargetEncoder | None
+    """With ``target_stats``, the encoder fitted on every row, as
+    :attr:`CvRefit.target_encoder`; ``None`` otherwise."""
+    stopping: TailStopping | None
+    """Under per-fold early stopping, the tail split of every row that sized
+    :attr:`booster`; ``None`` otherwise."""
+
+
+@dataclass(frozen=True)
+class FoldReport:
+    """One fold of a :class:`CvReport`: what its model was and predicted."""
+
+    test_rows: NDArray[np.int64]
+    """The fold's test rows, as the fold listed them."""
+    num_boost_round: int
+    """The rounds the fold's model used: every round without early
+    stopping, the best fold-mean round's count under fold-mean early
+    stopping, its own tail's best round's count under per-fold early
+    stopping."""
+    scores: dict[str, float]
+    """The model's test metrics after its last round, by metric name (empty
+    for a model of no rounds)."""
+    margins: NDArray[np.float32]
+    """The model's margins on :attr:`test_rows`: ``(rows,)`` for one output,
+    else ``(rows, outputs)``. Under fold-mean early stopping, the fold's
+    model through :attr:`num_boost_round` rounds."""
+    stopping: TailStopping | None
+    """Under per-fold early stopping, the fold's tail split; else ``None``."""
+
+
+@dataclass(frozen=True)
+class OutOfFold:
+    """Every row's out-of-fold margins (:meth:`CvReport.out_of_fold`)."""
+
+    margins: NDArray[np.float32]
+    """One margin row per ``dtrain`` row from the fold that held it out
+    (``(rows,)`` for one output, else ``(rows, outputs)``); NaN for a row no
+    fold held out."""
+    fold: NDArray[np.int64]
+    """Per row, the index of the fold that held it out, or ``-1``."""
+
+
+def _shaped(margins: NDArray[np.float32]) -> NDArray[np.float32]:
+    return margins.reshape(-1) if margins.shape[1] == 1 else margins
+
+
+def _stopping(stopping: tuple[int, int, int, float] | None) -> TailStopping | None:
+    return None if stopping is None else TailStopping(*stopping)
+
+
+@dataclass(frozen=True)
+class CvReport:
+    """What :func:`cross_validate` returns: the fold-mean history, every
+    fold's round count, scores and test margins, and, with ``refit``, the
+    booster retrained on every row."""
+
+    history: CvHistory
+    """The history :func:`cv` returns: per metric, the fold mean and
+    standard deviation per round. Empty under per-fold early stopping, whose
+    folds run different round counts."""
+    folds: list[FoldReport]
+    """One report per fold, in fold order."""
+    refit: CvReportRefit | None
+    """With ``refit=True``, the booster retrained on every row; else
+    ``None``."""
+    _core: _hessboost.CvReport = field(repr=False)
+
+    def out_of_fold(self) -> OutOfFold:
+        """Every row's margins from the fold that held it out. A row no fold
+        held out (forward folds never test the first rows) gets NaN margins
+        and fold ``-1``; a row one fold lists several times gets that fold's
+        margins.
+
+        Raises:
+            HessboostError: Two folds hold out the same row, which then has
+                no single out-of-fold margin (each fold's margins stay in
+                :attr:`folds`).
+        """
+        margins, fold = self._core.out_of_fold()
+        return OutOfFold(_shaped(margins), fold)
 
 
 def _history(results: list[tuple[str, list[float], list[float]]]) -> CvHistory:
@@ -415,6 +533,118 @@ def _history(results: list[tuple[str, list[float], list[float]]]) -> CvHistory:
         out[f"test-{metric}-mean"] = np.asarray(mean, dtype=np.float64)
         out[f"test-{metric}-std"] = np.asarray(std, dtype=np.float64)
     return out
+
+
+def _cross_validate(
+    params: Mapping[str, Any],
+    dtrain: DMatrix,
+    num_boost_round: int,
+    *,
+    nfold: int,
+    folds: _Splitter | Iterable[tuple[ArrayLike, ArrayLike]] | None,
+    seed: int,
+    early_stopping_rounds: int | None,
+    per_fold_stopping: PurgedTail | None,
+    target_stats: Sequence[Column] | None,
+    target_encoder: OrderedTargetEncoder | None,
+    target_stats_label: ArrayLike | None,
+    xgb_model: str | os.PathLike[str] | Booster | None,
+    refit: bool,
+    history_only: bool,
+) -> CvReport:
+    """The run :func:`cv` (``history_only``: no fold reports) and
+    :func:`cross_validate` share."""
+    if not isinstance(dtrain, DMatrix):
+        raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
+    if per_fold_stopping is not None and not isinstance(per_fold_stopping, PurgedTail):
+        raise TypeError(
+            f"per_fold_stopping must be a folds.PurgedTail, got {type(per_fold_stopping).__name__}"
+        )
+    native = _params(params, dtrain)
+    encoding: tuple[_hessboost.OrderedTargetEncoder, list[int]] | None = None
+    if target_stats is not None:
+        encoder = OrderedTargetEncoder() if target_encoder is None else target_encoder
+        if not isinstance(encoder, OrderedTargetEncoder):
+            raise TypeError(
+                f"target_encoder must be an OrderedTargetEncoder, got {type(encoder).__name__}"
+            )
+        encoding = (encoder._core, _column_indices(target_stats, dtrain._feature_names))
+    elif target_encoder is not None:
+        raise HessboostError("target_encoder needs target_stats, the columns to encode")
+    labels = None
+    if target_stats_label is not None:
+        labels = np.ascontiguousarray(target_stats_label, dtype=np.float32)
+        if labels.ndim != 1:
+            raise HessboostError(
+                f"target_stats_label must be one value per row, got shape {labels.shape}"
+            )
+    init = _init_model(xgb_model)
+    if init is not None:
+        _check_schema(init, dtrain, "dtrain", "xgb_model's")
+    rows = dtrain.num_row()
+    if folds is None:
+        pairs = [
+            (train.tolist(), test.tolist()) for train, test in _hessboost.k_fold(rows, nfold, seed)
+        ]
+    else:
+        chosen: Iterable[tuple[ArrayLike, ArrayLike]]
+        if hasattr(folds, "split"):
+            chosen = cast(_Splitter, folds).split(np.zeros((rows, 1)), dtrain.get_label())
+        else:
+            chosen = folds
+        pairs = [
+            (np.asarray(train).reshape(-1).tolist(), np.asarray(test).reshape(-1).tolist())
+            for train, test in chosen
+        ]
+    request: dict[str, object] = {
+        "params": native,
+        "dtrain": dtrain._core,
+        "num_boost_round": int(num_boost_round),
+        "folds": pairs,
+        "early_stopping_rounds": early_stopping_rounds,
+        "per_fold_stopping": None
+        if per_fold_stopping is None
+        else (
+            per_fold_stopping._decision_at,
+            per_fold_stopping._label_end,
+            per_fold_stopping._fraction,
+        ),
+        "target_stats": encoding,
+        "target_stats_label": labels,
+        "init_model": None if init is None else init._model,
+        "history_only": history_only,
+    }
+    core, refitted = _hessboost.cross_validate(request, refit)
+    history = _history(core.history())
+    metrics = core.metrics()
+    reports = [
+        FoldReport(
+            test,
+            rounds,
+            # No rounds, no scores.
+            dict(zip(metrics, scores, strict=True)) if scores else {},
+            _shaped(margins),
+            _stopping(stopping),
+        )
+        for test, rounds, scores, margins, stopping in core.folds()
+    ]
+    retrained = None
+    if refitted is not None:
+        booster, rounds, fitted, stopping = refitted
+        if encoding is None or fitted is None:
+            retrained = CvReportRefit(
+                _trained(booster, dtrain, init), rounds, None, _stopping(stopping)
+            )
+        else:
+            # The refit trained on dtrain encoded by `fitted`, its columns numerical.
+            encoded = _encoded(dtrain, dtrain._core, encoding[1])
+            retrained = CvReportRefit(
+                _trained(booster, encoded, None),
+                rounds,
+                FittedTargetEncoder._wrap(fitted, dtrain),
+                _stopping(stopping),
+            )
+    return CvReport(history, reports, retrained, core)
 
 
 @overload
@@ -487,7 +717,9 @@ def cv(
     or ``qid`` set), every fold's training and test rows must be whole query
     groups, each group's rows together and in row order (as
     ``sklearn.model_selection.GroupKFold`` over the query ids gives them);
-    the shuffled default folds split groups and are refused.
+    the shuffled default folds split groups and are refused. For each fold's
+    margins, every row's out-of-fold margin, and per-fold early stopping,
+    use :func:`cross_validate`.
 
     Args:
         nfold: Shuffled folds to use when ``folds`` is not given.
@@ -530,64 +762,95 @@ def cv(
             or an EBM stops its bags early (``ebm_early_stopping_rounds``:
             the folds would end their stages at different rounds).
     """
-    if not isinstance(dtrain, DMatrix):
-        raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
-    native = _params(params, dtrain)
-    encoding: tuple[_hessboost.OrderedTargetEncoder, list[int]] | None = None
-    if target_stats is not None:
-        encoder = OrderedTargetEncoder() if target_encoder is None else target_encoder
-        if not isinstance(encoder, OrderedTargetEncoder):
-            raise TypeError(
-                f"target_encoder must be an OrderedTargetEncoder, got {type(encoder).__name__}"
-            )
-        encoding = (encoder._core, _column_indices(target_stats, dtrain._feature_names))
-    elif target_encoder is not None:
-        raise HessboostError("target_encoder needs target_stats, the columns to encode")
-    labels = None
-    if target_stats_label is not None:
-        labels = np.ascontiguousarray(target_stats_label, dtype=np.float32)
-        if labels.ndim != 1:
-            raise HessboostError(
-                f"target_stats_label must be one value per row, got shape {labels.shape}"
-            )
-    init = _init_model(xgb_model)
-    if init is not None:
-        _check_schema(init, dtrain, "dtrain", "xgb_model's")
-    rows = dtrain.num_row()
-    if folds is None:
-        pairs = [
-            (train.tolist(), test.tolist()) for train, test in _hessboost.k_fold(rows, nfold, seed)
-        ]
-    else:
-        chosen: Iterable[tuple[ArrayLike, ArrayLike]]
-        if hasattr(folds, "split"):
-            chosen = cast(_Splitter, folds).split(np.zeros((rows, 1)), dtrain.get_label())
-        else:
-            chosen = folds
-        pairs = [
-            (np.asarray(train).reshape(-1).tolist(), np.asarray(test).reshape(-1).tolist())
-            for train, test in chosen
-        ]
-    request: dict[str, object] = {
-        "params": native,
-        "dtrain": dtrain._core,
-        "num_boost_round": int(num_boost_round),
-        "folds": pairs,
-        "early_stopping_rounds": early_stopping_rounds,
-        "target_stats": encoding,
-        "target_stats_label": labels,
-        "init_model": None if init is None else init._model,
-    }
-    if not refit:
-        return _history(_hessboost.cv(request))
-    results, core, rounds, fitted = _hessboost.cv_refit(request)
-    if encoding is None or fitted is None:
-        return CvRefit(_history(results), _trained(core, dtrain, init), rounds, None)
-    # The refit trained on dtrain encoded by `fitted`, its columns numerical.
-    encoded = _encoded(dtrain, dtrain._core, encoding[1])
+    report = _cross_validate(
+        params,
+        dtrain,
+        num_boost_round,
+        nfold=nfold,
+        folds=folds,
+        seed=seed,
+        early_stopping_rounds=early_stopping_rounds,
+        per_fold_stopping=None,
+        target_stats=target_stats,
+        target_encoder=target_encoder,
+        target_stats_label=target_stats_label,
+        xgb_model=xgb_model,
+        refit=refit,
+        history_only=True,
+    )
+    refitted = report.refit
+    if refitted is None:
+        return report.history
     return CvRefit(
-        _history(results),
-        _trained(core, encoded, None),
-        rounds,
-        FittedTargetEncoder._wrap(fitted, dtrain),
+        report.history, refitted.booster, refitted.num_boost_round, refitted.target_encoder
+    )
+
+
+def cross_validate(
+    params: Mapping[str, Any],
+    dtrain: DMatrix,
+    num_boost_round: int = 10,
+    *,
+    nfold: int = 3,
+    folds: _Splitter | Iterable[tuple[ArrayLike, ArrayLike]] | None = None,
+    seed: int = 0,
+    early_stopping_rounds: int | None = None,
+    per_fold_stopping: PurgedTail | None = None,
+    target_stats: Sequence[Column] | None = None,
+    target_encoder: OrderedTargetEncoder | None = None,
+    target_stats_label: ArrayLike | None = None,
+    xgb_model: str | os.PathLike[str] | Booster | None = None,
+    refit: bool = False,
+) -> CvReport:
+    """Cross-validates ``params`` on ``dtrain`` as :func:`cv` does, and
+    reports every fold's round count, test scores and test-row margins
+    (:class:`CvReport`; :meth:`CvReport.out_of_fold` combines them into
+    every row's out-of-fold margins).
+
+    With ``per_fold_stopping``, early stopping is leakage-safe and per fold
+    instead of on the fold means: each fold splits its own training rows by
+    the purged tail (:meth:`hessboost.folds.PurgedTail.split`), trains on
+    the split's fit rows while scoring the tail (``early_stopping_rounds``
+    is the patience, the last metric the watched one), and then trains its
+    model on all its training rows for the best round's count. No fold's
+    rounds depend on its test rows or on another fold, so with forward folds
+    (:func:`hessboost.folds.purged_forward`) no fold uses rounds chosen with
+    later labels. With ``refit``, the booster on every row is sized the same
+    way on the tail of every row. The fold-mean history is then empty.
+
+    Args:
+        per_fold_stopping: The purged tail, over every row of ``dtrain``,
+            to size each fold on; needs ``early_stopping_rounds``.
+        nfold, folds, seed, early_stopping_rounds, target_stats,
+            target_encoder, target_stats_label, xgb_model, refit: As for
+            :func:`cv`; per-fold early stopping fits its ``target_stats``
+            encoder on the tail split's fit rows.
+
+    Returns:
+        A :class:`CvReport`; with ``refit``, its :attr:`CvReport.refit`
+        holds the retrained booster.
+
+    Raises:
+        HessboostError: As :func:`cv`, or ``per_fold_stopping`` is given
+            without ``early_stopping_rounds``, its times are not one per row,
+            or a fold's (or with ``refit``, every row's) tail split leaves a
+            side empty.
+        TypeError: ``per_fold_stopping`` is not a
+            :class:`hessboost.folds.PurgedTail`.
+    """
+    return _cross_validate(
+        params,
+        dtrain,
+        num_boost_round,
+        nfold=nfold,
+        folds=folds,
+        seed=seed,
+        early_stopping_rounds=early_stopping_rounds,
+        per_fold_stopping=per_fold_stopping,
+        target_stats=target_stats,
+        target_encoder=target_encoder,
+        target_stats_label=target_stats_label,
+        xgb_model=xgb_model,
+        refit=refit,
+        history_only=False,
     )

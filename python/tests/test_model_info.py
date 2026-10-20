@@ -32,6 +32,14 @@ def leaf(tree: TreeInfo, row: NDArray[np.float32]) -> int:
     return node
 
 
+def longest_path(tree: TreeInfo, node: int = 0) -> int:
+    """Splits on the longest path from ``node`` to a leaf."""
+    if tree.left[node] == -1:
+        return 0
+    children = (int(tree.left[node]), int(tree.right[node]))
+    return 1 + max(longest_path(tree, child) for child in children)
+
+
 def margins(info: ModelInfo, x: NDArray[np.float64]) -> NDArray[np.float32]:
     """Every row's margins from ``info``: the intercepts plus each tree's
     weighted leaf, added in ``float32`` in tree order as prediction adds
@@ -91,6 +99,7 @@ def test_scalar_trees_with_categorical_splits_and_missing_values() -> None:
         assert (len(categories) > 0) == bool(tree.categorical[node])
     assert tree.linear is None
     assert (tree.cover > 0).all()
+    assert all(tree.depth == longest_path(tree) <= 4 for tree in info.trees)
 
 
 def test_forest_of_a_multiclass_model() -> None:

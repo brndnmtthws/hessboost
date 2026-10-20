@@ -4,9 +4,14 @@
 //! test has its own binary because it installs a counting global allocator.
 
 use hessboost::prelude::*;
+use hessboost::tree::{Node, RegTree};
 use serde_json::{Value, json};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+
+/// Features the row walk keys on the stack: a model splitting on a later
+/// one keys values as the walk reads them.
+const STACK_KEYED_FEATURES: usize = 512;
 
 /// The system allocator, counting the calling thread's allocations.
 struct Counting;
@@ -93,6 +98,24 @@ fn row_predictions_allocate_nothing() {
         kind("squared error", vec![], 8, 0),
         kind("wide rows", vec![("max_depth", json!(3))], 400, 0),
         kind(
+            "rows wider than the stack keys",
+            vec![("max_depth", json!(3))],
+            600,
+            0,
+        ),
+        kind(
+            "deep trees",
+            vec![("max_depth", json!(12)), ("min_child_weight", json!(0))],
+            8,
+            0,
+        ),
+        kind(
+            "dart",
+            vec![("booster", json!("dart")), ("rate_drop", json!(0.3))],
+            8,
+            0,
+        ),
+        kind(
             "softmax, 70 classes",
             vec![
                 ("objective", json!("multi:softmax")),
@@ -133,6 +156,13 @@ fn row_predictions_allocate_nothing() {
         let (model, x) = model(kind);
         let (name, n_cols) = (kind.name, kind.n_cols);
         let row = &x[n_cols..2 * n_cols];
+        if n_cols > STACK_KEYED_FEATURES {
+            // The row walk keys this case's values as it reads them only
+            // if a split reads a feature past the stack-keyed ones.
+            let past = |n: &Node| !n.is_leaf() && n.split_feature as usize >= STACK_KEYED_FEATURES;
+            let mut nodes = model.trees().iter().flat_map(RegTree::nodes);
+            assert!(nodes.any(past), "{name}: no split past the stack keys");
+        }
         let mut margins = vec![0.0; model.n_outputs()];
         let mut values = vec![0.0; model.prediction_width()];
         // The first prediction lays out the trees and the transform.

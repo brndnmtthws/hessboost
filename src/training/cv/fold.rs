@@ -262,7 +262,11 @@ impl Fold {
 /// by the count of distinct decision times): for rows decided from `first`
 /// to `last`, [`split`](Self::split) starts the tail at `split_at`, the
 /// first of their decision times at or after `first + (1 − fraction) ·
-/// (last − first)`, so irregular gaps do not shift it. The tail is
+/// (last − first)`, so irregular gaps do not shift it. That offset from
+/// `first` is evaluated in `f64` and rounded up to a whole tick, then
+/// compared exactly with each time's offset (so a `fraction` of `0.3` cuts
+/// a span of 10 ticks at 7, as the decimal says, though binary `0.3` is a
+/// little under 3/10; past 2^53 ticks the span itself rounds). The tail is
 /// every row decided at or after `split_at`, and the rows the
 /// early-stopping fit trains on are those decided before it whose labels
 /// end at or before it (so a label ending exactly at the split is kept, one
@@ -367,10 +371,11 @@ impl<'a> PurgedTail<'a> {
         if times.is_empty() {
             return Err("no rows to split".to_string());
         }
-        // The first decision time at or past `1 - fraction` of the span.
-        // Offsets compare as integers (in `f64`, one just before the cutoff
-        // could round onto it past 2^53) with the cutoff rounded up to a
-        // whole tick and capped at the span, which `last` always reaches.
+        // The first decision time at or past `1 - fraction` of the span: the
+        // cutoff offset in `f64`, rounded up to a whole tick and capped at
+        // the span (which `last` always reaches), against which offsets
+        // compare as integers (in `f64`, one just before the cutoff could
+        // round onto it past 2^53).
         let first = i128::from(times[0]);
         let span = i128::from(times[times.len() - 1]) - first;
         let cutoff = (((1.0 - self.fraction) * span as f64).ceil() as i128).min(span);
@@ -605,12 +610,21 @@ mod tests {
         assert_eq!(forward.test, [7, 8, 9]);
     }
 
-    /// Past 2^53 ticks (nanosecond times over months), a time one tick
-    /// before the cutoff stays before it: here the cutoff is exactly `t`,
-    /// which `t - 1` rounds onto in `f64`. A fraction so small that
-    /// `1 - fraction` rounds to 1 cuts at the last time, not past it.
+    /// The cutoff is `(1 - fraction) * span` in `f64`, rounded up to a whole
+    /// tick: 0.3 of 10 ticks cuts at 7, as the decimal says (the exact
+    /// complement of binary 0.3, a little over 7, would cut at 8). Offsets
+    /// compare exactly: past 2^53 ticks (nanosecond times over months), a
+    /// time one tick before the cutoff `t` stays out of the tail though its
+    /// `f64` offset rounds onto `t`. A fraction so small that `1 - fraction`
+    /// rounds to 1 cuts at the last time, not past it.
     #[test]
-    fn purged_tail_cutoff_is_exact_for_large_offsets() {
+    fn purged_tail_cuts_at_the_f64_cutoff() {
+        let at: Vec<i64> = (0..=10).collect();
+        let tail = PurgedTail::new(&at, &at, 0.3).unwrap();
+        let (split_at, split) = tail.split(&(0..=10).collect::<Vec<_>>()).unwrap();
+        assert_eq!(split_at, 7);
+        assert_eq!(split.test, [7, 8, 9, 10]);
+        assert_eq!(split.train, (0..7).collect::<Vec<_>>());
         let t = 1_i64 << 54;
         let at = [0, t - 1, t, 2 * t];
         let tail = PurgedTail::new(&at, &at, 0.5).unwrap();

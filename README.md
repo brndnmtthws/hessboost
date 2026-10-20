@@ -173,8 +173,8 @@ See [`python/README.md`](python/README.md).
   feature importance, SHAP values and interactions, model slicing and averaging (bagged
   models as one), and iteration ranges.
 - **Prediction & inspection:** Batch, in-place (borrowed rows), and allocation-free single-row
-  prediction, bit-identical in every batch; read-only model metadata (tree weights and nodes,
-  `gblinear` weights, model-shrinkage records).
+  prediction, bit-identical in every batch; read-only model metadata (tree weights, outputs,
+  depths, and nodes, `gblinear` weights, model-shrinkage records).
 - **Interchange:** Native binary and JSON formats, XGBoost JSON/UBJSON import/export, LightGBM model import, and models embedded in the binary at compile time.
 - **Modern modeling (opt-in):**
   - [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/): Finite-sample coverage guarantees.

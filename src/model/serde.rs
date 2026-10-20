@@ -1,5 +1,5 @@
 use super::objective::{PartialStoredObjectiveParams, StoredObjectiveParams};
-use super::{BoostedModel, LinearModel, ModelObjective, Shrinkage, TreeWeights};
+use super::{BoostedModel, LinearModel, ModelObjective, Shrinkage, TreeLayouts, TreeWeights};
 use crate::ebm::EbmInfo;
 use crate::error::{HessboostError, Result};
 use crate::inference::BoulevardInfo;
@@ -130,7 +130,7 @@ impl TryFrom<UncheckedBoostedModel> for BoostedModel {
             shrinkage: m.shrinkage,
             boulevard: m.boulevard,
             ebm: m.ebm,
-            compact: OnceLock::new(),
+            layouts: TreeLayouts::default(),
             transform: OnceLock::new(),
         };
         model.validate_structure()?;

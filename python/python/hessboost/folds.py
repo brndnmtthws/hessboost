@@ -120,7 +120,11 @@ class PurgedTail:
     :func:`purged_forward`, which cuts by the count of distinct decision
     times): for rows decided from ``first`` to ``last``, :meth:`split` starts
     the tail at the first of their decision times at or after ``first + (1 -
-    fraction) * (last - first)``.
+    fraction) * (last - first)``. That offset from ``first`` is computed in
+    ``float64`` and rounded up to a whole time unit, then compared exactly
+    with each time's offset (so a ``fraction`` of ``0.3`` cuts a span of 10
+    units at 7, as the decimal says; past 2**53 units the span itself
+    rounds).
     The tail is every row decided at or after it, and the early-stopping
     fit trains on the rows decided before it whose labels end at or before
     it (a label ending exactly at the split is kept, one ending a tick later

@@ -323,6 +323,32 @@ impl RegTree {
         self.nodes.iter().filter(|n| n.is_leaf()).count()
     }
 
+    /// Number of splits on the longest root-to-leaf path: `0` for a tree
+    /// that is a single leaf, `max_depth` for a tree grown to it.
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut stack = vec![(0usize, 0usize)];
+        while let Some((nid, depth)) = stack.pop() {
+            let node = &self.nodes[nid];
+            if node.is_leaf() {
+                deepest = deepest.max(depth);
+            } else {
+                stack.push((node.left as usize, depth + 1));
+                stack.push((node.right as usize, depth + 1));
+            }
+        }
+        deepest
+    }
+
+    /// Whether any split tests category membership
+    /// ([`Node::is_categorical`] on an internal node) rather than a numeric
+    /// threshold.
+    pub fn has_categorical_splits(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| node.is_categorical && !node.is_leaf())
+    }
+
     pub(crate) fn is_valid_for_features(&self, n_features: usize) -> bool {
         let locally_valid = !self.nodes.is_empty()
             && self.nodes.iter().all(|node| {
@@ -750,5 +776,43 @@ mod tests {
         assert!(tree.is_valid_for_features(1));
         tree.nodes[0].right = -2;
         assert!(!tree.is_valid_for_features(1));
+    }
+
+    /// `depth` counts the splits on the longest path, however uneven the
+    /// tree; `has_categorical_splits` sees categorical internal nodes only,
+    /// not a leaf that kept a pruned split's category flag.
+    #[test]
+    fn depth_and_categorical_splits() {
+        let mut tree = RegTree::with_root(1.0);
+        assert_eq!(tree.depth(), 0);
+        let (l, r) = tree.expand(
+            0,
+            SplitRule::numeric(0, 0.5, true),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(1.0, 1.0),
+        );
+        let (_, lr) = tree.expand(
+            l,
+            SplitRule::numeric(1, 0.5, false),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(1.0, 1.0),
+        );
+        tree.expand(
+            lr,
+            SplitRule::numeric(0, 0.25, true),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(1.0, 1.0),
+        );
+        assert_eq!(tree.depth(), 3);
+        tree.nodes[r].is_categorical = true;
+        assert!(!tree.has_categorical_splits(), "a categorical leaf");
+        tree.expand(
+            r,
+            SplitRule::categorical(1, &[2], false),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(1.0, 1.0),
+        );
+        assert!(tree.has_categorical_splits());
+        assert_eq!(tree.depth(), 3);
     }
 }

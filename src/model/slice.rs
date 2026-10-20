@@ -1,7 +1,6 @@
-use super::{BoostedModel, Iterations, Shrinkage, TreeWeights};
+use super::{BoostedModel, Iterations, Shrinkage, TreeLayouts, TreeWeights};
 use crate::error::{HessboostError, Result};
 use std::ops::{Range, RangeBounds};
-use std::sync::OnceLock;
 
 impl BoostedModel {
     /// A new model holding every `step`-th boosting iteration of
@@ -89,7 +88,7 @@ impl BoostedModel {
             // of an EBM drops some of its terms' trees.
             boulevard: None,
             ebm: None,
-            compact: OnceLock::new(),
+            layouts: TreeLayouts::default(),
             transform: self.transform.clone(),
         })
     }
@@ -116,7 +115,7 @@ impl BoostedModel {
             shrinkage: Some(shrinkage.truncated(k)),
             boulevard: None,
             ebm: None,
-            compact: OnceLock::new(),
+            layouts: TreeLayouts::default(),
             transform: self.transform.clone(),
         }
     }

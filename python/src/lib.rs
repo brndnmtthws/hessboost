@@ -53,6 +53,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         os.call_method("register_at_fork", (), Some(&hooks))?;
     }
     m.add_class::<data::DMatrix>()?;
+    m.add_class::<data::BinnedMatrix>()?;
     m.add_class::<params::Params>()?;
     m.add_class::<booster::Booster>()?;
     m.add_class::<compact::CompactModel>()?;

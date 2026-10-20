@@ -1,6 +1,7 @@
 //! A finished tree routed by the bins of a [`GHistIndex`]: each split becomes
 //! a test on its feature's local bins, so one pass over the index's narrow
-//! feature columns finds every row's leaf without reading a raw value.
+//! feature columns (or a sparse index's row bins) finds every row's leaf
+//! without reading a raw value.
 //!
 //! A row's bins route it as its values do when the tree's numeric thresholds
 //! are cuts of the index (or lie below every finite value) and the cuts were
@@ -8,7 +9,7 @@
 //! sketched value lies in the bin its neighbouring cuts bound, below the
 //! feature's last cut, and a sketched category has a bin of its own.
 
-use crate::data::ghist::{BinIndex, Column, ColumnSet, Columns, GHistIndex, missing_bit};
+use crate::data::ghist::{BinIndex, Bins, Column, ColumnSet, Columns, GHistIndex, missing_bit};
 use crate::tree::RegTree;
 use std::ops::Range;
 
@@ -17,6 +18,9 @@ use std::ops::Range;
 struct BinNode {
     /// The split feature (`0` at a leaf, which tests nothing).
     feature: u32,
+    /// The split feature's first global bin, and one past its last.
+    first_bin: u32,
+    end_bin: u32,
     /// A numeric split's limit (present local bins below it go left), or
     /// where a categorical split's per-bin table starts in
     /// [`BinnedTree::categories_left`].
@@ -28,10 +32,28 @@ struct BinNode {
     right: u32,
 }
 
-/// A tree's splits as tests on one index's feature columns
-/// ([`BinnedTree::new`]).
+impl BinNode {
+    /// Whether a present row whose local bin of the split feature is `bin`
+    /// goes left.
+    #[inline(always)]
+    fn present_left(&self, categories_left: &[bool], bin: usize) -> bool {
+        if self.categorical {
+            categories_left[self.test as usize + bin]
+        } else {
+            bin < self.test as usize
+        }
+    }
+
+    /// The child a row takes.
+    #[inline(always)]
+    fn child(&self, left: bool) -> usize {
+        (if left { self.left } else { self.right }) as usize
+    }
+}
+
+/// A tree's splits as tests on one index's bins ([`BinnedTree::new`]).
 pub(crate) struct BinnedTree<'a> {
-    columns: Columns<'a>,
+    index: &'a GHistIndex,
     nodes: Vec<BinNode>,
     /// Whether each local bin of a categorical split's feature goes left, one
     /// run per categorical split.
@@ -39,12 +61,11 @@ pub(crate) struct BinnedTree<'a> {
 }
 
 impl<'a> BinnedTree<'a> {
-    /// `tree`'s splits as tests on `index`'s bins. `None` when the index
-    /// keeps no feature columns (a sparse one less than half full) or a split
-    /// does not fall on the index's cuts: a numeric threshold inside a bin,
-    /// or a split whose kind its feature's cuts do not have.
+    /// `tree`'s splits as tests on `index`'s bins. `None` when a split does
+    /// not fall on the index's cuts: a numeric threshold inside a bin, or a
+    /// split whose kind its feature's cuts do not have. A tree grown on the
+    /// index always does.
     pub(crate) fn new(tree: &RegTree, index: &'a GHistIndex) -> Option<Self> {
-        let columns = index.columns()?;
         let cuts = index.cuts();
         let mut categories_left = Vec::new();
         let nodes = tree
@@ -53,6 +74,8 @@ impl<'a> BinnedTree<'a> {
             .map(|node| {
                 let mut binned = BinNode {
                     feature: 0,
+                    first_bin: 0,
+                    end_bin: 0,
                     test: 0,
                     categorical: false,
                     default_left: false,
@@ -74,7 +97,10 @@ impl<'a> BinnedTree<'a> {
                 } else {
                     cuts.bins_left_of(f, node.split_cond)?
                 };
+                let (first, end) = cuts.feature_bins(f);
                 binned.feature = node.split_feature;
+                binned.first_bin = u32::try_from(first).ok()?;
+                binned.end_bin = u32::try_from(end).ok()?;
                 binned.test = u32::try_from(test).ok()?;
                 binned.categorical = node.is_categorical;
                 binned.default_left = node.default_left;
@@ -84,7 +110,7 @@ impl<'a> BinnedTree<'a> {
             })
             .collect::<Option<Vec<_>>>()?;
         Some(BinnedTree {
-            columns,
+            index,
             nodes,
             categories_left,
         })
@@ -93,20 +119,25 @@ impl<'a> BinnedTree<'a> {
     /// Call `visit(row, leaf)` for every row of `rows` (below the index's
     /// row count), in order, with the id of the leaf the row's bins reach.
     pub(crate) fn for_each_leaf(&self, rows: Range<usize>, visit: impl FnMut(usize, usize)) {
-        match self.columns {
-            Columns::U8(set) => self.walk(set, rows, visit),
-            Columns::U16(set) => self.walk(set, rows, visit),
-            Columns::U32(set) => self.walk(set, rows, visit),
+        match self.index.columns() {
+            Some(Columns::U8(set)) => self.walk_columns(set, rows, visit),
+            Some(Columns::U16(set)) => self.walk_columns(set, rows, visit),
+            Some(Columns::U32(set)) => self.walk_columns(set, rows, visit),
+            // A sparse index less than half full keeps only its rows' bins.
+            None => match self.index.bins() {
+                Bins::U16(bins) => self.walk_rows(bins, rows, visit),
+                Bins::U32(bins) => self.walk_rows(bins, rows, visit),
+            },
         }
     }
 
-    /// [`Self::for_each_leaf`] over columns of one width.
+    /// [`Self::for_each_leaf`] over feature columns of one width.
     #[inline(always)]
     #[allow(
         clippy::needless_bitwise_bool,
         reason = "branch-free routing predicates keep the walk free of data-dependent branches"
     )]
-    fn walk<B: BinIndex>(
+    fn walk_columns<B: BinIndex>(
         &self,
         set: ColumnSet<'a, B>,
         rows: Range<usize>,
@@ -126,14 +157,39 @@ impl<'a> BinnedTree<'a> {
                     break;
                 }
                 let missing = column.missing.is_some_and(|bits| missing_bit(bits, row));
-                let bin = column.bins[row].index();
-                let present_left = if node.categorical {
-                    self.categories_left[node.test as usize + bin]
-                } else {
-                    bin < node.test as usize
+                let present_left =
+                    node.present_left(&self.categories_left, column.bins[row].index());
+                nid = node.child((present_left & !missing) | (missing & node.default_left));
+            }
+            visit(row, nid);
+        }
+    }
+
+    /// [`Self::for_each_leaf`] over each row's stored global bins: a row
+    /// takes its first bin in the split feature's range (as
+    /// [`DMatrix::get`](crate::data::DMatrix::get) takes a row's first entry
+    /// of a feature), and lacking one it is missing there.
+    fn walk_rows<B: BinIndex>(
+        &self,
+        bins: &[B],
+        rows: Range<usize>,
+        mut visit: impl FnMut(usize, usize),
+    ) {
+        let row_ptr = self.index.row_ptr();
+        for row in rows {
+            let stored = &bins[row_ptr[row]..row_ptr[row + 1]];
+            let mut nid = 0;
+            loop {
+                let node = &self.nodes[nid];
+                if node.leaf {
+                    break;
+                }
+                let range = node.first_bin as usize..node.end_bin as usize;
+                let left = match stored.iter().map(|b| b.index()).find(|b| range.contains(b)) {
+                    Some(bin) => node.present_left(&self.categories_left, bin - range.start),
+                    None => node.default_left,
                 };
-                let left = (present_left & !missing) | (missing & node.default_left);
-                nid = if left { node.left } else { node.right } as usize;
+                nid = node.child(left);
             }
             visit(row, nid);
         }
@@ -147,36 +203,52 @@ mod tests {
     use crate::data::{DMatrix, FeatureType};
     use crate::training::train;
 
+    /// Whether feature `f` of a row with hash `h` is absent.
+    type Absent = fn(usize, usize) -> bool;
+
     /// Every row's bins reach the leaf its values reach, on numeric splits
-    /// of a dense index and of one with missing values, and on categorical
-    /// splits.
+    /// of a dense index, of one with missing values (columns with a missing
+    /// bitmap) and of a sparse one too empty for columns (row bins), and on
+    /// categorical splits.
     #[test]
     fn bins_reach_the_leaves_values_reach() {
         let n = 2_000;
-        for with_missing in [false, true] {
-            let value = |i: usize, f: usize| -> f32 {
+        let layouts: [(&str, Absent); 3] = [
+            ("dense", |_, _| false),
+            ("missing values", |f, h| f == 1 && h.is_multiple_of(3)),
+            ("sparse", |f, h| f != 2 && !h.is_multiple_of(5)),
+        ];
+        for (layout, absent) in layouts {
+            let value = |i: usize, f: usize| -> Option<f32> {
                 let h = (i * 2_654_435_761 + f * 40_503) % 1_000;
-                match f {
-                    1 if with_missing && h.is_multiple_of(3) => f32::NAN,
+                (!absent(f, h)).then(|| match f {
                     // A category code.
                     2 => (h % 7) as f32,
                     _ => h as f32 / 10.0,
-                }
+                })
             };
-            let x: Vec<f32> = (0..n)
-                .flat_map(|i| (0..3).map(move |f| value(i, f)))
-                .collect();
+            let (mut indptr, mut indices, mut values) = (vec![0], Vec::new(), Vec::new());
+            for i in 0..n {
+                for f in 0..3 {
+                    if let Some(v) = value(i, f) {
+                        indices.push(f as u32);
+                        values.push(v);
+                    }
+                }
+                indptr.push(values.len());
+            }
             let y: Vec<f32> = (0..n)
                 .map(|i| {
-                    let category = if (value(i, 2) as u32).is_multiple_of(2) {
+                    let category = value(i, 2).unwrap_or(0.0) as u32;
+                    let shift = if category.is_multiple_of(2) {
                         3.0
                     } else {
                         -2.0
                     };
-                    value(i, 0) * 0.1 + value(i, 1).max(0.0) * 0.01 + category
+                    value(i, 0).unwrap_or(50.0) * 0.1 + value(i, 1).unwrap_or(0.0) * 0.01 + shift
                 })
                 .collect();
-            let data = DMatrix::from_dense(&x, n, 3)
+            let data = DMatrix::from_csr(indptr, indices, values, 3)
                 .unwrap()
                 .with_labels(&y)
                 .unwrap()
@@ -193,18 +265,23 @@ mod tests {
                 .unwrap();
             let model = train(&params, &data, 8).unwrap();
             let index = data.hist_index(params.max_bin);
-            let columns = index.columns().expect("a dense or nearly full index");
-            assert_eq!(columns.has_missing(), with_missing);
+            let has_missing = index.columns().map(|columns| columns.has_missing());
+            let expected = match layout {
+                "dense" => Some(false),
+                "missing values" => Some(true),
+                _ => None,
+            };
+            assert_eq!(has_missing, expected, "{layout}");
             let mut categorical_splits = 0;
             for tree in model.trees() {
                 categorical_splits += tree.nodes().iter().filter(|n| n.is_categorical).count();
                 let binned = BinnedTree::new(tree, &index).expect("splits on the index's cuts");
                 binned.for_each_leaf(0..n, |row, leaf| {
                     let by_value = tree.leaf_id_with(|f| data.get(row, f as usize));
-                    assert_eq!(leaf, by_value, "row {row}, missing values: {with_missing}");
+                    assert_eq!(leaf, by_value, "row {row} of the {layout} index");
                 });
             }
-            assert!(categorical_splits > 0, "no categorical split exercised");
+            assert!(categorical_splits > 0, "{layout}: no categorical split");
         }
     }
 

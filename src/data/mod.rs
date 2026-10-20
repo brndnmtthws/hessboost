@@ -1,8 +1,10 @@
-//! Datasets: the [`DMatrix`] container, the [`MetaInfo`] view objectives and
-//! metrics read, the libsvm/CSV loaders, and the opt-in [`target_stats`]
-//! encoder for categorical columns.
+//! Datasets: the [`DMatrix`] container, the [`BinnedMatrix`] of its
+//! histogram bins, the [`MetaInfo`] view objectives and metrics read, the
+//! libsvm/CSV loaders, and the opt-in [`target_stats`] encoder for
+//! categorical columns.
 
 pub(crate) mod bin_cache;
+mod binned;
 mod dmatrix;
 pub(crate) mod ghist;
 mod loaders;
@@ -13,6 +15,7 @@ mod sketch;
 pub(crate) mod sort;
 pub mod target_stats;
 
+pub use binned::BinnedMatrix;
 pub use dmatrix::{DMatrix, ViewCuts};
 pub(crate) use dmatrix::{
     DenseRows, SketchedRows, check_len, is_missing, rejects_dense, rejects_dense_values,

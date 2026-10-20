@@ -5,7 +5,7 @@ use super::train::{train_impl, with_thread_pool};
 use super::validate::validate_trained_model;
 
 use crate::config::TrainingParams;
-use crate::data::DMatrix;
+use crate::data::{BinnedMatrix, DMatrix};
 use crate::error::Result;
 use crate::metric::Metric;
 use crate::model::BoostedModel;
@@ -203,13 +203,31 @@ pub struct TrainResult {
     pub best_score: Option<f64>,
 }
 
+/// The matrix a training run reads ([`Trainer::new`], [`train`]): a
+/// [`DMatrix`], or a [`BinnedMatrix`] of its bins, which trains as that
+/// matrix does with the options binned rows support.
+#[derive(Debug, Clone, Copy)]
+pub struct TrainingData<'a>(&'a DMatrix);
+
+impl<'a> From<&'a DMatrix> for TrainingData<'a> {
+    fn from(data: &'a DMatrix) -> Self {
+        TrainingData(data)
+    }
+}
+
+impl<'a> From<&'a BinnedMatrix> for TrainingData<'a> {
+    fn from(data: &'a BinnedMatrix) -> Self {
+        TrainingData(data.matrix())
+    }
+}
+
 /// Train a model for `num_boost_round` iterations with no eval sets, early
 /// stopping, or custom hooks. Shorthand for
 /// `Trainer::new(params, dtrain, num_boost_round).train()?.model`; use
 /// [`Trainer`] for everything else.
-pub fn train(
-    params: &TrainingParams,
-    dtrain: &DMatrix,
+pub fn train<'a>(
+    params: &'a TrainingParams,
+    dtrain: impl Into<TrainingData<'a>>,
     num_boost_round: usize,
 ) -> Result<BoostedModel> {
     Ok(Trainer::new(params, dtrain, num_boost_round).train()?.model)
@@ -258,12 +276,17 @@ pub struct Trainer<'a> {
 pub(super) type RoundHook<'a> = Box<dyn FnMut(RoundEval<'_>) -> ControlFlow<()> + Send + 'a>;
 
 impl<'a> Trainer<'a> {
-    /// Train on `dtrain` for (at most) `num_boost_round` iterations with
-    /// `params`, which name the objective and metrics.
-    pub fn new(params: &'a TrainingParams, dtrain: &'a DMatrix, num_boost_round: usize) -> Self {
+    /// Train on `dtrain` (a [`DMatrix`] or [`BinnedMatrix`]) for (at most)
+    /// `num_boost_round` iterations with `params`, which name the objective
+    /// and metrics.
+    pub fn new(
+        params: &'a TrainingParams,
+        dtrain: impl Into<TrainingData<'a>>,
+        num_boost_round: usize,
+    ) -> Self {
         Trainer {
             params,
-            dtrain,
+            dtrain: dtrain.into().0,
             num_boost_round,
             evals: Vec::new(),
             early_stopping_rounds: None,

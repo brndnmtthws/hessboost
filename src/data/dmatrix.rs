@@ -180,6 +180,21 @@ enum Storage {
         indices: Arc<Vec<u32>>,
         values: Arc<Vec<f32>>,
     },
+    /// No values: only the `hist` index binned from them with `max_bin`
+    /// cuts, the storage of a [`BinnedMatrix`](crate::data::BinnedMatrix).
+    Bins {
+        index: Arc<GHistIndex>,
+        max_bin: usize,
+    },
+}
+
+/// What reading the values of a matrix holding only bins does. Training is
+/// the one operation that takes such a matrix, and it refuses every option
+/// that reads values before it starts
+/// ([`BinnedMatrix`](crate::data::BinnedMatrix)), so reaching this is a bug.
+#[cold]
+fn no_values() -> ! {
+    panic!("a binned matrix's feature values were read: only its bins exist")
 }
 
 /// Where a row view's histogram index takes its cuts
@@ -623,6 +638,7 @@ impl DMatrix {
                     return Err(invalid(col, v));
                 }
             }
+            Storage::Bins { .. } => no_values(),
         }
         Ok(self)
     }
@@ -750,6 +766,7 @@ impl DMatrix {
                 rows: self.rows.as_deref(),
             }),
             Storage::Csr { .. } => None,
+            Storage::Bins { .. } => no_values(),
         }
     }
 
@@ -770,6 +787,7 @@ impl DMatrix {
                 values,
                 rows: self.rows.as_deref(),
             }),
+            Storage::Bins { .. } => no_values(),
         }
     }
 
@@ -784,6 +802,7 @@ impl DMatrix {
     pub(crate) fn dense_values_mut(&mut self) -> Option<&mut [f32]> {
         let own = match (&self.storage, &self.rows) {
             (Storage::Csr { .. }, _) => return None,
+            (Storage::Bins { .. }, _) => no_values(),
             (Storage::Dense(values), Some(rows)) => {
                 let n_cols = self.n_cols;
                 let mut own = Vec::with_capacity(rows.len() * n_cols);
@@ -803,6 +822,7 @@ impl DMatrix {
         match &mut self.storage {
             Storage::Dense(data) => Some(Arc::make_mut(data).as_mut_slice()),
             Storage::Csr { .. } => None,
+            Storage::Bins { .. } => no_values(),
         }
     }
 
@@ -812,8 +832,17 @@ impl DMatrix {
     /// view its source's index, gathered: built on first use, then shared
     /// by every matrix sharing the values (clones and metadata copies,
     /// across threads), and freed with them. See
-    /// [`bin_cache`](crate::data::bin_cache).
+    /// [`bin_cache`](crate::data::bin_cache). A binned matrix's is its one
+    /// index, whose `max_bin` training checks first.
     pub(crate) fn hist_index(&self, max_bin: usize) -> Arc<GHistIndex> {
+        if let Storage::Bins {
+            index,
+            max_bin: binned,
+        } = &self.storage
+        {
+            debug_assert_eq!(max_bin, *binned, "training refuses another max_bin");
+            return Arc::clone(index);
+        }
         if let Some(source) = &self.cut_source {
             // The gather may wait on its source's own (parallel) build, so
             // with threads to spare it always builds on a pool of its own.
@@ -872,6 +901,28 @@ impl DMatrix {
             }
         }
         sketched
+    }
+
+    /// The `max_bin` a binned matrix's index was cut with; `None` for a
+    /// matrix holding values.
+    pub(crate) fn binned_max_bin(&self) -> Option<usize> {
+        match &self.storage {
+            Storage::Bins { max_bin, .. } => Some(*max_bin),
+            Storage::Dense(_) | Storage::Csr { .. } => None,
+        }
+    }
+
+    /// This matrix's metadata over `index` instead of its values: the
+    /// matrix of a [`BinnedMatrix`](crate::data::BinnedMatrix), which keeps
+    /// the index binned with `max_bin` alive without the values.
+    pub(crate) fn without_values(&self, index: Arc<GHistIndex>, max_bin: usize) -> DMatrix {
+        DMatrix {
+            storage: Storage::Bins { index, max_bin },
+            rows: None,
+            cut_source: None,
+            bins: Arc::default(),
+            ..self.clone()
+        }
     }
 
     /// Copy of this matrix, metadata included, with every non-missing stored
@@ -941,6 +992,7 @@ impl DMatrix {
                     values: Arc::new(values),
                 }
             }
+            (Storage::Bins { .. }, _) => no_values(),
         };
         let mut out = self.clone();
         out.storage = storage;

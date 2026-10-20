@@ -374,8 +374,11 @@ ones wait for the first build), reused by every training of a matrix
 sharing the values, and freed with them. A view bins its own rows by
 default, bit-identical to binning a copy of them; `ViewCuts::Source`
 gathers its rows of the source's index instead, so a source and its views
-share one binning pass. Dense input is checked 256 values at a time without
-a branch, and from 2^22 values on, checked and copied in parallel
+share one binning pass. A `BinnedMatrix` keeps just that index and the
+metadata, so its training holds no feature values at all (the index of a
+4M x 173 panel with 42% missing values takes 1.4 GiB, against 2.6 GiB of
+`f32` values). Dense input is checked 256 values at a time without a
+branch, and from 2^22 values on, checked and copied in parallel
 2^18-value blocks.
 
 ### Prediction

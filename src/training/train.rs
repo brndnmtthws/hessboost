@@ -7,7 +7,7 @@ use super::margins::MarginCaches;
 use super::prepare::{Prepared, TrainContext, prepare_builder};
 use super::round::{RoundPlan, RoundState, grow_round, refresh_round};
 use super::row_sampling::RowMeta;
-use super::validate::{TrainRequest, validate_request};
+use super::validate::{TrainRequest, validate_binned_request, validate_request};
 use crate::config::{BoosterKind, ProcessType, TrainingParams};
 use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
@@ -63,6 +63,9 @@ pub(super) fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<T
         early_stopping_rounds,
     };
     validate_request(&request, objective)?;
+    if let Some(max_bin) = dtrain.binned_max_bin() {
+        validate_binned_request(params, max_bin, init_model.is_some())?;
+    }
     let info = dtrain.info();
     let n_out = objective.n_outputs();
     let sglb = Sglb::resolve(params, dtrain.n_rows())?;

@@ -1,5 +1,6 @@
-"""``DMatrix`` (exported from :mod:`hessboost`) and the feature boundary
-every pairing of data with a model or a training matrix goes through."""
+"""``DMatrix`` and ``BinnedMatrix`` (exported from :mod:`hessboost`) and
+the feature boundary every pairing of data with a model or a training
+matrix goes through."""
 
 from __future__ import annotations
 
@@ -12,10 +13,59 @@ from numpy.typing import ArrayLike, NDArray
 from hessboost import _data, _hessboost
 from hessboost._exceptions import HessboostError
 
-__all__ = ["DMatrix"]
+__all__ = ["BinnedMatrix", "DMatrix"]
 
 
-class DMatrix:
+class _Metadata[Core: (_hessboost.DMatrix, _hessboost.BinnedMatrix)]:
+    """What :class:`DMatrix` and :class:`BinnedMatrix` read alike: their
+    shape, feature types, and per-row metadata."""
+
+    _core: Core
+    _feature_types: list[str] | None
+
+    def num_row(self) -> int:
+        """The number of rows."""
+        return self._core.num_row
+
+    def num_col(self) -> int:
+        """The number of features."""
+        return self._core.num_col
+
+    @property
+    def feature_types(self) -> list[str] | None:
+        """``"q"``/``"c"`` per feature, or ``None`` when every feature is
+        numerical by default."""
+        return None if self._feature_types is None else list(self._feature_types)
+
+    def get_label(self) -> NDArray[np.float32]:
+        """The labels, ``(rows,)`` or ``(rows, targets)``; empty when unset."""
+        return _or_empty(self._core.label)
+
+    def get_weight(self) -> NDArray[np.float32]:
+        """The instance weights; empty when unset."""
+        return _or_empty(self._core.weight)
+
+    def get_base_margin(self) -> NDArray[np.float32]:
+        """The base margins, ``(rows,)`` or ``(rows, outputs)``; empty when
+        unset."""
+        return _or_empty(self._core.base_margin)
+
+    def get_group(self) -> NDArray[np.int64]:
+        """The query-group sizes; empty when unset."""
+        group = self._core.group
+        return np.asarray([] if group is None else group, dtype=np.int64)
+
+    def get_label_bounds(self) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        """The ``survival:aft`` ``(lower, upper)`` label bounds; empty when
+        unset."""
+        return _or_empty(self._core.label_lower_bound), _or_empty(self._core.label_upper_bound)
+
+    def get_feature_weights(self) -> NDArray[np.float32]:
+        """The column-sampling feature weights; empty when unset."""
+        return _or_empty(self._core.feature_weights)
+
+
+class DMatrix(_Metadata[_hessboost.DMatrix]):
     """A dataset: features plus labels, weights, base margins, ranking
     groups and feature metadata, as XGBoost's ``xgboost.DMatrix``.
 
@@ -162,14 +212,6 @@ class DMatrix:
         )
         return matrix
 
-    def num_row(self) -> int:
-        """The number of rows."""
-        return self._core.num_row
-
-    def num_col(self) -> int:
-        """The number of features."""
-        return self._core.num_col
-
     @property
     def feature_names(self) -> list[str] | None:
         """The feature names, or ``None``. Assigning checks the count and
@@ -179,39 +221,6 @@ class DMatrix:
     @feature_names.setter
     def feature_names(self, names: Sequence[str] | None) -> None:
         self._feature_names = None if names is None else _data._check_names(names, self.num_col())
-
-    @property
-    def feature_types(self) -> list[str] | None:
-        """``"q"``/``"c"`` per feature, or ``None`` when every feature is
-        numerical by default."""
-        return None if self._feature_types is None else list(self._feature_types)
-
-    def get_label(self) -> NDArray[np.float32]:
-        """The labels, ``(rows,)`` or ``(rows, targets)``; empty when unset."""
-        return _or_empty(self._core.label)
-
-    def get_weight(self) -> NDArray[np.float32]:
-        """The instance weights; empty when unset."""
-        return _or_empty(self._core.weight)
-
-    def get_base_margin(self) -> NDArray[np.float32]:
-        """The base margins, ``(rows,)`` or ``(rows, outputs)``; empty when
-        unset."""
-        return _or_empty(self._core.base_margin)
-
-    def get_group(self) -> NDArray[np.int64]:
-        """The query-group sizes; empty when unset."""
-        group = self._core.group
-        return np.asarray([] if group is None else group, dtype=np.int64)
-
-    def get_label_bounds(self) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-        """The ``survival:aft`` ``(lower, upper)`` label bounds; empty when
-        unset."""
-        return _or_empty(self._core.label_lower_bound), _or_empty(self._core.label_upper_bound)
-
-    def get_feature_weights(self) -> NDArray[np.float32]:
-        """The column-sampling feature weights; empty when unset."""
-        return _or_empty(self._core.feature_weights)
 
     def set_info(
         self,
@@ -226,8 +235,9 @@ class DMatrix:
         feature_weights: ArrayLike | None = None,
     ) -> None:
         """Replaces the given metadata (``None`` keeps the current value),
-        validated as the constructor validates it. The features are copied
-        once per call."""
+        validated as the constructor validates it. Only the metadata is
+        copied: the feature values, and the bins training builds from them,
+        stay shared."""
         info = _data.info(
             label=label,
             weight=weight,
@@ -268,6 +278,95 @@ class DMatrix:
 
     def __repr__(self) -> str:
         return f"DMatrix(rows={self.num_row()}, features={self.num_col()})"
+
+
+class BinnedMatrix(_Metadata[_hessboost.BinnedMatrix]):
+    """A training matrix of a :class:`DMatrix`'s histogram bins, without
+    its feature values, as XGBoost's ``xgboost.QuantileDMatrix``:
+    :func:`train` with ``tree_method="hist"`` reads nothing else, so once
+    binned, the values (the ``DMatrix`` and the array it was built from)
+    can be freed.
+
+    Training on it is training on ``data``, bit for bit: its bins are the
+    ones ``data``'s own training builds for ``max_bin`` (cut from its
+    values, weights, feature types and missing value, and shared with it),
+    and ``train``'s ``max_bin`` must equal it. The weights and feature types
+    are therefore fixed; the labels, base margins, query groups, label
+    bounds and feature weights can be replaced (:meth:`set_info`). It keeps
+    ``data``'s feature names, types and categories.
+
+    Only :func:`train` takes one, and it refuses what would read the
+    values: a ``tree_method`` other than ``hist``, a booster other than
+    ``gbtree``, ``xgb_model``, ``device="cuda"``, and the options outside
+    ``hist`` growth, such as ``linear_tree`` (the error names them).
+    Evaluate and predict on a :class:`DMatrix`.
+
+    Args:
+        data: The matrix to bin.
+        max_bin: The most bins per feature, as ``train``'s ``max_bin``.
+
+    Raises:
+        HessboostError: ``max_bin`` is below 2, or a row has a zero weight
+            (the cuts need every row: :meth:`DMatrix.slice` the weighted
+            rows instead).
+        TypeError: ``data`` is not a :class:`DMatrix`.
+    """
+
+    __module__ = "hessboost"
+
+    _feature_names: list[str] | None
+    _categories: _data.Categories
+
+    def __init__(self, data: DMatrix, max_bin: int = 256) -> None:
+        if not isinstance(data, DMatrix):
+            raise TypeError(f"data must be a DMatrix, got {type(data).__name__}")
+        self._core = _hessboost.BinnedMatrix(data._core, int(max_bin))
+        self._feature_names = data._feature_names
+        self._feature_types = data._feature_types
+        self._categories = data._categories
+
+    @property
+    def max_bin(self) -> int:
+        """The most bins per feature it was binned with, the ``max_bin``
+        training must use."""
+        return self._core.max_bin
+
+    @property
+    def feature_names(self) -> list[str] | None:
+        """The feature names, or ``None``."""
+        return None if self._feature_names is None else list(self._feature_names)
+
+    def set_info(
+        self,
+        *,
+        label: ArrayLike | None = None,
+        base_margin: ArrayLike | None = None,
+        group: ArrayLike | None = None,
+        qid: ArrayLike | None = None,
+        label_lower_bound: ArrayLike | None = None,
+        label_upper_bound: ArrayLike | None = None,
+        feature_weights: ArrayLike | None = None,
+    ) -> None:
+        """Replaces the given metadata (``None`` keeps the current value),
+        validated as :class:`DMatrix` validates it; the bins stay shared.
+        Weights shaped the cuts, so they cannot change."""
+        info = _data.info(
+            label=label,
+            base_margin=base_margin,
+            group=group,
+            qid=qid,
+            label_lower_bound=label_lower_bound,
+            label_upper_bound=label_upper_bound,
+            feature_weights=feature_weights,
+        )
+        if info:
+            self._core = self._core.with_info({**info, "categorical": None})
+
+    def __repr__(self) -> str:
+        return (
+            f"BinnedMatrix(rows={self.num_row()}, features={self.num_col()}, "
+            f"max_bin={self.max_bin})"
+        )
 
 
 _RECODE_HINT = "; pass the DataFrame itself, which is re-coded to the model's categories"
@@ -358,7 +457,12 @@ def _matrix_for(
     checked against every reference with :func:`_check_schema` (feature
     names only with ``validate_names``), since a reference without recorded
     categories matches anything. With no references this is the training
-    matrix of ``data`` and ``label``."""
+    matrix of ``data`` and ``label``. A :class:`BinnedMatrix`, which has no
+    values to read, is refused."""
+    if isinstance(data, BinnedMatrix):
+        raise TypeError(
+            "a BinnedMatrix holds bins, not feature values: evaluate and predict on a DMatrix"
+        )
     # Resolves frame column names; refuses one for anything else, a DMatrix
     # included.
     data, fields = _data.take_metadata(data, label=label, base_margin=base_margin)

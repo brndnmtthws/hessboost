@@ -1,9 +1,12 @@
 //! `DMatrix`: hessboost's dataset container, built from borrowed row-major
-//! `float32` arrays (the Python layer converts everything else).
+//! `float32` arrays (the Python layer converts everything else), and
+//! `BinnedMatrix`, a matrix's histogram bins without its values.
 
 use crate::errors::{DetachExt, refuse};
 use hessboost::conformal::Interval;
-use hessboost::data::{DMatrix as RustMatrix, FeatureType, GroupInfo, ViewCuts};
+use hessboost::data::{
+    BinnedMatrix as RustBinned, DMatrix as RustMatrix, FeatureType, GroupInfo, ViewCuts,
+};
 use numpy::ndarray::{ArrayD, IxDyn};
 use numpy::{
     IntoPyArray, PyArrayDyn, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
@@ -194,6 +197,98 @@ impl InfoSlices<'_> {
         }
         Ok(matrix)
     }
+
+    /// `binned` with every given field attached; weights and feature types,
+    /// which shaped its cuts, are refused.
+    fn apply_binned(&self, mut binned: RustBinned) -> hessboost::error::Result<RustBinned> {
+        let fixed = |input, reason| {
+            Err(hessboost::error::HessboostError::invalid_data(
+                input, reason,
+            ))
+        };
+        if self.weight.is_some() {
+            return fixed(
+                "weight",
+                "a binned matrix keeps the weights its cuts were sketched with",
+            );
+        }
+        if self.categorical.is_some() {
+            return fixed(
+                "feature_types",
+                "a binned matrix keeps the feature types its cuts were computed for",
+            );
+        }
+        if let Some((label, targets)) = self.label {
+            binned = binned.with_label_matrix(label, targets)?;
+        }
+        if let Some(group) = self.group {
+            binned = binned.with_group_sizes(group)?;
+        }
+        if let Some(margin) = self.base_margin {
+            binned = binned.with_base_margin(margin)?;
+        }
+        if let Some((lower, upper)) = self.label_bounds {
+            binned = binned.with_label_bounds(lower, upper)?;
+        }
+        if let Some(weights) = self.feature_weights {
+            binned = binned.with_feature_weights(weights)?;
+        }
+        Ok(binned)
+    }
+}
+
+/// `(rows,)` values, or `(rows, width)` when each row holds `width`.
+fn rows_array<'py>(
+    py: Python<'py>,
+    values: Option<&[f32]>,
+    rows: usize,
+) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
+    values
+        .map(|values| {
+            let width = values.len() / rows.max(1);
+            let shape: &[usize] = if width == 1 { &[rows] } else { &[rows, width] };
+            to_numpy(py, values.to_vec(), shape)
+        })
+        .transpose()
+}
+
+/// `(rows,)` labels, or `(rows, targets)` for a label matrix.
+fn labels_array<'py>(
+    py: Python<'py>,
+    labels: Option<&[f32]>,
+    rows: usize,
+    targets: usize,
+) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
+    labels
+        .map(|labels| {
+            let shape: &[usize] = if targets == 1 {
+                &[rows]
+            } else {
+                &[rows, targets]
+            };
+            to_numpy(py, labels.to_vec(), shape)
+        })
+        .transpose()
+}
+
+/// Query-group sizes, if any.
+fn group_sizes(group: Option<&GroupInfo>) -> Option<Vec<usize>> {
+    group.map(|group| {
+        group
+            .iter_ranges()
+            .map(|(start, end)| end - start)
+            .collect()
+    })
+}
+
+/// Indices of the categorical columns.
+fn categorical_columns(types: &[FeatureType]) -> Vec<usize> {
+    types
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == FeatureType::Categorical)
+        .map(|(column, _)| column)
+        .collect()
 }
 
 /// An immutable hessboost dataset: features plus labels, weights, margins,
@@ -201,22 +296,6 @@ impl InfoSlices<'_> {
 #[pyclass(frozen, module = "hessboost._hessboost")]
 pub struct DMatrix {
     pub(crate) inner: RustMatrix,
-}
-
-impl DMatrix {
-    fn vector<'py>(
-        py: Python<'py>,
-        values: Option<&[f32]>,
-        rows: usize,
-    ) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
-        values
-            .map(|values| {
-                let width = values.len() / rows.max(1);
-                let shape: &[usize] = if width == 1 { &[rows] } else { &[rows, width] };
-                to_numpy(py, values.to_vec(), shape)
-            })
-            .transpose()
-    }
 }
 
 #[pymethods]
@@ -345,28 +424,18 @@ impl DMatrix {
 
     #[getter]
     fn label<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
-        let rows = self.inner.n_rows();
-        self.inner
-            .labels()
-            .map(|labels| {
-                let targets = self.inner.n_targets();
-                if targets == 1 {
-                    to_numpy(py, labels.to_vec(), &[rows])
-                } else {
-                    to_numpy(py, labels.to_vec(), &[rows, targets])
-                }
-            })
-            .transpose()
+        let m = &self.inner;
+        labels_array(py, m.labels(), m.n_rows(), m.n_targets())
     }
 
     #[getter]
     fn weight<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
-        Self::vector(py, self.inner.weights(), self.inner.n_rows())
+        rows_array(py, self.inner.weights(), self.inner.n_rows())
     }
 
     #[getter]
     fn base_margin<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
-        Self::vector(py, self.inner.base_margin(), self.inner.n_rows())
+        rows_array(py, self.inner.base_margin(), self.inner.n_rows())
     }
 
     #[getter]
@@ -374,7 +443,7 @@ impl DMatrix {
         &self,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
-        Self::vector(py, self.inner.label_lower_bound(), self.inner.n_rows())
+        rows_array(py, self.inner.label_lower_bound(), self.inner.n_rows())
     }
 
     #[getter]
@@ -382,7 +451,7 @@ impl DMatrix {
         &self,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
-        Self::vector(py, self.inner.label_upper_bound(), self.inner.n_rows())
+        rows_array(py, self.inner.label_upper_bound(), self.inner.n_rows())
     }
 
     #[getter]
@@ -390,29 +459,111 @@ impl DMatrix {
         &self,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
-        Self::vector(py, self.inner.feature_weights(), self.inner.n_cols())
+        rows_array(py, self.inner.feature_weights(), self.inner.n_cols())
     }
 
     /// Query-group sizes, if any.
     #[getter]
     fn group(&self) -> Option<Vec<usize>> {
-        self.inner.group().map(|group| {
-            group
-                .iter_ranges()
-                .map(|(start, end)| end - start)
-                .collect()
-        })
+        group_sizes(self.inner.group())
     }
 
     /// Indices of the categorical columns.
     #[getter]
     fn categorical(&self) -> Vec<usize> {
-        self.inner
-            .feature_types()
-            .iter()
-            .enumerate()
-            .filter(|(_, kind)| **kind == FeatureType::Categorical)
-            .map(|(column, _)| column)
-            .collect()
+        categorical_columns(self.inner.feature_types())
+    }
+}
+
+/// A training matrix of a `DMatrix`'s histogram bins, without its feature
+/// values; only training takes it. Build a changed copy with `with_info`.
+#[pyclass(frozen, module = "hessboost._hessboost")]
+pub struct BinnedMatrix {
+    pub(crate) inner: RustBinned,
+}
+
+#[pymethods]
+impl BinnedMatrix {
+    /// `data` binned with at most `max_bin` bins per feature, keeping its
+    /// metadata.
+    #[new]
+    fn new(py: Python<'_>, data: &DMatrix, max_bin: usize) -> PyResult<Self> {
+        let inner = py.detached(|| RustBinned::new(&data.inner, max_bin))?;
+        Ok(Self { inner })
+    }
+
+    /// A copy with the fields present in `info` replaced; weights and
+    /// feature types are refused.
+    fn with_info(&self, py: Python<'_>, info: Info<'_>) -> PyResult<Self> {
+        let info = info.slices()?;
+        let inner = py.detached(|| info.apply_binned(self.inner.clone()))?;
+        Ok(Self { inner })
+    }
+
+    #[getter]
+    fn num_row(&self) -> usize {
+        self.inner.n_rows()
+    }
+
+    #[getter]
+    fn num_col(&self) -> usize {
+        self.inner.n_cols()
+    }
+
+    #[getter]
+    fn max_bin(&self) -> usize {
+        self.inner.max_bin()
+    }
+
+    #[getter]
+    fn label<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
+        let m = &self.inner;
+        labels_array(py, m.labels(), m.n_rows(), m.n_targets())
+    }
+
+    #[getter]
+    fn weight<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
+        rows_array(py, self.inner.weights(), self.inner.n_rows())
+    }
+
+    #[getter]
+    fn base_margin<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
+        rows_array(py, self.inner.base_margin(), self.inner.n_rows())
+    }
+
+    #[getter]
+    fn label_lower_bound<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
+        rows_array(py, self.inner.label_lower_bound(), self.inner.n_rows())
+    }
+
+    #[getter]
+    fn label_upper_bound<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
+        rows_array(py, self.inner.label_upper_bound(), self.inner.n_rows())
+    }
+
+    #[getter]
+    fn feature_weights<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyArrayDyn<f32>>>> {
+        rows_array(py, self.inner.feature_weights(), self.inner.n_cols())
+    }
+
+    /// Query-group sizes, if any.
+    #[getter]
+    fn group(&self) -> Option<Vec<usize>> {
+        group_sizes(self.inner.group())
+    }
+
+    /// Indices of the categorical columns.
+    #[getter]
+    fn categorical(&self) -> Vec<usize> {
+        categorical_columns(self.inner.feature_types())
     }
 }

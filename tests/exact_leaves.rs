@@ -2,13 +2,13 @@
 //! every tree is `eta` times the residual quantile of the training rows
 //! prediction routes to it, checked against a brute-force reference with
 //! missing values, row and column sampling, sample weights, several levels,
-//! vector leaves, label matrices, and `max_delta_step`; models do not depend
-//! on the thread count, and the combinations that would set the leaves
-//! otherwise are refused.
+//! vector leaves, forests, label matrices, and `max_delta_step`; models do
+//! not depend on the thread count, and the combinations that would set the
+//! leaves otherwise are refused.
 
 use hessboost::config::{
-    BoosterKind, Dart, LeafEstimation, LinearTree, MaxDeltaStep, Monotone, MultiStrategy,
-    TrainingParamsBuilder,
+    BoosterKind, Dart, GrowPolicy, LeafEstimation, LinearTree, MaxDeltaStep, Monotone,
+    MultiStrategy, TrainingParamsBuilder,
 };
 use hessboost::objective::{Objective, Quantiles};
 use hessboost::prelude::*;
@@ -107,15 +107,18 @@ struct Reference<'a> {
 }
 
 impl Reference<'_> {
-    /// Every leaf of `model`, tree by tree, holds `eta` times the
-    /// (bound-clamped) quantile at `levels[output]` of `label[column] -
-    /// margin[output]` over the rows routed to it, at the margins of the
-    /// iterations before its tree's.
+    /// Every leaf of `model`, tree by tree, holds `eta / num_parallel_tree`
+    /// times the (bound-clamped) quantile at `levels[output]` of
+    /// `label[column] - margin[output]` over the rows routed to it, at the
+    /// margins of the iterations before its tree's: every tree of a forest
+    /// fits the same margins.
     fn check(&self, model: &BoostedModel) {
         let n_out = model.n_outputs();
         let label_cols = self.data.n_targets();
         let labels = self.data.labels().unwrap();
         let per_iteration = model.trees_per_iteration();
+        let parallel = model.num_parallel_tree();
+        let eta = ETA / parallel as f32;
         for (t, tree) in model.trees().iter().enumerate() {
             let margins = model
                 .predict_margin(self.data, ..t / per_iteration)
@@ -131,7 +134,7 @@ impl Reference<'_> {
                     None => interpolated(rows.iter().map(|&r| residual(r)).collect(), alpha),
                     Some(w) => weighted(rows.iter().map(|&r| (residual(r), w[r])).collect(), alpha),
                 };
-                self.bound.map_or(q, |b| q.clamp(-b, b)) * ETA
+                self.bound.map_or(q, |b| q.clamp(-b, b)) * eta
             };
             for (leaf, rows) in leaf_rows(tree, self.x).iter().enumerate() {
                 if !tree.node(leaf).is_leaf() {
@@ -147,7 +150,8 @@ impl Reference<'_> {
                         );
                     }
                 } else {
-                    let want = value(rows, t % per_iteration);
+                    // Scalar trees are grouped by output, a forest per output.
+                    let want = value(rows, t % per_iteration / parallel);
                     let got = tree.node(leaf).leaf_value;
                     assert_eq!(got.to_bits(), want.to_bits(), "tree {t} leaf {leaf}");
                 }
@@ -178,22 +182,31 @@ fn scalar_leaves_are_the_residual_quantiles_of_every_row() {
         .with_labels(&y)
         .unwrap();
     let levels = [0.1, 0.5, 0.9];
-    let model = train(
-        &params().objective(quantiles(&levels)).build().unwrap(),
-        &data,
-        4,
-    )
-    .unwrap();
-    assert_eq!(model.num_trees(), 12);
-    Reference {
-        data: &data,
-        x: &x,
-        weights: None,
-        levels: &levels,
-        columns: &[0, 0, 0],
-        bound: None,
+    // Every builder hands its finished structure over before `eta`.
+    for (method, policy) in [
+        (TreeMethod::Hist, GrowPolicy::DepthWise),
+        (TreeMethod::Hist, GrowPolicy::Symmetric),
+        (TreeMethod::Approx, GrowPolicy::DepthWise),
+        (TreeMethod::Exact, GrowPolicy::DepthWise),
+    ] {
+        let p = params()
+            .objective(quantiles(&levels))
+            .tree_method(method)
+            .grow_policy(policy)
+            .build()
+            .unwrap();
+        let model = train(&p, &data, 4).unwrap();
+        assert_eq!(model.num_trees(), 12);
+        Reference {
+            data: &data,
+            x: &x,
+            weights: None,
+            levels: &levels,
+            columns: &[0, 0, 0],
+            bound: None,
+        }
+        .check(&model);
     }
-    .check(&model);
 }
 
 #[test]
@@ -258,6 +271,38 @@ fn vector_leaves_hold_every_levels_quantile() {
         bound: None,
     }
     .check(&model);
+}
+
+#[test]
+fn every_tree_of_a_forest_fits_the_iterations_starting_margins() {
+    let (x, y) = features();
+    let data = DMatrix::from_dense(&x, ROWS, COLS)
+        .unwrap()
+        .with_labels(&y)
+        .unwrap();
+    let levels = [0.1, 0.9];
+    for strategy in [
+        MultiStrategy::OneOutputPerTree,
+        MultiStrategy::MultiOutputTree,
+    ] {
+        let p = params()
+            .objective(quantiles(&levels))
+            .multi_strategy(strategy)
+            .num_parallel_tree(3)
+            .build()
+            .unwrap();
+        let model = train(&p, &data, 3).unwrap();
+        assert_eq!(model.num_parallel_tree(), 3);
+        Reference {
+            data: &data,
+            x: &x,
+            weights: None,
+            levels: &levels,
+            columns: &[0, 0],
+            bound: None,
+        }
+        .check(&model);
+    }
 }
 
 #[test]

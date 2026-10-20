@@ -131,10 +131,11 @@ impl LinearLeaves {
         out as f32
     }
 
-    /// Multiply every intercept and slope by `factor` (shrinkage).
-    pub(crate) fn scale(&mut self, factor: f64) {
+    /// Replace every intercept and slope `v` by `map(v)` (shrinkage, model
+    /// averaging).
+    pub(crate) fn map_coefficients(&mut self, map: impl Fn(f64) -> f64) {
         for v in self.intercepts.iter_mut().chain(&mut self.coeffs) {
-            *v *= factor;
+            *v = map(*v);
         }
     }
 

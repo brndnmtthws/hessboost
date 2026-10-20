@@ -74,10 +74,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<forest::ForestModel>()?;
     m.add_class::<target_stats::OrderedTargetEncoder>()?;
     m.add_class::<target_stats::FittedTargetEncoder>()?;
+    m.add_class::<train::CvReport>()?;
     m.add_function(wrap_pyfunction!(train::train, m)?)?;
     m.add_function(wrap_pyfunction!(train::train_with_budget, m)?)?;
-    m.add_function(wrap_pyfunction!(train::cv, m)?)?;
-    m.add_function(wrap_pyfunction!(train::cv_refit, m)?)?;
+    m.add_function(wrap_pyfunction!(train::cross_validate, m)?)?;
+    m.add_function(wrap_pyfunction!(train::check_purged_tail, m)?)?;
+    m.add_function(wrap_pyfunction!(train::purged_tail_split, m)?)?;
     m.add_function(wrap_pyfunction!(train::k_fold, m)?)?;
     m.add_function(wrap_pyfunction!(train::forward_chaining, m)?)?;
     m.add_function(wrap_pyfunction!(train::purged_forward, m)?)?;

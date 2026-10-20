@@ -360,7 +360,9 @@ pub enum LeafEstimation {
     /// still grow the structure: output `j`'s leaf value is `eta` (over
     /// `num_parallel_tree`) times the quantile at level `alpha[j]` (for
     /// `reg:absoluteerror`, the median) of the residuals `label - margin` of
-    /// the training rows the finished tree routes to the leaf.
+    /// the training rows the finished tree routes to the leaf, at the
+    /// margins the iteration's gradients came from (every tree of a forest
+    /// fits the same ones).
     ///
     /// Every training row takes part, sampled or not, routed by its raw
     /// values as prediction routes it (XGBoost's adaptive leaves and

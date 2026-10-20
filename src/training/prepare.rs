@@ -3,6 +3,7 @@
 
 use super::dart::{round_rng, round_salt};
 use super::exact_leaves::ExactLeaves;
+use super::margins::RowRouting;
 use super::round::gather_output;
 use super::row_sampling::{RowMeta, gradient_sampling};
 use crate::config::{Device, GrowPolicy, TrainingParams, TreeMethod};
@@ -96,6 +97,17 @@ impl Prepared {
                 sketched: SketchedRows::All,
             } if backend.row_engine().is_some() => Some((index, backend.as_ref())),
             _ => None,
+        }
+    }
+
+    /// How finished trees route the training rows when no list of their
+    /// leaves was kept: by the index's bins when every row was sketched.
+    pub(super) fn row_routing(&self) -> RowRouting<'_> {
+        match self {
+            Prepared::Hist {
+                index, sketched, ..
+            } => RowRouting::of(index, *sketched),
+            Prepared::Exact(_) | Prepared::Approx { .. } => RowRouting::Values,
         }
     }
 

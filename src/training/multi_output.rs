@@ -5,7 +5,7 @@
 
 use super::dart::{dart_new_tree_weight, finish_dart, round_gradients};
 use super::exact_leaves::route_rows;
-use super::margins::{MarginCaches, TreeOutput};
+use super::margins::{MarginCaches, RowRouting, TreeOutput};
 use super::prepare::TrainContext;
 use super::round::tree_eta;
 use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
@@ -112,6 +112,14 @@ pub(super) struct VectorRound<'a> {
     pub(super) all_rows: &'a [u32],
 }
 
+impl VectorRound<'_> {
+    /// How finished trees route the training rows when no list of their
+    /// leaves was kept.
+    fn routing(&self) -> RowRouting<'_> {
+        RowRouting::of(self.ghist, self.sketched)
+    }
+}
+
 /// One boosting iteration: grow `num_parallel_tree` vector-leaf trees from
 /// the gradients at the current margins (DART: the ensemble minus this
 /// iteration's dropout set), add them to the model, and bring the train and
@@ -164,7 +172,7 @@ pub(super) fn boost_round(
                     && !gradient_sampling(params)
                     && ctx.sketched != SketchedRows::Partial);
             let captured = all_rows.then_some(leaf_rows.as_slice());
-            margins.add_tree(&tree, TreeOutput::Vector, captured);
+            margins.add_tree(&tree, TreeOutput::Vector, captured, ctx.routing());
         }
         model.push_tree_weighted(tree, weight);
     }
@@ -234,7 +242,7 @@ fn fit_tree(
     let (mut tree, mut leaf_rows) =
         MultiTreeBuilder::new(params).build(ctx.ghist, &grad, rows, &mut sampler);
     if let Some(exact) = ctx.run.exact_leaves {
-        leaf_rows = route_rows(&tree, ctx.run.dtrain);
+        leaf_rows = route_rows(&tree, ctx.run.dtrain, ctx.routing());
         exact.fit(&mut tree, TreeOutput::Vector, &leaf_rows, margins);
     }
     if let Some(langevin) = ctx.run.langevin {

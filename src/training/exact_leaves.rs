@@ -6,13 +6,13 @@
 //! loss (`reg:absoluteerror`, the median) over those rows.
 //!
 //! Every training row takes part, sampled or not. [`route_rows`] sends each
-//! one through the finished tree by raw value, as prediction does, and the
-//! same partition then adds the tree to the training margins. Leaves (and a
-//! vector leaf's outputs) are fit independently and in parallel, each from
-//! its residuals in a stable sort, so the values do not depend on the thread
-//! count.
+//! one through the finished tree as prediction does (by its bins when they
+//! route it as its values do), and the same partition then adds the tree to
+//! the training margins. Leaves (and a vector leaf's outputs) are fit
+//! independently and in parallel, each from its residuals in a stable sort,
+//! so the values do not depend on the thread count.
 
-use super::margins::TreeOutput;
+use super::margins::{RowRouting, TreeOutput};
 use crate::config::{LeafEstimation, TrainingParams};
 use crate::data::sort::{RadixScratch, sort_by_value, sort_values};
 use crate::data::{DMatrix, MetaInfo};
@@ -132,16 +132,30 @@ impl<'a> ExactLeaves<'a> {
     }
 }
 
-/// Every row of `data` routed through `tree` by raw value, as prediction
-/// routes it: one entry per leaf (an empty one for a leaf no row reaches),
-/// leaves in node order, each leaf's rows ascending.
-pub(super) fn route_rows(tree: &RegTree, data: &DMatrix) -> Vec<LeafRows> {
+/// Every row of `data` routed through `tree` as prediction routes it by raw
+/// value, through `routing`: one entry per leaf (an empty one for a leaf no
+/// row reaches), leaves in node order, each leaf's rows ascending.
+pub(super) fn route_rows(tree: &RegTree, data: &DMatrix, routing: RowRouting) -> Vec<LeafRows> {
     let n = data.n_rows();
-    let leaf_of: Vec<u32> = (0..n)
-        .into_par_iter()
-        .with_min_len(ROUTE_CHUNK_ROWS)
-        .map(|row| tree.leaf_id_with(|f| data.get(row, f as usize)) as u32)
-        .collect();
+    let mut leaf_of = vec![0u32; n];
+    match routing.binned(tree) {
+        Some(binned) => leaf_of
+            .par_chunks_mut(ROUTE_CHUNK_ROWS)
+            .enumerate()
+            .for_each(|(chunk, leaves)| {
+                let first = chunk * ROUTE_CHUNK_ROWS;
+                binned.for_each_leaf(first..first + leaves.len(), |row, leaf| {
+                    leaves[row - first] = leaf as u32;
+                });
+            }),
+        None => leaf_of
+            .par_iter_mut()
+            .with_min_len(ROUTE_CHUNK_ROWS)
+            .enumerate()
+            .for_each(|(row, leaf)| {
+                *leaf = tree.leaf_id_with(|f| data.get(row, f as usize)) as u32;
+            }),
+    }
     let mut counts = vec![0usize; tree.num_nodes()];
     for &leaf in &leaf_of {
         counts[leaf as usize] += 1;

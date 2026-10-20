@@ -258,6 +258,42 @@ impl HistCuts {
         // upper_bound: first cut strictly greater than value.
         global_bin(start, slice.partition_point(|&c| c <= value), slice.len())
     }
+
+    /// The local bins of numeric feature `f` that a split at `threshold`
+    /// (`value < threshold` goes left) sends left: those below the returned
+    /// limit. `None` when `threshold` falls inside a bin, being neither one
+    /// of the feature's cuts nor at most the smallest finite value, so that
+    /// a bin's values could go either way.
+    pub(crate) fn bins_left_of(&self, f: usize, threshold: f32) -> Option<usize> {
+        let (start, end) = self.feature_bins(f);
+        let cuts = &self.cut_values[start..end];
+        let limit = cuts.partition_point(|&c| c <= threshold);
+        let at_boundary = match limit.checked_sub(1) {
+            Some(last) => cuts[last] == threshold,
+            None => threshold <= f32::MIN,
+        };
+        at_boundary.then_some(limit)
+    }
+
+    /// Per local bin of categorical feature `f`, whether a split sending
+    /// `categories` left sends that bin left.
+    pub(crate) fn categories_left(&self, f: usize, categories: &[u32]) -> Vec<bool> {
+        let (start, end) = self.feature_bins(f);
+        // A bin goes left when its category code (`in_category_set`'s
+        // `cut as u32`) is in the set. Categorical cut values ascend and the
+        // saturating cast is monotone, so the codes ascend too: each category
+        // of the set marks its run of bins, found by binary search, instead
+        // of every bin scanning the set.
+        let codes = &self.cut_values[start..end];
+        let mut left = vec![false; codes.len()];
+        for &category in categories {
+            let first = codes.partition_point(|&c| (c as u32) < category);
+            for bin in (first..codes.len()).take_while(|&bin| codes[bin] as u32 == category) {
+                left[bin] = true;
+            }
+        }
+        left
+    }
 }
 
 /// Cuts per block of the two-level bin search.

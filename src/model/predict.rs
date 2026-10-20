@@ -108,6 +108,10 @@ impl BoostedModel {
         trees: std::ops::Range<usize>,
         weight: impl Fn(usize) -> f32 + Sync,
     ) {
+        // No tree to sum: nothing to load the rows for.
+        if trees.is_empty() {
+            return;
+        }
         let k = self.n_outputs();
         if self.has_vector_leaves() {
             self.traverse_blocks(

@@ -153,36 +153,8 @@ fn partition_categorical(
 ) -> (Vec<u32>, Vec<u32>) {
     let cuts = ghist.cuts();
     let (fs, _) = cuts.feature_bins(route.feature as usize);
-    let category_left = category_left(cuts, route.feature, categories);
+    let category_left = cuts.categories_left(route.feature as usize, categories);
     partition_by_bin(ghist, rows, route, |bin| category_left[bin - fs])
-}
-
-/// Per feature-local bin of `feature`, whether a categorical split sending
-/// `categories` left sends that bin left.
-pub(super) fn category_left(cuts: &HistCuts, feature: u32, categories: &[u32]) -> Vec<bool> {
-    let (fs, fe) = cuts.feature_bins(feature as usize);
-    // A bin goes left when its category code (`in_category_set`'s
-    // `cut as u32`) is in the set. Categorical cut values ascend and the
-    // saturating cast is monotone, so the codes ascend too: each category of
-    // the set marks its run of bins, found by binary search, instead of every
-    // bin scanning the set.
-    let code = |bin: usize| cuts.cut_value(bin) as u32;
-    let mut category_left = vec![false; fe - fs];
-    for &category in categories {
-        let (mut lo, mut hi) = (fs, fe);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if code(mid) < category {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        for bin in (lo..fe).take_while(|&bin| code(bin) == category) {
-            category_left[bin - fs] = true;
-        }
-    }
-    category_left
 }
 
 /// [`partition_rows`] without a numeric column fast path: a present bin

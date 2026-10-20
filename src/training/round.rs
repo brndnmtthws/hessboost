@@ -3,7 +3,7 @@
 
 use super::dart::{dart_new_tree_weight, finish_dart, round_gradients, round_rng, round_salt};
 use super::exact_leaves::route_rows;
-use super::margins::{MarginCaches, TreeOutput};
+use super::margins::{MarginCaches, RowRouting, TreeOutput};
 use super::prepare::{Prepared, TrainContext, TreeSample, approx_index};
 use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
 use crate::config::{BoosterKind, Device, GrowPolicy, Refresh, SamplingMethod, TrainingParams};
@@ -197,7 +197,11 @@ pub(super) fn refresh_round(
             RegTree::with_root(0.0),
         );
         refresh_tree(&mut tree, dtrain, gk, params, refresh, tree_eta(params));
-        state.margins.add_tree(&tree, TreeOutput::Scalar(k), None);
+        // Refreshed trees split where the initial model did, not on cuts.
+        let output = TreeOutput::Scalar(k);
+        state
+            .margins
+            .add_tree(&tree, output, None, RowRouting::Values);
         state.model.push_tree_weighted(tree, 1.0);
     }
     Ok(())
@@ -382,11 +386,13 @@ pub(super) fn grow_round(
         // caches, which `finish_dart` recomputes.
         if dropped.is_none() {
             // The builder's final row partitions already identify the training
-            // leaves when every row took part in growing the tree.
+            // leaves when every row took part in growing the tree; otherwise
+            // the rows are routed, by bins where they route as values do.
             let captured = slot.margin_rows.then_some(leaf_rows.as_slice());
+            let output = TreeOutput::Scalar(slot.output);
             state
                 .margins
-                .add_tree(&tree, TreeOutput::Scalar(slot.output), captured);
+                .add_tree(&tree, output, captured, prepared.row_routing());
         }
         state.model.push_tree_weighted(tree, weight);
     }
@@ -572,7 +578,7 @@ fn grow_sampled_tree(
         slot.capture_rows,
     );
     if let Some(exact) = grow.run.exact_leaves {
-        leaf_rows = route_rows(&tree, dtrain);
+        leaf_rows = route_rows(&tree, dtrain, grow.prepared.row_routing());
         exact.fit(
             &mut tree,
             TreeOutput::Scalar(slot.output),

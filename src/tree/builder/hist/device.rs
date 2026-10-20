@@ -20,7 +20,7 @@ use crate::config::GrowPolicy;
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
-use crate::tree::builder::partition::{category_left, with_sibling};
+use crate::tree::builder::partition::with_sibling;
 use crate::tree::builder::shared::{InteractionState, LeafRows, rayon_available};
 use crate::tree::builder::split::SplitScorer;
 use crate::tree::builder::{BestSplit, Children, SplitLocation, SplitPos, limit_or_unbounded};
@@ -341,7 +341,7 @@ impl HistTreeBuilder<'_> {
             .iter()
             .map(|split| match &split.entry.best.location {
                 SplitLocation::Categories(categories) => {
-                    Some(category_left(cuts, split.entry.best.feature, categories))
+                    Some(cuts.categories_left(split.entry.best.feature as usize, categories))
                 }
                 SplitLocation::Numeric(_) => None,
             })

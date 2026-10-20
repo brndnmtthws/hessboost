@@ -338,9 +338,13 @@ included.
 
 Leaves at `max_depth` skip histograms and split search. Under full row
 sampling, training keeps their final partitions (depthwise, loss-guide,
-exact) and adds leaf values straight into cached margins. Sampled and eval
-sets update disjoint rows in parallel, skipping inputs too small to
-parallelize. Stats, monotone bounds, and sampler draws preserved.
+exact) and adds leaf values straight into cached margins. Sampled rounds,
+and exact leaves, route every training row through the finished tree by its
+bins in the index's feature columns instead of its raw values, when
+the cuts were sketched from every row (no zero sample weight), which makes
+the two routings agree; eval sets route by value. Margin updates run over
+disjoint row chunks in parallel, skipping inputs too small to parallelize.
+Stats, monotone bounds, and sampler draws preserved.
 
 Cuts stream dense rows through in 65,536-row blocks, each transposed so
 every feature's sketch takes its values in row order (CSR input goes

@@ -213,11 +213,13 @@ impl GHistIndex {
     pub fn from_dmatrix(data: &DMatrix, cuts: HistCuts) -> Self {
         let n_rows = data.n_rows();
         let n_cols = cuts.n_features();
-        debug_assert_eq!(data.n_cols(), n_cols, "cuts are the data's");
-        // Every feature owns at least one bin, so the search's clamp to the
-        // last bin keeps every bin inside its feature's range (the type's
-        // invariant). `HistCuts` always builds one; this guards the unsafe
-        // histogram loops against any other source.
+        // Binning reads `data`'s features and stores the cuts' width, which
+        // the unsafe histogram loops (and the device backends) index rows
+        // by: they must agree, as must every feature's bin count with the
+        // search's clamp to its last bin (the type's invariant). `HistCuts`
+        // from the data always satisfies both; these guard against any
+        // other source.
+        assert_eq!(data.n_cols(), n_cols, "a cut table for every feature");
         assert!(
             (0..n_cols).all(|f| cuts.num_bins(f) > 0),
             "every feature of a cut table owns at least one bin"
@@ -524,20 +526,26 @@ impl GHistIndex {
 
     /// Every feature's column of *global* bins, feature-major, the width's
     /// maximum where the row lacks the feature: the store the Metal and
-    /// wgpu backends upload. `u16` when every global bin fits it (and, with
-    /// missing entries, stays below the sentinel), else `u32`.
+    /// wgpu backends upload, in `u16` when
+    /// [`global_columns_fit_u16`](Self::global_columns_fit_u16), else `u32`.
     #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
     pub(crate) fn global_columns(&self) -> GlobalBins {
-        let total = self.total_bins();
-        let fits_u16 = if self.dense {
-            total <= u16::MAX_BINS
-        } else {
-            total < u16::MAX_BINS
-        };
-        if fits_u16 {
+        if self.global_columns_fit_u16() {
             GlobalBins::U16(self.globalized(u16::MAX, |bin| bin as u16))
         } else {
             GlobalBins::U32(self.globalized(u32::MAX, |bin| bin))
+        }
+    }
+
+    /// Whether [`Self::global_columns`] are `u16`: every global bin fits it
+    /// and, with missing entries, stays below its maximum, their sentinel.
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+    pub(crate) fn global_columns_fit_u16(&self) -> bool {
+        let total = self.total_bins();
+        if self.dense {
+            total <= u16::MAX_BINS
+        } else {
+            total < u16::MAX_BINS
         }
     }
 

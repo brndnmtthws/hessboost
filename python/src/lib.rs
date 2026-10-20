@@ -13,9 +13,11 @@
 //! imports it as `hessboost._hessboost`, which loads the CUDA runtime's when
 //! it is installed; the classes' `module` is that name.
 //!
-//! The module declares free-threading support (`gil_used = false`): it has no
-//! `unsafe` code, and every class is `frozen`. Its only global state is the
-//! rayon pool native work runs on (`pool`), which a forked child rebuilds.
+//! The module declares free-threading support (`gil_used = false`): its one
+//! `unsafe` block reads a read-only numpy buffer in place (`borrowed`,
+//! behind `DMatrix(copy=False)`, whose caller keeps that buffer unchanged),
+//! and every class is `frozen`. Its only global state is the rayon pool
+//! native work runs on (`pool`), which a forked child rebuilds.
 //! Models and matrices are immutable and shared read-only between threads;
 //! the Python layer swaps whole objects rather than mutating them. The one
 //! exception, `OnlineModel`, updates in place under a mutex it never waits

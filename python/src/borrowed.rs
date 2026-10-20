@@ -14,12 +14,15 @@
 //! can set again (a view of a read-only array included), and rust-numpy's
 //! borrow guard carries the GIL token, so it cannot be held over a matrix's
 //! life (its storage is shared and dropped on arbitrary threads). `new`
-//! refuses what numpy can show is mutable now: a writeable array, an array
-//! whose ndarray base chain is writeable (a read-only view of a live array,
-//! which its owner can still write), and a buffer another extension holds a
-//! `PyReadwriteArray` of (rust-numpy's shared borrow, keyed on the array's
-//! base, taken and released by `new`). Past that, the choice of `copy=False`
-//! is the caller's promise, as documented.
+//! refuses what numpy can show is mutable now, and what it cannot show is
+//! not: a writeable array, an array whose base chain is writeable (a
+//! read-only view of a live array, which its owner can still write), a base
+//! that is neither an array nor a buffer the buffer protocol reports as
+//! read-only (an object exposing only an array interface, as `as_strided`
+//! builds, or a capsule: either may hide writeable memory), and a buffer
+//! another extension holds a `PyReadwriteArray` of (rust-numpy's shared
+//! borrow, keyed on the array's base, taken and released by `new`). Past
+//! that, the choice of `copy=False` is the caller's promise, as documented.
 
 use crate::errors::refuse;
 use numpy::{PyArray2, PyArrayMethods, PyUntypedArray, PyUntypedArrayMethods};
@@ -72,13 +75,14 @@ impl BorrowedArray {
     }
 }
 
-/// Refuses `array` when something it is a view of can still write the buffer:
-/// a view's own flag can be cleared while its base stays writeable, and the
-/// base's owner could then change the values a matrix reads. A memory view's
-/// `obj` is the buffer's owner, and an array over one has the view as its
-/// base; a non-array owner (a memory map, `bytes`, ...) is asked through the
-/// buffer protocol. (numpy lets any flag be set again afterwards; past this,
-/// `copy=False` is the caller's promise.)
+/// Refuses `array` when something it is a view of can still write the buffer,
+/// or may: a view's own flag can be cleared while its base stays writeable,
+/// and the base's owner could then change the values a matrix reads. A
+/// memory view's `obj` is the buffer's owner (a view without one owns it),
+/// and an array over one has the view as its base; a non-array owner (a
+/// memory map, `bytes`, ...) is asked through the buffer protocol. (numpy
+/// lets any flag be set again afterwards; past this, `copy=False` is the
+/// caller's promise.)
 fn ensure_read_only_bases(array: &Bound<'_, PyArray2<f32>>) -> PyResult<()> {
     let mut current = array.clone().into_any();
     for _ in 0..64 {
@@ -86,12 +90,19 @@ fn ensure_read_only_bases(array: &Bound<'_, PyArray2<f32>>) -> PyResult<()> {
         if base.is_none() {
             return Ok(());
         }
-        let base = match base.cast_into::<PyMemoryView>() {
-            Ok(view) => view.getattr("obj")?,
+        let owner = match base.cast_into::<PyMemoryView>() {
+            Ok(view) => {
+                let exporter = view.getattr("obj")?;
+                if exporter.is_none() {
+                    view.into_any()
+                } else {
+                    exporter
+                }
+            }
             Err(base) => base.into_inner(),
         };
-        let Ok(array) = base.clone().cast_into::<PyUntypedArray>() else {
-            return ensure_read_only_buffer(&base);
+        let Ok(array) = owner.clone().cast_into::<PyUntypedArray>() else {
+            return ensure_read_only_buffer(&owner);
         };
         if is_writeable(array.as_any())? {
             return Err(mutable_owner());
@@ -124,11 +135,17 @@ fn ndarray_attribute<'py>(
         .call_method1("__get__", (array, ndarray))
 }
 
-/// `object`'s buffer is read-only, or `object` has none to check.
-fn ensure_read_only_buffer(object: &Bound<'_, PyAny>) -> PyResult<()> {
-    match PyUntypedBuffer::get(object) {
-        Ok(buffer) if !buffer.readonly() => Err(mutable_owner()),
-        _ => Ok(()),
+/// `owner`'s buffer is read-only. An owner without a buffer to ask could
+/// still write the memory, so it is refused too.
+fn ensure_read_only_buffer(owner: &Bound<'_, PyAny>) -> PyResult<()> {
+    match PyUntypedBuffer::get(owner) {
+        Ok(buffer) if buffer.readonly() => Ok(()),
+        Ok(_) => Err(mutable_owner()),
+        Err(_) => Err(refuse(format!(
+            "copy=False cannot tell whether data's base (a {}) can write its memory: it \
+             exposes no buffer to ask; pass a read-only array of its own, or copy=True",
+            owner.get_type().name()?
+        ))),
     }
 }
 

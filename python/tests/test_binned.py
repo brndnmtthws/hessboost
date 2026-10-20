@@ -10,7 +10,13 @@ from numpy.typing import NDArray
 
 import hessboost
 from conftest import regression
-from hessboost import BinnedMatrix, DMatrix, HessboostError, InvalidDataError
+from hessboost import (
+    BinnedMatrix,
+    DMatrix,
+    HessboostError,
+    IncompatibleModelError,
+    InvalidDataError,
+)
 
 
 def test_training_on_bins_is_training_on_their_matrix() -> None:
@@ -93,7 +99,7 @@ def test_what_reads_values_is_refused() -> None:
         with pytest.raises(HessboostError, match="holds no feature values"):
             hessboost.train(params, binned, 2)
     model = hessboost.train({"max_bin": 32}, matrix, 2)
-    with pytest.raises(HessboostError, match="cannot continue"):
+    with pytest.raises(IncompatibleModelError, match="cannot continue"):
         hessboost.train({"max_bin": 32}, binned, 2, xgb_model=model)
     with pytest.raises(TypeError, match="predict on a DMatrix"):
         model.predict(binned)

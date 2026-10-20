@@ -65,7 +65,7 @@ pub(super) fn validate_binned_request(
     continued: bool,
 ) -> Result<()> {
     if continued {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "init_model",
             "a binned matrix cannot continue a model: its trees route rows by feature value",
         ));

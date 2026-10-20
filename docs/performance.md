@@ -348,16 +348,18 @@ Stats, monotone bounds, and sampler draws preserved.
 
 Cuts stream dense rows through in 65,536-row blocks, each transposed so
 every feature's sketch takes its values in row order (CSR input goes
-through its CSC view a feature at a time); unweighted sketch queues
-radix-sort (whole-number weights sum identically in any order). One
-parallel pass over 1,024-row blocks bins every value once into both index
-layouts: CSR global bins (16- or 32-bit) for row gathers and, for dense
-indexes and sparse ones at least half full, feature-major bins local to
-their feature (8-bit up to 256 bins, else 16 or 32) with a missing-entry
-bitmap, for single-column streaming (categorical splits stream the same
-columns through a per-bin left-set table); sparser indexes scan stored
-bins inline, in parallel row-order chunks for large nodes. Large dense
-inputs validate and copy in parallel. Architecture-independent.
+through its CSC view a feature at a time; `approx`'s sorted summaries
+transpose the rows once and sort one column per worker); unweighted
+sketch queues radix-sort (whole-number weights sum identically in any
+order). One parallel pass over 1,024-row blocks bins every value once into
+both index layouts: CSR global bins (16- or 32-bit) for row gathers and,
+for dense indexes and sparse ones at least half full, feature-major bins
+local to their feature (8-bit up to 256 bins, else 16 or 32) with a
+missing-entry bitmap, for single-column streaming (categorical splits
+stream the same columns through a per-bin left-set table); sparser
+indexes scan stored bins inline, in parallel row-order chunks for large
+nodes. Large dense inputs validate and copy in parallel.
+Architecture-independent.
 
 Objective gradients and metrics run in parallel over fixed row chunks or
 query groups, and AUC, AUCPR, ungrouped ranking metrics, and `cox-nloglik`
@@ -367,17 +369,18 @@ are bit-identical at any thread count.
 A `DMatrix` shares its feature values behind an `Arc`: a copy with other
 metadata (Python's `copy` and `set_info`) copies only metadata, and a row
 selection (`select_rows`, Python's `slice`, every cross-validation fold) is
-a view, its row map plus gathered metadata. The `hist` index binned from the
-values is cached with them, keyed by `max_bin`, weights, feature types, and
-missing value: built once, even for trainings that start together (later
-ones wait for the first build), reused by every training of a matrix
-sharing the values, and freed with them. A view bins its own rows by
-default, bit-identical to binning a copy of them; `ViewCuts::Source`
-gathers its rows of the source's index instead, so a source and its views
-share one binning pass. A `BinnedMatrix` keeps just that index and the
-metadata, so its training holds no feature values at all (the index of a
-4M x 173 panel with 42% missing values takes 1.4 GiB, against 2.6 GiB of
-`f32` values). A dense matrix may also read a caller's buffer in place
+a view, its row map plus gathered metadata. The latest `hist` index binned
+from the values is cached with them, keyed by `max_bin`, weights, feature
+types, and missing value: built once, even for trainings that start
+together (later ones wait for the first build), reused by every training
+of a matrix sharing the values, and freed with them or once another
+binning replaces it. A view bins its own rows by default, bit-identical to
+binning a copy of them; `ViewCuts::Source` gathers its rows of the
+source's index instead, so a source and its views share one binning pass.
+A `BinnedMatrix` keeps just that index and the metadata, so its training
+holds no feature values at all (the index of a 4M x 173 panel with 42%
+missing values takes 1.4 GiB resident, against 2.6 GiB of `f32` values).
+A dense matrix may also read a caller's buffer in place
 (`DMatrix::from_dense_shared`; Python's `copy=False` for a read-only
 `float32` array, memory-mapped `.npy` files included, whose pages then stay
 file-backed). Dense input is checked 256 values at a time without a

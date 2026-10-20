@@ -151,28 +151,44 @@ fn training_on_a_view_is_training_on_a_copy() {
     }
 }
 
-/// A [`ViewCuts::Source`] view splits only on its source's cut values,
-/// and every view of a source with these cuts trains as a view of it.
+/// A [`ViewCuts::Source`] view splits only on its source's cut values, not
+/// on the ones its own rows (with their weights) would give: with fewer
+/// bins than distinct values the two differ, and some split shows it.
 #[test]
 fn source_cut_views_split_on_their_sources_cuts() {
     use hessboost::internals::HistCuts;
     let data = source(f32::NAN);
-    let cuts = HistCuts::from_dmatrix(&data, 256);
+    let mut params = params("hist");
+    params.max_bin = 16;
+    let source_cuts = HistCuts::from_dmatrix(&data, params.max_bin);
+    let own_cuts = HistCuts::from_dmatrix(&copy_rows(&data, &selection()), params.max_bin);
+    let is_cut = |cuts: &HistCuts, feature: usize, threshold: f32| {
+        let (start, end) = cuts.feature_bins(feature);
+        (start..end).any(|bin| cuts.cut_value(bin) == threshold)
+    };
     let view = data
         .select_rows_with_cuts(&selection(), ViewCuts::Source)
         .unwrap();
-    let model = hessboost::prelude::train(&params("hist"), &view, 12).unwrap();
+    let model = hessboost::prelude::train(&params, &view, 12).unwrap();
+    let mut off_own_cuts = 0;
     for tree in model.trees() {
         for node in tree.nodes().iter().filter(|node| !node.is_leaf()) {
             let feature = node.split_feature as usize;
-            let (start, end) = cuts.feature_bins(feature);
+            // `f32::MIN` sends every present value right, on any cuts.
             assert!(
-                (start..end).any(|bin| cuts.cut_value(bin) == node.split_cond),
+                node.split_cond == f32::MIN || is_cut(&source_cuts, feature, node.split_cond),
                 "split on feature {feature} at {} is not a source cut",
                 node.split_cond
             );
+            off_own_cuts += usize::from(
+                node.split_cond != f32::MIN && !is_cut(&own_cuts, feature, node.split_cond),
+            );
         }
     }
+    assert!(
+        off_own_cuts > 0,
+        "no split tells the source's cuts from the view's own"
+    );
 }
 
 /// Rows of a source-cut view whose source never sketched one of them: feature

@@ -1123,11 +1123,14 @@ impl MetalHistBackend {
         // per (row, `RECORD_FEATURES` features). `u16` records (one
         // 16-byte word) cover indexes whose global bins (and, with missing
         // values, the `u16` sentinel) fit `u16`; wider bin counts get `u32`
-        // records.
+        // records. Its size is checked before the global columns it is
+        // copied from are built, which a refused copy would not need.
         let n_records = n_cols.div_ceil(RECORD_FEATURES);
+        let columns_u16 = index.global_columns_fit_u16();
+        let words = interleaved_words((n_rows, n_cols), n_records, columns_u16)?;
         let global = index.global_columns();
-        let columns_u16 = matches!(global, GlobalBins::U16(_));
-        let columns = interleaved_columns(&ctx.device, &global, (n_rows, n_cols), n_records)?;
+        let columns =
+            interleaved_columns(&ctx.device, &global, (n_rows, n_cols), n_records, words)?;
         // The scatter kernel needs no interleaved copy at all: it reads the
         // feature-major global store itself, when that store is `u16`.
         let feature_bins = match &global {
@@ -1618,24 +1621,18 @@ impl HistogramBackend for MetalHistBackend {
     }
 }
 
-/// Build the interleaved column store the scan kernels read: one record per
-/// (row, feature block of [`RECORD_FEATURES`]), each packing the block's
-/// eight bins — `u16` records as one 16-byte word (`u16::MAX` marking a
-/// missing entry), `u32` records as two (`u32::MAX` marking one) — from the
-/// index's feature-major `global` bins ([`GHistIndex::global_columns`],
-/// whose width and sentinel are the records'), of `(n, f_count)` rows and
-/// features.
-fn interleaved_columns(
-    device: &ProtocolObject<dyn MTLDevice>,
-    global: &GlobalBins,
+/// The `u32` words of the interleaved column store the scan kernels read
+/// for `n` rows of `n_records` records each (`u16_pack`: four words a
+/// record, else eight), refused past the 4 GiB one Metal buffer holds.
+fn interleaved_words(
     (n, f_count): (usize, usize),
     n_records: usize,
-) -> Result<GpuBuffer> {
-    let u16_pack = matches!(global, GlobalBins::U16(_));
+    u16_pack: bool,
+) -> Result<usize> {
     let record = if u16_pack { 4 } else { 8 };
-    let words = n
-        .checked_mul(n_records)
-        .filter(|&r| r * record <= MAX_BUFFER_ENTRIES)
+    n.checked_mul(n_records)
+        .and_then(|records| records.checked_mul(record))
+        .filter(|&words| words <= MAX_BUFFER_ENTRIES)
         .ok_or_else(|| {
             HessboostError::invalid_data(
                 "data",
@@ -1644,8 +1641,25 @@ fn interleaved_columns(
                      ({n} rows x {f_count} features) exceeds 4 GiB"
                 ),
             )
-        })?
-        * record;
+        })
+}
+
+/// Build the interleaved column store the scan kernels read, of `words`
+/// `u32`s ([`interleaved_words`]): one record per (row, feature block of
+/// [`RECORD_FEATURES`]), each packing the block's eight bins — `u16`
+/// records as one 16-byte word (`u16::MAX` marking a missing entry), `u32`
+/// records as two (`u32::MAX` marking one) — from the index's feature-major
+/// `global` bins ([`GHistIndex::global_columns`], whose width and sentinel
+/// are the records'), of `(n, f_count)` rows and features.
+fn interleaved_columns(
+    device: &ProtocolObject<dyn MTLDevice>,
+    global: &GlobalBins,
+    (n, f_count): (usize, usize),
+    n_records: usize,
+    words: usize,
+) -> Result<GpuBuffer> {
+    let u16_pack = matches!(global, GlobalBins::U16(_));
+    let record = if u16_pack { 4 } else { 8 };
     let buffer = GpuBuffer::new(device, words * 4)?;
     // SAFETY: the buffer was just allocated and is not yet shared; its
     // length covers `words` u32s.

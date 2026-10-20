@@ -320,6 +320,8 @@ def test_read_only_float32_arrays_are_borrowed_with_copy_false(tmp_path: Path) -
     borrowed = [
         DMatrix(frozen, y, copy=False),
         DMatrix(np.load(tmp_path / "x.npy", mmap_mode="r"), y, copy=False),
+        # A view of a read-only buffer.
+        DMatrix(np.frombuffer(x.tobytes(), np.float32).reshape(x.shape), y, copy=False),
     ]
     # The matrices keep the arrays alive: the memory map has no other owner.
     del frozen
@@ -366,6 +368,11 @@ def test_copy_false_refuses_what_it_cannot_borrow() -> None:
         over_owner.setflags(write=False)
         with pytest.raises(HessboostError, match="base can still write it"):
             DMatrix(over_owner, copy=False)
+    # A base exposing only an array interface hides whether its memory (here
+    # `x`'s) can be written.
+    interfaced = np.lib.stride_tricks.as_strided(x, writeable=False)
+    with pytest.raises(HessboostError, match="exposes no buffer to ask"):
+        DMatrix(interfaced, y, copy=False)
     with pytest.raises(TypeError, match="float32"):
         DMatrix(x.astype(np.float64), y, copy=False)
     with pytest.raises(TypeError, match="numpy array"):

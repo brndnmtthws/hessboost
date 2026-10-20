@@ -128,7 +128,8 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
         copy: With ``False``, ``data`` must be a read-only, C-contiguous
             2-D ``float32`` numpy array (such as
             ``np.load(path, mmap_mode="r")``, or an array after
-            ``setflags(write=False)``), which the matrix reads in place
+            ``setflags(write=False)``) that owns its memory or views
+            read-only arrays or buffers, which the matrix reads in place
             instead of copying. The matrix and every copy or slice of it
             keep the array alive; a ``BinnedMatrix`` keeps only the bins, so
             it outlives the array. The array (with every array sharing its
@@ -142,8 +143,9 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
         HessboostError: The inputs do not fit together (lengths, shapes,
             non-finite values, invalid category codes), or ``copy=False``
             got a writeable or non-contiguous array, a read-only view of a
-            writeable array or buffer, or one another Rust extension holds a
-            mutable borrow of.
+            writeable array or buffer (or of an owner exposing no buffer to
+            ask, such as an ``as_strided`` result), or one another Rust
+            extension holds a mutable borrow of.
         TypeError: An input has an unsupported type or dtype.
     """
 
@@ -321,7 +323,8 @@ class BinnedMatrix(_Metadata[_hessboost.BinnedMatrix]):
 
     Args:
         data: The matrix to bin.
-        max_bin: The most bins per feature, as ``train``'s ``max_bin``.
+        max_bin: The most bins per numerical feature (a categorical one
+            keeps a bin per category), as ``train``'s ``max_bin``.
 
     Raises:
         HessboostError: ``max_bin`` is below 2, or a row has a zero weight
@@ -345,8 +348,8 @@ class BinnedMatrix(_Metadata[_hessboost.BinnedMatrix]):
 
     @property
     def max_bin(self) -> int:
-        """The most bins per feature it was binned with, the ``max_bin``
-        training must use."""
+        """The ``max_bin`` it was binned with (the most bins per numerical
+        feature), which training must use."""
         return self._core.max_bin
 
     @property

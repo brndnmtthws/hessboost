@@ -279,9 +279,10 @@ struct CutSource {
 ///
 /// Clones share the feature values: `clone` copies only the metadata
 /// (labels, weights, and the rest), and no operation on a clone changes the
-/// matrix it was cloned from. They also share the histogram indexes binned
+/// matrix it was cloned from. They also share the histogram index binned
 /// from those values (`hist_index`), so a binning is computed once for
-/// every copy and freed with the values. A row selection
+/// every copy and freed with the values or once another binning (another
+/// `max_bin` or weighting) replaces it. A row selection
 /// ([`select_rows`](Self::select_rows)) is a view of its source's values,
 /// copying only the metadata.
 #[derive(Debug, Clone)]
@@ -899,9 +900,9 @@ impl DMatrix {
     /// value ([`HistCuts::from_dmatrix`]), or for a [`ViewCuts::Source`]
     /// view its source's index, gathered: built on first use, then shared
     /// by every matrix sharing the values (clones and metadata copies,
-    /// across threads), and freed with them. See
-    /// [`bin_cache`](crate::data::bin_cache). A binned matrix's is its one
-    /// index, whose `max_bin` training checks first.
+    /// across threads) until it is freed with them or another binning
+    /// replaces it. See [`bin_cache`](crate::data::bin_cache). A binned
+    /// matrix's is its one index, whose `max_bin` training checks first.
     pub(crate) fn hist_index(&self, max_bin: usize) -> Arc<GHistIndex> {
         if let Storage::Bins {
             index,
@@ -1327,8 +1328,9 @@ mod tests {
     }
 
     /// A matrix and its metadata copies bin their shared values once per
-    /// `max_bin` and sample weighting; new values bin afresh (the copy
-    /// sees its own values) while the source keeps its index.
+    /// `max_bin` and sample weighting, the cache keeping the latest binning
+    /// (another replaces it); new values bin afresh (the copy sees its own
+    /// values) while the source keeps its index.
     #[test]
     fn copies_share_binned_indexes_until_their_values_change() {
         let (n, cols) = (200, 2);
@@ -1338,7 +1340,6 @@ mod tests {
         let labels = vec![1.0; n];
         let labeled = data.clone().with_labels(&labels).unwrap();
         assert!(Arc::ptr_eq(&index, &labeled.hist_index(16)));
-        assert!(!Arc::ptr_eq(&index, &data.hist_index(8)));
         let weights: Vec<f32> = (0..n).map(|r| 1.0 + (r % 3) as f32).collect();
         let weighted = data.clone().with_weights(&weights).unwrap();
         let weighted_index = weighted.hist_index(16);
@@ -1349,6 +1350,11 @@ mod tests {
             serde_json::to_value(&reference).unwrap(),
             "the weighted copy bins with its own weights"
         );
+        // The weighted binning replaced the unweighted one, which only this
+        // test still holds; a request for it bins again.
+        assert_eq!(Arc::strong_count(&index), 1);
+        let index = data.hist_index(16);
+        assert_eq!(Arc::strong_count(&weighted_index), 1);
         let mut changed = data.clone();
         changed.dense_values_mut().unwrap()[0] = 1e6;
         let changed_index = changed.hist_index(16);

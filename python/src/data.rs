@@ -506,8 +506,8 @@ pub struct BinnedMatrix {
 
 #[pymethods]
 impl BinnedMatrix {
-    /// `data` binned with at most `max_bin` bins per feature, keeping its
-    /// metadata.
+    /// `data` binned with at most `max_bin` bins per numerical feature,
+    /// keeping its metadata.
     #[new]
     fn new(py: Python<'_>, data: &DMatrix, max_bin: usize) -> PyResult<Self> {
         let inner = py.detached(|| RustBinned::new(&data.inner, max_bin))?;

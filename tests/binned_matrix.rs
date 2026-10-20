@@ -9,7 +9,7 @@ use hessboost::training::TrainingData;
 use serde_json::{Value, json};
 
 mod common;
-use common::{four_features, invalid_data, invalid_param, lcg};
+use common::{four_features, incompatible_model, invalid_data, invalid_param, lcg};
 
 const ROWS: usize = 1_200;
 const MAX_BIN: usize = 64;
@@ -251,7 +251,8 @@ fn binned_matrices_take_new_metadata() {
 }
 
 /// Training refuses every option that reads feature values, a `max_bin`
-/// other than the bins', and continuation.
+/// other than the bins', `device = cuda` (allowed to pass the option check,
+/// so refused on its own), and continuation.
 #[test]
 fn binned_training_refuses_what_reads_values() {
     let data = dense(true);
@@ -260,6 +261,8 @@ fn binned_training_refuses_what_reads_values() {
         invalid_param(hessboost::prelude::train(&params(keys), &binned, 2))
     };
     assert_eq!(refused(&[("max_bin", json!(32))]), "max_bin");
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    assert_eq!(refused(&[("device", json!("cuda"))]), "device");
     for keys in [
         &[("tree_method", json!("approx"))][..],
         &[("tree_method", json!("exact"))],
@@ -275,7 +278,7 @@ fn binned_training_refuses_what_reads_values() {
     let params = params(&[]);
     let model = hessboost::prelude::train(&params, &data, 2).unwrap();
     let continued = Trainer::new(&params, &binned, 2).init_model(&model).train();
-    assert_eq!(invalid_param(continued), "init_model");
+    assert_eq!(incompatible_model(continued), "init_model");
 }
 
 /// Binning needs every row in the cuts: a zero sample weight is refused,

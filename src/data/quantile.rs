@@ -135,40 +135,66 @@ impl HistCuts {
         let per_feature: Vec<Vec<f32>> = if let Some(rows) = data.dense_rows() {
             let missing = data.missing();
             let present = present_counts(rows, n_rows, n_features, missing, parallel);
-            let mut columns: Vec<ColumnCuts> = (0..n_features)
-                .map(|f| ColumnCuts::new(is_categorical[f], present[f], max_bin, ingest))
-                .collect();
-            // Rows stream through in blocks, each transposed so a
-            // feature's values are contiguous: every feature's sketch
-            // takes its values in row order, as a whole-column pass
-            // would, while only one block is ever transposed.
-            let mut block = Vec::new();
-            for start in (0..n_rows).step_by(CUT_BLOCK_ROWS) {
-                let end = (start + CUT_BLOCK_ROWS).min(n_rows);
-                let len = end - start;
+            if ingest.sorted {
+                // A sorted summary (upstream `PushColPage`) holds a whole
+                // column's `(value, weight)` pairs until it sorts them, so
+                // the rows are transposed once and each feature's pairs are
+                // gathered only while its cuts are made: one column of
+                // pairs per worker, never every feature's at once.
+                let mut columns = Vec::new();
                 crate::data::ghist::transpose_rows_into(
-                    |r| rows.row(start + r),
-                    len,
+                    |r| rows.row(r),
+                    n_rows,
                     n_features,
-                    &mut block,
+                    &mut columns,
                 );
-                let feed = |(f, column): (usize, &mut ColumnCuts)| {
-                    column.push_column(&block[f * len..][..len], start, missing, &weight_of);
+                let column_cuts = |f: usize| {
+                    let mut column =
+                        ColumnCuts::new(is_categorical[f], present[f], max_bin, ingest);
+                    column.push_column(&columns[f * n_rows..][..n_rows], 0, missing, &weight_of);
+                    column.cut_values()
                 };
                 if parallel {
-                    columns.par_iter_mut().enumerate().for_each(feed);
+                    (0..n_features).into_par_iter().map(column_cuts).collect()
                 } else {
-                    columns.iter_mut().enumerate().for_each(feed);
+                    (0..n_features).map(column_cuts).collect()
                 }
-            }
-            drop(block);
-            if parallel {
-                columns
-                    .into_par_iter()
-                    .map(ColumnCuts::cut_values)
-                    .collect()
             } else {
-                columns.into_iter().map(ColumnCuts::cut_values).collect()
+                let mut columns: Vec<ColumnCuts> = (0..n_features)
+                    .map(|f| ColumnCuts::new(is_categorical[f], present[f], max_bin, ingest))
+                    .collect();
+                // Rows stream through in blocks, each transposed so a
+                // feature's values are contiguous: every feature's sketch
+                // takes its values in row order, as a whole-column pass
+                // would, while only one block is ever transposed.
+                let mut block = Vec::new();
+                for start in (0..n_rows).step_by(CUT_BLOCK_ROWS) {
+                    let end = (start + CUT_BLOCK_ROWS).min(n_rows);
+                    let len = end - start;
+                    crate::data::ghist::transpose_rows_into(
+                        |r| rows.row(start + r),
+                        len,
+                        n_features,
+                        &mut block,
+                    );
+                    let feed = |(f, column): (usize, &mut ColumnCuts)| {
+                        column.push_column(&block[f * len..][..len], start, missing, &weight_of);
+                    };
+                    if parallel {
+                        columns.par_iter_mut().enumerate().for_each(feed);
+                    } else {
+                        columns.iter_mut().enumerate().for_each(feed);
+                    }
+                }
+                drop(block);
+                if parallel {
+                    columns
+                        .into_par_iter()
+                        .map(ColumnCuts::cut_values)
+                        .collect()
+                } else {
+                    columns.into_iter().map(ColumnCuts::cut_values).collect()
+                }
             }
         } else {
             // Sparse storage goes through its CSC view: each feature's
@@ -482,15 +508,19 @@ fn present_counts(
     }
 }
 
-/// One feature's cut construction state while the rows stream through
-/// [`HistCuts::build`].
+/// One feature's cut construction state in [`HistCuts::build`], fed its
+/// present values in row order: block by block, or a column at once.
 enum ColumnCuts {
-    /// A categorical feature's distinct values so far, ascending by
-    /// [`f32::total_cmp`] and deduplicated by bit pattern: what the sorted
-    /// column [`build_categorical_cuts`] reads reduces to. `block` and
-    /// `scratch` are the buffers each block of rows is sorted in.
+    /// A categorical feature's distinct values: each block's, ascending by
+    /// [`f32::total_cmp`] and deduplicated by bit pattern, appended in turn
+    /// (`runs` of them), so one sort and deduplication at the end gives
+    /// what the sorted column [`build_categorical_cuts`] reads reduces to
+    /// (merging each block into the values so far would copy them all once
+    /// per block). `block` and `scratch` are the buffers each block of rows
+    /// is sorted in.
     Categorical {
         distinct: Vec<f32>,
+        runs: usize,
         block: Vec<f32>,
         scratch: RadixScratch<f32>,
     },
@@ -510,6 +540,7 @@ impl ColumnCuts {
         if categorical {
             return ColumnCuts::Categorical {
                 distinct: Vec::new(),
+                runs: 0,
                 block: Vec::new(),
                 scratch: RadixScratch::default(),
             };
@@ -570,6 +601,7 @@ impl ColumnCuts {
         match self {
             ColumnCuts::Categorical {
                 distinct,
+                runs,
                 block,
                 scratch,
             } => {
@@ -577,7 +609,10 @@ impl ColumnCuts {
                 block.extend(entries.map(|(_, v)| v));
                 sort_values(block, scratch);
                 block.dedup_by(|a, b| a.to_bits() == b.to_bits());
-                merge_distinct(distinct, block);
+                if !block.is_empty() {
+                    distinct.extend_from_slice(block);
+                    *runs += 1;
+                }
             }
             ColumnCuts::Streamed { sketch, .. } => {
                 for (row, v) in entries {
@@ -594,7 +629,18 @@ impl ColumnCuts {
     fn cut_values(self) -> Vec<f32> {
         let mut out = Vec::new();
         match self {
-            ColumnCuts::Categorical { distinct, .. } => build_categorical_cuts(&distinct, &mut out),
+            ColumnCuts::Categorical {
+                mut distinct,
+                runs,
+                mut scratch,
+                ..
+            } => {
+                if runs > 1 {
+                    sort_values(&mut distinct, &mut scratch);
+                    distinct.dedup_by(|a, b| a.to_bits() == b.to_bits());
+                }
+                build_categorical_cuts(&distinct, &mut out);
+            }
             ColumnCuts::Streamed { mut sketch, .. } => sketch.cut_values(&mut out),
             ColumnCuts::Sorted {
                 mut sketch,
@@ -607,30 +653,6 @@ impl ColumnCuts {
         }
         out
     }
-}
-
-/// Merge the ascending, bit-distinct `block` into the ascending,
-/// bit-distinct `distinct` (both by [`f32::total_cmp`]).
-fn merge_distinct(distinct: &mut Vec<f32>, block: &[f32]) {
-    if block.is_empty() {
-        return;
-    }
-    let mut merged = Vec::with_capacity(distinct.len() + block.len());
-    let (mut a, mut b) = (distinct.iter().peekable(), block.iter().peekable());
-    while let (Some(&&x), Some(&&y)) = (a.peek(), b.peek()) {
-        match x.total_cmp(&y) {
-            std::cmp::Ordering::Less => merged.push(*a.next().expect("peeked")),
-            std::cmp::Ordering::Greater => merged.push(*b.next().expect("peeked")),
-            std::cmp::Ordering::Equal => {
-                merged.push(x);
-                a.next();
-                b.next();
-            }
-        }
-    }
-    merged.extend(a);
-    merged.extend(b);
-    *distinct = merged;
 }
 
 /// Append one bin per distinct category value (ascending) for a categorical

@@ -106,8 +106,9 @@
 //! - **Data sharing:** a matrix's copies with other metadata share its
 //!   values, and those with its sample weights and feature types the
 //!   `hist` index binned from them, built once for every training
-//!   (concurrent ones included) and freed with the values; row selections
-//!   are views of their source's values
+//!   (concurrent ones included) and kept until the values are freed or
+//!   another binning replaces it; row selections are views of their
+//!   source's values
 //!   ([`DMatrix::select_rows`](data::DMatrix::select_rows)), binned by
 //!   their own rows or by their source's cuts
 //!   ([`ViewCuts`](data::ViewCuts)). A dense matrix can read a caller's

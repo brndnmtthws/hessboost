@@ -9,8 +9,8 @@ use crate::error::{HessboostError, Result};
 /// hist` growth reads nothing else, so a matrix binned once trains without
 /// its values in memory.
 ///
-/// [`BinnedMatrix::new`] bins a [`DMatrix`] with `max_bin` cuts per feature
-/// from its values, sample weights, feature types, and missing value, the
+/// [`BinnedMatrix::new`] bins a [`DMatrix`] with `max_bin`'s cuts from its
+/// values, sample weights, feature types, and missing value, the
 /// index that matrix's own `hist` training uses (and shares with it), so
 /// training on the binned matrix is training on the `DMatrix`, bit for bit.
 /// The weights and feature types are therefore fixed; the labels and the
@@ -51,10 +51,11 @@ pub struct BinnedMatrix {
 }
 
 impl BinnedMatrix {
-    /// Bin `data` with at most `max_bin` bins per feature, keeping its
-    /// metadata. The index is `data`'s own: built here unless an earlier
-    /// training or binning of `data` (or of a matrix sharing its values)
-    /// built it, and freed once neither holds it.
+    /// Bin `data` with at most `max_bin` bins per numerical feature (a
+    /// categorical one keeps a bin per category), keeping its metadata. The
+    /// index is `data`'s own: built here unless an earlier training or
+    /// binning of `data` (or of a matrix sharing its values) built it, and
+    /// freed once nothing holds it.
     ///
     /// Every row must be one the cuts are sketched from, so that its bins
     /// route it through a tree as its values would: a row with a zero
@@ -122,7 +123,9 @@ impl BinnedMatrix {
         self.matrix.label_upper_bound()
     }
 
-    /// The sample weights the cuts were sketched with.
+    /// The sample weights training reads, `data`'s, fixed at binning (a
+    /// [`ViewCuts::Source`](crate::data::ViewCuts::Source) view's own,
+    /// although its source's sketched its cuts).
     pub fn weights(&self) -> Option<&[f32]> {
         self.matrix.weights()
     }

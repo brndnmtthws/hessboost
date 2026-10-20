@@ -87,25 +87,6 @@ fn canonical<'s>(cats: &[u32], scratch: &'s mut Vec<u32>) -> &'s [u32] {
     scratch
 }
 
-/// Depth of the deepest leaf (root = 0) and whether every leaf sits there;
-/// `stack` is scratch.
-fn depth_and_completeness(tree: &RegTree, stack: &mut Vec<(usize, u32)>) -> (u32, bool) {
-    stack.clear();
-    stack.push((0, 0));
-    let (mut shallowest, mut deepest) = (u32::MAX, 0);
-    while let Some((id, d)) = stack.pop() {
-        let node = tree.node(id);
-        if node.is_leaf() {
-            shallowest = shallowest.min(d);
-            deepest = deepest.max(d);
-        } else {
-            stack.push((node.left as usize, d + 1));
-            stack.push((node.right as usize, d + 1));
-        }
-    }
-    (deepest, shallowest >= deepest)
-}
-
 /// Node ids in preorder (node, left subtree, right subtree) into `order`;
 /// `stack` is scratch.
 fn preorder(tree: &RegTree, order: &mut Vec<usize>, stack: &mut Vec<usize>) {
@@ -254,14 +235,17 @@ fn feature_map(features: BTreeMap<u32, Collected>) -> Vec<MapEntry> {
 /// The smaller layout of each tree (heap only up to [`MAX_HEAP_DEPTH`]),
 /// and the widths of the heap depths and preorder node counts.
 fn choose_layouts(trees: &[RegTree], widths: Widths) -> (Vec<Layout>, u32, u32) {
-    let mut stack = Vec::new();
     let layouts: Vec<Layout> = trees
         .iter()
         .map(|tree| {
             let preorder = Layout::Preorder {
                 nodes: tree.num_nodes() as u32,
             };
-            let (depth, complete) = depth_and_completeness(tree, &mut stack);
+            // A tree has fewer nodes than `u32::MAX` (`nodes` above).
+            let depth = tree.depth() as u32;
+            // A binary tree of depth `d` has `2^d` leaves exactly when every
+            // leaf sits at depth `d`.
+            let complete = 1usize.checked_shl(depth) == Some(tree.num_leaves());
             let heap = Layout::Heap { depth, complete };
             if depth <= MAX_HEAP_DEPTH && heap.total_bits(widths) <= preorder.total_bits(widths) {
                 heap

@@ -1154,14 +1154,27 @@ impl BoostedModel {
         Ok(())
     }
 
-    /// The output tree `t` contributes to (XGBoost `tree_info[t]`): `0` for
-    /// every vector-leaf tree, whose leaves carry all outputs.
+    /// The outputs (margin columns) tree `t` adds to: the one output
+    /// `(t / num_parallel_tree) % n_outputs` of a scalar-leaf tree (see the
+    /// type docs' tree layout; XGBoost's `tree_info[t]` is its start), every
+    /// output for a vector-leaf tree, whose leaves hold one value per output.
+    ///
+    /// # Panics
+    ///
+    /// When `t` is not a tree of the model (`t >= num_trees()`), as
+    /// [`RegTree::node`] does for a node id.
     #[inline]
-    pub(crate) fn tree_output(&self, t: usize) -> usize {
+    pub fn tree_outputs(&self, t: usize) -> Range<usize> {
+        assert!(
+            t < self.trees.len(),
+            "tree {t} of a model of {} trees",
+            self.trees.len()
+        );
         if self.has_vector_leaves() {
-            0
+            0..self.n_outputs
         } else {
-            scalar_tree_output(t, self.num_parallel_tree, self.n_outputs)
+            let output = scalar_tree_output(t, self.num_parallel_tree, self.n_outputs);
+            output..output + 1
         }
     }
 

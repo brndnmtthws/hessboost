@@ -2094,7 +2094,7 @@ impl BoostedModel {
             .map(|(t, &root)| PTree {
                 root,
                 weight: self.tree_weight(t),
-                output: self.tree_output(t) as u32,
+                output: self.tree_outputs(t).start as u32,
                 vector: u32::from(self.tree_is_vector_leaf(t)),
             })
             .collect();

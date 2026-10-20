@@ -318,6 +318,39 @@ fn rows_predict_what_every_batch_predicts() {
     }
 }
 
+/// The public tree metadata is enough for an external walker to predict
+/// with: the intercepts plus every tree's weight times its leaf, added in
+/// tree order to the outputs [`BoostedModel::tree_outputs`] names, give the
+/// margins bit for bit. Shrunk, linear-leaf, and `gblinear` models predict
+/// otherwise.
+#[test]
+fn tree_metadata_recomputes_the_margins() {
+    for case in cases() {
+        let (model, x) = train_case(&case);
+        let name = case.name;
+        if model.shrinkage().is_some()
+            || model.linear().is_some()
+            || model.trees().iter().any(|t| t.linear_leaves().is_some())
+        {
+            continue;
+        }
+        let margins = model.predict_margin(&matrix(&x, case.n_cols), ..).unwrap();
+        let weights: Vec<f32> = model.tree_weights().collect();
+        for (row, want) in x.chunks(case.n_cols).zip(margins.rows()) {
+            let mut margin = model.base_scores().to_vec();
+            for (t, tree) in model.trees().iter().enumerate() {
+                let leaf = tree.leaf_vector(tree.leaf_id_dense(row, f32::NAN));
+                let outputs = model.tree_outputs(t);
+                assert_eq!(outputs.len(), leaf.len(), "{name}: tree {t}");
+                for (m, &v) in margin[outputs].iter_mut().zip(leaf) {
+                    *m += weights[t] * v;
+                }
+            }
+            assert_eq!(bits(&margin), bits(want), "{name}");
+        }
+    }
+}
+
 /// `multi:softmax` predicts XGBoost's `FindMaxIndex`: the first of equal
 /// largest margins. Without its trees, every row's margins are the (equal)
 /// intercepts of balanced classes.

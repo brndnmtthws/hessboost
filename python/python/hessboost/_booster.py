@@ -197,6 +197,9 @@ class TreeInfo:
     """The sum of Hessians training routed through every node."""
     gain: NDArray[np.float32]
     """Every node's split gain (``0`` for leaves)."""
+    depth: int
+    """Splits on the longest root-to-leaf path (``0`` for a tree that is a
+    single leaf)."""
     linear: LinearLeavesInfo | None
     """The leaves' linear models of a ``linear_tree`` tree, else ``None``."""
 

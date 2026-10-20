@@ -885,7 +885,7 @@ struct ShapForest {
     /// Per output: `Σ weight · E[f_tree]`, summed in `f64`, rounded once.
     root_mean_sums: Vec<f32>,
     /// Per output: the ids (into `trees`) of the trees feeding it, ascending
-    /// (`BoostedModel::tree_output`; a vector-leaf tree contributes one
+    /// (`BoostedModel::tree_outputs`; a vector-leaf tree contributes one
     /// per-output view to every list).
     by_output: Vec<Vec<usize>>,
 }
@@ -920,7 +920,12 @@ impl BoostedModel {
                 }
             } else {
                 let shap = ShapTree::from_tree(tree, |id| tree.node(id).leaf_value)?;
-                push(shap, self.tree_output(ti), root_mean_value(tree, 0), weight);
+                push(
+                    shap,
+                    self.tree_outputs(ti).start,
+                    root_mean_value(tree, 0),
+                    weight,
+                );
             }
         }
         Ok(ShapForest {
@@ -1637,20 +1642,12 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 6).unwrap();
-        let depth = |t: &crate::tree::RegTree| {
-            let mut best = 0;
-            let mut stack = vec![(0usize, 0usize)];
-            while let Some((nid, dep)) = stack.pop() {
-                best = best.max(dep);
-                let node = t.node(nid);
-                if !node.is_leaf() {
-                    stack.push((node.left as usize, dep + 1));
-                    stack.push((node.right as usize, dep + 1));
-                }
-            }
-            best
-        };
-        let deepest = model.trees().iter().map(depth).max().unwrap();
+        let deepest = model
+            .trees()
+            .iter()
+            .map(crate::tree::RegTree::depth)
+            .max()
+            .unwrap();
         assert!(deepest >= 25, "trees only reach depth {deepest}");
 
         let rows = 200;

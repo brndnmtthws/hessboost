@@ -552,7 +552,7 @@ impl BoostedModel {
                     .flat_map(|(t, &root)| {
                         [
                             root,
-                            self.tree_output(t) as u32,
+                            self.tree_outputs(t).start as u32,
                             u32::from(self.tree_is_vector_leaf(t)),
                             0,
                         ]

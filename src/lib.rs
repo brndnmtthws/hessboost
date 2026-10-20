@@ -92,9 +92,11 @@
 //!   quantiles) is transformed on its own, with XGBoost's scalar `expf`,
 //!   sigmoid, and softmax
 //!   ([`transform_margins_into`](model::BoostedModel::transform_margins_into)).
-//!   Read-only model metadata: tree weights, nodes, and category sets,
-//!   `gblinear` weights, and the model-shrinkage record
+//!   Read-only model metadata: tree weights, the outputs each tree feeds,
+//!   nodes, depths, and category sets, `gblinear` weights, and the
+//!   model-shrinkage record
 //!   ([`tree_weights`](model::BoostedModel::tree_weights),
+//!   [`tree_outputs`](model::BoostedModel::tree_outputs),
 //!   [`RegTree`](tree::RegTree), [`linear`](model::BoostedModel::linear),
 //!   [`shrinkage`](model::BoostedModel::shrinkage)).
 //! - **Tree methods:** `exact`, `hist`, `approx`; `depthwise`/`lossguide`

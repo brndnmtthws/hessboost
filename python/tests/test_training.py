@@ -667,6 +667,35 @@ def test_cross_validate_sizes_each_fold_on_its_own_purged_tail() -> None:
     untested = oof.fold == -1
     assert untested.sum() == 400 - sum(len(test) for _, test in splits)
     assert np.isnan(oof.margins[untested]).all()
+    # The refit is sized on the tail of every row, then trains them all.
+    refitted = hessboost.cross_validate(
+        params,
+        dtrain,
+        60,
+        folds=splits,
+        early_stopping_rounds=3,
+        per_fold_stopping=tail,
+        refit=True,
+    ).refit
+    assert refitted is not None
+    split_at, (fit_rows, tail_rows) = tail.split(np.arange(400))
+    trial = hessboost.train(
+        params,
+        dtrain.slice(fit_rows),
+        60,
+        evals=[(dtrain.slice(tail_rows), "tail")],
+        early_stopping_rounds=3,
+        verbose_eval=False,
+    )
+    assert trial.best_iteration is not None
+    assert refitted.num_boost_round == trial.best_iteration + 1
+    assert refitted.stopping is not None
+    assert refitted.stopping.split_at == split_at
+    assert split_at in at
+    expected = hessboost.train(params, dtrain, refitted.num_boost_round)
+    assert refitted.booster.save_raw() == expected.save_raw()
+    with pytest.raises(TypeError, match="integer"):
+        tail.split([0.5, 1.5])
 
 
 def test_cross_validate_refuses_unusable_stopping() -> None:

@@ -30,6 +30,7 @@ __all__ = [
     "FoldReport",
     "Objective",
     "OutOfFold",
+    "Refit",
     "TailStopping",
     "TrainingCallback",
     "cross_validate",
@@ -412,13 +413,11 @@ class TailStopping:
 
 @dataclass(frozen=True)
 class CvRefit:
-    """What ``cv(..., refit=True)`` returns (and :attr:`CvReport.refit`):
-    the cross-validation history and the booster retrained on every row at
-    the chosen round count."""
+    """What ``cv(..., refit=True)`` returns: the cross-validation history
+    and the booster retrained on every row at the chosen round count."""
 
     history: CvHistory
-    """The history :func:`cv` returns without ``refit`` (empty under
-    per-fold early stopping)."""
+    """The history :func:`cv` returns without ``refit``."""
     booster: Booster
     """The booster trained on every row of ``dtrain`` for
     :attr:`num_boost_round` rounds (continuing ``xgb_model`` when given), as
@@ -426,15 +425,30 @@ class CvRefit:
     it was trained on ``dtrain`` encoded by :attr:`target_encoder`, so its
     encoded columns are numerical."""
     num_boost_round: int
-    """The chosen round count: through the best fold-mean round under
-    fold-mean early stopping (the length of each history array), the best
-    round on the purged tail of every row under per-fold early stopping,
-    else every round the folds ran."""
+    """The chosen round count: through the best round under early stopping
+    (the length of each history array), else every round the folds ran."""
     target_encoder: FittedTargetEncoder | None
     """With ``target_stats``, the encoder fitted on every row of ``dtrain``:
     encode new data with its ``transform`` before predicting with
     :attr:`booster`. ``None`` otherwise."""
-    stopping: TailStopping | None = None
+
+
+@dataclass(frozen=True)
+class Refit:
+    """The booster ``cross_validate(..., refit=True)`` retrained on every
+    row (:attr:`CvReport.refit`; the history is the report's)."""
+
+    booster: Booster
+    """The booster trained on every row of ``dtrain`` for
+    :attr:`num_boost_round` rounds, as :attr:`CvRefit.booster`."""
+    num_boost_round: int
+    """The chosen round count: through the best fold-mean round under
+    fold-mean early stopping, the best round on the purged tail of every row
+    under per-fold early stopping, else every round the folds ran."""
+    target_encoder: FittedTargetEncoder | None
+    """With ``target_stats``, the encoder fitted on every row, as
+    :attr:`CvRefit.target_encoder`; ``None`` otherwise."""
+    stopping: TailStopping | None
     """Under per-fold early stopping, the tail split of every row that sized
     :attr:`booster`; ``None`` otherwise."""
 
@@ -493,7 +507,7 @@ class CvReport:
     folds run different round counts."""
     folds: list[FoldReport]
     """One report per fold, in fold order."""
-    refit: CvRefit | None
+    refit: Refit | None
     """With ``refit=True``, the booster retrained on every row; else
     ``None``."""
     _core: _hessboost.CvReport = field(repr=False)
@@ -614,14 +628,11 @@ def _cross_validate(
     if refitted is not None:
         booster, rounds, fitted, stopping = refitted
         if encoding is None or fitted is None:
-            retrained = CvRefit(
-                history, _trained(booster, dtrain, init), rounds, None, _stopping(stopping)
-            )
+            retrained = Refit(_trained(booster, dtrain, init), rounds, None, _stopping(stopping))
         else:
             # The refit trained on dtrain encoded by `fitted`, its columns numerical.
             encoded = _encoded(dtrain, dtrain._core, encoding[1])
-            retrained = CvRefit(
-                history,
+            retrained = Refit(
                 _trained(booster, encoded, None),
                 rounds,
                 FittedTargetEncoder._wrap(fitted, dtrain),
@@ -760,9 +771,12 @@ def cv(
         xgb_model=xgb_model,
         refit=refit,
     )
-    if report.refit is None:
+    refitted = report.refit
+    if refitted is None:
         return report.history
-    return report.refit
+    return CvRefit(
+        report.history, refitted.booster, refitted.num_boost_round, refitted.target_encoder
+    )
 
 
 def cross_validate(

@@ -6,10 +6,11 @@ mod common;
 
 use common::{four_features, incompatible_model, invalid_param, labeled_dense};
 use hessboost::config::{
-    BoosterKind, Boulevard, Dart, Ebm, LinearTree, ModelShrink, ModelShrinkMode, MultiStrategy,
-    TrainingParamsBuilder,
+    BoosterKind, Boulevard, Dart, Ebm, LinearTree, MaxDeltaStep, ModelShrink, ModelShrinkMode,
+    MultiStrategy, TrainingParamsBuilder,
 };
-use hessboost::objective::{Objective, Quantiles};
+use hessboost::data::FeatureType;
+use hessboost::objective::{Multiclass, Objective, Quantiles};
 use hessboost::prelude::*;
 use std::num::NonZeroUsize;
 
@@ -190,4 +191,103 @@ fn incompatible_members_are_refused() {
             "case {case}"
         );
     }
+}
+
+/// Members with categorical splits keep their category sets: the average's
+/// margins are the members' mean.
+#[test]
+fn categorical_members_average() {
+    let x: Vec<f32> = (0..ROWS)
+        .flat_map(|i| [(i % 6) as f32, four_features(i)[0]])
+        .collect();
+    let y: Vec<f32> = (0..ROWS)
+        .map(|i| [3.0, -1.0, 0.5, 2.0, -2.0, 1.0][i % 6] + four_features(i)[0])
+        .collect();
+    let data = labeled_dense(&x, 2, &y)
+        .with_feature_types(&[FeatureType::Categorical, FeatureType::Numerical])
+        .unwrap();
+    let members: Vec<BoostedModel> = (0..3u64)
+        .map(|seed| train(&base().seed(seed).build().unwrap(), &data, 6).unwrap())
+        .collect();
+    assert!(
+        members[0]
+            .trees()
+            .iter()
+            .any(|tree| tree.nodes().iter().any(|node| node.is_categorical))
+    );
+    let average = BoostedModel::average(&members).unwrap();
+    let margins = |m: &BoostedModel| {
+        m.predict_margin(&data, Iterations::Best)
+            .unwrap()
+            .into_vec()
+    };
+    let member_margins: Vec<Vec<f32>> = members.iter().map(margins).collect();
+    for (row, got) in margins(&average).into_iter().enumerate() {
+        let expected = member_margins
+            .iter()
+            .map(|m| f64::from(m[row]))
+            .sum::<f64>()
+            / 3.0;
+        assert!((f64::from(got) - expected).abs() < 1e-5, "row {row}");
+    }
+}
+
+/// Members that differ only in a stored setting or class count, or in leaf
+/// kind (also behind a tree-less first member), are refused.
+#[test]
+fn members_differing_in_layout_are_refused() {
+    let data = data();
+    let plain = train(&base().build().unwrap(), &data, 3).unwrap();
+    let bounded = train(
+        &base()
+            .max_delta_step(MaxDeltaStep::Bounded(0.5))
+            .build()
+            .unwrap(),
+        &data,
+        3,
+    )
+    .unwrap();
+    assert_eq!(
+        incompatible_model(BoostedModel::average([&plain, &bounded])),
+        "average"
+    );
+
+    let classes = |k: usize| {
+        let x: Vec<f32> = (0..ROWS).flat_map(four_features).collect();
+        let y: Vec<f32> = (0..ROWS).map(|i| (i % k) as f32).collect();
+        let params = base()
+            .objective(Objective::Softprob(Multiclass::new(k).unwrap()))
+            .build()
+            .unwrap();
+        train(&params, &labeled_dense(&x, 4, &y), 2).unwrap()
+    };
+    assert_eq!(
+        incompatible_model(BoostedModel::average([&classes(3), &classes(4)])),
+        "average"
+    );
+
+    let quantiles =
+        || base().objective(Objective::Quantile(Quantiles::new(vec![0.2, 0.8]).unwrap()));
+    let empty = train(&quantiles().build().unwrap(), &data, 0).unwrap();
+    let scalar = train(&quantiles().build().unwrap(), &data, 2).unwrap();
+    let vector = train(
+        &quantiles()
+            .multi_strategy(MultiStrategy::MultiOutputTree)
+            .build()
+            .unwrap(),
+        &data,
+        2,
+    )
+    .unwrap();
+    assert_eq!(empty.num_trees(), 0);
+    for members in [[&scalar, &vector, &empty], [&empty, &vector, &scalar]] {
+        assert_eq!(
+            incompatible_model(BoostedModel::average(members)),
+            "average"
+        );
+    }
+    // A tree-less member fits either kind.
+    let average = BoostedModel::average([&empty, &vector]).unwrap();
+    assert!(average.has_vector_leaves());
+    average.predict_margin(&data, Iterations::Best).unwrap();
 }

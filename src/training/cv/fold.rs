@@ -132,8 +132,9 @@ impl Fold {
     /// (shrinking the test tail) until it leaves `min_train`; the tail is
     /// then cut into the blocks.
     ///
-    /// Fails when the slices differ in length or are empty, a label ends
-    /// before its decision, `validation_fraction` is not in `(0, 1)`,
+    /// Fails with [`HessboostError::DimensionMismatch`] when the slices
+    /// differ in length, else (`purged folds`) when they are empty, a label
+    /// ends before its decision, `validation_fraction` is not in `(0, 1)`,
     /// `blocks` is 0, no start leaves `min_train` training rows and a
     /// decision time per block, or a fold would have no training or test
     /// rows.
@@ -162,12 +163,15 @@ impl Fold {
         min_train: usize,
     ) -> Result<Vec<Fold>> {
         let refuse = |reason: String| HessboostError::invalid_param("purged folds", reason);
-        if decision_at.len() != label_end.len() || decision_at.is_empty() {
-            return Err(refuse(format!(
-                "need one decision time and one label end per row, got {} and {}",
+        if decision_at.len() != label_end.len() {
+            return Err(HessboostError::dimension_mismatch(
+                "label_end length (one per decision time)",
                 decision_at.len(),
-                label_end.len()
-            )));
+                label_end.len(),
+            ));
+        }
+        if decision_at.is_empty() {
+            return Err(refuse("no rows".to_string()));
         }
         if !(validation_fraction > 0.0 && validation_fraction < 1.0) || blocks == 0 {
             return Err(refuse(format!(
@@ -253,14 +257,16 @@ impl Fold {
 ///
 /// `decision_at[i]` and `label_end[i]` are row `i`'s decision time and the
 /// end of its label window plus any embargo, as for
-/// [`Fold::purged_forward`]. For rows whose decision times span `first ..=
-/// last`, [`split`](Self::split) cuts at `split_at`, the first time at or
-/// after `first + (1 − fraction) · (last − first)` (that product rounded up
-/// to a whole time step): the tail is every row decided at or after
-/// `split_at`, and the rows the early-stopping fit trains on are those
-/// decided before it whose labels end at or before it (so a label ending
-/// exactly at the split is kept, one ending a tick later is purged; the
-/// rows in between go to neither side).
+/// [`Fold::purged_forward`], whose single-block split this is: of the `n`
+/// sorted distinct decision times of the rows split, [`split`](Self::split)
+/// starts the tail at `split_at`, the one at index `min(n − 1, floor((1 −
+/// fraction) · n))` (always a decision time of those rows). The tail is
+/// every row decided at or after `split_at`, and the rows the
+/// early-stopping fit trains on are those decided before it whose labels
+/// end at or before it (so a label ending exactly at the split is kept, one
+/// ending a tick later is purged; the rows in between go to neither side).
+/// Unlike `purged_forward`, the start never moves: a split leaving either
+/// side empty is refused.
 ///
 /// ```
 /// use hessboost::training::PurgedTail;
@@ -272,8 +278,8 @@ impl Fold {
 /// let label_end: Vec<i64> = decision_at.iter().map(|at| at + 2 * hour).collect();
 /// let tail = PurgedTail::new(&decision_at, &label_end, 0.25)?;
 /// let (split_at, split) = tail.split(&(0..9).collect::<Vec<_>>())?;
-/// // 0 + 0.75 · 8 hours: rows from hour 6 on are the tail; row 5 is
-/// // purged, as its label ends after the split, and row 4's ends at it.
+/// // Nine decision times: the tail starts at index floor(0.75 · 9) = 6.
+/// // Row 5 is purged, as its label ends after the split; row 4's ends at it.
 /// assert_eq!(split_at, 6 * hour);
 /// assert_eq!(split.test, [6, 7, 8]);
 /// assert_eq!(split.train, [0, 1, 2, 3, 4]);
@@ -293,17 +299,21 @@ impl<'a> PurgedTail<'a> {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] (`purged tail`) when the slices
-    /// differ in length or are empty, a label ends before its decision, or
-    /// `fraction` is not in `(0, 1)`.
+    /// [`HessboostError::DimensionMismatch`] when the slices differ in
+    /// length; [`HessboostError::InvalidParameter`] (`purged tail`) when they
+    /// are empty, a label ends before its decision, or `fraction` is not in
+    /// `(0, 1)`.
     pub fn new(decision_at: &'a [i64], label_end: &'a [i64], fraction: f64) -> Result<Self> {
         let refuse = |reason: String| HessboostError::invalid_param("purged tail", reason);
-        if decision_at.len() != label_end.len() || decision_at.is_empty() {
-            return Err(refuse(format!(
-                "need one decision time and one label end per row, got {} and {}",
+        if decision_at.len() != label_end.len() {
+            return Err(HessboostError::dimension_mismatch(
+                "label_end length (one per decision time)",
                 decision_at.len(),
-                label_end.len()
-            )));
+                label_end.len(),
+            ));
+        }
+        if decision_at.is_empty() {
+            return Err(refuse("no rows".to_string()));
         }
         if !(fraction > 0.0 && fraction < 1.0) {
             return Err(refuse(format!(
@@ -348,16 +358,15 @@ impl<'a> PurgedTail<'a> {
         if let Some(&row) = rows.iter().find(|&&row| row >= n) {
             return Err(format!("row {row} is out of bounds for {n} rows"));
         }
-        let times = rows.iter().map(|&row| self.decision_at[row]);
-        let (Some(first), Some(last)) = (times.clone().min(), times.max()) else {
+        let mut times: Vec<i64> = rows.iter().map(|&row| self.decision_at[row]).collect();
+        times.sort_unstable();
+        times.dedup();
+        if times.is_empty() {
             return Err("no rows to split".to_string());
-        };
-        // The span fits `i128` and, rounded, `f64`; the offset never passes
-        // it in exact arithmetic, so the clamp only absorbs that rounding.
-        let span = i128::from(last) - i128::from(first);
-        let offset = ((1.0 - self.fraction) * span as f64).ceil() as i128;
-        let split_at =
-            i64::try_from((i128::from(first) + offset).min(i128::from(last))).unwrap_or(last);
+        }
+        // `Fold::purged_forward`'s start index.
+        let count = times.len();
+        let split_at = times[(count - 1).min(((1.0 - self.fraction) * count as f64) as usize)];
         let (mut train, mut test) = (Vec::new(), Vec::new());
         for &row in rows {
             if self.decision_at[row] >= split_at {
@@ -508,7 +517,10 @@ mod tests {
         for (fraction, blocks) in [(0.0, 1), (1.0, 1), (f64::NAN, 1), (0.2, 0)] {
             assert!(Fold::purged_forward(&decisions, &ends, fraction, blocks, 1).is_err());
         }
-        assert!(Fold::purged_forward(&decisions, &ends[1..], 0.2, 1, 1).is_err());
+        assert!(matches!(
+            Fold::purged_forward(&decisions, &ends[1..], 0.2, 1, 1),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
         assert!(Fold::purged_forward(&[], &[], 0.2, 1, 1).is_err());
         assert!(Fold::purged_forward(&[5, 6], &[4, 7], 0.5, 1, 1).is_err());
     }
@@ -522,33 +534,34 @@ mod tests {
         let tail = PurgedTail::new(&decisions, &ends, 0.25).unwrap();
         let rows: Vec<usize> = (0..120).rev().collect();
         let (split_at, split) = tail.split(&rows).unwrap();
-        // Days 0..=19: 0.75 · 19 days is day 14.25.
-        assert_eq!(split_at, 14 * day + day / 4);
-        assert!(
-            times(&decisions, &split.test)
-                .iter()
-                .all(|&at| at >= 15 * day)
-        );
+        // 20 decision days: the tail starts at day floor(0.75 · 20) = 15,
+        // where purged_forward's single block starts too.
+        assert_eq!(split_at, 15 * day);
+        let forward = &Fold::purged_forward(&decisions, &ends, 0.25, 1, 1).unwrap()[0];
+        let sorted = |rows: &[usize]| {
+            let mut rows = rows.to_vec();
+            rows.sort_unstable();
+            rows
+        };
+        assert_eq!(sorted(&split.test), forward.test);
+        assert_eq!(sorted(&split.train), forward.train);
         assert_eq!(split.test.len(), 30);
-        // Labels end two days after their decision: day 12's at day 14,
-        // before the split; day 13's after it.
+        // Labels end two days after their decision: day 13's exactly at the
+        // split, so they train; a tick later they are purged.
         assert_eq!(
             times(&decisions, &split.train).into_iter().max(),
-            Some(12 * day)
+            Some(13 * day)
         );
         assert!(split.train.windows(2).all(|pair| pair[0] > pair[1]));
-        for (end, &at) in ends.iter_mut().zip(&decisions) {
-            if at == 12 * day {
-                *end = split_at;
-            }
-        }
-        let tail = PurgedTail::new(&decisions, &ends, 0.25).unwrap();
-        assert_eq!(tail.split(&rows).unwrap().1.train.len(), 78);
         for end in ends.iter_mut().filter(|end| **end == split_at) {
             *end += 1;
         }
         let tail = PurgedTail::new(&decisions, &ends, 0.25).unwrap();
-        assert_eq!(tail.split(&rows).unwrap().1.train.len(), 72);
+        let (_, split) = tail.split(&rows).unwrap();
+        assert_eq!(
+            times(&decisions, &split.train).into_iter().max(),
+            Some(12 * day)
+        );
     }
 
     #[test]
@@ -557,7 +570,10 @@ mod tests {
         for fraction in [0.0, 1.0, f64::NAN] {
             assert!(PurgedTail::new(&decisions, &ends, fraction).is_err());
         }
-        assert!(PurgedTail::new(&decisions, &ends[1..], 0.2).is_err());
+        assert!(matches!(
+            PurgedTail::new(&decisions, &ends[1..], 0.2),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
         assert!(PurgedTail::new(&[], &[], 0.2).is_err());
         assert!(PurgedTail::new(&[5, 6], &[4, 7], 0.5).is_err());
         let tail = PurgedTail::new(&decisions, &ends, 0.2).unwrap();

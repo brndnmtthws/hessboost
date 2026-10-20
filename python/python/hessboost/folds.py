@@ -116,12 +116,14 @@ class PurgedTail:
 
     ``decision_at`` and ``label_end`` hold every row's decision time and the
     end of its label window plus any embargo, as for
-    :func:`purged_forward`. For rows whose decision times span ``first`` to
-    ``last``, :meth:`split` cuts at the first time at or after ``first + (1
-    - fraction) * (last - first)``: the tail is every row decided at or
-    after it, and the early-stopping fit trains on the rows decided before
-    it whose labels end at or before it (a label ending exactly at the
-    split is kept, one ending a tick later is purged).
+    :func:`purged_forward`, whose single-block split this is: of the ``n``
+    sorted distinct decision times of the rows split, :meth:`split` starts
+    the tail at the one at index ``min(n - 1, floor((1 - fraction) * n))``.
+    The tail is every row decided at or after it, and the early-stopping
+    fit trains on the rows decided before it whose labels end at or before
+    it (a label ending exactly at the split is kept, one ending a tick later
+    is purged). The start never moves: a split leaving a side empty is
+    refused.
 
     Raises:
         HessboostError: The inputs differ in length or are empty, a label
@@ -153,14 +155,20 @@ class PurgedTail:
         return self._fraction
 
     def split(self, rows: ArrayLike) -> tuple[int, Split]:
-        """The split time of ``rows`` and their split: ``(fit_rows,
-        tail_rows)``, each in ``rows`` order.
+        """The split time of ``rows`` (a decision time, in the integer units
+        of ``decision_at``: nanoseconds since the epoch for ``datetime64``
+        times) and their split: ``(fit_rows, tail_rows)``, each in ``rows``
+        order.
 
         Raises:
             HessboostError: A row is out of bounds, or a side of the split
                 is empty.
+            TypeError: ``rows`` are not integers.
         """
-        selected = np.asarray(rows, dtype=np.int64).reshape(-1)
+        array = np.asarray(rows).reshape(-1)
+        if array.size and not np.issubdtype(array.dtype, np.integer):
+            raise TypeError(f"rows must be integer indices, got {array.dtype}")
+        selected = array.astype(np.int64)
         split_at, [split] = _hessboost.purged_tail_split(
             self._decision_at, self._label_end, self._fraction, selected.tolist()
         )

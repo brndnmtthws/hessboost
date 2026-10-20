@@ -1086,7 +1086,7 @@ fn eval_histories_are_identical_across_thread_counts() {
 /// fold's stages at a round of its own, is refused.
 #[test]
 fn cross_validation_early_stops_an_ebm() {
-    use hessboost::training::{CrossValidation, CvStopping, Fold};
+    use hessboost::training::{CrossValidation, CvStopping, Fold, PurgedTail};
     // Pure-noise labels, so the held-out error soon stops improving.
     let (x, _) = data(300, 36);
     let mut noise = lcg(5);
@@ -1142,4 +1142,12 @@ fn cross_validation_early_stops_an_ebm() {
     let cv = || CrossValidation::new(&bag_stopping, &data, 6, folds());
     assert_eq!(invalid_param(cv().run()), "ebm_early_stopping_rounds");
     assert_eq!(invalid_param(cv().refit()), "ebm_early_stopping_rounds");
+    // Per-fold stopping does not lift the refusal.
+    let at: Vec<i64> = (0..300).collect();
+    let tail = PurgedTail::new(&at, &at, 0.3).unwrap();
+    let per_fold = CvStopping::per_fold(NonZeroUsize::new(2).unwrap(), tail);
+    assert_eq!(
+        invalid_param(cv().early_stopping(per_fold).run()),
+        "ebm_early_stopping_rounds"
+    );
 }

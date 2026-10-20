@@ -851,8 +851,9 @@ class Booster(_SchemaState):
         Predictions apply the shared objective's transform to that mean
         margin, so for log links (``count:poisson``, ``reg:gamma``,
         ``reg:tweedie``, ``survival:cox``) the average predicts the geometric
-        mean of the members' predictions, and for ``binary:logistic`` the
-        sigmoid of their mean logit.
+        mean of the members' predictions, for ``binary:logistic`` the
+        sigmoid of their mean logit, and for ``multi:softprob`` the softmax of
+        their mean logits.
 
         Each leaf ``v`` becomes the ``float32`` nearest ``v / k``; each
         intercept is the members' intercepts summed in ``float64`` in member
@@ -866,6 +867,7 @@ class Booster(_SchemaState):
 
         Raises:
             HessboostError: ``models`` is empty.
+            TypeError: A member is not a :class:`Booster`.
             IncompatibleModelError: A member differs from the first in its
                 objective (with its parameters), feature count, output,
                 target or class count, ``num_parallel_tree``, vector leaves,
@@ -874,6 +876,9 @@ class Booster(_SchemaState):
                 early-stopped (slice it, e.g. ``booster[: best + 1]``, first).
         """
         members = list(models)
+        for member in members:
+            if not isinstance(member, Booster):
+                raise TypeError(f"models must be Boosters, got {type(member).__name__}")
         if not members:
             raise HessboostError("no models to average")
         first = members[0]

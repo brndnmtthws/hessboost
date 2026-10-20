@@ -245,6 +245,8 @@ def test_averaging_refuses_incompatible_members(trained: tuple[Booster, np.ndarr
     booster, x = trained
     with pytest.raises(HessboostError, match="no models"):
         Booster.average([])
+    with pytest.raises(TypeError, match="Booster"):
+        Booster.average([booster, booster._model])  # ty: ignore[invalid-argument-type]
     renamed = booster.copy()
     renamed.feature_names = list("vwxyz")
     with pytest.raises(hessboost.IncompatibleModelError, match="feature names"):

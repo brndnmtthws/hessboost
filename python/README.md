@@ -168,13 +168,15 @@ predictions = refit.booster.predict(X_test)
 
 `hessboost.cross_validate` takes the same arguments and returns a
 `CvReport`: the `history`, every fold's `FoldReport` (its round count, test
-scores, and test-row margins), and with `refit=True` the `CvRefit`.
+scores, and test-row margins), and with `refit=True` its `Refit` (the
+retrained `booster`, `num_boost_round`, `target_encoder`, `stopping`).
 `report.out_of_fold()` combines the folds into one margin row per training
 row (NaN and fold `-1` for rows no fold tests; refused when two folds test
 the same row). With `per_fold_stopping=folds.PurgedTail(decision_at,
 label_end, fraction)`, early stopping is per fold and leakage-safe: each
 fold sizes its rounds on the purged chronological tail of its own training
-rows (`early_stopping_rounds` the patience), then trains on all of them, so
+rows (cut as `purged_forward` cuts one block: the last `fraction` of their
+distinct decision times) (`early_stopping_rounds` the patience), then trains on all of them, so
 no forward fold uses rounds chosen with later labels; the refit is sized the
 same way on every row:
 

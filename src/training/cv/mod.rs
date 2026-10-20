@@ -155,7 +155,8 @@ pub struct FoldReport {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct TailStopping {
-    /// The split time ([`PurgedTail::split`]).
+    /// The split time ([`PurgedTail::split`]): a decision time of the rows
+    /// split.
     pub split_at: i64,
     /// The rows the early-stopping fit trained on.
     pub fit_rows: usize,
@@ -327,9 +328,12 @@ impl<'a> CrossValidation<'a> {
     ///
     /// [`run`](Self::run) and [`refit`](Self::refit) refuse per-fold
     /// stopping unless its tail times hold one value per row of `data`
-    /// ([`HessboostError::DimensionMismatch`]), and refuse a fold (or, in
-    /// `refit`, the data) whose tail split leaves either side empty
-    /// ([`HessboostError::InvalidParameter`] `early_stopping`).
+    /// ([`HessboostError::DimensionMismatch`]), for a Boulevard fit
+    /// (`booster = boulevard` or a Boulevard EBM, which do not early-stop:
+    /// [`HessboostError::InvalidParameter`] `early_stopping`), and for a fold
+    /// (or, in `refit`, the data) whose tail split leaves either side empty
+    /// ([`HessboostError::InvalidParameter`] `purged tail`, as
+    /// [`PurgedTail::split`]).
     #[must_use]
     pub fn early_stopping(mut self, stopping: CvStopping<'a>) -> Self {
         self.stopping = Some(stopping);
@@ -395,8 +399,8 @@ impl<'a> CrossValidation<'a> {
     /// when [`early_stopping`](Self::early_stopping),
     /// [`target_stats_label`](Self::target_stats_label) or
     /// [`init_model`](Self::init_model) is refused, or when encoding,
-    /// training, or predicting a fold fails. Without per-fold stopping, an
-    /// EBM that stops its bags early
+    /// training, or predicting a fold fails. An EBM that stops its bags
+    /// early
     /// ([`Ebm::early_stopping`](crate::config::Ebm::early_stopping)) is
     /// refused ([`HessboostError::InvalidParameter`]
     /// `ebm_early_stopping_rounds`): each fold would end its stages at a
@@ -497,13 +501,24 @@ impl<'a> CrossValidation<'a> {
         }
         if let BoosterKind::Ebm(ebm) = &self.params.booster
             && ebm.early_stopping().is_some()
-            && !matches!(self.stopping, Some(CvStopping::PerFold { .. }))
         {
             return Err(HessboostError::invalid_param(
                 "ebm_early_stopping_rounds",
                 "cross-validation averages the folds round by round, but stopping each \
                  fold's bags on its own held-out rows ends the folds' stages at different \
                  rounds; stop on the fold means with early_stopping_rounds instead",
+            ));
+        }
+        let boulevard = match &self.params.booster {
+            BoosterKind::Boulevard(_) => true,
+            BoosterKind::Ebm(ebm) => ebm.boulevard(),
+            _ => false,
+        };
+        if boulevard && matches!(self.stopping, Some(CvStopping::PerFold { .. })) {
+            return Err(HessboostError::invalid_param(
+                "early_stopping",
+                "per-fold stopping early-stops a trial on each fold's tail, but Boulevard \
+                 fits do not early-stop; cross-validate them without it or on the fold means",
             ));
         }
         if let Some(CvStopping::PerFold { tail, .. }) = &self.stopping
@@ -699,7 +714,7 @@ impl<'a> CrossValidation<'a> {
         whose: &str,
     ) -> Result<(TailStopping, usize)> {
         let (split_at, split) = tail.split_rows(rows).map_err(|reason| {
-            HessboostError::invalid_param("early_stopping", format!("{whose}: {reason}"))
+            HessboostError::invalid_param("purged tail", format!("{whose}: {reason}"))
         })?;
         let (dfit, encoder) = self.train_data(&split.train)?;
         let dtail = self.held_out_data(&split.test, encoder.as_ref())?;
@@ -708,6 +723,9 @@ impl<'a> CrossValidation<'a> {
             .eval(&dtail, "early_stopping")
             .early_stopping_rounds(patience)
             .train()?;
+        // Re-run the stopping rule over the trial's rounds rather than read
+        // its `best_iteration`, which counts trees for an EBM (a tree per
+        // term and bag each round), not rounds.
         let watched: Vec<f64> = trial
             .history
             .rounds()

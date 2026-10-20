@@ -436,6 +436,76 @@ fn per_fold_stopping_refuses_unusable_tails() {
     for (tail, train) in [(tail, vec![0, 1]), (same_time, vec![0, 1])] {
         let cv = CrossValidation::new(&params, &data, 5, vec![Fold::new(train, vec![5])])
             .early_stopping(CvStopping::per_fold(patience, tail));
-        assert_eq!(invalid_param(cv.run()), "early_stopping");
+        assert_eq!(invalid_param(cv.run()), "purged tail");
     }
+}
+
+/// Under per-fold stopping with target statistics, the trial's encoder is
+/// fitted on the tail split's fit rows only, and the fold's on all its
+/// training rows: bit for bit the folds encoded and trained by hand.
+#[test]
+fn per_fold_stopping_encodes_the_trial_on_its_fit_rows() {
+    let data = categorical(1);
+    let params = params();
+    let encoder = OrderedTargetEncoder::builder().seed(4).build().unwrap();
+    let (decision_at, label_end) = schedule();
+    let folds = || Fold::purged_forward(&decision_at, &label_end, 0.4, 2, 20).unwrap();
+    let tail = PurgedTail::new(&decision_at, &label_end, 0.3).unwrap();
+    let patience = NonZeroUsize::new(3).unwrap();
+    let report = CrossValidation::new(&params, &data, 40, folds())
+        .early_stopping(CvStopping::per_fold(patience, tail))
+        .target_stats(encoder.clone(), vec![0])
+        .run()
+        .unwrap();
+    for (fold, got) in folds().iter().zip(&report.folds) {
+        let (_, split) = tail.split(&fold.train).unwrap();
+        let (dfit, fitted) = encoder
+            .fit_transform(&data.select_rows(&split.train).unwrap(), &[0])
+            .unwrap();
+        let dtail = fitted
+            .transform(&data.select_rows(&split.test).unwrap())
+            .unwrap();
+        let trial = Trainer::new(&params, &dfit, 40)
+            .eval(&dtail, "early_stopping")
+            .early_stopping_rounds(patience)
+            .train()
+            .unwrap();
+        let rounds = trial.model.best_iteration().unwrap() + 1;
+        let (dtrain, fitted) = encoder
+            .fit_transform(&data.select_rows(&fold.train).unwrap(), &[0])
+            .unwrap();
+        let dtest = fitted
+            .transform(&data.select_rows(&fold.test).unwrap())
+            .unwrap();
+        let model = Trainer::new(&params, &dtrain, rounds)
+            .train()
+            .unwrap()
+            .model;
+        assert_eq!(got.num_boost_round, rounds);
+        assert_eq!(
+            got.margins,
+            model.predict_margin(&dtest, Iterations::Best).unwrap()
+        );
+    }
+}
+
+/// Boulevard fits do not early-stop, so per-fold stopping refuses them
+/// before training.
+#[test]
+fn per_fold_stopping_refuses_boulevard() {
+    use hessboost::config::{BoosterKind, Boulevard};
+    let data = regression();
+    let params = TrainingParams::builder()
+        .booster(BoosterKind::Boulevard(
+            Boulevard::builder().build().unwrap(),
+        ))
+        .eta(0.8)
+        .subsample(0.8)
+        .build()
+        .unwrap();
+    let (decision_at, label_end) = schedule();
+    let tail = PurgedTail::new(&decision_at, &label_end, 0.3).unwrap();
+    let cv = CrossValidation::new(&params, &data, 5, folds())
+        .early_stopping(CvStopping::per_fold(NonZeroUsize::new(2).unwrap(), tail));
+    assert_eq!(invalid_param(cv.run()), "early_stopping");
 }

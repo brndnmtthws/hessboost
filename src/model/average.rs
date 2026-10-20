@@ -17,8 +17,9 @@ impl BoostedModel {
     /// transform to that mean margin: for an identity link that is the mean
     /// prediction, for a log link (`count:poisson`, `reg:gamma`,
     /// `reg:tweedie`, `survival:cox`) the geometric mean of the members'
-    /// predictions, for `binary:logistic` the sigmoid of the mean logit, and
-    /// for `reg:quantileerror` the sorted mean margins.
+    /// predictions, for `binary:logistic` the sigmoid of the mean logit, for
+    /// `multi:softprob` the softmax of the mean logits, and for
+    /// `reg:quantileerror` the sorted mean margins.
     ///
     /// Arithmetic, which fixes the result bit for bit: each scalar or vector
     /// leaf `v` becomes the `f32` nearest `v / k` (computed as `f64` division
@@ -36,7 +37,8 @@ impl BoostedModel {
     /// Members must agree on everything their margins depend on besides
     /// the trees and intercepts: the objective with its parameters (and the
     /// stored `max_delta_step`), the feature count, the output, target, and
-    /// class counts, `num_parallel_tree`, and scalar or vector leaves.
+    /// class counts, `num_parallel_tree`, and scalar or vector leaves (a
+    /// member without trees fits either).
     /// Feature names and categories are not part of a [`BoostedModel`]; the
     /// caller checks them (Python's `Booster.average` does).
     ///
@@ -97,11 +99,29 @@ impl BoostedModel {
                 ),
             ));
         }
+        // Tree-less members fit either leaf kind; the rest share the kind
+        // of the first one with trees.
+        let leaf_kind = members
+            .iter()
+            .enumerate()
+            .find(|(_, member)| !member.trees.is_empty())
+            .map(|(index, member)| (member.has_vector_leaves(), index));
         for (index, member) in members.iter().enumerate() {
             let conflict = member
                 .averageable()
                 .map(String::from)
-                .or_else(|| first.layout_conflict(member));
+                .or_else(|| first.layout_conflict(member))
+                .or_else(|| match leaf_kind {
+                    Some((vector, reference))
+                        if !member.trees.is_empty() && member.has_vector_leaves() != vector =>
+                    {
+                        Some(format!(
+                            "has vector leaves {}, model {reference} {vector}",
+                            member.has_vector_leaves()
+                        ))
+                    }
+                    _ => None,
+                });
             if let Some(reason) = conflict {
                 return Err(HessboostError::incompatible_model(
                     "average",
@@ -129,7 +149,7 @@ impl BoostedModel {
                 (sum / count) as f32
             })
             .collect();
-        Ok(BoostedModel {
+        let average = BoostedModel {
             trees,
             base_score,
             objective: first.objective.clone(),
@@ -147,7 +167,17 @@ impl BoostedModel {
             ebm: None,
             compact: OnceLock::new(),
             transform: first.transform.clone(),
-        })
+        };
+        // The checks above make the result valid; keep a loader's check as
+        // the last guard, so a missed combination is an error, not a model
+        // that cannot predict.
+        average.validate_structure().map_err(|error| {
+            HessboostError::incompatible_model(
+                "average",
+                format!("the members do not combine into a valid model: {error}"),
+            )
+        })?;
+        Ok(average)
     }
 
     /// Why this model cannot be an average's member on its own, if it
@@ -197,15 +227,6 @@ impl BoostedModel {
                 "num_parallel_tree",
                 &self.num_parallel_tree,
                 &other.num_parallel_tree,
-            )
-        } else if !self.trees.is_empty()
-            && !other.trees.is_empty()
-            && self.has_vector_leaves() != other.has_vector_leaves()
-        {
-            differs(
-                "vector leaves",
-                &self.has_vector_leaves(),
-                &other.has_vector_leaves(),
             )
         } else {
             None

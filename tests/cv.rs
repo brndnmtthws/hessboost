@@ -570,3 +570,42 @@ fn fold_mean_margins_of_dart_are_the_retrained_folds() {
         );
     }
 }
+
+/// A history-only run reports the full run's fold-mean history without
+/// any fold (so a DART fold stopped early is not retrained for margins),
+/// and its refit is the full refit's model. Per-fold stopping, which has no
+/// fold-mean history, is refused.
+#[test]
+fn history_only_reports_the_fold_mean_history_alone() {
+    use hessboost::config::{BoosterKind, Dart};
+    let data = regression();
+    let params = TrainingParams::builder()
+        .booster(BoosterKind::Dart(
+            Dart::builder().rate_drop(0.3).build().unwrap(),
+        ))
+        .max_depth(6)
+        .eta(0.8)
+        .subsample(0.8)
+        .seed(3)
+        .build()
+        .unwrap();
+    let stopping = CvStopping::fold_mean(NonZeroUsize::new(3).unwrap());
+    let cv = || CrossValidation::new(&params, &data, 30, folds()).early_stopping(stopping);
+    let full = cv().refit().unwrap();
+    let history = cv().history_only().refit().unwrap();
+    assert!(full.num_boost_round < 30, "{} rounds", full.num_boost_round);
+    assert!(history.report.folds.is_empty());
+    assert_eq!(history.report.metrics, full.report.metrics);
+    for (got, expected) in history.report.results.iter().zip(&full.report.results) {
+        assert_eq!(got.rounds, expected.rounds);
+    }
+    assert_eq!(history.num_boost_round, full.num_boost_round);
+    assert_same_model(&history.model, &full.model, &data);
+
+    let (decision_at, label_end) = schedule();
+    let tail = PurgedTail::new(&decision_at, &label_end, 0.3).unwrap();
+    let per_fold = CrossValidation::new(&params, &data, 5, folds())
+        .early_stopping(CvStopping::per_fold(NonZeroUsize::new(2).unwrap(), tail))
+        .history_only();
+    assert_eq!(invalid_param(per_fold.run()), "early_stopping");
+}

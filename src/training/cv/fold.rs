@@ -367,12 +367,14 @@ impl<'a> PurgedTail<'a> {
         if times.is_empty() {
             return Err("no rows to split".to_string());
         }
-        // The first decision time at or past `1 - fraction` of the span
-        // (`last` always is: the rounded product never exceeds the span).
-        let first = times[0];
-        let offset = |time: i64| (i128::from(time) - i128::from(first)) as f64;
-        let target = (1.0 - self.fraction) * offset(times[times.len() - 1]);
-        let split_at = times[times.partition_point(|&time| offset(time) < target)];
+        // The first decision time at or past `1 - fraction` of the span.
+        // Offsets compare as integers (in `f64`, one just before the cutoff
+        // could round onto it past 2^53) with the cutoff rounded up to a
+        // whole tick and capped at the span, which `last` always reaches.
+        let first = i128::from(times[0]);
+        let span = i128::from(times[times.len() - 1]) - first;
+        let cutoff = (((1.0 - self.fraction) * span as f64).ceil() as i128).min(span);
+        let split_at = times[times.partition_point(|&time| i128::from(time) - first < cutoff)];
         let (mut train, mut test) = (Vec::new(), Vec::new());
         for &row in rows {
             if self.decision_at[row] >= split_at {
@@ -601,5 +603,25 @@ mod tests {
         // purged_forward, by decision times, also tests time 7.
         let forward = &Fold::purged_forward(&at, &at, 0.3, 1, 1).unwrap()[0];
         assert_eq!(forward.test, [7, 8, 9]);
+    }
+
+    /// Past 2^53 ticks (nanosecond times over months), a time one tick
+    /// before the cutoff stays before it: here the cutoff is exactly `t`,
+    /// which `t - 1` rounds onto in `f64`. A fraction so small that
+    /// `1 - fraction` rounds to 1 cuts at the last time, not past it.
+    #[test]
+    fn purged_tail_cutoff_is_exact_for_large_offsets() {
+        let t = 1_i64 << 54;
+        let at = [0, t - 1, t, 2 * t];
+        let tail = PurgedTail::new(&at, &at, 0.5).unwrap();
+        let (split_at, split) = tail.split(&[0, 1, 2, 3]).unwrap();
+        assert_eq!(split_at, t);
+        assert_eq!(split.test, [2, 3]);
+        assert_eq!(split.train, [0, 1]);
+        let at = [0, 1, i64::MAX - 1];
+        let tail = PurgedTail::new(&at, &at, f64::EPSILON / 4.0).unwrap();
+        let (split_at, split) = tail.split(&[0, 1, 2]).unwrap();
+        assert_eq!(split_at, i64::MAX - 1);
+        assert_eq!(split.test, [2]);
     }
 }

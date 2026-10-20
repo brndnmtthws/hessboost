@@ -117,7 +117,8 @@ pub struct CvReport {
     /// held-out metric per round across folds. Empty under
     /// [`CvStopping::PerFold`], whose folds run different round counts.
     pub results: Vec<CvResult>,
-    /// One report per fold, in fold order.
+    /// One report per fold, in fold order (none under
+    /// [`CrossValidation::history_only`]).
     pub folds: Vec<FoldReport>,
     /// The cross-validated data's row count.
     n_rows: usize,
@@ -139,11 +140,14 @@ pub struct FoldReport {
     pub scores: Vec<f64>,
     /// The model's margins on the test rows, one row per entry of
     /// [`test`](Self::test) (target-encoded by the fold's own statistics
-    /// under [`CrossValidation::target_stats`]), bit for bit those of the
-    /// fold's model trained for `num_boost_round` rounds (under
-    /// [`CvStopping::FoldMean`], a gbtree fold's first iterations; for
-    /// other boosters, whose later rounds rescale earlier trees or add
-    /// several trees per round, the fold retrained for that many rounds).
+    /// under [`CrossValidation::target_stats`]): bit for bit those of the
+    /// fold's configured run stopped through [`Trainer::on_round`] after
+    /// `num_boost_round` rounds (the same as a run configured for that
+    /// many, except under `booster = ebm`, whose configured count caps each
+    /// stage). Under [`CvStopping::FoldMean`] they are a gbtree fold's first
+    /// iterations; other boosters, whose later rounds rescale earlier trees
+    /// or add several trees per round, retrain the fold for that many
+    /// rounds.
     pub margins: Predictions,
     /// Under [`CvStopping::PerFold`], the fold's tail split and its best
     /// score; `None` otherwise.
@@ -328,6 +332,7 @@ pub struct CrossValidation<'a> {
     target_stats: Option<(OrderedTargetEncoder, Vec<usize>)>,
     target_stats_label: Option<&'a [f32]>,
     init_model: Option<&'a BoostedModel>,
+    history_only: bool,
 }
 
 impl<'a> CrossValidation<'a> {
@@ -348,10 +353,11 @@ impl<'a> CrossValidation<'a> {
             target_stats: None,
             target_stats_label: None,
             init_model: None,
+            history_only: false,
         }
     }
 
-    /// Choose each fold's round count (at most `num_boost_round`) by
+    /// Choose each fold's round count (at most the rounds the folds train) by
     /// `stopping`: on the fold means ([`CvStopping::fold_mean`], as
     /// `xgboost.cv`'s `early_stopping_rounds`), or per fold on a purged tail
     /// of its own training rows ([`CvStopping::per_fold`]).
@@ -421,12 +427,29 @@ impl<'a> CrossValidation<'a> {
         self
     }
 
+    /// Report only the fold-mean history ([`CvReport::results`]), as [`cv`]
+    /// and Python's `hessboost.cv` do: [`CvReport::folds`] stays empty, so
+    /// no fold's model outlives its run, and none is predicted on or (under
+    /// [`CvStopping::FoldMean`], for boosters other than gbtree) retrained
+    /// for its margins.
+    ///
+    /// [`run`](Self::run) and [`refit`](Self::refit) refuse it with
+    /// [`CvStopping::per_fold`] ([`HessboostError::InvalidParameter`]
+    /// `early_stopping`), whose folds report different round counts and
+    /// no fold-mean history.
+    #[must_use]
+    pub fn history_only(mut self) -> Self {
+        self.history_only = true;
+        self
+    }
+
     /// Train and evaluate every fold, returning the fold-mean history and
     /// every fold's report ([`CvReport`]).
     ///
     /// Fails when there are no folds, a fold's training or test rows are
     /// empty, out of bounds, or (on ranking data) not whole query groups,
-    /// when [`early_stopping`](Self::early_stopping),
+    /// when [`early_stopping`](Self::early_stopping) (alone or with
+    /// [`history_only`](Self::history_only)),
     /// [`target_stats_label`](Self::target_stats_label) or
     /// [`init_model`](Self::init_model) is refused, or when encoding,
     /// training, or predicting a fold fails. An EBM that stops its bags
@@ -536,7 +559,7 @@ impl<'a> CrossValidation<'a> {
                 "ebm_early_stopping_rounds",
                 "cross-validation averages the folds round by round, but stopping each \
                  fold's bags on its own held-out rows ends the folds' stages at different \
-                 rounds; stop on the fold means with early_stopping_rounds instead",
+                 rounds; stop on the fold means instead (fold-mean early stopping)",
             ));
         }
         let boulevard = match &self.params.booster {
@@ -549,6 +572,13 @@ impl<'a> CrossValidation<'a> {
                 "early_stopping",
                 "per-fold stopping early-stops a trial on each fold's tail, but Boulevard \
                  fits do not early-stop; cross-validate them without it or on the fold means",
+            ));
+        }
+        if self.history_only && matches!(self.stopping, Some(CvStopping::PerFold { .. })) {
+            return Err(HessboostError::invalid_param(
+                "early_stopping",
+                "per-fold stopping has no fold-mean history, only the folds' reports; run it \
+                 without history_only",
             ));
         }
         if let Some(CvStopping::PerFold { tail, .. }) = &self.stopping
@@ -610,7 +640,8 @@ impl<'a> CrossValidation<'a> {
 
     /// Every fold trained for every round and scored on its test rows,
     /// aggregated per round and, under `patience`, truncated at the best
-    /// fold-mean round, which then sizes every fold's report.
+    /// fold-mean round, which then sizes every fold's report (none when
+    /// history-only).
     fn fold_mean(
         &self,
         metrics: &[Box<dyn Metric>],
@@ -619,6 +650,7 @@ impl<'a> CrossValidation<'a> {
         // `values[metric][round][fold]`, grown as rounds arrive (not sized
         // by `num_boost_round`, which is caller input).
         let mut values: Vec<Vec<Vec<f64>>> = vec![Vec::new(); metrics.len()];
+        // Each fold's history and margins (or what they come from).
         let mut runs = Vec::with_capacity(self.folds.len());
         for fold in &self.folds {
             let (dtrain, encoder) = self.train_data(&fold.train)?;
@@ -635,13 +667,17 @@ impl<'a> CrossValidation<'a> {
                     per_round[round].push(value);
                 }
             }
-            // Without early stopping every round counts: predict now rather
-            // than select the test rows again.
-            let margins = match patience {
-                None => Some(model.predict_margin(&dtest, ..)?),
-                Some(_) => None,
-            };
-            runs.push((model, encoder, history, margins));
+            // A history-only run keeps nothing of the fold past its scores.
+            // Without early stopping every round counts: predict now, so the
+            // model goes before the next fold trains instead of every fold's
+            // being kept to the end.
+            if !self.history_only {
+                let margins = match patience {
+                    None => FoldMargins::Ready(model.predict_margin(&dtest, ..)?),
+                    Some(_) => FoldMargins::Pending(Box::new(model), encoder),
+                };
+                runs.push((history, margins));
+            }
         }
         let mut results: Vec<CvResult> = metrics
             .iter()
@@ -663,30 +699,32 @@ impl<'a> CrossValidation<'a> {
             .folds
             .iter()
             .zip(runs)
-            .map(|(fold, (model, encoder, history, margins))| {
+            .map(|(fold, (history, margins))| {
                 let used = rounds.min(history.len());
                 let last = used
                     .checked_sub(1)
                     .and_then(|round| history.rounds().nth(round));
-                let margins = if let Some(margins) = margins {
-                    margins
-                } else {
-                    let dtest = self.held_out_data(&fold.test, encoder.as_ref())?;
-                    match last {
-                        _ if used == history.len() => model.predict_margin(&dtest, ..)?,
-                        // A gbtree round is one iteration, and its first
-                        // iterations are the shorter run's model (shrunk
-                        // ones included).
-                        Some(round) if matches!(self.params.booster, BoosterKind::GbTree) => {
-                            model.predict_margin(&dtest, ..round.iteration() + 1)?
-                        }
-                        // DART rescales earlier trees and an EBM round adds
-                        // a tree per term (and bag): replay the shorter run.
-                        _ => {
-                            let (dtrain, _) = self.train_data(&fold.train)?;
-                            self.train_rounds(&dtrain, None, used)?
-                                .model
-                                .predict_margin(&dtest, ..)?
+                let margins = match margins {
+                    FoldMargins::Ready(margins) => margins,
+                    FoldMargins::Pending(model, encoder) => {
+                        let dtest = self.held_out_data(&fold.test, encoder.as_ref())?;
+                        match last {
+                            _ if used == history.len() => model.predict_margin(&dtest, ..)?,
+                            // A gbtree round is one iteration, and its first
+                            // iterations are the shorter run's model (shrunk
+                            // ones included).
+                            Some(round) if matches!(self.params.booster, BoosterKind::GbTree) => {
+                                model.predict_margin(&dtest, ..round.iteration() + 1)?
+                            }
+                            // DART rescales earlier trees and an EBM round
+                            // adds a tree per term (and bag): replay the
+                            // shorter run.
+                            _ => {
+                                let (dtrain, _) = self.train_data(&fold.train)?;
+                                self.train_rounds(&dtrain, None, used)?
+                                    .model
+                                    .predict_margin(&dtest, ..)?
+                            }
                         }
                     }
                 };
@@ -842,6 +880,14 @@ impl<'a> CrossValidation<'a> {
     }
 }
 
+/// A fold's test margins in [`CrossValidation::fold_mean`]: taken as soon as
+/// its run ends when every round counts, else its model (with the fold's
+/// encoder) kept until the fold-mean round count is known.
+enum FoldMargins {
+    Ready(Predictions),
+    Pending(Box<BoostedModel>, Option<FittedTargetEncoder>),
+}
+
 /// Whether the watched (last) metric is maximized.
 fn maximizes(metrics: &[Box<dyn Metric>]) -> bool {
     metrics.last().is_some_and(|metric| metric.maximize())
@@ -947,6 +993,7 @@ pub fn cv(
 ) -> Result<Vec<CvResult>> {
     let folds = Fold::k_fold(data.n_rows(), nfold, seed)?;
     Ok(CrossValidation::new(params, data, num_boost_round, folds)
+        .history_only()
         .run()?
         .results)
 }

@@ -869,11 +869,13 @@ class Booster(_SchemaState):
             HessboostError: ``models`` is empty.
             TypeError: A member is not a :class:`Booster`.
             IncompatibleModelError: A member differs from the first in its
-                objective (with its parameters), feature count, output,
-                target or class count, ``num_parallel_tree``, vector leaves,
-                or feature names, types or categories; or a member is a
-                ``gblinear``, DART, model-shrinkage, Boulevard or EBM model, or
-                early-stopped (slice it, e.g. ``booster[: best + 1]``, first).
+                objective (with its parameters and ``max_delta_step``),
+                feature count, output, target or class count,
+                ``num_parallel_tree``, vector leaves, or feature names, types
+                or categories; or a member is a ``gblinear``, model-shrinkage,
+                Boulevard or EBM model, has tree weights other than 1 (DART),
+                or is early-stopped (slice it, e.g. ``booster[: best + 1]``,
+                first).
         """
         members = list(models)
         for member in members:

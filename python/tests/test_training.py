@@ -720,12 +720,31 @@ def test_cross_validate_refuses_unusable_stopping() -> None:
         hessboost.folds.PurgedTail(at, at, 1.0)
     with pytest.raises(HessboostError, match="before its decision"):
         hessboost.folds.PurgedTail(at, at - 1, 0.5)
+    for rows in ([-1, 5], [400]):
+        with pytest.raises(HessboostError, match="out of range"):
+            tail.split(rows)
     overlapping = hessboost.cross_validate(
         {}, dtrain, 2, folds=[(range(100), [100, 101]), (range(100), [101])]
     )
     np.testing.assert_array_equal(overlapping.folds[1].test_rows, [101])
     with pytest.raises(HessboostError, match="held out by folds 0 and 1"):
         overlapping.out_of_fold()
+
+
+def test_cross_validation_of_no_rounds_has_no_scores() -> None:
+    """Zero rounds leave each fold its intercept: empty histories, and no
+    fold scores, in both the history-only and the reporting run."""
+    x, y = regression()
+    dtrain = DMatrix(x, y)
+    history = hessboost.cv({}, dtrain, 0)
+    assert {key: len(values) for key, values in history.items()} == {
+        "test-rmse-mean": 0,
+        "test-rmse-std": 0,
+    }
+    report = hessboost.cross_validate({}, dtrain, 0, refit=True)
+    assert [(fold.num_boost_round, fold.scores) for fold in report.folds] == [(0, {})] * 3
+    assert report.refit is not None
+    assert report.refit.num_boost_round == 0
 
 
 def test_train_with_budget_fits_and_refuses_tuned_parameters() -> None:

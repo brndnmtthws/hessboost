@@ -170,8 +170,10 @@ class PurgedTail:
         array = np.asarray(rows).reshape(-1)
         if array.size and not np.issubdtype(array.dtype, np.integer):
             raise TypeError(f"rows must be integer indices, got {array.dtype}")
-        selected = array.astype(np.int64)
         split_at, [split] = _hessboost.purged_tail_split(
-            self._decision_at, self._label_end, self._fraction, selected.tolist()
+            self._decision_at,
+            self._label_end,
+            self._fraction,
+            np.ascontiguousarray(array, dtype=np.int64),
         )
         return split_at, split

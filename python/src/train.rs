@@ -512,9 +512,10 @@ type RefitTuple = (
 /// One cross-validation run, passed from Python as a `dict`: explicit
 /// `(train rows, test rows)` folds, with `target_stats = (encoder, columns)`
 /// fitted inside each fold (over `target_stats_label` when given), an
-/// `init_model` every fold continues, and per-fold early stopping on the
+/// `init_model` every fold continues, per-fold early stopping on the
 /// purged tail `per_fold_stopping = (decision_at, label_end, fraction)`
-/// (with `early_stopping_rounds` its patience).
+/// (with `early_stopping_rounds` its patience), and `history_only` (what
+/// `hessboost.cv` runs: the fold-mean history without fold reports).
 #[derive(FromPyObject)]
 #[pyo3(from_item_all)]
 pub(crate) struct CvRequest<'py> {
@@ -532,6 +533,8 @@ pub(crate) struct CvRequest<'py> {
     target_stats_label: Option<PyReadonlyArray1<'py, f32>>,
     #[pyo3(default)]
     init_model: Option<Py<Booster>>,
+    #[pyo3(default)]
+    history_only: bool,
 }
 
 impl CvRequest<'_> {
@@ -584,6 +587,9 @@ impl CvRequest<'_> {
         }
         if let Some(booster) = &request.init_model {
             cv = cv.init_model(&booster.get().model);
+        }
+        if request.history_only {
+            cv = cv.history_only();
         }
         Ok(cv)
     }
@@ -721,7 +727,7 @@ pub(crate) fn purged_tail_split<'py>(
     decision_at: PyReadonlyArray1<'_, i64>,
     label_end: PyReadonlyArray1<'_, i64>,
     fraction: f64,
-    rows: Vec<usize>,
+    rows: PyReadonlyArray1<'_, i64>,
 ) -> PyResult<(i64, FoldArrays<'py>)> {
     let tail = PurgedTail::new(
         row_major(&decision_at, "decision_at")?,
@@ -729,6 +735,16 @@ pub(crate) fn purged_tail_split<'py>(
         fraction,
     )
     .or_raise()?;
+    let n = tail.n_rows();
+    let rows = row_major(&rows, "rows")?
+        .iter()
+        .map(|&row| {
+            usize::try_from(row)
+                .ok()
+                .filter(|&row| row < n)
+                .ok_or_else(|| refuse(format!("row index {row} is out of range for {n} rows")))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
     let (split_at, fold) = tail.split(&rows).or_raise()?;
     Ok((split_at, fold_arrays(py, vec![fold])?))
 }

@@ -487,7 +487,7 @@ def purged_tail_split(
     decision_at: NDArray[np.int64],
     label_end: NDArray[np.int64],
     fraction: float,
-    rows: list[int],
+    rows: NDArray[np.int64],
 ) -> tuple[int, list[tuple[NDArray[np.int64], NDArray[np.int64]]]]: ...
 def k_fold(
     n_rows: int, nfold: int, seed: int

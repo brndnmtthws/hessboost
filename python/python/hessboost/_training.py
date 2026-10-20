@@ -550,8 +550,10 @@ def _cross_validate(
     target_stats_label: ArrayLike | None,
     xgb_model: str | os.PathLike[str] | Booster | None,
     refit: bool,
+    history_only: bool,
 ) -> CvReport:
-    """The run :func:`cv` and :func:`cross_validate` share."""
+    """The run :func:`cv` (``history_only``: no fold reports) and
+    :func:`cross_validate` share."""
     if not isinstance(dtrain, DMatrix):
         raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
     if per_fold_stopping is not None and not isinstance(per_fold_stopping, PurgedTail):
@@ -610,6 +612,7 @@ def _cross_validate(
         "target_stats": encoding,
         "target_stats_label": labels,
         "init_model": None if init is None else init._model,
+        "history_only": history_only,
     }
     core, refitted = _hessboost.cross_validate(request, refit)
     history = _history(core.history())
@@ -618,7 +621,8 @@ def _cross_validate(
         FoldReport(
             test,
             rounds,
-            dict(zip(metrics, scores, strict=True)),
+            # No rounds, no scores.
+            dict(zip(metrics, scores, strict=True)) if scores else {},
             _shaped(margins),
             _stopping(stopping),
         )
@@ -772,6 +776,7 @@ def cv(
         target_stats_label=target_stats_label,
         xgb_model=xgb_model,
         refit=refit,
+        history_only=True,
     )
     refitted = report.refit
     if refitted is None:
@@ -847,4 +852,5 @@ def cross_validate(
         target_stats_label=target_stats_label,
         xgb_model=xgb_model,
         refit=refit,
+        history_only=False,
     )

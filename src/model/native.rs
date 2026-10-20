@@ -50,7 +50,7 @@ use std::sync::OnceLock;
 use super::container::{ContainerSpec, WRITER};
 use super::objective::{ModelObjective, StoredObjectiveParams};
 use super::sections::{Sections, Writer, format_error, unknown_value, wrong_length};
-use super::{BoostedModel, LinearModel, Shrinkage, TreeWeights};
+use super::{BoostedModel, LinearModel, Shrinkage, TreeLayouts, TreeWeights};
 use crate::ebm::{EbmBoulevard, EbmInfo};
 use crate::error::Result;
 use crate::inference::BoulevardInfo;
@@ -573,7 +573,7 @@ fn read_model(s: &Sections) -> Result<BoostedModel> {
         boulevard: read_boulevard(s)?,
         ebm: read_ebm(s)?,
         shrinkage: read_shrinkage(s)?,
-        compact: OnceLock::new(),
+        layouts: TreeLayouts::default(),
         transform: OnceLock::new(),
     })
 }
@@ -1115,7 +1115,7 @@ mod tests {
             shrinkage: None,
             boulevard: None,
             ebm: None,
-            compact: OnceLock::new(),
+            layouts: TreeLayouts::default(),
             transform: OnceLock::new(),
         })
         .unwrap()

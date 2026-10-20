@@ -1637,20 +1637,12 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 6).unwrap();
-        let depth = |t: &crate::tree::RegTree| {
-            let mut best = 0;
-            let mut stack = vec![(0usize, 0usize)];
-            while let Some((nid, dep)) = stack.pop() {
-                best = best.max(dep);
-                let node = t.node(nid);
-                if !node.is_leaf() {
-                    stack.push((node.left as usize, dep + 1));
-                    stack.push((node.right as usize, dep + 1));
-                }
-            }
-            best
-        };
-        let deepest = model.trees().iter().map(depth).max().unwrap();
+        let deepest = model
+            .trees()
+            .iter()
+            .map(crate::tree::RegTree::depth)
+            .max()
+            .unwrap();
         assert!(deepest >= 25, "trees only reach depth {deepest}");
 
         let rows = 200;

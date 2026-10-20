@@ -1,8 +1,7 @@
 //! [`BoostedModel::average`]: one model predicting its members' mean margin.
 
-use super::{BoostedModel, TreeWeights};
+use super::{BoostedModel, TreeLayouts, TreeWeights};
 use crate::error::{HessboostError, Result};
-use std::sync::OnceLock;
 
 /// Members [`BoostedModel::average`] takes at most: every count below `2^24`
 /// is a 24-bit float, which makes each leaf quotient correctly rounded.
@@ -165,7 +164,7 @@ impl BoostedModel {
             shrinkage: None,
             boulevard: None,
             ebm: None,
-            compact: OnceLock::new(),
+            layouts: TreeLayouts::default(),
             transform: first.transform.clone(),
         };
         // The checks above make the result valid; keep a loader's check as

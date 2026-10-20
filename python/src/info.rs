@@ -39,6 +39,7 @@ struct TreeArrays {
     cover: Vec<f32>,
     gain: Vec<f32>,
     linear: Option<LinearArrays>,
+    depth: usize,
 }
 
 impl TreeArrays {
@@ -58,6 +59,7 @@ impl TreeArrays {
             cover: Vec::with_capacity(nodes.len()),
             gain: Vec::with_capacity(nodes.len()),
             linear: None,
+            depth: tree.depth(),
         };
         for (nid, node) in nodes.iter().enumerate() {
             let leaf = node.is_leaf();
@@ -122,6 +124,7 @@ impl TreeArrays {
         dict.set_item("threshold", to_numpy(py, self.threshold, &[nodes])?)?;
         dict.set_item("default_left", to_numpy(py, self.default_left, &[nodes])?)?;
         dict.set_item("categorical", to_numpy(py, self.categorical, &[nodes])?)?;
+        dict.set_item("depth", self.depth)?;
         let categories = self
             .categories
             .into_iter()
@@ -164,17 +167,11 @@ struct ModelArrays {
 
 impl ModelArrays {
     fn of(model: &BoostedModel) -> Result<Self, String> {
-        let vector = model.has_vector_leaves();
-        let (parallel, outputs) = (model.num_parallel_tree(), model.n_outputs());
-        let tree_outputs = (0..model.trees().len())
-            .map(|t| {
-                if vector {
-                    Ok(0)
-                } else {
-                    // A scalar tree feeds output `(t / num_parallel_tree) % n_outputs`.
-                    int32((t / parallel) % outputs, "an output index")
-                }
-            })
+        // Every tree's first output (`0` for a vector-leaf tree, which feeds
+        // every output).
+        let tree_outputs = model
+            .tree_outputs()
+            .map(|outputs| int32(outputs.start, "an output index"))
             .collect::<Result<_, _>>()?;
         Ok(ModelArrays {
             tree_weights: model.tree_weights().collect(),

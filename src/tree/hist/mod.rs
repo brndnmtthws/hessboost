@@ -571,11 +571,17 @@ fn accumulate_blocks(
 }
 
 /// Bin-index storage widths the accumulation and partition loops specialize on.
-pub(crate) trait BinIndex: Copy + Send + Sync {
+pub(crate) trait BinIndex: Copy + PartialEq + Send + Sync {
+    /// The width's maximum, never a bin: what
+    /// [`GHistIndex::missing_columns`] stores where a row lacks a feature.
+    const MISSING: Self;
+
     fn index(self) -> usize;
 }
 
 impl BinIndex for u16 {
+    const MISSING: Self = u16::MAX;
+
     #[inline(always)]
     fn index(self) -> usize {
         self as usize
@@ -583,6 +589,8 @@ impl BinIndex for u16 {
 }
 
 impl BinIndex for u32 {
+    const MISSING: Self = u32::MAX;
+
     #[inline(always)]
     fn index(self) -> usize {
         self as usize

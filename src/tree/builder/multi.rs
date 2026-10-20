@@ -44,10 +44,10 @@ use super::shared::{
 use super::{SplitLocation, SplitPos, limit_or_unbounded, need_replace};
 use crate::K_RT_EPS_F32;
 use crate::config::{GrowPolicy, TrainingParams};
-use crate::data::ghist::{Bins, GHistIndex};
+use crate::data::ghist::{BinIndex, Bins, ColumnSet, Columns, GHistIndex, missing_bit};
 use crate::objective::GradPair;
 use crate::tree::gain::{GradStats, RegParams, threshold_l1};
-use crate::tree::hist::{BinIndex, feature_slices};
+use crate::tree::hist::feature_slices;
 use crate::tree::sampler::{ColumnSampler, FeatureSet};
 use crate::tree::{ChildLeaf, RegTree};
 use rayon::prelude::*;
@@ -314,9 +314,11 @@ impl NodeHistograms<'_> {
         let ghist = self.ghist;
         let mut hist = vec![GradStats::default(); ghist.total_bins() * self.n_split];
         let sweep = rows.len().saturating_mul(self.pool.len()) >= FEATURE_SWEEP_ENTRIES;
-        match (ghist.column_bins(), ghist.missing_columns()) {
-            (Some(columns), _) if sweep => self.by_features::<false>(&columns, rows, &mut hist),
-            (_, Some(columns)) if sweep => self.by_features::<true>(&columns, rows, &mut hist),
+        match ghist.columns() {
+            Some(columns) if sweep && columns.has_missing() => {
+                self.by_features::<true>(columns, rows, &mut hist);
+            }
+            Some(columns) if sweep => self.by_features::<false>(columns, rows, &mut hist),
             _ => self.by_rows(rows, &mut hist),
         }
         hist
@@ -324,33 +326,30 @@ impl NodeHistograms<'_> {
 
     /// [`Self::build`] by feature: tasks of up to [`FEATURES_PER_TASK`] pool
     /// features sweep their feature-major `columns` into their disjoint
-    /// slices of `hist`. `SPARSE` columns hold [`BinIndex::MISSING`] where a
-    /// row lacks the feature ([`GHistIndex::missing_columns`]).
+    /// slices of `hist`, skipping the rows a `SPARSE` index's missing
+    /// bitmap marks.
     fn by_features<const SPARSE: bool>(
         &self,
-        columns: &Bins<'_>,
+        columns: Columns<'_>,
         rows: &[u32],
         hist: &mut [GradStats],
     ) {
         let (s, gp) = (self.n_split, self.split);
-        let n_rows = self.ghist.n_rows();
         let mut pool = self.pool.iter().map(|&f| f as usize).peekable();
         let mut slices: Vec<PoolSlice<'_>> = feature_slices(self.ghist, hist, s)
             .into_iter()
             .enumerate()
-            .filter_map(|(feature, (first, slice))| {
-                pool.next_if_eq(&feature).map(|_| PoolSlice {
-                    feature,
-                    first,
-                    slice,
-                })
+            .filter_map(|(feature, (_, slice))| {
+                pool.next_if_eq(&feature)
+                    .map(|_| PoolSlice { feature, slice })
             })
             .collect();
         slices
             .par_chunks_mut(FEATURES_PER_TASK)
             .for_each(|group| match columns {
-                Bins::U16(c) => sweep_group::<SPARSE, _>(c, n_rows, group, rows, gp, s),
-                Bins::U32(c) => sweep_group::<SPARSE, _>(c, n_rows, group, rows, gp, s),
+                Columns::U8(set) => sweep_group::<SPARSE, _>(set, group, rows, gp, s),
+                Columns::U16(set) => sweep_group::<SPARSE, _>(set, group, rows, gp, s),
+                Columns::U32(set) => sweep_group::<SPARSE, _>(set, group, rows, gp, s),
             });
     }
 
@@ -1045,27 +1044,29 @@ fn add_pairs(slot: &mut [GradStats], g: &[GradPair]) {
     }
 }
 
-/// A pool feature's share of a feature sweep: its `[bin][target]` slice of
-/// the histogram, whose first global bin is `first`.
+/// A pool feature's share of a feature sweep: its `[local bin][target]`
+/// slice of the histogram.
 struct PoolSlice<'h> {
     feature: usize,
-    first: usize,
     slice: &'h mut [GradStats],
 }
 
 /// Sweep `rows` into the features of `group` (up to [`FEATURES_PER_TASK`]),
-/// whose feature-major columns of `n_rows` global bins each are in
-/// `columns`: a full group in one pass, the pool's last few features one
-/// pass each.
+/// whose columns are in `set`: a full group in one pass, the pool's last
+/// few features one pass each.
 fn sweep_group<const SPARSE: bool, B: BinIndex>(
-    columns: &[B],
-    n_rows: usize,
+    set: ColumnSet<'_, B>,
     group: &mut [PoolSlice<'_>],
     rows: &[u32],
     gp: &[GradPair],
     s: usize,
 ) {
-    let column = |feature: usize| &columns[feature * n_rows..][..n_rows];
+    // A feature's bins and missing bitmap (empty, and never read, unless
+    // `SPARSE`).
+    let column = |feature: usize| {
+        let column = set.column(feature);
+        (column.bins, column.missing.unwrap_or_default())
+    };
     if let Ok(full) = <&mut [PoolSlice<'_>; FEATURES_PER_TASK]>::try_from(&mut *group) {
         let columns = full.each_ref().map(|f| column(f.feature));
         sweep::<FEATURES_PER_TASK, SPARSE, B>(columns, full.each_mut(), rows, gp, s);
@@ -1077,28 +1078,27 @@ fn sweep_group<const SPARSE: bool, B: BinIndex>(
 }
 
 /// Add each of `rows` (ascending, so every bin's chain is in row order) to
-/// its bin in each of the `K` features, reading the row's `s` split
-/// gradients once for all of them. The `K` bins of a row belong to different
-/// features, so every load can be issued before any store. A `SPARSE`
-/// column's [`BinIndex::MISSING`] adds nothing.
+/// its bin in each of the `K` features' `(bins, missing bitmap)`, reading
+/// the row's `s` split gradients once for all of them. The `K` bins of a
+/// row belong to different features, so every load can be issued before
+/// any store. A `SPARSE` row whose bitmap bit is set adds nothing.
 #[inline(always)]
 fn sweep<const K: usize, const SPARSE: bool, B: BinIndex>(
-    columns: [&[B]; K],
+    columns: [(&[B], &[u64]); K],
     features: [&mut PoolSlice<'_>; K],
     rows: &[u32],
     gp: &[GradPair],
     s: usize,
 ) {
-    let mut slices = features.map(|f| (f.first, &mut *f.slice));
+    let mut slices = features.map(|f| &mut *f.slice);
     for &r in rows {
         let r = r as usize;
         let g = &gp[r * s..][..s];
-        for (column, (first, slice)) in columns.iter().zip(&mut slices) {
-            let bin = column[r];
-            if SPARSE && bin == B::MISSING {
+        for ((bins, missing), slice) in columns.iter().zip(&mut slices) {
+            if SPARSE && missing_bit(missing, r) {
                 continue;
             }
-            let at = (bin.index() - *first) * s;
+            let at = bins[r].index() * s;
             add_pairs(&mut slice[at..at + s], g);
         }
     }
@@ -1322,7 +1322,8 @@ mod tests {
                 .map(|&v| if uniform() < missing { f32::NAN } else { v })
                 .collect();
             let ghist = binned(&x, n, cols);
-            assert_eq!(ghist.missing_columns().is_some(), missing > 0.0);
+            assert!(ghist.columns().is_some());
+            assert_eq!(ghist.is_dense(), missing == 0.0);
             let hists = NodeHistograms {
                 ghist: &ghist,
                 split: &g,

@@ -102,7 +102,7 @@ use crate::backend::shared::{
     ensure_forest_model, materialize_rows, plan_margins, weighted_leaves,
 };
 use crate::data::DMatrix;
-use crate::data::ghist::{Bins, GHistIndex};
+use crate::data::ghist::{GHistIndex, GlobalBins};
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Iterations, Predictions};
 use crate::objective::GradPair;
@@ -1244,20 +1244,12 @@ impl std::fmt::Debug for WgpuHistBackend {
 
 /// The feature-major bin store the scatter kernel reads, as the `u32` words
 /// to upload, and whether they hold `u32` bins (`true`) or packed `u16`
-/// pairs. Dense indexes and sparse ones at least half full already keep
-/// such a store (with the width's maximum marking a missing entry); the
-/// rest is built from the CSR rows here.
+/// pairs, with the width's maximum marking a missing entry
+/// ([`GHistIndex::global_columns`]).
 fn feature_major_bins(index: &GHistIndex) -> (Vec<u32>, bool) {
-    match index.column_bins().or_else(|| index.missing_columns()) {
-        Some(Bins::U16(bins)) => (pack_u16(bins), false),
-        Some(Bins::U32(bins)) => (bins.to_vec(), true),
-        // The sentinel must never be a bin, so `u16` stores need
-        // `total_bins < u16::MAX`.
-        None if index.total_bins() < usize::from(u16::MAX) => {
-            let store = sparse_feature_major(index, u16::MAX, |bin| bin as u16);
-            (pack_u16(&store), false)
-        }
-        None => (sparse_feature_major(index, u32::MAX, |bin| bin), true),
+    match index.global_columns() {
+        GlobalBins::U16(bins) => (pack_u16(&bins), false),
+        GlobalBins::U32(bins) => (bins, true),
     }
 }
 
@@ -1272,36 +1264,6 @@ fn pack_u16(bins: &[u16]) -> Vec<u32> {
             *word = u32::from(pair[0]) | (pair.get(1).map_or(0, |&b| u32::from(b)) << 16);
         });
     words
-}
-
-/// A sparse index's entries scattered into a feature-major store (feature
-/// `f` of row `r` at `f * n_rows + r`) filled with `missing`, each bin
-/// stored as `stored(bin)`.
-fn sparse_feature_major<T: Copy>(
-    index: &GHistIndex,
-    missing: T,
-    stored: impl Fn(u32) -> T,
-) -> Vec<T> {
-    let n = index.n_rows();
-    let cuts = index.cuts();
-    let starts: Vec<u32> = (0..index.n_cols())
-        .map(|f| cuts.feature_bins(f).0 as u32)
-        .collect();
-    let row_ptr = index.row_ptr();
-    let bins = index.bins();
-    let mut store = vec![missing; n * index.n_cols()];
-    for r in 0..n {
-        let entries = row_ptr[r]..row_ptr[r + 1];
-        let mut put = |bin: u32| {
-            let feature = starts.partition_point(|&start| start <= bin) - 1;
-            store[feature * n + r] = stored(bin);
-        };
-        match &bins {
-            Bins::U16(bins) => bins[entries].iter().for_each(|&bin| put(u32::from(bin))),
-            Bins::U32(bins) => bins[entries].iter().for_each(|&bin| put(bin)),
-        }
-    }
-    store
 }
 
 impl WgpuHistBackend {
@@ -2237,11 +2199,7 @@ mod tests {
                 .collect();
             let data = DMatrix::from_dense_with_missing(&x, n, cols, f32::NAN).unwrap();
             let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 32));
-            assert_eq!(
-                index.missing_columns().is_some(),
-                missing_every == 5,
-                "the test must cover both stores"
-            );
+            assert!(!index.is_dense(), "the test covers missing entries");
             let gpair: Vec<GradPair> = (0..n)
                 .map(|i| GradPair {
                     grad: ((i as i32 % 13) as f32 - 6.0) * 0.05,

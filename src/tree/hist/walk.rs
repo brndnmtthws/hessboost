@@ -1,20 +1,20 @@
 //! The traversal the `f64` and quantized histograms share: which layout a
-//! build sweeps (column-major copy, dense row tiles, or CSR rows), in which
-//! order its rows reach each bin, and what it prefetches. Both histograms
-//! instantiate the same sequential loops ([`accumulate`]), monomorphized
-//! over a [`Bucket`] (the histogram entry: `GradStats`, or a packed integer)
-//! and a [`RowValue`] (a row's stored statistic, turned into the value it
-//! adds to each of its bins). The feature-parallel sweep ([`by_features`])
-//! serves the `f64` build; the quantized one widens a contiguous range's
-//! values once for all its feature tasks instead, which the per-row
-//! widening here would repeat per feature.
+//! build sweeps (a dense index's feature columns, dense row tiles, or CSR
+//! rows), in which order its rows reach each bin, and what it prefetches.
+//! Both histograms instantiate the same sequential loops ([`accumulate`]),
+//! monomorphized over a [`Bucket`] (the histogram entry: `GradStats`, or a
+//! packed integer) and a [`RowValue`] (a row's stored statistic, turned
+//! into the value it adds to each of its bins). The feature-parallel sweep
+//! ([`by_features`]) serves the `f64` build; the quantized one widens a
+//! contiguous range's values once for all its feature tasks instead, which
+//! the per-row widening here would repeat per feature.
 //!
 //! Every traversal adds each bin's rows in the order of `rows`, ascending,
 //! so the `f64` sums are the row-order chain; tiling and grouping change
 //! only which bins are hot.
 
-use super::{BinIndex, feature_slices};
-use crate::data::ghist::{Bins, GHistIndex};
+use super::feature_slices;
+use crate::data::ghist::{BinIndex, Bins, ColumnSet, Columns, GHistIndex};
 use rayon::prelude::*;
 use std::ops::Range;
 
@@ -136,23 +136,24 @@ fn accumulate_bins<E: Bucket, V: RowValue<E>, B: BinIndex>(
         }
     };
 
-    // A contiguous row range (the root, or a root chunk, without row
-    // sampling) sweeps the column-major copy one feature at a time: the bins
-    // stream sequentially and each feature's histogram slice stays in L1.
-    // Every bin still receives its rows in ascending order, so the sums are
-    // identical to the row sweep.
-    if let Some(columns) = ghist.column_bins()
+    // A dense index's contiguous row range (the root, or a root chunk,
+    // without row sampling) sweeps the feature columns a few features at a
+    // time: the bins stream sequentially and each feature's histogram slice
+    // stays in L1. Every bin still receives its rows in ascending order, so
+    // the sums are identical to the row sweep.
+    if ghist.is_dense()
+        && let Some(columns) = ghist.columns()
         && let Some(range) = contiguous_range(rows)
     {
-        let n_rows = ghist.n_rows();
-        match columns {
-            Bins::U16(columns) => accumulate_columns(columns, n_rows, range, values, out),
-            Bins::U32(columns) => accumulate_columns(columns, n_rows, range, values, out),
+        let rows = SweepRows::Range(range);
+        let mut slices = feature_slices(ghist, out, 1);
+        for (task, features) in slices.chunks_mut(FEATURES_PER_PASS).enumerate() {
+            feature_group(columns, task * FEATURES_PER_PASS, features, &rows, values);
         }
         return;
     }
-    if let Some(stride) = ghist.dense_stride() {
-        accumulate_dense(ghist, bins, stride, rows, values, out, add_row);
+    if ghist.is_dense() {
+        accumulate_dense(ghist, bins, ghist.n_cols(), rows, values, out, add_row);
     } else {
         let rp = ghist.row_ptr();
         for (i, &r) in rows.iter().enumerate() {
@@ -185,69 +186,9 @@ pub(super) fn contiguous_range(rows: &[u32]) -> Option<Range<usize>> {
     contiguous.then_some(first..end)
 }
 
-/// Column-wise accumulation of the rows in `range` over every feature, four
-/// features per pass so each pass reads and widens the values once for all
-/// of them. `columns` is the column-major bin copy (`n_rows` entries per
-/// feature). Each bin still receives its rows in ascending order.
-#[inline(always)]
-fn accumulate_columns<E: Bucket, V: RowValue<E>, B: BinIndex>(
-    columns: &[B],
-    n_rows: usize,
-    range: Range<usize>,
-    values: &[V],
-    out: &mut [E],
-) {
-    fn column<'a, B>(group: &'a [B], k: usize, n_rows: usize, range: &Range<usize>) -> &'a [B] {
-        &group[k * n_rows..][..n_rows][range.clone()]
-    }
-    let values = &values[range.clone()];
-    let mut quads = columns.chunks_exact(4 * n_rows);
-    for quad in &mut quads {
-        let c = |k| column(quad, k, n_rows, &range);
-        sweep_columns([c(0), c(1), c(2), c(3)], values, out);
-    }
-    let rest = quads.remainder();
-    let c = |k| column(rest, k, n_rows, &range);
-    match rest.len() / n_rows {
-        3 => sweep_columns([c(0), c(1), c(2)], values, out),
-        2 => sweep_columns([c(0), c(1)], values, out),
-        1 => sweep_columns([c(0)], values, out),
-        _ => {}
-    }
-}
-
-/// Add each row's value to its bin in each of the `K` feature columns
-/// `columns` (bins are global histogram indices, rows aligned with `values`).
-/// The `K` bins of a row belong to different features, so they are distinct:
-/// all are loaded before any is stored, which lets the loads overlap.
-#[inline(always)]
-fn sweep_columns<const K: usize, E: Bucket, V: RowValue<E>, B: BinIndex>(
-    columns: [&[B]; K],
-    values: &[V],
-    out: &mut [E],
-) {
-    let n = values.len();
-    let columns = columns.map(|c| &c[..n]);
-    let base = out.as_mut_ptr();
-    for (r, v) in values.iter().enumerate() {
-        let v = v.value();
-        // SAFETY: `r < n` and every column holds `n` entries.
-        let bins = columns.map(|c| unsafe { c.get_unchecked(r) }.index());
-        // SAFETY: every bin is `< ghist.total_bins() == out.len()` by the
-        // index invariant and the caller's assertion, and the `K` bins are
-        // distinct (different features of one row), so the reads and writes
-        // are in bounds and never overlap.
-        unsafe {
-            let mut entries = bins.map(|b| *base.add(b));
-            for e in &mut entries {
-                e.push(v);
-            }
-            for (&b, e) in bins.iter().zip(entries) {
-                *base.add(b) = e;
-            }
-        }
-    }
-}
+/// Features one pass of a column sweep visits: each pass reads every row's
+/// value once for all of them.
+const FEATURES_PER_PASS: usize = 4;
 
 /// Dense accumulation tiled by rows and feature blocks. Every bin still
 /// receives its rows in ascending order, so the result is identical to a
@@ -314,34 +255,30 @@ pub(super) enum SweepRows<'a> {
     Subset(&'a [u32]),
 }
 
-/// Build `out` (overwritten) over `rows` from the column-major copy
+/// Build `out` (overwritten) over `rows` from a dense index's feature
 /// `columns`, split by feature instead of by rows: each task streams its
 /// features' columns straight into their slices of `out`. Every bin has one
 /// writer that adds its rows in ascending order, so there are no partial
 /// histograms to allocate or reduce and the result is the sequential
 /// sweep's. Tasks take as few features as keep every one of `threads`
-/// workers busy (at most four), swept together so each pass reads and
-/// widens the row values once for all of them.
+/// workers busy (at most [`FEATURES_PER_PASS`]), swept together so each
+/// pass reads and widens the row values once for all of them.
 pub(super) fn by_features<E: Bucket, V: RowValue<E>>(
     ghist: &GHistIndex,
-    columns: &Bins<'_>,
+    columns: Columns<'_>,
     rows: &SweepRows<'_>,
     values: &[V],
     out: &mut [E],
     threads: usize,
 ) {
-    let n_rows = ghist.n_rows();
-    let per_task = ghist.n_cols().div_ceil(threads).clamp(1, 4);
+    out.fill(E::default());
+    let per_task = features_per_task(ghist, threads);
     let mut slices = feature_slices(ghist, out, 1);
     slices
         .par_chunks_mut(per_task)
         .enumerate()
         .for_each(|(task, features)| {
-            let f = task * per_task;
-            match columns {
-                Bins::U16(c) => feature_group(c, n_rows, f, features, rows, values),
-                Bins::U32(c) => feature_group(c, n_rows, f, features, rows, values),
-            }
+            feature_group(columns, task * per_task, features, rows, values);
         });
 }
 
@@ -354,7 +291,7 @@ pub(super) fn by_features<E: Bucket, V: RowValue<E>>(
 #[cfg(all(target_os = "linux", feature = "cuda"))]
 pub(super) fn by_features_scoped<E: Bucket, V: RowValue<E>>(
     ghist: &GHistIndex,
-    columns: &Bins<'_>,
+    columns: Columns<'_>,
     rows: &SweepRows<'_>,
     values: &[V],
     out: &mut [E],
@@ -362,18 +299,14 @@ pub(super) fn by_features_scoped<E: Bucket, V: RowValue<E>>(
 ) {
     /// One thread's features: `(task, features)` pairs as in [`by_features`].
     type Group<'a, 'b, E> = Vec<(usize, &'a mut [(usize, &'b mut [E])])>;
-    let n_rows = ghist.n_rows();
-    let per_task = ghist.n_cols().div_ceil(threads).clamp(1, 4);
+    out.fill(E::default());
+    let per_task = features_per_task(ghist, threads);
     let mut slices = feature_slices(ghist, out, 1);
     let tasks: Vec<_> = slices.chunks_mut(per_task).enumerate().collect();
     let per_thread = tasks.len().div_ceil(threads.max(1)).max(1);
     let build = |group: Group<'_, '_, E>| {
         for (task, features) in group {
-            let f = task * per_task;
-            match columns {
-                Bins::U16(c) => feature_group(c, n_rows, f, features, rows, values),
-                Bins::U32(c) => feature_group(c, n_rows, f, features, rows, values),
-            }
+            feature_group(columns, task * per_task, features, rows, values);
         }
     };
     // Each group sits behind its own lock, so a failed spawn (which drops
@@ -396,27 +329,49 @@ pub(super) fn by_features_scoped<E: Bucket, V: RowValue<E>>(
     });
 }
 
-/// Accumulation of `rows` for the (up to four) consecutive features `f..`
-/// whose histogram slices `features` holds (`features[k]` is feature
-/// `f + k`'s first global bin and its slice, overwritten), in one pass that
-/// reads each row's value once. Bins in a column are global indices, so each
-/// slice is indexed relative to its first bin; the binned-index invariant
-/// keeps every bin of a feature's column in its range, and the slice index
-/// bounds check catches any violation. Every bin receives its rows in
-/// ascending order, as in a one-feature sweep.
+/// Features per task of a sweep split across `threads` workers: as few as
+/// keep every worker busy, at most [`FEATURES_PER_PASS`].
+fn features_per_task(ghist: &GHistIndex, threads: usize) -> usize {
+    ghist
+        .n_cols()
+        .div_ceil(threads.max(1))
+        .clamp(1, FEATURES_PER_PASS)
+}
+
+/// Add `rows` into the histogram slices `features` (one to
+/// [`FEATURES_PER_PASS`] consecutive features `f..`: `features[k]` is
+/// feature `f + k`'s first global bin and its slice) from a dense index's
+/// `columns`, in one pass that reads each row's value once. Every bin
+/// receives its rows in ascending order, as in a one-feature sweep.
 #[inline(always)]
-fn feature_group<E: Bucket, V: RowValue<E>, B: BinIndex>(
-    columns: &[B],
-    n_rows: usize,
+fn feature_group<E: Bucket, V: RowValue<E>>(
+    columns: Columns<'_>,
     f: usize,
     features: &mut [(usize, &mut [E])],
     rows: &SweepRows<'_>,
     values: &[V],
 ) {
-    let column = |f: usize| &columns[f * n_rows..][..n_rows];
-    for (_, slice) in features.iter_mut() {
-        slice.fill(E::default());
+    match columns {
+        Columns::U8(set) => feature_group_in(set, f, features, rows, values),
+        Columns::U16(set) => feature_group_in(set, f, features, rows, values),
+        Columns::U32(set) => feature_group_in(set, f, features, rows, values),
     }
+}
+
+/// [`feature_group`] in the column width `B`.
+#[inline(always)]
+fn feature_group_in<E: Bucket, V: RowValue<E>, B: BinIndex>(
+    set: ColumnSet<'_, B>,
+    f: usize,
+    features: &mut [(usize, &mut [E])],
+    rows: &SweepRows<'_>,
+    values: &[V],
+) {
+    let column = |f: usize| {
+        let column = set.column(f);
+        debug_assert!(column.missing.is_none(), "a dense index's columns");
+        column.bins
+    };
     match features {
         [a] => sweep_slices([column(f)], [a], rows, values),
         [a, b] => sweep_slices([column(f), column(f + 1)], [a, b], rows, values),
@@ -436,8 +391,10 @@ fn feature_group<E: Bucket, V: RowValue<E>, B: BinIndex>(
     }
 }
 
-/// Add each row's value to its bin in each of the `K` full-length feature
-/// columns, into that feature's `(first bin, slice)`.
+/// Add each row's value to its local bin in each of the `K` full-length
+/// feature columns, into that feature's slice. The binned-index invariant
+/// keeps every bin of a dense index's column below its feature's bin
+/// count; the slice index bounds check catches any violation.
 #[inline(always)]
 fn sweep_slices<const K: usize, E: Bucket, V: RowValue<E>, B: BinIndex>(
     columns: [&[B]; K],
@@ -445,7 +402,7 @@ fn sweep_slices<const K: usize, E: Bucket, V: RowValue<E>, B: BinIndex>(
     rows: &SweepRows<'_>,
     values: &[V],
 ) {
-    let mut slices = slices.map(|(first, slice)| (*first, &mut **slice));
+    let mut slices = slices.map(|(_, slice)| &mut **slice);
     match rows {
         SweepRows::Range(range) => {
             let values = &values[range.clone()];
@@ -453,8 +410,8 @@ fn sweep_slices<const K: usize, E: Bucket, V: RowValue<E>, B: BinIndex>(
             let columns = columns.map(|c| &c[range.clone()][..n]);
             for (r, v) in values.iter().enumerate() {
                 let v = v.value();
-                for (column, (first, slice)) in columns.iter().zip(&mut slices) {
-                    slice[column[r].index() - *first].push(v);
+                for (column, slice) in columns.iter().zip(&mut slices) {
+                    slice[column[r].index()].push(v);
                 }
             }
         }
@@ -462,8 +419,8 @@ fn sweep_slices<const K: usize, E: Bucket, V: RowValue<E>, B: BinIndex>(
             for &r in *rows {
                 let r = r as usize;
                 let v = values[r].value();
-                for (column, (first, slice)) in columns.iter().zip(&mut slices) {
-                    slice[column[r].index() - *first].push(v);
+                for (column, slice) in columns.iter().zip(&mut slices) {
+                    slice[column[r].index()].push(v);
                 }
             }
         }

@@ -109,7 +109,7 @@ use crate::backend::shared::{
     IndexShape, MAX_BUFFER_ENTRIES, MarginPlan, StagedSlice, ensure_dense_copy_fits,
     ensure_forest_model, materialize_rows, plan_margins,
 };
-use crate::data::ghist::{Bins, GHistIndex};
+use crate::data::ghist::{GHistIndex, GlobalBins};
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Iterations};
 use crate::objective::GradPair;
@@ -1121,29 +1121,26 @@ impl MetalHistBackend {
         }
         // Interleaved column store, the scan kernels' layout: one record
         // per (row, `RECORD_FEATURES` features). `u16` records (one
-        // 16-byte word) cover dense indexes and sparse ones with a spare
-        // `u16` sentinel; wider bin counts (or a sparse index that cannot
-        // spare one) get `u32` records.
+        // 16-byte word) cover indexes whose global bins (and, with missing
+        // values, the `u16` sentinel) fit `u16`; wider bin counts get `u32`
+        // records.
         let n_records = n_cols.div_ceil(RECORD_FEATURES);
-        let columns_u16 = match index.column_bins() {
-            Some(Bins::U16(_)) => true,
-            Some(Bins::U32(_)) => false,
-            None => u16::try_from(total_bins).is_ok(),
-        };
-        let columns = interleaved_columns(&ctx.device, index, columns_u16, n_records)?;
+        let global = index.global_columns();
+        let columns_u16 = matches!(global, GlobalBins::U16(_));
+        let columns = interleaved_columns(&ctx.device, &global, (n_rows, n_cols), n_records)?;
         // The scatter kernel needs no interleaved copy at all: it reads the
-        // feature-major store the index already keeps, when that store is
-        // `u16` (the dense one, or the one with the missing-value sentinel).
-        let feature_bins = match index.column_bins().or_else(|| index.missing_columns()) {
-            Some(Bins::U16(bins)) => {
+        // feature-major global store itself, when that store is `u16`.
+        let feature_bins = match &global {
+            GlobalBins::U16(bins) => {
                 let buffer = GpuBuffer::new(&ctx.device, bins.len() * 2)?;
                 // SAFETY: the buffer was just allocated and is not yet
                 // shared; its length covers `bins`.
                 unsafe { buffer.write(0, as_bytes(bins))? };
                 Some(buffer)
             }
-            _ => None,
+            GlobalBins::U32(_) => None,
         };
+        drop(global);
         let gathered = GpuBuffer::new(&ctx.device, n_rows * 16)?;
         // Feature blocks per threadgroup. Measured on Apple Silicon: one
         // feature per threadgroup (a whole 256-bin window) beats every wider
@@ -1624,18 +1621,17 @@ impl HistogramBackend for MetalHistBackend {
 /// Build the interleaved column store the scan kernels read: one record per
 /// (row, feature block of [`RECORD_FEATURES`]), each packing the block's
 /// eight bins — `u16` records as one 16-byte word (`u16::MAX` marking a
-/// missing entry), `u32` records as two (`u32::MAX` marking one).
-///
-/// Dense indexes read their existing feature-major store; sparse indexes
-/// walk each row's CSR entries once, filling the rest with the sentinel.
+/// missing entry), `u32` records as two (`u32::MAX` marking one) — from the
+/// index's feature-major `global` bins ([`GHistIndex::global_columns`],
+/// whose width and sentinel are the records'), of `(n, f_count)` rows and
+/// features.
 fn interleaved_columns(
     device: &ProtocolObject<dyn MTLDevice>,
-    index: &GHistIndex,
-    u16_pack: bool,
+    global: &GlobalBins,
+    (n, f_count): (usize, usize),
     n_records: usize,
 ) -> Result<GpuBuffer> {
-    let n = index.n_rows();
-    let f_count = index.n_cols();
+    let u16_pack = matches!(global, GlobalBins::U16(_));
     let record = if u16_pack { 4 } else { 8 };
     let words = n
         .checked_mul(n_records)
@@ -1659,57 +1655,28 @@ fn interleaved_columns(
     } else {
         [u32::MAX; RECORD_FEATURES]
     };
-    if let Some(cols) = index.column_bins() {
-        // The bin at feature-major position `i` (`feature * n + row`).
-        let bin_at = |i: usize| match &cols {
-            Bins::U16(c) => u32::from(c[i]),
-            Bins::U32(c) => c[i],
-        };
-        let row_words = record * n_records;
-        store
-            .par_chunks_mut(row_words)
-            .enumerate()
-            .for_each(|(r, row)| {
-                for (b, out) in row.chunks_exact_mut(record).enumerate() {
-                    let mut bins = sentinel;
-                    for (f, bin) in bins.iter_mut().enumerate() {
-                        let feature = b * RECORD_FEATURES + f;
-                        if feature < f_count {
-                            *bin = bin_at(feature * n + r);
-                        }
+    // The bin (or sentinel) at feature-major position `i` (`feature * n +
+    // row`).
+    let bin_at = |i: usize| match global {
+        GlobalBins::U16(c) => u32::from(c[i]),
+        GlobalBins::U32(c) => c[i],
+    };
+    let row_words = record * n_records;
+    store
+        .par_chunks_mut(row_words)
+        .enumerate()
+        .for_each(|(r, row)| {
+            for (b, out) in row.chunks_exact_mut(record).enumerate() {
+                let mut bins = sentinel;
+                for (f, bin) in bins.iter_mut().enumerate() {
+                    let feature = b * RECORD_FEATURES + f;
+                    if feature < f_count {
+                        *bin = bin_at(feature * n + r);
                     }
-                    write_record(out, &bins, u16_pack);
                 }
-            });
-    } else {
-        // Sparse: walk each row's CSR entries once, mapping bins to
-        // their owning feature, and leave the rest at the sentinel.
-        let cuts = index.cuts();
-        let starts: Vec<u32> = (0..f_count)
-            .map(|f| cuts.feature_bins(f).0 as u32)
-            .collect();
-        let row_ptr = index.row_ptr();
-        let bins = index.bins();
-        let row_words = record * n_records;
-        store.par_chunks_mut(row_words).enumerate().for_each_init(
-            || vec![sentinel; n_records],
-            |scratch, (r, row)| {
-                scratch.fill(sentinel);
-                let (s, e) = (row_ptr[r], row_ptr[r + 1]);
-                let mut place = |bin: u32| {
-                    let feature = starts.partition_point(|&start| start <= bin) - 1;
-                    scratch[feature / RECORD_FEATURES][feature % RECORD_FEATURES] = bin;
-                };
-                match &bins {
-                    Bins::U16(b) => b[s..e].iter().for_each(|&bin| place(u32::from(bin))),
-                    Bins::U32(b) => b[s..e].iter().for_each(|&bin| place(bin)),
-                }
-                for (b, out) in row.chunks_exact_mut(record).enumerate() {
-                    write_record(out, &scratch[b], u16_pack);
-                }
-            },
-        );
-    }
+                write_record(out, &bins, u16_pack);
+            }
+        });
     Ok(buffer)
 }
 

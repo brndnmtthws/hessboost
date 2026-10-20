@@ -28,13 +28,14 @@
 //! does for the integers.
 
 use super::walk::{Bucket, RowValue, accumulate, contiguous_range};
-use super::{BinIndex, PARALLEL_THRESHOLD, REDUCE_BINS, ROWS_PER_TASK, feature_slices};
+use super::{PARALLEL_THRESHOLD, REDUCE_BINS, ROWS_PER_TASK, feature_slices};
 use crate::config::QuantizedGrad;
-use crate::data::ghist::{Bins, GHistIndex};
+use crate::data::ghist::{BinIndex, Column, Columns, GHistIndex, missing_bit};
 use crate::objective::GradPair;
 use crate::rng::{keyed_unit, mix64};
 use crate::tree::gain::GradStats;
 use rayon::prelude::*;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Rows per parallel quantization task.
@@ -245,27 +246,30 @@ impl QuantizedGradients {
             return out;
         }
 
-        if let (Some(columns), Some(range)) = (ghist.column_bins(), contiguous_range(rows)) {
+        if let (Some(columns), Some(range)) = (ghist.columns(), contiguous_range(rows)) {
             let mut out = vec![A::default(); total];
             // Unlike the shared feature-group sweep, which widens each row
             // once per feature, the row values are widened once up front:
-            // that pays when every feature task re-reads them.
+            // that pays when every feature task re-reads them. Integer sums
+            // are exact, so any index's columns serve.
             let values: Vec<A> = self.packed[range.clone()]
                 .iter()
                 .map(|&p| A::from_row(p))
                 .collect();
-            let n_rows = ghist.n_rows();
             feature_slices(ghist, &mut out, 1)
                 .into_par_iter()
                 .enumerate()
-                .for_each(|(f, (fs, slice))| {
-                    let span = range.clone();
+                .for_each(|(f, (_, slice))| {
+                    let range = range.clone();
                     match columns {
-                        Bins::U16(c) => {
-                            accumulate_column(&c[f * n_rows..][span], fs, &values, slice);
+                        Columns::U8(set) => {
+                            accumulate_column(set.column(f), range, &values, slice);
                         }
-                        Bins::U32(c) => {
-                            accumulate_column(&c[f * n_rows..][span], fs, &values, slice);
+                        Columns::U16(set) => {
+                            accumulate_column(set.column(f), range, &values, slice);
+                        }
+                        Columns::U32(set) => {
+                            accumulate_column(set.column(f), range, &values, slice);
                         }
                     }
                 });
@@ -535,18 +539,32 @@ packed!(i32, i16, 16);
 packed!(i64, i32, 32);
 packed!(i128, i64, 64);
 
-/// Accumulate one feature column (`column[i]` is the bin of `values[i]`'s
-/// row) into `slice`, whose first entry is global bin `first_bin`.
+/// Accumulate the rows `range` of one feature's column (`values[i]` is the
+/// value of row `range.start + i`) into the feature's histogram `slice`,
+/// skipping the rows the column marks missing.
 #[inline(always)]
 fn accumulate_column<A: Packed, B: BinIndex>(
-    column: &[B],
-    first_bin: usize,
+    column: Column<'_, B>,
+    range: Range<usize>,
     values: &[A],
     slice: &mut [A],
 ) {
-    for (&bin, &v) in column.iter().zip(values) {
-        let slot = &mut slice[bin.index() - first_bin];
-        *slot = slot.add(v);
+    let bins = &column.bins[range.clone()];
+    match column.missing {
+        None => {
+            for (&bin, &v) in bins.iter().zip(values) {
+                let slot = &mut slice[bin.index()];
+                *slot = slot.add(v);
+            }
+        }
+        Some(bits) => {
+            for ((r, &bin), &v) in range.zip(bins).zip(values) {
+                if !missing_bit(bits, r) {
+                    let slot = &mut slice[bin.index()];
+                    *slot = slot.add(v);
+                }
+            }
+        }
     }
 }
 
@@ -705,12 +723,10 @@ mod tests {
     /// Integer histograms equal a direct per-row, per-feature sum of the
     /// dequantized rows: both add exact multiples of the scales.
     fn assert_matches_reference(ghist: &GHistIndex, q: &QuantizedGradients, rows: &[u32]) {
-        let cuts = ghist.cuts();
         let mut expected = vec![GradStats::default(); ghist.total_bins()];
         for &r in rows {
             for f in 0..ghist.n_cols() {
-                let (fs, fe) = cuts.feature_bins(f);
-                if let Some(bin) = ghist.feature_bin_at(r as usize, f, fs, fe) {
+                if let Some(bin) = ghist.feature_bin(r as usize, f) {
                     expected[bin as usize].add(q.row_stats(r as usize));
                 }
             }

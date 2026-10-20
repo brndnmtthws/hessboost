@@ -3,11 +3,11 @@
 
 use super::SplitLocation;
 use super::shared::rayon_available;
-use crate::data::ghist::{Bins, GHistIndex};
+use crate::data::ghist::{BinIndex, Bins, Column, Columns, GHistIndex, missing_bit};
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
 use crate::tree::SplitRule;
-use crate::tree::hist::{BinIndex, Histogram, HistogramBackend, subtract_in_place, zeroed};
+use crate::tree::hist::{Histogram, HistogramBackend, subtract_in_place, zeroed};
 use rayon::prelude::*;
 
 /// Rows per parallel partition chunk. Large nodes near the root are routed in
@@ -116,12 +116,9 @@ pub(super) fn partition_rows(
     }
 }
 
-/// [`partition_rows`] of a numeric split: present bins up to `split_bin` go
-/// left (`None`: none do, only missing values follow `default_left`).
-#[allow(
-    clippy::needless_bitwise_bool,
-    reason = "branch-free routing predicates keep the partition loop free of data-dependent branches"
-)]
+/// [`partition_rows`] of a numeric split: present bins up to `split_bin`
+/// (global) go left (`None`: none do, only missing values follow
+/// `default_left`).
 fn partition_numeric(
     ghist: &GHistIndex,
     rows: &[u32],
@@ -129,45 +126,20 @@ fn partition_numeric(
     split_bin: Option<usize>,
 ) -> (Vec<u32>, Vec<u32>) {
     let feature = route.feature as usize;
-    if let Some(columns) = ghist.column_bins() {
-        let Some(split_bin) = split_bin else {
-            // Missing-only-left split: a dense index has no missing rows.
-            return (Vec::new(), rows.to_vec());
-        };
-        let n_rows = ghist.n_rows();
-        return match columns {
-            Bins::U16(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
-                b <= split_bin
-            }),
-            Bins::U32(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
-                b <= split_bin
-            }),
-        };
+    let Some(columns) = ghist.columns() else {
+        return partition_by_bin(ghist, rows, route, |bin| {
+            split_bin.is_some_and(|s| bin <= s)
+        });
+    };
+    // Present local bins below `limit` go left.
+    let limit = split_bin.map_or(0, |s| s + 1 - ghist.cuts().feature_bins(feature).0);
+    let default_left = route.default_left;
+    let below = move |b: usize| b < limit;
+    match columns {
+        Columns::U8(set) => route_column(rows, set.column(feature), default_left, below),
+        Columns::U16(set) => route_column(rows, set.column(feature), default_left, below),
+        Columns::U32(set) => route_column(rows, set.column(feature), default_left, below),
     }
-    if let Some(columns) = ghist.missing_columns() {
-        // Present bins below `limit` go left; the sentinel (above every bin,
-        // so never below `limit`) follows `default_left`.
-        let limit = split_bin.map_or(0, |s| s + 1);
-        let default_left = route.default_left;
-        let n_rows = ghist.n_rows();
-        return match columns {
-            Bins::U16(bins) => {
-                let missing = usize::from(u16::MAX);
-                route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
-                    (b < limit) | ((b == missing) & default_left)
-                })
-            }
-            Bins::U32(bins) => {
-                let missing = u32::MAX as usize;
-                route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
-                    (b < limit) | ((b == missing) & default_left)
-                })
-            }
-        };
-    }
-    partition_by_bin(ghist, rows, route, |bin| {
-        split_bin.is_some_and(|s| bin <= s)
-    })
 }
 
 /// [`partition_rows`] of a categorical split: present bins go left when they
@@ -213,61 +185,68 @@ pub(super) fn category_left(cuts: &HistCuts, feature: u32, categories: &[u32]) -
     category_left
 }
 
-/// [`partition_rows`] without a numeric column fast path: a present bin of
-/// the split feature goes left when `present_left(bin)`, a missing value
-/// follows `route.default_left`. Uses the feature's column when the index
-/// keeps one (a missing sentinel lies outside the feature's bins), else each
-/// row's stored bins.
+/// [`partition_rows`] without a numeric column fast path: a present bin
+/// (global) of the split feature goes left when `present_left(bin)`, a
+/// missing value follows `route.default_left`. Uses the feature's column
+/// when the index keeps columns, else each row's stored bins.
 #[inline(always)]
 fn partition_by_bin(
     ghist: &GHistIndex,
     rows: &[u32],
     route: SplitRoute,
-    present_left: impl Fn(usize) -> bool + Sync,
+    present_left: impl Fn(usize) -> bool + Sync + Copy,
 ) -> (Vec<u32>, Vec<u32>) {
     let feature = route.feature as usize;
     let (fs, fe) = ghist.cuts().feature_bins(feature);
     let default_left = route.default_left;
-    if let Some(columns) = ghist.column_bins().or_else(|| ghist.missing_columns()) {
-        let go_left = |b: usize| {
-            if (fs..fe).contains(&b) {
-                present_left(b)
-            } else {
-                default_left
-            }
-        };
-        let n_rows = ghist.n_rows();
+    if let Some(columns) = ghist.columns() {
+        let local_left = move |b: usize| present_left(fs + b);
         return match columns {
-            Bins::U16(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], go_left),
-            Bins::U32(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], go_left),
+            Columns::U8(set) => route_column(rows, set.column(feature), default_left, local_left),
+            Columns::U16(set) => route_column(rows, set.column(feature), default_left, local_left),
+            Columns::U32(set) => route_column(rows, set.column(feature), default_left, local_left),
         };
     }
-    // Only sparse indexes reach here: a dense one always keeps its columns.
+    // Only sparse indexes less than half full reach here: every other one
+    // keeps its columns.
     let row_ptr = ghist.row_ptr();
     let row = |r: u32| row_ptr[r as usize]..row_ptr[r as usize + 1];
     match ghist.bins() {
         Bins::U16(bins) => route_rows!(rows, |r| {
-            row_goes_left(&bins[row(r)], (fs, fe), default_left, &present_left)
+            row_goes_left(&bins[row(r)], (fs, fe), default_left, present_left)
         }),
         Bins::U32(bins) => route_rows!(rows, |r| {
-            row_goes_left(&bins[row(r)], (fs, fe), default_left, &present_left)
+            row_goes_left(&bins[row(r)], (fs, fe), default_left, present_left)
         }),
     }
 }
 
-/// Partition rows on a split using the split feature's column (`column[r]`
-/// is row `r`'s bin, or a missing sentinel); `go_left` decides a bin. Rows
-/// ascend, so the column is read as a monotone stream the hardware
+/// Partition rows on a split using the split feature's column: a present
+/// row goes left when `present_left` holds for its local bin, a missing one
+/// (its bitmap bit set) when `default_left` does. Rows ascend, so the
+/// column and its bitmap are read as monotone streams the hardware
 /// prefetcher follows.
 #[inline(always)]
+#[allow(
+    clippy::needless_bitwise_bool,
+    reason = "branch-free routing predicates keep the partition loop free of data-dependent branches"
+)]
 fn route_column<B: BinIndex>(
     rows: &[u32],
-    column: &[B],
-    go_left: impl Fn(usize) -> bool + Sync + Copy,
+    column: Column<'_, B>,
+    default_left: bool,
+    present_left: impl Fn(usize) -> bool + Sync + Copy,
 ) -> (Vec<u32>, Vec<u32>) {
-    route_rows!(rows, [go_left, column], |r| go_left(
-        column[r as usize].index()
-    ))
+    let bins = column.bins;
+    match column.missing {
+        None => route_rows!(rows, [present_left, bins], |r| present_left(
+            bins[r as usize].index()
+        )),
+        Some(bits) => route_rows!(rows, [present_left, bins, bits, default_left], |r| {
+            let missing = missing_bit(bits, r as usize);
+            (present_left(bins[r as usize].index()) & !missing) | (missing & default_left)
+        }),
+    }
 }
 
 /// Whether a sparse row whose stored bins are `row` goes left on the feature
@@ -333,9 +312,9 @@ mod tests {
     use crate::tree::in_category_set;
 
     /// Every layout's routing (dense columns, columns with a missing
-    /// sentinel, per-row CSR scans) sends each row where its own bin
-    /// decides, for numeric and categorical splits in both default
-    /// directions, serially and in parallel chunks.
+    /// sentinel, per-row scans of a sparser index's rows) sends each row
+    /// where its own bin decides, for numeric and categorical splits in both
+    /// default directions, serially and in parallel chunks.
     #[test]
     fn partition_matches_per_row_routing_in_every_layout() {
         use crate::data::FeatureType;
@@ -373,14 +352,11 @@ mod tests {
                 .with_feature_types(&types)
                 .unwrap();
             let ghist = binned(&data, 32);
-            let has = (
-                ghist.column_bins().is_some(),
-                ghist.missing_columns().is_some(),
-            );
+            let has = (ghist.is_dense(), ghist.columns().is_some());
             assert_eq!(
                 has,
                 match layout {
-                    "dense" => (true, false),
+                    "dense" => (true, true),
                     "missing columns" => (false, true),
                     _ => (false, false),
                 },
@@ -402,18 +378,16 @@ mod tests {
                         location: &location,
                         default_left,
                     };
-                    let goes_left = |r: u32| match (
-                        ghist.feature_bin_at(r as usize, feature, fs, fe),
-                        &location,
-                    ) {
-                        (Some(bin), SplitLocation::Categories(categories)) => {
-                            in_category_set(categories, cuts.cut_value(bin as usize))
-                        }
-                        (Some(bin), SplitLocation::Numeric(pos)) => {
-                            pos.bin().is_some_and(|s| bin as usize <= s)
-                        }
-                        (None, _) => default_left,
-                    };
+                    let goes_left =
+                        |r: u32| match (ghist.feature_bin(r as usize, feature), &location) {
+                            (Some(bin), SplitLocation::Categories(categories)) => {
+                                in_category_set(categories, cuts.cut_value(bin as usize))
+                            }
+                            (Some(bin), SplitLocation::Numeric(pos)) => {
+                                pos.bin().is_some_and(|s| bin as usize <= s)
+                            }
+                            (None, _) => default_left,
+                        };
                     let expected: (Vec<u32>, Vec<u32>) = rows.iter().partition(|&&r| goes_left(r));
                     let serial = serial_pool.install(|| partition_rows(&ghist, &rows, route));
                     let parallel = parallel_pool.install(|| partition_rows(&ghist, &rows, route));

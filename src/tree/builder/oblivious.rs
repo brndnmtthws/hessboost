@@ -381,7 +381,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
             return None; // degenerate feature, no interior boundary
         }
         let n_bins = fe - fs;
-        let dense = ghist.dense_stride().is_some();
+        let dense = ghist.is_dense();
         let dir = self.config.cons.dir(f as usize);
         let gamma = self.config.params.gamma;
         // `(Σ (loss_chg − gamma), nodes split)` per boundary.
@@ -486,7 +486,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
             acc
         };
         let (left, right) = if split.missing_left {
-            let has_missing = ghist.dense_stride().is_none() && prefix(hist.len() - 1) != total;
+            let has_missing = !ghist.is_dense() && prefix(hist.len() - 1) != total;
             if has_missing {
                 let mut suffix = GradStats::default();
                 for &bin in hist[split.offset..].iter().rev() {
@@ -701,7 +701,7 @@ mod tests {
     fn missing_values_follow_one_direction_per_level_and_leaf_rows_match_routing() {
         let (data, y) = synthetic(3000, 5, true);
         let ghist = binned(&data, 32);
-        assert!(ghist.dense_stride().is_none());
+        assert!(!ghist.is_dense());
         let params = symmetric().max_depth(4).build().unwrap();
         let (tree, leaf_rows) = HistTreeBuilder::new(&params).build_with_leaf_rows(
             &ghist,

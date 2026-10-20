@@ -53,7 +53,7 @@ impl HistTreeBuilder<'_> {
         // A dense index has no missing entries: every feature's bins sum to
         // `total`, so the missing direction is never distinct and the
         // per-feature sums need not be computed.
-        let dense = ghist.dense_stride().is_some();
+        let dense = ghist.is_dense();
         let total = node.stats;
         let node_scorer = self.node_scorer(node);
         // [`scan_numeric_splits`] of every plain numeric feature of `chunk`
@@ -129,7 +129,7 @@ impl HistTreeBuilder<'_> {
         mut scans: Vec<Option<NumericScan>>,
     ) -> BestSplit {
         let cuts = ghist.cuts();
-        let dense = ghist.dense_stride().is_some();
+        let dense = ghist.is_dense();
         let total = node.stats;
         let node_scorer = self.node_scorer(node);
         let mut best = BestSplit::none();

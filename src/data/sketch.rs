@@ -495,7 +495,7 @@ pub(crate) struct WQSketch {
     sort_scratch: SketchScratch,
 }
 
-/// Radix sort buffers a [`WQSketch`] reuses, lent across sketches.
+/// Radix sort buffers a [`WQSketch`] reuses across its queue flushes.
 #[derive(Default)]
 pub(crate) struct SketchScratch {
     pairs: RadixScratch<(f32, f32)>,
@@ -520,18 +520,6 @@ impl WQSketch {
             unit_weights: false,
             sort_scratch: SketchScratch::default(),
         }
-    }
-
-    /// Sort with `scratch`'s buffers (reused across sketches), returned by
-    /// [`Self::into_sort_scratch`].
-    pub(crate) fn with_sort_scratch(mut self, scratch: SketchScratch) -> Self {
-        self.sort_scratch = scratch;
-        self
-    }
-
-    /// The radix sort's buffers, for the next sketch.
-    pub(crate) fn into_sort_scratch(self) -> SketchScratch {
-        self.sort_scratch
     }
 
     /// `WQuantileSketch::Push`: add one value in row order.

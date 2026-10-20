@@ -69,7 +69,7 @@ impl Cache {
             add_tree_margins(tree, data, &mut margins, 1, TreeOutput::Scalar(0));
             trees.push(TreeCache { nodes, grads });
         }
-        let dense = ghist.dense_stride().is_some();
+        let dense = ghist.is_dense();
         Ok(Cache {
             tolerance,
             cuts,

@@ -81,7 +81,7 @@ impl SplitOptions {
         node: NodeCtx,
     ) -> BestSplit {
         let cuts = ghist.cuts();
-        let dense = ghist.dense_stride().is_some();
+        let dense = ghist.is_dense();
         let total = node.stats;
         let bounds = node.bounds;
         let scorer = if self.smoothing() {

@@ -1042,7 +1042,7 @@ mod tests {
             .collect();
         let data = DMatrix::from_dense(&values, n, 2).unwrap();
         let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 64));
-        assert!(index.column_bins().is_some());
+        assert!(index.is_dense());
         // Spread over 60 binades: no chunk's sum is exact.
         let labels: Vec<f32> = (0..n)
             .map(|r| ((r * 7919) % 1237) as f32 / 331.0 * 2f32.powi((r * 37 % 61) as i32 - 30))

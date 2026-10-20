@@ -131,12 +131,13 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
             ``setflags(write=False)``) that owns its memory or views
             read-only arrays or buffers, which the matrix reads in place
             instead of copying. The matrix and every copy or slice of it
-            keep the array alive; a ``BinnedMatrix`` keeps only the bins, so
-            it outlives the array. The array (with every array sharing its
-            memory) must stay unchanged while any of them lives: a write
-            there would change data training already checked. The matrix's
-            reference to the array is a native one, so a reference cycle
-            through the borrowed array (an attribute on it naming the
+            keep the array alive (and numpy refuses to ``resize`` it, or an
+            array it views, meanwhile); a ``BinnedMatrix`` keeps only the
+            bins, so it outlives the array. The array (with every array
+            sharing its memory) must stay unchanged while any of them lives:
+            a write there would change data training already checked. The
+            matrix's reference to the array is a native one, so a reference
+            cycle through the borrowed array (an attribute on it naming the
             matrix, say) is not collected.
 
     Raises:

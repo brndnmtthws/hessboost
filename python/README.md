@@ -175,8 +175,8 @@ row (NaN and fold `-1` for rows no fold tests; refused when two folds test
 the same row). With `per_fold_stopping=folds.PurgedTail(decision_at,
 label_end, fraction)`, early stopping is per fold and leakage-safe: each
 fold sizes its rounds on the purged chronological tail of its own training
-rows (cut as `purged_forward` cuts one block: the last `fraction` of their
-distinct decision times) (`early_stopping_rounds` the patience), then trains on all of them, so
+rows (the last `fraction` of their time span, starting at a decision time;
+purged as `purged_forward` purges) (`early_stopping_rounds` the patience), then trains on all of them, so
 no forward fold uses rounds chosen with later labels; the refit is sized the
 same way on every row:
 

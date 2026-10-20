@@ -257,16 +257,19 @@ impl Fold {
 ///
 /// `decision_at[i]` and `label_end[i]` are row `i`'s decision time and the
 /// end of its label window plus any embargo, as for
-/// [`Fold::purged_forward`], whose single-block split this is: of the `n`
-/// sorted distinct decision times of the rows split, [`split`](Self::split)
-/// starts the tail at `split_at`, the one at index `min(n − 1, floor((1 −
-/// fraction) · n))` (always a decision time of those rows). The tail is
+/// [`Fold::purged_forward`]. The cut is by time span, as an expanding
+/// fold's early-stopping tail is cut (unlike `purged_forward`, which cuts
+/// by the count of distinct decision times): for rows decided from `first`
+/// to `last`, [`split`](Self::split) starts the tail at `split_at`, the
+/// first of their decision times at or after `first + (1 − fraction) ·
+/// (last − first)`, so irregular gaps do not shift it. The tail is
 /// every row decided at or after `split_at`, and the rows the
 /// early-stopping fit trains on are those decided before it whose labels
 /// end at or before it (so a label ending exactly at the split is kept, one
 /// ending a tick later is purged; the rows in between go to neither side).
-/// Unlike `purged_forward`, the start never moves: a split leaving either
-/// side empty is refused.
+/// The purge is `purged_forward`'s: inclusive at the split. Unlike
+/// `purged_forward`, the start never moves: a split leaving either side
+/// empty is refused.
 ///
 /// ```
 /// use hessboost::training::PurgedTail;
@@ -278,7 +281,7 @@ impl Fold {
 /// let label_end: Vec<i64> = decision_at.iter().map(|at| at + 2 * hour).collect();
 /// let tail = PurgedTail::new(&decision_at, &label_end, 0.25)?;
 /// let (split_at, split) = tail.split(&(0..9).collect::<Vec<_>>())?;
-/// // Nine decision times: the tail starts at index floor(0.75 · 9) = 6.
+/// // 0 + 0.75 · 8 hours: the tail starts at hour 6.
 /// // Row 5 is purged, as its label ends after the split; row 4's ends at it.
 /// assert_eq!(split_at, 6 * hour);
 /// assert_eq!(split.test, [6, 7, 8]);
@@ -364,9 +367,12 @@ impl<'a> PurgedTail<'a> {
         if times.is_empty() {
             return Err("no rows to split".to_string());
         }
-        // `Fold::purged_forward`'s start index.
-        let count = times.len();
-        let split_at = times[(count - 1).min(((1.0 - self.fraction) * count as f64) as usize)];
+        // The first decision time at or past `1 - fraction` of the span
+        // (`last` always is: the rounded product never exceeds the span).
+        let first = times[0];
+        let offset = |time: i64| (i128::from(time) - i128::from(first)) as f64;
+        let target = (1.0 - self.fraction) * offset(times[times.len() - 1]);
+        let split_at = times[times.partition_point(|&time| offset(time) < target)];
         let (mut train, mut test) = (Vec::new(), Vec::new());
         for &row in rows {
             if self.decision_at[row] >= split_at {
@@ -534,8 +540,8 @@ mod tests {
         let tail = PurgedTail::new(&decisions, &ends, 0.25).unwrap();
         let rows: Vec<usize> = (0..120).rev().collect();
         let (split_at, split) = tail.split(&rows).unwrap();
-        // 20 decision days: the tail starts at day floor(0.75 · 20) = 15,
-        // where purged_forward's single block starts too.
+        // Days 0..=19: the first day at or after 0.75 · 19 = 14.25 is day
+        // 15, where purged_forward's single block also starts here.
         assert_eq!(split_at, 15 * day);
         let forward = &Fold::purged_forward(&decisions, &ends, 0.25, 1, 1).unwrap()[0];
         let sorted = |rows: &[usize]| {
@@ -580,5 +586,20 @@ mod tests {
         for rows in [vec![], vec![0, 1, 2], vec![0, 120], vec![0, 6]] {
             assert!(tail.split(&rows).is_err(), "{rows:?}");
         }
+    }
+
+    /// The tail is a fraction of the time span, not of the decision
+    /// times: after a long gap, only the late times are held out.
+    #[test]
+    fn purged_tail_cuts_by_time_span() {
+        let at = [0, 1, 2, 3, 4, 5, 6, 7, 999, 1000];
+        let tail = PurgedTail::new(&at, &at, 0.3).unwrap();
+        let (split_at, split) = tail.split(&(0..10).collect::<Vec<_>>()).unwrap();
+        assert_eq!(split_at, 999);
+        assert_eq!(split.test, [8, 9]);
+        assert_eq!(split.train, (0..8).collect::<Vec<_>>());
+        // purged_forward, by decision times, also tests time 7.
+        let forward = &Fold::purged_forward(&at, &at, 0.3, 1, 1).unwrap()[0];
+        assert_eq!(forward.test, [7, 8, 9]);
     }
 }

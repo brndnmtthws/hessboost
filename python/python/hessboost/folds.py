@@ -116,9 +116,11 @@ class PurgedTail:
 
     ``decision_at`` and ``label_end`` hold every row's decision time and the
     end of its label window plus any embargo, as for
-    :func:`purged_forward`, whose single-block split this is: of the ``n``
-    sorted distinct decision times of the rows split, :meth:`split` starts
-    the tail at the one at index ``min(n - 1, floor((1 - fraction) * n))``.
+    :func:`purged_forward`. The cut is by time span (unlike
+    :func:`purged_forward`, which cuts by the count of distinct decision
+    times): for rows decided from ``first`` to ``last``, :meth:`split` starts
+    the tail at the first of their decision times at or after ``first + (1 -
+    fraction) * (last - first)``.
     The tail is every row decided at or after it, and the early-stopping
     fit trains on the rows decided before it whose labels end at or before
     it (a label ending exactly at the split is kept, one ending a tick later

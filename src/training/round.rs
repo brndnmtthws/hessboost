@@ -496,10 +496,11 @@ struct TreeSlot<'a> {
 /// gradient-based row sampling when configured (per tree, as XGBoost's hist
 /// updater does, or once per output forest under `approx`, kept in
 /// `forest_sample` by the forest's first tree for the rest), derive its
-/// column sampler, build the tree, fit linear leaves when configured, and
-/// shrink its leaves by `eta / num_parallel_tree`. The caller owns the round
-/// RNG (already seeded and salted), the reuse dictionary, and what happens
-/// to the tree (margin updates, contribution weight).
+/// column sampler, build the tree, set exact or fit linear leaves when
+/// configured, and shrink its leaves by `eta / num_parallel_tree`. The
+/// caller owns the round RNG (already seeded and salted), the reuse
+/// dictionary, and what happens to the tree (margin updates, contribution
+/// weight).
 fn fit_output_tree(
     grow: &GrowRound,
     slot: &TreeSlot,

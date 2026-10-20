@@ -145,17 +145,21 @@ pub(super) fn boost_round(
     // The row samples, all drawn before the trees: one per parallel tree
     // under uniform sampling, else one all-rows subset they share.
     let row_subsets = iteration_row_subsets(params, false, ctx.run.rows, ctx.all_rows, &mut rng);
-    for p in 0..params.num_parallel_tree {
-        let rows = row_subsets.rows(p);
-        let (tree, leaf_rows) = fit_tree(ctx, &grads, &mut rng, rows, &margins.train)?;
+    // The trees of an iteration share the round's gradients and, with exact
+    // leaves, the margins those came from: they join the margins only once
+    // all of them are grown, as `round::grow_round`'s scalar trees do.
+    let trees = (0..params.num_parallel_tree)
+        .map(|p| fit_tree(ctx, &grads, &mut rng, row_subsets.rows(p), &margins.train))
+        .collect::<Result<Vec<_>>>()?;
+    for (p, (tree, leaf_rows)) in trees.into_iter().enumerate() {
         // A dropout round's gradients come from the ensemble, not the margin
         // caches, which `finish_dart` recomputes.
         if dropped.is_none() {
             // Leaf row lists identify every training row's leaf when all
             // rows took part in growing the tree, or exact leaves routed
             // them all.
-            let all_rows =
-                ctx.run.exact_leaves.is_some() || (rows.len() == n && !gradient_sampling(params));
+            let all_rows = ctx.run.exact_leaves.is_some()
+                || (row_subsets.rows(p).len() == n && !gradient_sampling(params));
             let captured = all_rows.then_some(leaf_rows.as_slice());
             margins.add_tree(&tree, TreeOutput::Vector, captured);
         }

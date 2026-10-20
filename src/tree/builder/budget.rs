@@ -34,7 +34,7 @@
 use super::partition::{SplitRoute, partition_rows};
 use super::shared::rayon_available;
 use super::{SplitLocation, SplitPos};
-use crate::data::ghist::{Bins, GHistIndex};
+use crate::data::ghist::{BinIndex, Bins, Column, Columns, GHistIndex};
 use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
 use crate::tree::hist::feature_slices;
@@ -661,20 +661,17 @@ fn update_decrement(
 fn build_histogram(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Vec<FoldStats> {
     let mut hist = vec![FoldStats::default(); ghist.total_bins()];
     let parallel = rows.len() >= PARALLEL_ROWS && rayon_available();
-    if let (true, Some(columns)) = (parallel, ghist.column_bins()) {
+    if let (true, Some(columns)) = (parallel, ghist.columns()) {
         // Feature-parallel: each task owns one feature's bin range and adds
-        // that feature's rows in the node's row order.
-        let n_rows = ghist.n_rows();
+        // that feature's rows in the node's row order, as the row sweep
+        // does.
         feature_slices(ghist, &mut hist, 1)
             .into_par_iter()
             .enumerate()
-            .for_each(|(f, (fs, slice))| match columns {
-                Bins::U16(c) => {
-                    accumulate_column(&c[f * n_rows..(f + 1) * n_rows], fs, rows, gpair, slice);
-                }
-                Bins::U32(c) => {
-                    accumulate_column(&c[f * n_rows..(f + 1) * n_rows], fs, rows, gpair, slice);
-                }
+            .for_each(|(f, (_, slice))| match columns {
+                Columns::U8(set) => accumulate_column(set.column(f), rows, gpair, slice),
+                Columns::U16(set) => accumulate_column(set.column(f), rows, gpair, slice),
+                Columns::U32(set) => accumulate_column(set.column(f), rows, gpair, slice),
             });
     } else {
         match ghist.bins() {
@@ -685,16 +682,18 @@ fn build_histogram(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Vec<
     hist
 }
 
-fn accumulate_column<B: Copy + Into<u32>>(
-    column: &[B],
-    first_bin: usize,
+/// Add `rows` (in order) to their local bins of one feature's `column` in
+/// the feature's histogram slice `out`, skipping missing entries.
+fn accumulate_column<B: BinIndex>(
+    column: Column<'_, B>,
     rows: &[u32],
     gpair: &[GradPair],
     out: &mut [FoldStats],
 ) {
     for &r in rows {
-        let bin = column[r as usize].into() as usize - first_bin;
-        out[bin].add_row(r, gpair[r as usize]);
+        if let Some(bin) = column.get(r as usize) {
+            out[bin as usize].add_row(r, gpair[r as usize]);
+        }
     }
 }
 

@@ -40,15 +40,17 @@ pub(super) struct NodeCache {
 }
 
 impl Cache {
-    /// Replay `model`'s trees over `data` (as training grew them).
+    /// Replay `model`'s trees over `data` (as training grew them), on the
+    /// index training bins `data` with: its cached one, whose cuts (a
+    /// source-cut view's source's) the model's splits were found on.
     pub(super) fn build(
         model: &BoostedModel,
         params: &TrainingParams,
         data: &DMatrix,
         tolerance: f64,
     ) -> Result<Self> {
-        let cuts = HistCuts::from_dmatrix(data, params.max_bin);
-        let ghist = GHistIndex::from_dmatrix(data, cuts.clone());
+        let ghist = data.hist_index(params.max_bin);
+        let cuts = ghist.cuts().clone();
         let objective = params.loss(1)?;
         let mut margins = vec![model.base_scores()[0]; data.n_rows()];
         let mut trees = Vec::with_capacity(model.num_trees());
@@ -69,7 +71,7 @@ impl Cache {
             add_tree_margins(tree, data, &mut margins, 1, TreeOutput::Scalar(0));
             trees.push(TreeCache { nodes, grads });
         }
-        let dense = ghist.dense_stride().is_some();
+        let dense = ghist.is_dense();
         Ok(Cache {
             tolerance,
             cuts,

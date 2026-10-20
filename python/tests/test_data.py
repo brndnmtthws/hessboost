@@ -3,6 +3,9 @@ categoricals, scipy sparse matrices, and DMatrix metadata."""
 
 from __future__ import annotations
 
+import array
+import gc
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -106,6 +109,32 @@ def test_metadata_getters_and_set_info() -> None:
     with pytest.raises(HessboostError, match="out of range"):
         matrix.slice([10])
     assert repr(matrix) == "DMatrix(rows=10, features=5)"
+
+
+def test_slices_train_as_copies_or_on_their_sources_bins() -> None:
+    x, y = regression(rows=600)
+    x[::7, 1] = np.nan
+    matrix = DMatrix(x, y)
+    rows = np.r_[np.arange(599, 0, -3), np.repeat(np.arange(50, 90), 2)]
+    params = {"max_depth": 4, "subsample": 0.8, "seed": 3}
+    copy = hessboost.train(params, DMatrix(x[rows], y[rows]), 6)
+    view = hessboost.train(params, matrix.slice(rows), 6)
+    assert view.save_raw() == copy.save_raw()
+    with pytest.raises(HessboostError, match="cuts must be"):
+        matrix.slice(rows, cuts="parent")  # ty: ignore[invalid-argument-type]
+
+    # A step at 5 on a feature of the values 0..9: a view without the rows
+    # at 5 cuts at the next value it holds, a view with its source's cuts
+    # at 5 itself.
+    steps = np.repeat(np.arange(10, dtype=np.float32), 30)[:, None]
+    labels = (steps[:, 0] >= 5).astype(np.float32)
+    without_five = np.flatnonzero(steps[:, 0] != 5)
+    stepped = DMatrix(steps, labels)
+    stump = {"max_depth": 1}
+    own = hessboost.train(stump, stepped.slice(without_five), 1).model_info()
+    source = hessboost.train(stump, stepped.slice(without_five, cuts="source"), 1).model_info()
+    assert own.trees[0].threshold[0] == 6.0
+    assert source.trees[0].threshold[0] == 5.0
 
 
 def test_scipy_sparse_matrices_equal_dense_with_nan() -> None:
@@ -277,3 +306,74 @@ def test_native_base_margin_rank_is_checked() -> None:
     for margin in (np.array(0.5, np.float32), np.zeros((1, 1, 1), np.float32)):
         with pytest.raises(HessboostError, match="1-D or 2-D"):
             native.with_info({"base_margin": margin, "categorical": None})
+
+
+def test_read_only_float32_arrays_are_borrowed_with_copy_false(tmp_path: Path) -> None:
+    x, y = regression(rows=500)
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    x[::7, 1] = np.nan
+    params = {"max_depth": 3, "subsample": 0.8, "seed": 2}
+    reference = hessboost.train(params, DMatrix(x, y), 5).save_raw()
+    np.save(tmp_path / "x.npy", x)
+    frozen = x.copy()
+    frozen.setflags(write=False)
+    borrowed = [
+        DMatrix(frozen, y, copy=False),
+        DMatrix(np.load(tmp_path / "x.npy", mmap_mode="r"), y, copy=False),
+        # A view of a read-only buffer.
+        DMatrix(np.frombuffer(x.tobytes(), np.float32).reshape(x.shape), y, copy=False),
+    ]
+    # The matrices keep the arrays alive: the memory map has no other owner.
+    del frozen
+    gc.collect()
+    for matrix in borrowed:
+        assert hessboost.train(params, matrix, 5).save_raw() == reference
+        rows = np.arange(0, 500, 3)
+        copy = DMatrix(x[rows], y[rows])
+        assert (
+            hessboost.train(params, matrix.slice(rows), 5).save_raw()
+            == hessboost.train(params, copy, 5).save_raw()
+        )
+
+
+def test_copy_false_refuses_what_it_cannot_borrow() -> None:
+    x, y = regression(rows=50)
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    with pytest.raises(HessboostError, match="read-only"):
+        DMatrix(x, y, copy=False)
+    strided = x[:, ::2]
+    strided.setflags(write=False)
+    with pytest.raises(HessboostError, match="C-contiguous"):
+        DMatrix(strided, y, copy=False)
+    view = x.view()
+    view.setflags(write=False)
+    with pytest.raises(HessboostError, match="base can still write it"):
+        DMatrix(view, y, copy=False)
+    wrapped = np.asarray(memoryview(x))
+    wrapped.setflags(write=False)
+    with pytest.raises(HessboostError, match="base can still write it"):
+        DMatrix(wrapped, y, copy=False)
+
+    class HidesBase(np.ndarray):
+        @property
+        def base(self) -> None:
+            return None
+
+    hidden = x.view(HidesBase)
+    hidden.setflags(write=False)
+    with pytest.raises(HessboostError, match="base can still write it"):
+        DMatrix(hidden, y, copy=False)
+    for owner in (bytearray(32), array.array("f", [0.0] * 8)):
+        over_owner = np.ndarray((4, 2), dtype=np.float32, buffer=owner)
+        over_owner.setflags(write=False)
+        with pytest.raises(HessboostError, match="base can still write it"):
+            DMatrix(over_owner, copy=False)
+    # A base exposing only an array interface hides whether its memory (here
+    # `x`'s) can be written.
+    interfaced = np.lib.stride_tricks.as_strided(x, writeable=False)
+    with pytest.raises(HessboostError, match="exposes no buffer to ask"):
+        DMatrix(interfaced, y, copy=False)
+    with pytest.raises(TypeError, match="float32"):
+        DMatrix(x.astype(np.float64), y, copy=False)
+    with pytest.raises(TypeError, match="numpy array"):
+        DMatrix(pd.DataFrame(x), y, copy=False)

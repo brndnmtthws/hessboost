@@ -817,7 +817,7 @@ mod tests {
             assert_eq!(column(&d, col), column(&s, col));
         }
         assert_eq!(column(&s, 0)[1], None);
-        assert!(s.csr_parts().is_some());
+        assert!(s.csr_rows().is_some());
     }
 
     #[test]

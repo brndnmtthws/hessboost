@@ -1274,7 +1274,7 @@ mod tests {
         let n = x.len();
         let data = DMatrix::from_dense(&x, n, 1).unwrap();
         let ghist = binned(&data, 256);
-        assert!(ghist.dense_stride().is_none());
+        assert!(!ghist.is_dense());
         let mut gpair = vec![gp(-1.0, 1.0); 4];
         gpair.extend([gp(1.0, 1.0), gp(1.0, 1.0)]);
         let params = TrainingParams::builder()
@@ -1342,7 +1342,7 @@ mod tests {
         let n = 6;
         let data = DMatrix::from_dense(&x, n, 2).unwrap();
         let ghist = binned(&data, 256);
-        assert!(ghist.dense_stride().is_none());
+        assert!(!ghist.is_dense());
         let gpair = vec![
             gp(1.0, 1.0),
             gp(1.0, 1.0),

@@ -11,7 +11,7 @@
 pub(crate) mod quantized;
 mod walk;
 
-use crate::data::ghist::GHistIndex;
+use crate::data::ghist::{Columns, GHistIndex};
 use crate::objective::GradPair;
 use crate::tree::gain::{GradStats, RegParams};
 use rayon::prelude::*;
@@ -397,19 +397,14 @@ pub(crate) enum SumOrder {
 }
 
 /// The order [`CpuBackend::build`] sums a node of `len` rows in, on an
-/// index of `index_rows` rows that has a column-major copy
-/// (`column_major`, [`GHistIndex::column_bins`]); `contiguous`: the node's
-/// rows are one ascending range. A node below [`PARALLEL_THRESHOLD`] rows,
-/// or one the column-major copy is swept for by feature (a contiguous
+/// index of `index_rows` rows that is `dense` ([`GHistIndex::is_dense`]:
+/// its feature columns are swept by feature); `contiguous`: the node's rows
+/// are one ascending range. A node below [`PARALLEL_THRESHOLD`] rows, or
+/// one a dense index's columns are swept for by feature (a contiguous
 /// range, or any subset of an index of at most [`GATHER_MAX_ROWS`] rows),
 /// is one chain; any other node sums `len / ROWS_PER_TASK` equal blocks.
-pub(crate) fn sum_order(
-    column_major: bool,
-    index_rows: usize,
-    len: usize,
-    contiguous: bool,
-) -> SumOrder {
-    if len < PARALLEL_THRESHOLD || column_major && (contiguous || index_rows <= GATHER_MAX_ROWS) {
+pub(crate) fn sum_order(dense: bool, index_rows: usize, len: usize, contiguous: bool) -> SumOrder {
+    if len < PARALLEL_THRESHOLD || dense && (contiguous || index_rows <= GATHER_MAX_ROWS) {
         return SumOrder::Chain;
     }
     let blocks = len / ROWS_PER_TASK;
@@ -418,12 +413,17 @@ pub(crate) fn sum_order(
     }
 }
 
+/// The feature columns [`CpuBackend`] sweeps by feature: a dense index's.
+fn dense_columns(ghist: &GHistIndex) -> Option<Columns<'_>> {
+    ghist.columns().filter(|_| ghist.is_dense())
+}
+
 #[cfg(all(target_os = "linux", feature = "cuda"))]
 impl CpuBackend {
     /// [`CpuBackend::build`]'s histogram, bit for bit, without entering
     /// Rayon: CUDA's fallback runs under its state lock, which pool work
-    /// stealing could re-enter. A chained node with a column-major copy is
-    /// swept by feature on up to `threads` scoped threads (one per
+    /// stealing could re-enter. A chained node of a dense index is swept
+    /// by feature on up to `threads` scoped threads (one per
     /// [`PARALLEL_THRESHOLD`] rows); anything else runs on the caller.
     pub(crate) fn build_locked(
         ghist: &GHistIndex,
@@ -433,13 +433,13 @@ impl CpuBackend {
         threads: usize,
     ) {
         out.fill(GradStats::default());
-        let columns = ghist.column_bins();
+        let columns = dense_columns(ghist);
         let range = columns
             .as_ref()
             .filter(|_| rows.len() >= PARALLEL_THRESHOLD)
             .and_then(|_| contiguous_range(rows));
         let order = sum_order(
-            columns.is_some(),
+            ghist.is_dense(),
             ghist.n_rows(),
             rows.len(),
             range.is_some(),
@@ -451,7 +451,7 @@ impl CpuBackend {
                     Some(range) => SweepRows::Range(range),
                     None => SweepRows::Subset(rows),
                 };
-                by_features_scoped(ghist, &columns, &rows, gpair, out, threads);
+                by_features_scoped(ghist, columns, &rows, gpair, out, threads);
             }
             (SumOrder::Chain, _) => accumulate(ghist, rows, gpair, out),
             (SumOrder::Blocked { grain }, _) => {
@@ -478,10 +478,10 @@ impl HistogramBackend for CpuBackend {
             return;
         }
         let threads = rayon::current_num_threads();
-        let columns = ghist.column_bins();
+        let columns = dense_columns(ghist);
         let range = columns.as_ref().and_then(|_| contiguous_range(rows));
         let order = sum_order(
-            columns.is_some(),
+            ghist.is_dense(),
             ghist.n_rows(),
             rows.len(),
             range.is_some(),
@@ -498,15 +498,15 @@ impl HistogramBackend for CpuBackend {
             return;
         };
 
-        // A contiguous row range with a column-major copy is split by
-        // feature. Any other row subset of a small enough column-major index
-        // is gathered the same way: every feature group re-reads the
-        // gradients, so this pays only while they stay in a core's cache.
+        // A dense index's contiguous row range is split by feature. Any
+        // other row subset of a small enough dense index is gathered the
+        // same way: every feature group re-reads the gradients, so this
+        // pays only while they stay in a core's cache.
         let rows = match range {
             Some(range) => SweepRows::Range(range),
             None => SweepRows::Subset(rows),
         };
-        by_features(ghist, &columns, &rows, gpair, out, threads);
+        by_features(ghist, columns, &rows, gpair, out, threads);
     }
 }
 
@@ -570,33 +570,6 @@ fn accumulate_blocks(
     }
 }
 
-/// Bin-index storage widths the accumulation and partition loops specialize on.
-pub(crate) trait BinIndex: Copy + PartialEq + Send + Sync {
-    /// The width's maximum, never a bin: what
-    /// [`GHistIndex::missing_columns`] stores where a row lacks a feature.
-    const MISSING: Self;
-
-    fn index(self) -> usize;
-}
-
-impl BinIndex for u16 {
-    const MISSING: Self = u16::MAX;
-
-    #[inline(always)]
-    fn index(self) -> usize {
-        self as usize
-    }
-}
-
-impl BinIndex for u32 {
-    const MISSING: Self = u32::MAX;
-
-    #[inline(always)]
-    fn index(self) -> usize {
-        self as usize
-    }
-}
-
 impl Bucket for GradStats {
     #[inline(always)]
     fn push(&mut self, value: GradStats) {
@@ -642,7 +615,8 @@ mod tests {
     /// its rows in ascending order, which is the order both the row sweep and
     /// the column sweep must reproduce bit for bit.
     fn row_order_reference(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Histogram {
-        let stride = ghist.dense_stride().expect("dense index");
+        assert!(ghist.is_dense(), "dense index");
+        let stride = ghist.n_cols();
         let mut h = zeroed(ghist.total_bins());
         for &r in rows {
             let r = r as usize;
@@ -668,8 +642,8 @@ mod tests {
         let cuts = HistCuts::from_dmatrix(&data, 64);
         let ghist = GHistIndex::from_dmatrix(&data, cuts);
         assert!(
-            ghist.column_bins().is_some(),
-            "dense index keeps a column copy"
+            ghist.is_dense() && ghist.columns().is_some(),
+            "dense index keeps its columns"
         );
         let gpair: Vec<GradPair> = (0..n)
             .map(|i| {
@@ -712,8 +686,8 @@ mod tests {
         let cuts = HistCuts::from_dmatrix(&data, 256);
         let ghist = GHistIndex::from_dmatrix(&data, cuts);
         assert!(
-            ghist.column_bins().is_none(),
-            "sparse index has no column copy"
+            !ghist.is_dense() && ghist.columns().is_none(),
+            "a third full: rows only"
         );
         ghist
     }

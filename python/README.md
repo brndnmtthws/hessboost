@@ -106,13 +106,18 @@ gains, linear leaves).
 
 ### Input data
 
-`DMatrix` takes numpy arrays of any numeric dtype and memory layout (a
-C-contiguous `float32` array is used without a copy), pandas and polars
-DataFrames, polars LazyFrames, scipy sparse matrices, and anything
-`numpy.asarray` accepts. NaN, and a frame's null, is missing (or pass
+`DMatrix` takes numpy arrays of any numeric dtype and memory layout,
+pandas and polars DataFrames, polars LazyFrames, scipy sparse matrices, and
+anything `numpy.asarray` accepts, and keeps its own copy of the values;
+`copy=False` reads a read-only, C-contiguous `float32` array in place
+instead (such as `np.load(path, mmap_mode="r")`), which must then stay
+unchanged. NaN, and a frame's null, is missing (or pass
 `missing=`); ranking data takes `group=` sizes or `qid=`, and
 `survival:aft` takes `label_lower_bound=`/`label_upper_bound=`.
-`Booster.predict` accepts the same inputs directly.
+`Booster.predict` accepts the same inputs directly. `DMatrix.slice(rows)`
+is a view of the rows, sharing the values, and `BinnedMatrix(dtrain,
+max_bin)` keeps only a matrix's histogram bins (XGBoost's
+`QuantileDMatrix`), which `train` takes for `hist` growth.
 
 With a frame, the per-row metadata can name its columns instead of
 arriving as separate arrays: `label`, `weight`, `base_margin`, `qid`,
@@ -692,7 +697,7 @@ a constructor parameter.
   lays the model out for GPU batch prediction (`GpuModel.predict`,
   bit-identical to `Booster.predict`), taking the same GPU `device` strings.
 - Model files do not store feature names or categories (pickles do).
-- Not available: `DMatrix` from files or `QuantileDMatrix`, `inplace_predict`
+- Not available: `DMatrix` from files, `inplace_predict`
   (`predict` takes arrays directly, and `predict_row` single rows),
   `Booster.get_dump`/`trees_to_dataframe`/`dump_model` (`model_info()`
   returns the trees as arrays), attributes (`set_attr`), plotting,

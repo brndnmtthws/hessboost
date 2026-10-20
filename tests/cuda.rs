@@ -214,13 +214,11 @@ fn assert_cpu_rounds_exact_chunk_bins(index: &GHistIndex, rows: &[u32], what: &s
     assert!(rows.contains(&16), "{what}: the node must hold row 16");
     let gpair = chunk_exact_pairs(index.n_rows());
     let grains = 2f64.powi(40);
-    let cuts = index.cuts();
     let mut exact = vec![0i64; index.total_bins()];
-    for f in 0..cuts.n_features() {
-        let (fs, fe) = cuts.feature_bins(f);
+    for f in 0..index.n_cols() {
         for &r in rows {
             let r = r as usize;
-            if let Some(bin) = index.feature_bin_at(r, f, fs, fe) {
+            if let Some(bin) = index.feature_bin(r, f) {
                 exact[bin as usize] += (f64::from(gpair[r].grad) * grains) as i64;
             }
         }

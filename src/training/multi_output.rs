@@ -5,11 +5,12 @@
 
 use super::dart::{dart_new_tree_weight, finish_dart, round_gradients};
 use super::exact_leaves::route_rows;
-use super::margins::{MarginCaches, TreeOutput};
+use super::margins::{MarginCaches, RowRouting, TreeOutput};
 use super::prepare::TrainContext;
 use super::round::tree_eta;
 use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
 use crate::config::{BoosterKind, Device, MultiStrategy, TrainingParams, TreeMethod};
+use crate::data::SketchedRows;
 use crate::data::ghist::GHistIndex;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
@@ -104,8 +105,19 @@ fn split_gradient(
 pub(super) struct VectorRound<'a> {
     pub(super) run: TrainContext<'a>,
     pub(super) ghist: &'a GHistIndex,
+    /// Which training rows `ghist`'s cuts were sketched from (see
+    /// [`Prepared::Hist`](super::prepare::Prepared::Hist)).
+    pub(super) sketched: SketchedRows,
     /// Every training row, ascending: the rows of an unsampled round.
     pub(super) all_rows: &'a [u32],
+}
+
+impl VectorRound<'_> {
+    /// How finished trees route the training rows when no list of their
+    /// leaves was kept.
+    fn routing(&self) -> RowRouting<'_> {
+        RowRouting::of(self.ghist, self.sketched)
+    }
 }
 
 /// One boosting iteration: grow `num_parallel_tree` vector-leaf trees from
@@ -156,12 +168,15 @@ pub(super) fn boost_round(
         // caches, which `finish_dart` recomputes.
         if dropped.is_none() {
             // Leaf row lists identify every training row's leaf when all
-            // rows took part in growing the tree, or exact leaves routed
+            // rows took part in growing the tree and the partitions route
+            // every weighted row as its values do, or exact leaves routed
             // them all.
             let all_rows = ctx.run.exact_leaves.is_some()
-                || (row_subsets.rows(p).len() == n && !gradient_sampling(params));
+                || (row_subsets.rows(p).len() == n
+                    && !gradient_sampling(params)
+                    && ctx.sketched != SketchedRows::Partial);
             let captured = all_rows.then_some(leaf_rows.as_slice());
-            margins.add_tree(&tree, TreeOutput::Vector, captured);
+            margins.add_tree(&tree, TreeOutput::Vector, captured, ctx.routing());
         }
         model.push_tree_weighted(tree, weight);
     }
@@ -231,16 +246,20 @@ fn fit_tree(
     let (mut tree, mut leaf_rows) =
         MultiTreeBuilder::new(params).build(ctx.ghist, &grad, rows, &mut sampler);
     if let Some(exact) = ctx.run.exact_leaves {
-        leaf_rows = route_rows(&tree, ctx.run.dtrain);
+        leaf_rows = route_rows(&tree, ctx.run.dtrain, ctx.routing());
         exact.fit(&mut tree, TreeOutput::Vector, &leaf_rows, margins);
     }
     if let Some(langevin) = ctx.run.langevin {
+        // The builder's partitions route every weighted row as its values
+        // do unless the cuts missed some (`SketchedRows::Partial`); then
+        // renewal routes the rows itself. Exact leaves' rows are routed.
+        let partitions = ctx.run.exact_leaves.is_some() || ctx.sketched != SketchedRows::Partial;
         let at = LeafRenewal {
             data: ctx.run.dtrain,
             gpair,
             n_out,
             rows,
-            leaf_rows: &leaf_rows,
+            leaf_rows: if partitions { &leaf_rows } else { &[] },
             iteration: grads.iteration,
             tree: 0,
         };

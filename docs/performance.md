@@ -325,39 +325,68 @@ order; monotone/`alpha`/`max_delta_step`/reuse-penalty/non-finite
 configs score everything exactly, still batched. `tree::builder::tests`
 checks both against sequential search.
 
-The root sweeps the column-major bin copy two features at a time, one
-writer per bin. Other subsets up to 2^18 rows gather per feature pair from
-the same copy — no partial histograms, rows ascending per bin. Larger nodes
-(8,192+ rows, sparse or big) split into `n / 4,096` fixed blocks, each
-summed from zero and added in block order, one wave per worker count — sums
-depend on rows, never thread count (serial sums the same blocks). Row
-sweeps prefetch four bins before storing. Partitions route rows through a
-branch-free loop keyed off the bin, categorical splits included.
+A dense index's root sweeps its feature columns a few features at a time,
+one writer per bin. Its other subsets up to 2^18 rows gather per feature
+from the same columns — no partial histograms, rows ascending per bin.
+Larger nodes (8,192+ rows, sparse or big) gather their CSR rows in
+`n / 4,096` fixed blocks, each summed from zero and added in block order,
+one wave per worker count — sums depend on rows, never thread count
+(serial sums the same blocks). Row sweeps prefetch four bins before
+storing. Partitions route rows through a branch-free loop keyed off the
+split feature's column (its bin, or its missing bit), categorical splits
+included.
 
 Leaves at `max_depth` skip histograms and split search. Under full row
 sampling, training keeps their final partitions (depthwise, loss-guide,
-exact) and adds leaf values straight into cached margins. Sampled and eval
-sets update disjoint rows in parallel, skipping inputs too small to
-parallelize. Stats, monotone bounds, and sampler draws preserved.
+exact) and adds leaf values straight into cached margins. Sampled rounds,
+and exact leaves, route every training row through the finished tree by its
+bins in the index's feature columns instead of its raw values, when
+the cuts were sketched from every row (no zero sample weight), which makes
+the two routings agree; eval sets route by value. Margin updates run over
+disjoint row chunks in parallel, skipping inputs too small to parallelize.
+Stats, monotone bounds, and sampler draws preserved.
 
-Cuts sort per feature; rows bin in parallel chunks. Unweighted sketch
-queues radix-sort (whole-number weights sum identically in any order).
-Large dense inputs validate and copy in parallel. Collection preserves cut
-layout, row order, missing handling, categorical bins, and 16/32-bit bin
-choice. Half-full-or-denser sparse indexes keep a column-major copy with a
-missing sentinel for single-column streaming (categorical splits stream the
-same columns through a per-bin left-set table); sparser ones scan stored
-bins inline, in parallel row-order chunks for large nodes. Architecture-independent.
+Cuts stream dense rows through in 65,536-row blocks, each transposed so
+every feature's sketch takes its values in row order (CSR input goes
+through its CSC view a feature at a time; `approx`'s sorted summaries
+transpose the rows once and sort one column per worker); unweighted
+sketch queues radix-sort (whole-number weights sum identically in any
+order). One parallel pass over 1,024-row blocks bins every value once into
+both index layouts: CSR global bins (16- or 32-bit) for row gathers and,
+for dense indexes and sparse ones at least half full, feature-major bins
+local to their feature (8-bit up to 256 bins, else 16 or 32) with a
+missing-entry bitmap, for single-column streaming (categorical splits
+stream the same columns through a per-bin left-set table); sparser
+indexes scan stored bins inline, in parallel row-order chunks for large
+nodes. Large dense inputs validate and copy in parallel.
+Architecture-independent.
 
 Objective gradients and metrics run in parallel over fixed row chunks or
 query groups, and AUC, AUCPR, ungrouped ranking metrics, and `cox-nloglik`
 sort with a stable parallel sort; each reduces in a fixed order, so values
 are bit-identical at any thread count.
 
-A `DMatrix` shares its feature values behind an `Arc`, so a clone (Python's
-`set_info`, the per-fold and per-sample matrices) copies only metadata.
-Dense input is checked 256 values at a time without a branch, and from 2^22
-values on, checked and copied in parallel 2^18-value blocks.
+A `DMatrix` shares its feature values behind an `Arc`: a copy with other
+metadata (Python's `copy` and `set_info`) copies only metadata, and a row
+selection (`select_rows`, Python's `slice`, every cross-validation fold) is
+a view, its row map plus gathered metadata. The `hist` index binned from
+the values is cached with them, keyed by `max_bin`, weights, feature
+types, and missing value: built once, even for trainings that start
+together (later ones wait for the first build), reused by every training
+of a matrix sharing the values, and kept while in use or the latest asked
+for (a request drops the others), until freed with the values. A view
+bins its own rows by default, bit-identical to binning a copy of them;
+`ViewCuts::Source` gathers its rows of the source's index instead, so a
+source and its views share one binning pass.
+A `BinnedMatrix` keeps just that index and the metadata, so its training
+holds no feature values at all (the index of a 4M x 173 panel with 42%
+missing values takes 1.4 GiB resident, against 2.6 GiB of `f32` values).
+A dense matrix may also read a caller's buffer in place
+(`DMatrix::from_dense_shared`; Python's `copy=False` for a read-only
+`float32` array, memory-mapped `.npy` files included, whose pages then stay
+file-backed). Dense input is checked 256 values at a time without a
+branch, and from 2^22 values on, checked and copied in parallel
+2^18-value blocks.
 
 ### Prediction
 

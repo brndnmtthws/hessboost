@@ -2,6 +2,7 @@
 //! for inspection: [`RegTree`], its [`Node`]s, and the [`LinearLeaves`] of
 //! `linear_tree` models.
 
+pub(crate) mod binned;
 pub(crate) mod builder;
 pub(crate) mod compact;
 pub(crate) mod constraints;

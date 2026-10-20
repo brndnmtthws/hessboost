@@ -2,7 +2,7 @@
 //! construction.
 
 use crate::booster::Booster;
-use crate::data::{DMatrix, row_major, to_numpy};
+use crate::data::{BinnedMatrix, DMatrix, row_major, to_numpy};
 use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::Params;
 use crate::target_stats::{FittedTargetEncoder, OrderedTargetEncoder};
@@ -11,7 +11,7 @@ use hessboost::metric::CustomMetric;
 use hessboost::objective::{CustomLoss, GradPair, Objective};
 use hessboost::training::budget::{self, BudgetConfig};
 use hessboost::training::{
-    CrossValidation, CvStopping, Fold, PurgedTail, RoundEval, TailStopping, Trainer,
+    CrossValidation, CvStopping, Fold, PurgedTail, RoundEval, TailStopping, Trainer, TrainingData,
 };
 use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArrayDyn, PyReadonlyArray1, ToPyArray};
@@ -360,12 +360,35 @@ pub(crate) struct MetricRequest {
     maximize: bool,
 }
 
+/// The matrix a training run reads, as Python passes it.
+#[derive(FromPyObject)]
+pub(crate) enum TrainingMatrix {
+    Values(Py<DMatrix>),
+    Bins(Py<BinnedMatrix>),
+}
+
+impl TrainingMatrix {
+    fn data(&self) -> TrainingData<'_> {
+        match self {
+            TrainingMatrix::Values(data) => (&data.get().inner).into(),
+            TrainingMatrix::Bins(binned) => (&binned.get().inner).into(),
+        }
+    }
+
+    fn n_targets(&self) -> usize {
+        match self {
+            TrainingMatrix::Values(data) => data.get().inner.n_targets(),
+            TrainingMatrix::Bins(binned) => binned.get().inner.n_targets(),
+        }
+    }
+}
+
 /// One training run, passed from Python as a `dict`.
 #[derive(FromPyObject)]
 #[pyo3(from_item_all)]
 pub(crate) struct TrainRequest {
     params: Py<Params>,
-    dtrain: Py<DMatrix>,
+    dtrain: TrainingMatrix,
     num_boost_round: usize,
     #[pyo3(default)]
     evals: Vec<(Py<DMatrix>, String)>,
@@ -408,7 +431,7 @@ fn patience(rounds: Option<usize>) -> PyResult<Option<NonZeroUsize>> {
 #[pyfunction]
 pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster, Option<f64>)> {
     let parsed = &request.params.get().inner;
-    let dtrain = &request.dtrain.get().inner;
+    let dtrain = request.dtrain.data();
     let early_stopping_rounds = patience(request.early_stopping_rounds)?;
     let evals: Vec<(&hessboost::data::DMatrix, &str)> = request
         .evals
@@ -423,7 +446,9 @@ pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster,
     let custom;
     let params = match request.obj {
         Some(function) => {
-            let outputs = request.outputs.unwrap_or_else(|| dtrain.n_targets());
+            let outputs = request
+                .outputs
+                .unwrap_or_else(|| request.dtrain.n_targets());
             let base = parsed.base_score.unwrap_or(0.0) as f32;
             let mut params = parsed.clone();
             params.objective =
@@ -433,7 +458,7 @@ pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster,
         }
         None => parsed,
     };
-    let targets = dtrain.n_targets();
+    let targets = request.dtrain.n_targets();
     let metric = request
         .custom_metric
         .map(|metric| custom_metric(metric, targets, failure.clone()));

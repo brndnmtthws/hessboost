@@ -13,7 +13,7 @@ from numpy.typing import ArrayLike, NDArray
 from hessboost import _hessboost
 from hessboost._booster import Booster
 from hessboost._exceptions import HessboostError
-from hessboost._matrix import DMatrix, _check_schema
+from hessboost._matrix import BinnedMatrix, DMatrix, _check_schema
 from hessboost.folds import PurgedTail
 from hessboost.target_stats import (
     Column,
@@ -39,10 +39,13 @@ __all__ = [
     "train_with_budget",
 ]
 
-type Objective = Callable[[NDArray[np.float32], DMatrix], tuple[ArrayLike, ArrayLike]]
+type Objective[M: (DMatrix, BinnedMatrix)] = Callable[
+    [NDArray[np.float32], M], tuple[ArrayLike, ArrayLike]
+]
 """A custom objective, as XGBoost's ``obj``: ``obj(margins, dtrain)``
 returns ``(grad, hess)`` for the raw ``margins`` (``(rows,)`` or ``(rows,
-outputs)``), each with one value per margin."""
+outputs)``), each with one value per margin. ``dtrain`` is the training
+matrix, a :class:`DMatrix` or :class:`BinnedMatrix`."""
 
 type CustomMetric = Callable[
     [NDArray[np.float32], NDArray[np.float32], NDArray[np.float32] | None], float
@@ -73,7 +76,7 @@ def _feature_index(name: object, names: list[str] | None) -> int:
     return names.index(str(name))
 
 
-def _params(params: Mapping[str, Any], dtrain: DMatrix) -> _hessboost.Params:
+def _params(params: Mapping[str, Any], dtrain: DMatrix | BinnedMatrix) -> _hessboost.Params:
     """Native parameters, with XGBoost's feature-name forms of the
     constraint parameters resolved against ``dtrain``."""
     if not isinstance(params, Mapping):
@@ -161,13 +164,13 @@ class TrainingCallback:
         return False
 
 
-def train(
+def train[M: (DMatrix, BinnedMatrix)](
     params: Mapping[str, Any],
-    dtrain: DMatrix,
+    dtrain: M,
     num_boost_round: int = 10,
     *,
     evals: Sequence[tuple[DMatrix, str]] = (),
-    obj: Objective | None = None,
+    obj: Objective[M] | None = None,
     custom_metric: CustomMetric | None = None,
     maximize: bool | None = None,
     early_stopping_rounds: int | None = None,
@@ -187,7 +190,9 @@ def train(
             raise :class:`HessboostError`; nothing is silently ignored.
             ``monotone_constraints`` may map feature names to directions and
             ``interaction_constraints`` list feature names.
-        dtrain: The training data.
+        dtrain: The training data: a :class:`DMatrix`, or a
+            :class:`BinnedMatrix` of one, which trains as that matrix does
+            and refuses the parameters that would read its feature values.
         num_boost_round: Boosting iterations (with ``process_type="update"``,
             the number of iterations of ``xgb_model`` to refresh).
         evals: ``(data, name)`` pairs evaluated after every round. Each must
@@ -233,8 +238,8 @@ def train(
             refused.
         KeyboardInterrupt: Training was interrupted.
     """
-    if not isinstance(dtrain, DMatrix):
-        raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
+    if not isinstance(dtrain, (DMatrix, BinnedMatrix)):
+        raise TypeError(f"dtrain must be a DMatrix or BinnedMatrix, got {type(dtrain).__name__}")
     outputs: int | None = None
     if obj is not None:
         params, outputs = _custom_objective_params(params)
@@ -243,11 +248,13 @@ def train(
     # Every matrix meets the model being continued as well as dtrain, and a
     # side without recorded categories matches anything, so each pairing is
     # checked on its own (the checks are not transitive).
-    references: list[tuple[DMatrix | Booster, str]] = [(dtrain, "dtrain's")]
+    references: list[tuple[DMatrix | BinnedMatrix | Booster, str]] = [(dtrain, "dtrain's")]
     if init is not None:
         _check_schema(init, dtrain, "dtrain", "xgb_model's")
         references.append((init, "xgb_model's"))
     for data, name in evals:
+        if not isinstance(data, DMatrix):
+            raise TypeError(f"eval set {str(name)!r} must be a DMatrix, got {type(data).__name__}")
         for reference, against in references:
             _check_schema(reference, data, f"eval set {str(name)!r}", against)
     request: dict[str, object] = {
@@ -315,7 +322,9 @@ def train(
     return booster
 
 
-def _trained(core: _hessboost.Booster, dtrain: DMatrix, init: Booster | None) -> Booster:
+def _trained(
+    core: _hessboost.Booster, dtrain: DMatrix | BinnedMatrix, init: Booster | None
+) -> Booster:
     """The booster of ``core``, trained on ``dtrain`` (continuing ``init``),
     with their feature schema."""
     if init is None:

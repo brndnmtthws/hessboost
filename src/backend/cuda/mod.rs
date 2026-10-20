@@ -1663,7 +1663,7 @@ impl CudaHistBackend {
             n_rows,
             n_cols,
             total_bins,
-            dense: index.dense_stride().is_some(),
+            dense: index.is_dense(),
             device,
             state: Mutex::new(state),
             counters: Counters::default(),
@@ -1697,7 +1697,7 @@ impl CudaHistBackend {
             })
             .collect();
         let widest = bins_of.iter().copied().max().unwrap_or(0);
-        let dense = index.dense_stride().is_some();
+        let dense = index.is_dense();
         let mut first: Vec<u32> = (0..n_cols).map(|f| cuts.feature_bins(f).0 as u32).collect();
         first.push(total_bins as u32);
         let feature_first = clone_host(stream, &first)?;
@@ -2756,12 +2756,7 @@ fn max_tile(state: &State) -> usize {
 /// [module docs](self)' numbering) and the CPU's order for it
 /// ([`sum_order`]), with tiles of at most `max_tile` rows.
 fn plan(staged: &Staged, ghist: &GHistIndex, seg: Span, max_tile: usize) -> (Strategy, SumOrder) {
-    let order = sum_order(
-        ghist.column_bins().is_some(),
-        ghist.n_rows(),
-        seg.len,
-        seg.contiguous,
-    );
+    let order = sum_order(ghist.is_dense(), ghist.n_rows(), seg.len, seg.contiguous);
     // NaN payloads are not portable between the CPU's and the GPU's
     // arithmetic, so a non-finite slice keeps the CPU's bits by running there.
     let strategy = if !staged.finite() {
@@ -3471,8 +3466,7 @@ mod tests {
         let [part] =
             <[Partitioned; 1]>::try_from(backend.partition(&index, vec![split(root)]).unwrap())
                 .unwrap();
-        let (fs, fe) = index.cuts().feature_bins(0);
-        let left = |r: u32| index.feature_bin(r as usize, fs, fe).unwrap() < 2;
+        let left = |r: u32| index.feature_bin(r as usize, 0).unwrap() < 2;
         let wanted_left: Vec<u32> = rows.iter().copied().filter(|&r| left(r)).collect();
         assert_eq!(backend.rows(&[&part.left]).unwrap(), [wanted_left]);
         backend
@@ -3613,16 +3607,15 @@ mod tests {
         let segments = [&children.left, &children.right];
         let hists = backend.histograms(&index, Some(&pairs), &segments).unwrap();
         let actual_rows = backend.rows(&segments).unwrap();
-        let (fs, fe) = index.cuts().feature_bins(0);
         let wanted_left: Vec<u32> = rows
             .iter()
             .copied()
-            .filter(|&r| index.feature_bin(r as usize, fs, fe).unwrap() < 2)
+            .filter(|&r| index.feature_bin(r as usize, 0).unwrap() < 2)
             .collect();
         let wanted_right: Vec<u32> = rows
             .iter()
             .copied()
-            .filter(|&r| index.feature_bin(r as usize, fs, fe).unwrap() >= 2)
+            .filter(|&r| index.feature_bin(r as usize, 0).unwrap() >= 2)
             .collect();
         assert_eq!(actual_rows[0], wanted_left);
         assert_eq!(actual_rows[1], wanted_right);
@@ -3738,12 +3731,10 @@ mod tests {
                         .copied()
                         .filter(|&r| {
                             let go_left =
-                                index
-                                    .feature_bin(r as usize, fs, fe)
-                                    .map_or(default_left, |b| {
-                                        let local = (b as usize) - fs;
-                                        if table_rule { table[local] } else { local < 2 }
-                                    });
+                                index.feature_bin(r as usize, 1).map_or(default_left, |b| {
+                                    let local = (b as usize) - fs;
+                                    if table_rule { table[local] } else { local < 2 }
+                                });
                             go_left == left
                         })
                         .collect::<Vec<_>>()
@@ -3830,8 +3821,8 @@ mod tests {
                 let cols = read(state.cols.as_ref().unwrap());
                 for r in 0..n {
                     for f in 0..3 {
-                        let (fs, fe) = index.cuts().feature_bins(f);
-                        let local = index.feature_bin(r, fs, fe).unwrap() - fs as u32;
+                        let fs = index.cuts().feature_bins(f).0;
+                        let local = index.feature_bin(r, f).unwrap() - fs as u32;
                         assert_eq!(rows[r * state.stride as usize + f], local);
                         assert_eq!(cols[f * n + r], local);
                     }

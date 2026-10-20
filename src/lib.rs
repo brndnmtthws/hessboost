@@ -103,6 +103,21 @@
 //!   growth; uniform or `gradient_based` row sampling; column sampling with
 //!   optional per-feature weights
 //!   ([`DMatrix::with_feature_weights`](data::DMatrix::with_feature_weights)).
+//! - **Data sharing:** a matrix's copies with other metadata share its
+//!   values, and those with its sample weights and feature types the
+//!   `hist` index binned from them, built once for every training
+//!   (concurrent ones included) and kept while in use or the latest asked
+//!   for, until the values are freed; row selections are views of their
+//!   source's values
+//!   ([`DMatrix::select_rows`](data::DMatrix::select_rows)), binned by
+//!   their own rows or by their source's cuts
+//!   ([`ViewCuts`](data::ViewCuts)). A dense matrix can read a caller's
+//!   buffer in place
+//!   ([`DMatrix::from_dense_shared`](data::DMatrix::from_dense_shared);
+//!   Python's `copy=False`), and a [`BinnedMatrix`](data::BinnedMatrix)
+//!   keeps only a matrix's bins and metadata (XGBoost's `QuantileDMatrix`),
+//!   training as the matrix does with `hist` growth and refusing what would
+//!   read the values.
 //! - **Objectives** ([`Objective`](objective::Objective), each with its
 //!   parameters): regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)

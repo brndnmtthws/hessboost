@@ -1,7 +1,7 @@
 //! Request validation: what training refuses before anything is built.
 
 use super::eval::EvalSet;
-use crate::config::{BoosterKind, ProcessType, TrainingParams};
+use crate::config::{BoosterKind, Device, ProcessType, TrainingParams, TreeMethod};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
@@ -47,6 +47,88 @@ pub(super) fn validate_training_data(params: &TrainingParams, dtrain: &DMatrix) 
             early_stopping_rounds: None,
         },
         objective.as_ref(),
+    )
+}
+
+/// Refuse what training on a binned matrix, whose index was cut with
+/// `max_bin`, cannot run: anything that reads the feature values its bins
+/// replaced. `hist` growth reads only the bins, and so do the options
+/// copied below; every other field must keep its default
+/// ([`TrainingParams::refuse_changes_from`] compares them all), so an
+/// option added later is refused until it is vetted here. Continuing a
+/// model (`continued`), whose trees route rows by feature value, is refused
+/// too, and so is `device = cuda`, whose recovery from a device failure
+/// recomputes the margins by value.
+pub(super) fn validate_binned_request(
+    params: &TrainingParams,
+    max_bin: usize,
+    continued: bool,
+) -> Result<()> {
+    if continued {
+        return Err(HessboostError::incompatible_model(
+            "init_model",
+            "a binned matrix cannot continue a model: its trees route rows by feature value",
+        ));
+    }
+    if params.max_bin != max_bin {
+        return Err(HessboostError::invalid_param(
+            "max_bin",
+            format!(
+                "the matrix was binned with max_bin = {max_bin}, which training must use, not {}",
+                params.max_bin
+            ),
+        ));
+    }
+    if matches!(params.device, Device::Cuda { .. }) {
+        return Err(HessboostError::invalid_param(
+            "device",
+            "a binned matrix does not train on CUDA, which recovers from a device failure by \
+             routing rows by feature value",
+        ));
+    }
+    let tree_method = match params.tree_method {
+        method @ (TreeMethod::Hist | TreeMethod::Auto) => method,
+        _ => TrainingParams::default().tree_method,
+    };
+    let supported = TrainingParams {
+        nthread: params.nthread,
+        seed: params.seed,
+        device: params.device,
+        objective: params.objective.clone(),
+        base_score: params.base_score,
+        eval_metric: params.eval_metric.clone(),
+        eta: params.eta,
+        gamma: params.gamma,
+        max_depth: params.max_depth,
+        max_leaves: params.max_leaves,
+        min_child_weight: params.min_child_weight,
+        max_delta_step: params.max_delta_step,
+        subsample: params.subsample,
+        colsample_bytree: params.colsample_bytree,
+        colsample_bylevel: params.colsample_bylevel,
+        colsample_bynode: params.colsample_bynode,
+        lambda: params.lambda,
+        alpha: params.alpha,
+        tree_method,
+        grow_policy: params.grow_policy,
+        max_bin: params.max_bin,
+        monotone_constraints: params.monotone_constraints.clone(),
+        interaction_constraints: params.interaction_constraints.clone(),
+        num_parallel_tree: params.num_parallel_tree,
+        sampling_method: params.sampling_method,
+        balanced_bagging: params.balanced_bagging,
+        bagging_by_query: params.bagging_by_query,
+        multi_strategy: params.multi_strategy,
+        leaf_estimation: params.leaf_estimation,
+        extra_trees: params.extra_trees,
+        path_smooth: params.path_smooth,
+        quantized: params.quantized,
+        ..TrainingParams::default()
+    };
+    params.refuse_changes_from(
+        &supported,
+        "dtrain",
+        "a binned matrix holds no feature values, which these options read",
     )
 }
 

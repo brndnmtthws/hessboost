@@ -1,9 +1,11 @@
 //! The margin caches training keeps current, and how a tree adds to them.
 
 use super::eval::EvalSet;
-use crate::data::DMatrix;
+use crate::data::ghist::GHistIndex;
+use crate::data::{DMatrix, SketchedRows};
 use crate::model::{BoostedModel, shrink_margins};
 use crate::tree::RegTree;
+use crate::tree::binned::BinnedTree;
 use crate::tree::builder::LeafRows;
 use rayon::prelude::*;
 
@@ -23,6 +25,58 @@ fn for_each_row_margins(
             .for_each(update);
     } else {
         margins.chunks_mut(n_out).enumerate().for_each(update);
+    }
+}
+
+/// Rows per parallel task of the leaf-value margin updates.
+const MARGIN_CHUNK_ROWS: usize = 8192;
+
+/// Call `update(first, chunk)` on consecutive row chunks of `margins`
+/// (`[row][n_out]`), `chunk` holding the margins of rows `first..`, in
+/// parallel for large inputs.
+fn for_each_row_chunk(
+    margins: &mut [f32],
+    n_out: usize,
+    update: impl Fn(usize, &mut [f32]) + Sync + Send,
+) {
+    if margins.len() / n_out < 2 * MARGIN_CHUNK_ROWS || rayon::current_num_threads() <= 1 {
+        update(0, margins);
+    } else {
+        margins
+            .par_chunks_mut(MARGIN_CHUNK_ROWS * n_out)
+            .enumerate()
+            .for_each(|(chunk, margins)| update(chunk * MARGIN_CHUNK_ROWS, margins));
+    }
+}
+
+/// How a finished tree finds the training rows' leaves when no list of them
+/// was kept.
+#[derive(Clone, Copy)]
+pub(super) enum RowRouting<'a> {
+    /// Through the rows' bins in the training index, which route every row
+    /// as its values do ([`SketchedRows::All`]).
+    Bins(&'a GHistIndex),
+    /// Through the rows' values.
+    Values,
+}
+
+impl<'a> RowRouting<'a> {
+    /// The routing of the training rows of `index` sketched as `sketched`
+    /// says: by bins only when every row was.
+    pub(super) fn of(index: &'a GHistIndex, sketched: SketchedRows) -> Self {
+        match sketched {
+            SketchedRows::All => RowRouting::Bins(index),
+            SketchedRows::Weighted | SketchedRows::Partial => RowRouting::Values,
+        }
+    }
+
+    /// `tree` routed by bins, when this routing has them and the tree splits
+    /// on their cuts.
+    pub(super) fn binned(self, tree: &RegTree) -> Option<BinnedTree<'a>> {
+        match self {
+            RowRouting::Bins(index) => BinnedTree::new(tree, index),
+            RowRouting::Values => None,
+        }
     }
 }
 
@@ -70,23 +124,22 @@ impl<'a> MarginCaches<'a> {
     }
 
     /// Add `tree`'s predictions to every cache. `leaf_rows`, when given,
-    /// lists the leaf of every training row and replaces the training
-    /// matrix's traversal.
+    /// lists the leaf of every training row; otherwise the training rows are
+    /// routed as `routing` says.
     pub(super) fn add_tree(
         &mut self,
         tree: &RegTree,
         output: TreeOutput,
         leaf_rows: Option<&[LeafRows]>,
+        routing: RowRouting,
     ) {
+        let (train, n_out) = (&mut self.train, self.n_out);
         match leaf_rows {
-            Some(leaf_rows) => {
-                let train = &mut self.train;
-                apply_leaf_rows(tree, self.dtrain, leaf_rows, train, self.n_out, output);
-            }
-            None => add_tree_margins(tree, self.dtrain, &mut self.train, self.n_out, output),
+            Some(leaf_rows) => apply_leaf_rows(tree, self.dtrain, leaf_rows, train, n_out, output),
+            None => add_routed_margins(tree, self.dtrain, routing, train, n_out, output),
         }
         for (margins, set) in self.evals.iter_mut().zip(self.eval_sets) {
-            add_tree_margins(tree, set.data, margins, self.n_out, output);
+            add_tree_margins(tree, set.data, margins, n_out, output);
         }
     }
 
@@ -150,6 +203,45 @@ pub(super) fn add_tree_margins(
     }
 }
 
+/// [`add_tree_margins`] of the training rows `data`, routed as `routing`
+/// says: by bins unless the tree's leaves are linear (their models read the
+/// values) or its splits miss the bins' cuts. Each row still receives one
+/// addition of its leaf's value, so the margins are the routing's by value
+/// bit for bit.
+fn add_routed_margins(
+    tree: &RegTree,
+    data: &DMatrix,
+    routing: RowRouting,
+    margins: &mut [f32],
+    n_out: usize,
+    output: TreeOutput,
+) {
+    let binned = match tree.linear_leaves() {
+        None => routing.binned(tree),
+        Some(_) => None,
+    };
+    let Some(binned) = binned else {
+        return add_tree_margins(tree, data, margins, n_out, output);
+    };
+    for_each_row_chunk(margins, n_out, |first, margins| {
+        let rows = first..first + margins.len() / n_out;
+        match output {
+            TreeOutput::Scalar(k) => binned.for_each_leaf(rows, |row, leaf| {
+                margins[(row - first) * n_out + k] += tree.node(leaf).leaf_value;
+            }),
+            TreeOutput::Vector => binned.for_each_leaf(rows, |row, leaf| {
+                let at = (row - first) * n_out;
+                for (m, &v) in margins[at..at + n_out]
+                    .iter_mut()
+                    .zip(tree.leaf_vector(leaf))
+                {
+                    *m += v;
+                }
+            }),
+        }
+    });
+}
+
 /// Add each leaf's value (or vector), or its linear model's output, to the
 /// margins of the training rows of `data` that reached it.
 fn apply_leaf_rows(
@@ -204,32 +296,17 @@ fn apply_leaf_values<V: Copy + Send + Sync>(
     value: impl Fn(usize) -> V + Sync,
     add: impl Fn(&mut [f32], usize, u32, V) + Sync,
 ) {
-    const CHUNK_ROWS: usize = 8192;
-    let n = margins.len() / n_out;
-    if n < 2 * CHUNK_ROWS || rayon::current_num_threads() <= 1 {
+    for_each_row_chunk(margins, n_out, |first, margins| {
+        let (first, last) = (first as u32, (first + margins.len() / n_out) as u32);
         for leaf in leaf_rows {
             let v = value(leaf.node);
-            for &row in &leaf.rows {
-                add(margins, row as usize * n_out, row, v);
+            let start = leaf.rows.partition_point(|&row| row < first);
+            let end = start + leaf.rows[start..].partition_point(|&row| row < last);
+            for &row in &leaf.rows[start..end] {
+                add(margins, (row - first) as usize * n_out, row, v);
             }
         }
-        return;
-    }
-    margins
-        .par_chunks_mut(CHUNK_ROWS * n_out)
-        .enumerate()
-        .for_each(|(chunk, margins)| {
-            let first = (chunk * CHUNK_ROWS) as u32;
-            let last = first + (margins.len() / n_out) as u32;
-            for leaf in leaf_rows {
-                let v = value(leaf.node);
-                let start = leaf.rows.partition_point(|&row| row < first);
-                let end = start + leaf.rows[start..].partition_point(|&row| row < last);
-                for &row in &leaf.rows[start..end] {
-                    add(margins, (row - first) as usize * n_out, row, v);
-                }
-            }
-        });
+    });
 }
 
 #[cfg(test)]

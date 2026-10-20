@@ -46,7 +46,7 @@ from hessboost._exceptions import (
     InvalidDataError,
     ModelFormatError,
 )
-from hessboost._matrix import DMatrix
+from hessboost._matrix import BinnedMatrix, DMatrix
 from hessboost._training import (
     CustomMetric,
     CvHistory,
@@ -69,6 +69,7 @@ __version__: str = _version("hessboost")
 """The installed distribution's version (PEP 440, e.g. ``0.3.0rc1``)."""
 
 __all__ = [
+    "BinnedMatrix",
     "Booster",
     "CompactModel",
     "CustomMetric",

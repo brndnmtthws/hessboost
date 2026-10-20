@@ -739,6 +739,41 @@ fn approximate_updates_refuse_values_beyond_the_training_bins() {
     );
 }
 
+/// The approximate mode replays a model on the cuts its training binned
+/// with: for a [`ViewCuts::Source`](hessboost::data::ViewCuts::Source) view,
+/// its source's, so an update keeps splitting on those.
+#[test]
+fn approximate_updates_of_a_source_cut_view_split_on_its_sources_cuts() {
+    use hessboost::data::ViewCuts;
+    use hessboost::internals::HistCuts;
+    let source = data(600, 23, false);
+    let rows: Vec<usize> = (0..600).step_by(2).collect();
+    let view = source
+        .select_rows_with_cuts(&rows, ViewCuts::Source)
+        .unwrap();
+    let mut p = params(Objective::SquaredError(RegLoss::default()));
+    p.max_bin = 16;
+    let cuts = HistCuts::from_dmatrix(&source, p.max_bin);
+    let on_source_cuts = |model: &BoostedModel| {
+        model.trees().iter().all(|tree| {
+            tree.nodes()
+                .iter()
+                .filter(|node| !node.is_leaf())
+                .all(|node| {
+                    let (start, end) = cuts.feature_bins(node.split_feature as usize);
+                    (start..end).any(|bin| cuts.cut_value(bin) == node.split_cond)
+                })
+        })
+    };
+    let mut online =
+        OnlineModel::train(&p, &view, 10, OnlineParams::approximate(1.0).unwrap()).unwrap();
+    assert!(on_source_cuts(online.model()));
+    online
+        .update(Some(&data(40, 24, false)), &[0, 7, 11])
+        .unwrap();
+    assert!(on_source_cuts(online.model()));
+}
+
 /// An update whose arithmetic overflows `f32` is refused, as training
 /// refuses the model it would produce, and changes nothing.
 #[test]

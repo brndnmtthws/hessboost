@@ -3,12 +3,13 @@
 
 use super::dart::{round_rng, round_salt};
 use super::exact_leaves::ExactLeaves;
+use super::margins::RowRouting;
 use super::round::gather_output;
 use super::row_sampling::{RowMeta, gradient_sampling};
 use crate::config::{Device, GrowPolicy, TrainingParams, TreeMethod};
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
-use crate::data::{DMatrix, MetaInfo};
+use crate::data::{DMatrix, MetaInfo, SketchedRows};
 use crate::error::{HessboostError, Result};
 use crate::objective::{GradPair, Loss};
 use crate::training::sampling::gradient_based_sample;
@@ -20,7 +21,7 @@ use crate::tree::builder::{
 use crate::tree::hist::{CpuBackend, HistogramBackend};
 use crate::tree::reuse::ReuseSet;
 use crate::tree::sampler::ColumnSampler;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// What every boosting round of one training run reads: the parameters, the
 /// training matrix with its metadata, the objective, the Langevin noise
@@ -54,21 +55,20 @@ pub(super) struct TreeSample<'a> {
 /// Prepared, reusable per-round builder state, chosen by `tree_method`.
 pub(super) enum Prepared {
     Exact(SortedColumns),
-    /// Histogram method: the binned dataset plus the backend its histograms
-    /// are built on (the CPU's, or a GPU's when `device` names one).
+    /// Histogram method: the binned dataset (the matrix's cached index,
+    /// shared with every other training of it) plus the backend its
+    /// histograms are built on (the CPU's, or a GPU's when `device` names
+    /// one).
     Hist {
-        index: GHistIndex,
+        index: Arc<GHistIndex>,
         backend: Box<dyn HistogramBackend>,
-        /// Every training value was sketched (no row has a zero sample
-        /// weight), so the builder's row partitions equal routing each
-        /// training row through the finished tree by raw value: numeric
-        /// values lie below their feature's last cut, and categorical cuts
-        /// hold every category. A zero-weight row's value can lie beyond the
-        /// last cut, where binning clamps it into the last bin while the tree
-        /// routes it by its threshold, so linear leaves then route instead of
-        /// reading the builder's rows, and rounds stay off the device
-        /// ([`Prepared::device_backend`]).
-        rows_route_like_trees: bool,
+        /// Which training rows the index's cuts were sketched from: the
+        /// builder's row partitions send exactly those through the finished
+        /// tree as their values do. Only under [`SketchedRows::All`] do
+        /// linear leaves read the builder's rows and rounds run on a device
+        /// ([`Prepared::device_backend`]); under [`SketchedRows::Partial`]
+        /// the training margins do not read them either.
+        sketched: SketchedRows,
     },
     /// `tree_method=approx`: Hessian-weighted cuts. XGBoost regenerates them
     /// every round from a sorted-column summary unless the objective has a
@@ -85,7 +85,7 @@ pub(super) enum Prepared {
 impl Prepared {
     /// The binned index and backend of a histogram run whose backend keeps
     /// the rows on a device (the CUDA backend), for device-resident rounds.
-    /// `None` unless the rows route like trees (`rows_route_like_trees`):
+    /// `None` unless every training row was sketched ([`SketchedRows::All`]):
     /// after a device failure the host rebuilds the margins by routing the
     /// rows through the trees, which equals the binned partitions the
     /// device's margins came from only then.
@@ -94,9 +94,20 @@ impl Prepared {
             Prepared::Hist {
                 index,
                 backend,
-                rows_route_like_trees: true,
+                sketched: SketchedRows::All,
             } if backend.row_engine().is_some() => Some((index, backend.as_ref())),
             _ => None,
+        }
+    }
+
+    /// How finished trees route the training rows when no list of their
+    /// leaves was kept: by the index's bins when every row was sketched.
+    pub(super) fn row_routing(&self) -> RowRouting<'_> {
+        match self {
+            Prepared::Hist {
+                index, sketched, ..
+            } => RowRouting::of(index, *sketched),
+            Prepared::Exact(_) | Prepared::Approx { .. } => RowRouting::Values,
         }
     }
 
@@ -308,18 +319,19 @@ pub(super) fn prepare_builder(
     }
     Ok(match method {
         TreeMethod::Hist => {
-            let cuts = HistCuts::from_dmatrix(dtrain, params.max_bin);
             // A host index is required for exact fallback. Uploading raw
             // floats and reading global bins back costs more than CPU binning
             // at the measured large-data shapes; CUDA still reencodes and
-            // transposes the compact global bins on device.
-            let index = GHistIndex::from_dmatrix(dtrain, cuts);
+            // transposes the compact global bins on device. The index comes
+            // from the matrix's bin cache: every training of these values
+            // with these weights and `max_bin` shares it.
+            let index = dtrain.hist_index(params.max_bin);
             let backend = hist_backend(params, &index)?;
-            let rows_route_like_trees = dtrain.weights().is_none_or(|w| !w.contains(&0.0));
+            let sketched = dtrain.sketched_rows();
             Prepared::Hist {
                 index,
                 backend,
-                rows_route_like_trees,
+                sketched,
             }
         }
         TreeMethod::Approx => Prepared::Approx {

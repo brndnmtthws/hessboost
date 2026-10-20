@@ -12,8 +12,9 @@
 //! ([`HistCuts::from_dmatrix_weighted`]).
 
 use crate::data::DMatrix;
+use crate::data::dmatrix::DenseRows;
 use crate::data::meta::FeatureType;
-use crate::data::sketch::{SketchScratch, WQSketch};
+use crate::data::sketch::WQSketch;
 use crate::data::sort::{RadixScratch, sort_values};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -121,119 +122,104 @@ impl HistCuts {
         weight_of: impl Fn(usize) -> f32 + Sync,
         ingest: Ingest,
     ) -> Self {
-        let Ingest {
-            sorted,
-            unit_weights,
-        } = ingest;
         let n_rows = data.n_rows();
         let n_features = data.n_cols();
-        // Dense storage is transposed in blocks so each feature's values are
-        // contiguous; sparse storage goes through the CSC view.
-        let (columns, csc) = match data.dense_values() {
-            Some(values) => (
-                Some(crate::data::ghist::transpose_dense(
-                    values, n_rows, n_features,
-                )),
-                None,
-            ),
-            None => (None, Some(data.to_csc())),
-        };
-        let missing = data.missing();
-        let ftypes = data.feature_types();
-        let is_categorical: Vec<bool> = ftypes
+        let is_categorical: Vec<bool> = data
+            .feature_types()
             .iter()
             .map(|&t| t == FeatureType::Categorical)
             .collect();
-        let mut feature_offset = Vec::with_capacity(n_features + 1);
-        feature_offset.push(0u32);
-        let mut cut_values = Vec::new();
-        // Per-feature `(row, value)` pairs in row order, for either storage.
-        let for_each_value = |f: usize, visit: &mut dyn FnMut(usize, f32)| match (&columns, &csc) {
-            (Some(columns), _) => {
-                for (row, &v) in columns[f * n_rows..(f + 1) * n_rows].iter().enumerate() {
-                    if !crate::data::dmatrix::is_missing(v, missing) {
-                        visit(row, v);
+        let parallel = n_features > 1
+            && n_rows.saturating_mul(n_features) >= crate::data::ghist::PARALLEL_BINNING_CELLS
+            && rayon::current_num_threads() > 1;
+        let per_feature: Vec<Vec<f32>> = if let Some(rows) = data.dense_rows() {
+            let missing = data.missing();
+            let present = present_counts(rows, n_rows, n_features, missing, parallel);
+            if ingest.sorted {
+                // A sorted summary (upstream `PushColPage`) holds a whole
+                // column's `(value, weight)` pairs until it sorts them, so
+                // the rows are transposed once and each feature's pairs are
+                // gathered only while its cuts are made: one column of
+                // pairs per worker, never every feature's at once.
+                let mut columns = Vec::new();
+                crate::data::ghist::transpose_rows_into(
+                    |r| rows.row(r),
+                    n_rows,
+                    n_features,
+                    &mut columns,
+                );
+                let column_cuts = |f: usize| {
+                    let mut column =
+                        ColumnCuts::new(is_categorical[f], present[f], max_bin, ingest);
+                    column.push_column(&columns[f * n_rows..][..n_rows], 0, missing, &weight_of);
+                    column.cut_values()
+                };
+                if parallel {
+                    (0..n_features).into_par_iter().map(column_cuts).collect()
+                } else {
+                    (0..n_features).map(column_cuts).collect()
+                }
+            } else {
+                let mut columns: Vec<ColumnCuts> = (0..n_features)
+                    .map(|f| ColumnCuts::new(is_categorical[f], present[f], max_bin, ingest))
+                    .collect();
+                // Rows stream through in blocks, each transposed so a
+                // feature's values are contiguous: every feature's sketch
+                // takes its values in row order, as a whole-column pass
+                // would, while only one block is ever transposed.
+                let mut block = Vec::new();
+                for start in (0..n_rows).step_by(CUT_BLOCK_ROWS) {
+                    let end = (start + CUT_BLOCK_ROWS).min(n_rows);
+                    let len = end - start;
+                    crate::data::ghist::transpose_rows_into(
+                        |r| rows.row(start + r),
+                        len,
+                        n_features,
+                        &mut block,
+                    );
+                    let feed = |(f, column): (usize, &mut ColumnCuts)| {
+                        column.push_column(&block[f * len..][..len], start, missing, &weight_of);
+                    };
+                    if parallel {
+                        columns.par_iter_mut().enumerate().for_each(feed);
+                    } else {
+                        columns.iter_mut().enumerate().for_each(feed);
                     }
                 }
-            }
-            (None, Some(csc)) => {
-                let (rows, values) = csc.column(f);
-                for (&row, &v) in rows.iter().zip(values) {
-                    visit(row as usize, v);
+                drop(block);
+                if parallel {
+                    columns
+                        .into_par_iter()
+                        .map(ColumnCuts::cut_values)
+                        .collect()
+                } else {
+                    columns.into_iter().map(ColumnCuts::cut_values).collect()
                 }
             }
-            (None, None) => unreachable!("one column source is always built"),
-        };
-        let build = |f, scratch: &mut ColumnScratch, output: &mut Vec<f32>| {
-            let ColumnScratch {
-                values,
-                sort: spare,
-                pairs,
-                sketch_sort,
-            } = scratch;
-            if is_categorical[f] {
-                values.clear();
-                for_each_value(f, &mut |_, v| values.push(v));
-                sort_values(values, spare);
-                build_categorical_cuts(values, output);
-                return;
-            }
-            // The CSC view knows each column's count; dense columns are
-            // counted in a pass.
-            let n_values = csc.as_ref().map_or_else(
-                || {
-                    let column =
-                        &columns.as_ref().expect("dense columns")[f * n_rows..(f + 1) * n_rows];
-                    column
-                        .iter()
-                        .filter(|&&v| !crate::data::dmatrix::is_missing(v, missing))
-                        .count()
-                },
-                |csc| csc.col_len(f),
-            );
-            // The worker's radix scratch serves every column it sketches.
-            let mut sketch =
-                WQSketch::new(n_values, max_bin).with_sort_scratch(std::mem::take(sketch_sort));
-            if unit_weights {
-                sketch = sketch.with_unit_weights();
-            }
-            if sorted {
-                pairs.clear();
-                for_each_value(f, &mut |row, v| pairs.push((v, weight_of(row))));
-                pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
-                sketch.push_sorted(pairs);
-            } else if unit_weights && let Some(columns) = &columns {
-                sketch.push_unit_column(&columns[f * n_rows..(f + 1) * n_rows], missing);
-            } else {
-                for_each_value(f, &mut |row, v| sketch.push(v, weight_of(row)));
-            }
-            sketch.cut_values(output);
-            *sketch_sort = sketch.into_sort_scratch();
-        };
-        if n_features > 1
-            && n_rows.saturating_mul(n_features) >= 65_536
-            && rayon::current_num_threads() > 1
-        {
-            let columns: Vec<_> = (0..n_features)
-                .into_par_iter()
-                .map_init(ColumnScratch::default, |scratch, f| {
-                    let mut output = Vec::new();
-                    build(f, scratch, &mut output);
-                    output
-                })
-                .collect();
-            for column in columns {
-                cut_values.extend(column);
-                feature_offset.push(cut_values.len() as u32);
-            }
         } else {
-            let mut scratch = ColumnScratch::default();
-            for f in 0..n_features {
-                build(f, &mut scratch, &mut cut_values);
-                feature_offset.push(cut_values.len() as u32);
+            // Sparse storage goes through its CSC view: each feature's
+            // present entries, in row order, summarized one feature at
+            // a time.
+            let csc = data.to_csc();
+            let column_cuts = |f: usize| {
+                let (rows, values) = csc.column(f);
+                let mut column = ColumnCuts::new(is_categorical[f], rows.len(), max_bin, ingest);
+                column.push_entries(rows, values, &weight_of);
+                column.cut_values()
+            };
+            if parallel {
+                (0..n_features).into_par_iter().map(column_cuts).collect()
+            } else {
+                (0..n_features).map(column_cuts).collect()
             }
+        };
+        let mut feature_offset = Vec::with_capacity(n_features + 1);
+        feature_offset.push(0u32);
+        let mut cut_values = Vec::with_capacity(per_feature.iter().map(Vec::len).sum());
+        for cuts in per_feature {
+            cut_values.extend(cuts);
+            feature_offset.push(cut_values.len() as u32);
         }
-
         HistCuts {
             n_features,
             feature_offset,
@@ -297,6 +283,42 @@ impl HistCuts {
         }
         // upper_bound: first cut strictly greater than value.
         global_bin(start, slice.partition_point(|&c| c <= value), slice.len())
+    }
+
+    /// The local bins of numeric feature `f` that a split at `threshold`
+    /// (`value < threshold` goes left) sends left: those below the returned
+    /// limit. `None` when `threshold` falls inside a bin, being neither one
+    /// of the feature's cuts nor at most the smallest finite value, so that
+    /// a bin's values could go either way.
+    pub(crate) fn bins_left_of(&self, f: usize, threshold: f32) -> Option<usize> {
+        let (start, end) = self.feature_bins(f);
+        let cuts = &self.cut_values[start..end];
+        let limit = cuts.partition_point(|&c| c <= threshold);
+        let at_boundary = match limit.checked_sub(1) {
+            Some(last) => cuts[last] == threshold,
+            None => threshold <= f32::MIN,
+        };
+        at_boundary.then_some(limit)
+    }
+
+    /// Per local bin of categorical feature `f`, whether a split sending
+    /// `categories` left sends that bin left.
+    pub(crate) fn categories_left(&self, f: usize, categories: &[u32]) -> Vec<bool> {
+        let (start, end) = self.feature_bins(f);
+        // A bin goes left when its category code (`in_category_set`'s
+        // `cut as u32`) is in the set. Categorical cut values ascend and the
+        // saturating cast is monotone, so the codes ascend too: each category
+        // of the set marks its run of bins, found by binary search, instead
+        // of every bin scanning the set.
+        let codes = &self.cut_values[start..end];
+        let mut left = vec![false; codes.len()];
+        for &category in categories {
+            let first = codes.partition_point(|&c| (c as u32) < category);
+            for bin in (first..codes.len()).take_while(|&bin| codes[bin] as u32 == category) {
+                left[bin] = true;
+            }
+        }
+        left
     }
 }
 
@@ -380,19 +402,6 @@ impl<'a> BinSearch<'a> {
         }
     }
 
-    /// Number of features of the underlying cut table.
-    #[inline]
-    pub fn n_features(&self) -> usize {
-        self.cuts.n_features()
-    }
-
-    /// Map a feature value to its global bin index, with the same result as
-    /// [`HistCuts::bin_of`].
-    #[inline(always)]
-    pub fn bin_of(&self, f: usize, value: f32) -> u32 {
-        self.feature(f).bin_of(value)
-    }
-
     /// Feature `f`'s tables, for binning many of its values in a row.
     #[inline(always)]
     pub(crate) fn feature(&self, f: usize) -> FeatureBins<'_> {
@@ -422,7 +431,7 @@ pub(crate) struct FeatureBins<'a> {
 }
 
 impl FeatureBins<'_> {
-    /// [`BinSearch::bin_of`] for this feature.
+    /// [`HistCuts::bin_of`] for this feature, through the two-level tables.
     #[inline(always)]
     pub(crate) fn bin_of(&self, value: f32) -> u32 {
         if self.categorical {
@@ -443,19 +452,207 @@ impl FeatureBins<'_> {
         };
         global_bin(self.start, local, self.n_cuts)
     }
+
+    /// [`Self::bin_of`] local to the feature: `0` up to its bin count.
+    #[inline(always)]
+    pub(crate) fn local_bin_of(&self, value: f32) -> u32 {
+        self.bin_of(value) - self.first_bin()
+    }
+
+    /// The feature's first global bin.
+    #[inline(always)]
+    pub(crate) fn first_bin(&self) -> u32 {
+        self.start as u32
+    }
 }
 
-/// One cut-building worker's reused buffers.
-#[derive(Default)]
-struct ColumnScratch {
-    /// A categorical column's values.
-    values: Vec<f32>,
-    /// Radix scratch of the categorical column sort.
-    sort: RadixScratch<f32>,
-    /// A numeric column's `(value, weight)` pairs (sorted ingestion).
-    pairs: Vec<(f32, f32)>,
-    /// Radix scratch lent to each numeric column's sketch.
-    sketch_sort: SketchScratch,
+/// Rows per block of the dense cut pass: a block of the panel's 173
+/// features is 44 MiB transposed.
+const CUT_BLOCK_ROWS: usize = 1 << 16;
+
+/// Non-missing values per feature of the first `n_rows` dense `rows` (of
+/// `n_features` each).
+fn present_counts(
+    rows: DenseRows<'_>,
+    n_rows: usize,
+    n_features: usize,
+    missing: f32,
+    parallel: bool,
+) -> Vec<usize> {
+    let count = |block: std::ops::Range<usize>| {
+        let mut counts = vec![0usize; n_features];
+        for r in block {
+            for (count, &v) in counts.iter_mut().zip(rows.row(r)) {
+                *count += usize::from(!crate::data::dmatrix::is_missing(v, missing));
+            }
+        }
+        counts
+    };
+    let sum = |mut a: Vec<usize>, b: Vec<usize>| {
+        for (a, b) in a.iter_mut().zip(b) {
+            *a += b;
+        }
+        a
+    };
+    let blocks = (0..n_rows)
+        .step_by(CUT_BLOCK_ROWS)
+        .map(|start| start..(start + CUT_BLOCK_ROWS).min(n_rows));
+    if parallel {
+        blocks
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(count)
+            .reduce(|| vec![0; n_features], sum)
+    } else {
+        blocks.map(count).fold(vec![0; n_features], sum)
+    }
+}
+
+/// One feature's cut construction state in [`HistCuts::build`], fed its
+/// present values in row order: block by block, or a column at once.
+enum ColumnCuts {
+    /// A categorical feature's distinct values: each block's, ascending by
+    /// [`f32::total_cmp`] and deduplicated by bit pattern, appended in turn
+    /// (`runs` of them), so one sort and deduplication at the end gives
+    /// what the sorted column [`build_categorical_cuts`] reads reduces to
+    /// (merging each block into the values so far would copy them all once
+    /// per block). `block` and `scratch` are the buffers each block of rows
+    /// is sorted in.
+    Categorical {
+        distinct: Vec<f32>,
+        runs: usize,
+        block: Vec<f32>,
+        scratch: RadixScratch<f32>,
+    },
+    /// A numeric feature's streaming sketch (upstream `PushRowPage`), fed
+    /// whole blocks without per-value weights when every weight is `1`.
+    Streamed { sketch: WQSketch, unit: bool },
+    /// A numeric feature's `(value, weight)` pairs in row order, sorted and
+    /// summarized once every row is in (upstream `PushColPage`).
+    Sorted {
+        sketch: WQSketch,
+        pairs: Vec<(f32, f32)>,
+    },
+}
+
+impl ColumnCuts {
+    fn new(categorical: bool, present: usize, max_bin: usize, ingest: Ingest) -> Self {
+        if categorical {
+            return ColumnCuts::Categorical {
+                distinct: Vec::new(),
+                runs: 0,
+                block: Vec::new(),
+                scratch: RadixScratch::default(),
+            };
+        }
+        let sketch = WQSketch::new(present, max_bin);
+        if ingest.sorted {
+            ColumnCuts::Sorted {
+                sketch,
+                pairs: Vec::with_capacity(present),
+            }
+        } else if ingest.unit_weights {
+            ColumnCuts::Streamed {
+                sketch: sketch.with_unit_weights(),
+                unit: true,
+            }
+        } else {
+            ColumnCuts::Streamed {
+                sketch,
+                unit: false,
+            }
+        }
+    }
+
+    /// Take the feature's values of the dense rows from `first` on
+    /// (`missing` entries skipped), weighted by `weight_of(row)`.
+    fn push_column(
+        &mut self,
+        values: &[f32],
+        first: usize,
+        missing: f32,
+        weight_of: impl Fn(usize) -> f32,
+    ) {
+        if let ColumnCuts::Streamed { sketch, unit: true } = self {
+            sketch.push_unit_column(values, missing);
+            return;
+        }
+        let present = values
+            .iter()
+            .enumerate()
+            .filter(|&(_, &v)| !crate::data::dmatrix::is_missing(v, missing))
+            .map(|(i, &v)| (first + i, v));
+        self.push(present, weight_of);
+    }
+
+    /// Take a sparse feature's stored entries (every one present), `rows`
+    /// ascending, weighted by `weight_of(row)`.
+    fn push_entries(&mut self, rows: &[u32], values: &[f32], weight_of: impl Fn(usize) -> f32) {
+        let entries = rows.iter().zip(values).map(|(&row, &v)| (row as usize, v));
+        self.push(entries, weight_of);
+    }
+
+    /// Take present `(row, value)` entries in row order.
+    fn push(
+        &mut self,
+        entries: impl Iterator<Item = (usize, f32)>,
+        weight_of: impl Fn(usize) -> f32,
+    ) {
+        match self {
+            ColumnCuts::Categorical {
+                distinct,
+                runs,
+                block,
+                scratch,
+            } => {
+                block.clear();
+                block.extend(entries.map(|(_, v)| v));
+                sort_values(block, scratch);
+                block.dedup_by(|a, b| a.to_bits() == b.to_bits());
+                if !block.is_empty() {
+                    distinct.extend_from_slice(block);
+                    *runs += 1;
+                }
+            }
+            ColumnCuts::Streamed { sketch, .. } => {
+                for (row, v) in entries {
+                    sketch.push(v, weight_of(row));
+                }
+            }
+            ColumnCuts::Sorted { pairs, .. } => {
+                pairs.extend(entries.map(|(row, v)| (v, weight_of(row))));
+            }
+        }
+    }
+
+    /// The feature's cut values.
+    fn cut_values(self) -> Vec<f32> {
+        let mut out = Vec::new();
+        match self {
+            ColumnCuts::Categorical {
+                mut distinct,
+                runs,
+                mut scratch,
+                ..
+            } => {
+                if runs > 1 {
+                    sort_values(&mut distinct, &mut scratch);
+                    distinct.dedup_by(|a, b| a.to_bits() == b.to_bits());
+                }
+                build_categorical_cuts(&distinct, &mut out);
+            }
+            ColumnCuts::Streamed { mut sketch, .. } => sketch.cut_values(&mut out),
+            ColumnCuts::Sorted {
+                mut sketch,
+                mut pairs,
+            } => {
+                pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+                sketch.push_sorted(&pairs);
+                sketch.cut_values(&mut out);
+            }
+        }
+        out
+    }
 }
 
 /// Append one bin per distinct category value (ascending) for a categorical
@@ -479,6 +676,143 @@ fn build_categorical_cuts(sorted_vals: &[f32], out: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each feature's cuts by one whole-column pass: every present value of
+    /// the column, in row order, into one sketch (sorted first for
+    /// `sorted`), or the column's sorted values for a categorical feature.
+    fn whole_column_cuts(
+        data: &DMatrix,
+        max_bin: usize,
+        weight_of: impl Fn(usize) -> f32,
+        ingest: Ingest,
+    ) -> Vec<Vec<f32>> {
+        (0..data.n_cols())
+            .map(|f| {
+                let entries: Vec<(usize, f32)> = (0..data.n_rows())
+                    .filter_map(|r| data.get(r, f).map(|v| (r, v)))
+                    .collect();
+                let mut out = Vec::new();
+                if data.feature_types()[f] == FeatureType::Categorical {
+                    let mut values: Vec<f32> = entries.iter().map(|&(_, v)| v).collect();
+                    values.sort_by(f32::total_cmp);
+                    build_categorical_cuts(&values, &mut out);
+                    return out;
+                }
+                let mut sketch = WQSketch::new(entries.len(), max_bin);
+                if ingest.unit_weights {
+                    sketch = sketch.with_unit_weights();
+                }
+                if ingest.sorted {
+                    let mut pairs: Vec<(f32, f32)> =
+                        entries.iter().map(|&(r, v)| (v, weight_of(r))).collect();
+                    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    sketch.push_sorted(&pairs);
+                } else {
+                    for &(r, v) in &entries {
+                        sketch.push(v, weight_of(r));
+                    }
+                }
+                sketch.cut_values(&mut out);
+                out
+            })
+            .collect()
+    }
+
+    /// Cuts streamed through row blocks (dense storage) or the CSC view
+    /// (CSR storage) equal one whole-column pass per feature, unweighted,
+    /// weighted, and sorted, across several blocks with missing values and
+    /// a categorical feature, serially and in parallel.
+    #[test]
+    fn streamed_cuts_equal_whole_column_cuts() {
+        let (n, cols) = (2 * CUT_BLOCK_ROWS + 1_234, 4);
+        let x: Vec<f32> = (0..n * cols)
+            .map(|i| {
+                let (r, f) = (i / cols, i % cols);
+                if (r * 31 + f * 7) % 9 == 0 {
+                    f32::NAN
+                } else if f == 1 {
+                    ((r * 13) % 11) as f32
+                } else {
+                    ((r * 2_654_435_761 + f * 97) % 100_003) as f32 / 7.0
+                }
+            })
+            .collect();
+        let mut types = vec![FeatureType::Numerical; cols];
+        types[1] = FeatureType::Categorical;
+        let dense = DMatrix::from_dense(&x, n, cols)
+            .unwrap()
+            .with_feature_types(&types)
+            .unwrap();
+        let (mut indptr, mut indices, mut values) = (vec![0], Vec::new(), Vec::new());
+        for r in 0..n {
+            for f in 0..cols {
+                if let Some(v) = dense.get(r, f) {
+                    indices.push(f as u32);
+                    values.push(v);
+                }
+            }
+            indptr.push(indices.len());
+        }
+        let csr = DMatrix::from_csr(indptr, indices, values, cols)
+            .unwrap()
+            .with_feature_types(&types)
+            .unwrap();
+        let weights: Vec<f32> = (0..n).map(|r| 0.25 + (r % 5) as f32).collect();
+        let hessians: Vec<f32> = (0..n).map(|r| 1.0 + (r % 3) as f32 * 0.5).collect();
+        let per_feature = |cuts: &HistCuts| -> Vec<Vec<f32>> {
+            (0..cuts.n_features())
+                .map(|f| {
+                    let (s, e) = cuts.feature_bins(f);
+                    cuts.cut_values[s..e].to_vec()
+                })
+                .collect()
+        };
+        let unit = Ingest {
+            sorted: false,
+            unit_weights: true,
+        };
+        let weighted = Ingest {
+            sorted: false,
+            unit_weights: false,
+        };
+        let sorted = Ingest {
+            sorted: true,
+            unit_weights: false,
+        };
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for data in [&dense, &csr] {
+                let weighted_data = data.clone().with_weights(&weights).unwrap();
+                let hess = |r: usize| hessians[r] * weights[r];
+                let cases = [
+                    (
+                        pool.install(|| HistCuts::from_dmatrix(data, 64)),
+                        whole_column_cuts(data, 64, |_| 1.0, unit),
+                    ),
+                    (
+                        pool.install(|| HistCuts::from_dmatrix(&weighted_data, 64)),
+                        whole_column_cuts(data, 64, |r| weights[r], weighted),
+                    ),
+                    (
+                        pool.install(|| {
+                            HistCuts::from_dmatrix_weighted(&weighted_data, 64, &hessians, true)
+                        }),
+                        whole_column_cuts(data, 64, hess, sorted),
+                    ),
+                ];
+                for (case, (streamed, whole)) in cases.into_iter().enumerate() {
+                    assert_eq!(
+                        per_feature(&streamed),
+                        whole,
+                        "case {case}, {threads} threads"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn two_level_search_matches_bin_of() {
@@ -504,7 +838,7 @@ mod tests {
             probes.extend([-1e9, 1e9, -0.0, 0.0, 0.5, 2.5, 3.0]);
             for value in probes {
                 assert_eq!(
-                    search.bin_of(f, value),
+                    search.feature(f).bin_of(value),
                     cuts.bin_of(f, value),
                     "feature {f} value {value}"
                 );

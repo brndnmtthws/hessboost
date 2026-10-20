@@ -19,6 +19,11 @@
 //! enters rayon, so it never picks up a waiter's work and runs on the
 //! caller. A builder that cannot start a pool (a thread limit) abandons the
 //! key and builds on its own thread, and every waiter then builds its own.
+//!
+//! A forked child inherits its parent's caches as they were at the fork,
+//! possibly mid-build (an entry whose builder thread did not fork) or with a
+//! lock held, and cannot tell; it bypasses them, binning as if uncached,
+//! while the caches of matrices it builds itself work as usual.
 
 use crate::data::ghist::GHistIndex;
 use crate::data::meta::FeatureType;
@@ -57,9 +62,21 @@ impl BinKey {
 }
 
 /// The indexes built from one set of feature values.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct BinCache {
+    /// The process the cache was made in; any other one (a forked child)
+    /// bypasses it.
+    owner: u32,
     entries: Mutex<Vec<Arc<Entry>>>,
+}
+
+impl Default for BinCache {
+    fn default() -> Self {
+        BinCache {
+            owner: std::process::id(),
+            entries: Mutex::default(),
+        }
+    }
 }
 
 /// One key's index, built once.
@@ -140,13 +157,17 @@ impl Drop for AbandonOnUnwind<'_> {
 impl BinCache {
     /// The index for `key`: the cached one, or `build`'s (once per key, see
     /// the module docs). `parallel`: whether `build` uses rayon (then it
-    /// runs on a pool of its own).
+    /// runs on a pool of its own). Outside the process that made the cache,
+    /// `build`'s, unshared.
     pub(crate) fn get_or_build(
         &self,
         key: &BinKey,
         parallel: bool,
         build: impl FnOnce() -> GHistIndex + Send,
     ) -> Arc<GHistIndex> {
+        if self.owner != std::process::id() {
+            return Arc::new(build());
+        }
         let mut build = Some(build);
         loop {
             let (entry, claimed) = self.claim(key);
@@ -271,6 +292,24 @@ mod tests {
         }));
         assert!(failed.is_err());
         let index = cache.get_or_build(&key(8, None), false, || index_of(&data));
+        assert_eq!(index.n_rows(), 2);
+    }
+
+    /// A cache inherited from another process (a fork) is bypassed: an
+    /// entry its parent was still building, whose builder thread the child
+    /// lacks, does not hold the child's request up.
+    #[test]
+    fn an_inherited_cache_is_bypassed() {
+        let data = DMatrix::from_dense(&[0.0, 1.0, 2.0, 3.0], 2, 2).unwrap();
+        let inherited = BinCache {
+            owner: std::process::id().wrapping_add(1),
+            entries: Mutex::new(vec![Arc::new(Entry {
+                key: key(8, None),
+                state: Mutex::new(State::Building),
+                done: Condvar::new(),
+            })]),
+        };
+        let index = inherited.get_or_build(&key(8, None), false, || index_of(&data));
         assert_eq!(index.n_rows(), 2);
     }
 }

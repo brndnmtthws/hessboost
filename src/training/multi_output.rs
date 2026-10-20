@@ -246,12 +246,16 @@ fn fit_tree(
         exact.fit(&mut tree, TreeOutput::Vector, &leaf_rows, margins);
     }
     if let Some(langevin) = ctx.run.langevin {
+        // The builder's partitions route every weighted row as its values
+        // do unless the cuts missed some (`SketchedRows::Partial`); then
+        // renewal routes the rows itself. Exact leaves' rows are routed.
+        let partitions = ctx.run.exact_leaves.is_some() || ctx.sketched != SketchedRows::Partial;
         let at = LeafRenewal {
             data: ctx.run.dtrain,
             gpair,
             n_out,
             rows,
-            leaf_rows: &leaf_rows,
+            leaf_rows: if partitions { &leaf_rows } else { &[] },
             iteration: grads.iteration,
             tree: 0,
         };

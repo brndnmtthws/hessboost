@@ -309,3 +309,26 @@ fn binning_refuses_rows_the_cuts_never_saw() {
     assert!(BinnedMatrix::new(&view, MAX_BIN).is_ok());
     assert_eq!(invalid_param(BinnedMatrix::new(&data, 1)), "max_bin");
 }
+
+/// A source-cut view of an unweighted source may weigh rows zero itself:
+/// its source's cuts sketched them all the same, so it bins, and trains as
+/// the view does, rows routed by their bins (exact leaves, sampled rounds).
+#[test]
+fn binned_source_cut_views_keep_their_sources_sketch() {
+    let data = dense(false);
+    let rows: Vec<usize> = (0..ROWS).collect();
+    let mut weights = vec![1.0; ROWS];
+    weights[10] = 0.0;
+    let view = data
+        .select_rows_with_cuts(&rows, ViewCuts::Source)
+        .unwrap()
+        .with_weights(&weights)
+        .unwrap();
+    let binned = BinnedMatrix::new(&view, MAX_BIN).unwrap();
+    let params = params(&[
+        ("objective", json!("reg:absoluteerror")),
+        ("leaf_estimation_method", json!("exact")),
+        ("subsample", json!(0.7)),
+    ]);
+    assert_eq!(fit(&params, &binned, &data), fit(&params, &view, &data));
+}

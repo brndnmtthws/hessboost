@@ -100,7 +100,7 @@
 
 use crate::check::ensure;
 use crate::config::TrainingParams;
-use crate::data::DMatrix;
+use crate::data::{DMatrix, SketchedRows};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, Objective};
@@ -274,7 +274,10 @@ pub struct BudgetResult {
 
 /// Train with a fitting budget instead of a learning rate, tree limits, and
 /// a round count (see the [module docs](self) for the algorithm and the
-/// parameters it reads).
+/// parameters it reads). Its trees update the training margins from their
+/// histogram partitions, so a [`ViewCuts::Source`](crate::data::ViewCuts::Source)
+/// view weighing rows its source weighs zero (rows its cuts never saw) is
+/// refused.
 ///
 /// ```
 /// use hessboost::prelude::*;
@@ -355,6 +358,16 @@ fn train_budget_inner(
     let base_margins = initial_intercepts(params, objective.as_ref(), &info, n_out)?;
     let mut model = new_model(params, objective.as_ref(), dtrain, base_margins);
 
+    // The margins and loss decrements follow the builder's partitions,
+    // which route a weighted row as its values do only where the cuts saw
+    // it.
+    if dtrain.sketched_rows() == SketchedRows::Partial {
+        return Err(HessboostError::invalid_data(
+            "weights",
+            "budget mode needs every weighted row in the cuts: this view with its source's \
+             cuts weighs rows its source weighs zero",
+        ));
+    }
     let ghist = dtrain.hist_index(params.max_bin);
     let weights = dtrain.weights();
     let weight_of = |r: usize| weights.map_or(1.0, |w| f64::from(w[r]));

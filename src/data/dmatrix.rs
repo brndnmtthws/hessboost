@@ -596,9 +596,20 @@ impl DMatrix {
         Ok(self)
     }
 
-    /// Set the feature types (`len == n_cols`).
+    /// Set the feature types (`len == n_cols`). A [`ViewCuts::Source`] view
+    /// keeps its source's, which its source's cuts were computed for.
     pub fn with_feature_types(mut self, types: &[FeatureType]) -> Result<Self> {
         check_len("feature_types length", types.len(), self.n_cols)?;
+        if self
+            .cut_source
+            .as_ref()
+            .is_some_and(|source| source.matrix.feature_types != types)
+        {
+            return Err(HessboostError::invalid_param(
+                "feature_types",
+                "a view with its source's cuts keeps the feature types they were computed for",
+            ));
+        }
         self.feature_types = types.to_vec();
         let invalid = |col: usize, v: f32| {
             HessboostError::invalid_data(
@@ -873,8 +884,13 @@ impl DMatrix {
     /// Which of this matrix's rows the cuts of its `hist` index were
     /// sketched from: those with a nonzero sample weight in the matrix the
     /// cuts are computed on (this one, or a [`ViewCuts::Source`] view's
-    /// source).
+    /// source). A binned matrix's are all of them: binning refuses anything
+    /// else, and its weights cannot change since, though they may hold
+    /// zeros a source-cut view's source sketched anyway.
     pub(crate) fn sketched_rows(&self) -> SketchedRows {
+        if let Storage::Bins { .. } = self.storage {
+            return SketchedRows::All;
+        }
         let Some(source) = &self.cut_source else {
             return match self.weights.as_deref() {
                 Some(w) if w.contains(&0.0) => SketchedRows::Weighted,

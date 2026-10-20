@@ -2,13 +2,15 @@
 //! training on it (and evaluating on it) is training on a copy of the rows,
 //! bit for bit.
 
-use hessboost::data::ViewCuts;
+use hessboost::config::Langevin;
+use hessboost::data::{FeatureType, ViewCuts};
 use hessboost::model::ModelFormat;
 use hessboost::prelude::{DMatrix, Trainer, TrainingParams};
+use hessboost::training::budget::{BudgetConfig, train_with_budget};
 use serde_json::json;
 
 mod common;
-use common::{four_features, lcg};
+use common::{four_features, invalid_data, invalid_param, lcg};
 
 const ROWS: usize = 3_000;
 
@@ -173,17 +175,12 @@ fn source_cut_views_split_on_their_sources_cuts() {
     }
 }
 
-/// A [`ViewCuts::Source`] view weighing a row its source weighs zero trains
-/// as continuing its training does: the source's cuts never saw that row,
-/// whose value beyond their last cut bins into the last bin, so the
-/// training margins route it by its value, as the continued model's
-/// prediction does, sampled rows or not.
-#[test]
-fn source_cut_views_route_rows_their_source_never_sketched_by_value() {
-    let n = 300;
-    // Feature 0 is missing on every third row, the only rows labeled 10,
-    // so the first split isolates them at the last bin boundary; the last
-    // row lies far beyond the others.
+/// Rows of a source-cut view whose source never sketched one of them: feature
+/// 0 is missing on every third row, the only rows labeled 10, so a first
+/// split isolates them at the last bin boundary; the last row, weighed zero
+/// by the source and one by the view, lies far beyond the others, past the
+/// source's last cut.
+fn unsketched_view(n: usize) -> DMatrix {
     let x: Vec<f32> = (0..=n)
         .map(|i| match i {
             _ if i == n => 1e6,
@@ -203,11 +200,19 @@ fn source_cut_views_route_rows_their_source_never_sketched_by_value() {
         .with_weights(&weights)
         .unwrap();
     let rows: Vec<usize> = (0..=n).collect();
-    let view = data
-        .select_rows_with_cuts(&rows, ViewCuts::Source)
+    data.select_rows_with_cuts(&rows, ViewCuts::Source)
         .unwrap()
         .with_weights(&vec![1.0; n + 1])
-        .unwrap();
+        .unwrap()
+}
+
+/// A [`ViewCuts::Source`] view weighing a row its source weighs zero trains
+/// as continuing its training does: its value beyond the source's last cut
+/// bins into the last bin, so the training margins route it by its value,
+/// as the continued model's prediction does, sampled rows or not.
+#[test]
+fn source_cut_views_route_rows_their_source_never_sketched_by_value() {
+    let view = unsketched_view(300);
     for subsample in [1.0, 0.5] {
         let params = TrainingParams::from_xgboost([
             ("max_depth", json!(1)),
@@ -229,4 +234,63 @@ fn source_cut_views_route_rows_their_source_never_sketched_by_value() {
             "subsample {subsample}"
         );
     }
+}
+
+/// Langevin leaf re-estimation over such a view takes each leaf's rows as
+/// its values route them: every leaf is the mean label of the rows
+/// predicted there (zero intercept, no `lambda`, unit Hessians).
+#[test]
+fn langevin_leaves_of_unsketched_rows_follow_their_values() {
+    let view = unsketched_view(300);
+    let params = TrainingParams::builder()
+        .max_depth(1)
+        .eta(1.0)
+        .lambda(0.0)
+        .min_child_weight(0.0)
+        .base_score(0.0)
+        .langevin(Langevin::default())
+        .build()
+        .unwrap();
+    let model = hessboost::prelude::train(&params, &view, 1).unwrap();
+    let leaves = model.predict_leaf(&view, ..).unwrap();
+    let tree = &model.trees()[0];
+    let labels = view.labels().unwrap();
+    for leaf in (0..tree.num_nodes()).filter(|&node| tree.node(node).is_leaf()) {
+        let routed: Vec<f32> = leaves
+            .as_slice()
+            .iter()
+            .zip(labels)
+            .filter(|&(&l, _)| l as usize == leaf)
+            .map(|(_, &y)| y)
+            .collect();
+        let mean = routed.iter().sum::<f32>() / routed.len() as f32;
+        let value = tree.node(leaf).leaf_value;
+        // Partitions instead of values would give the right leaf 10, the
+        // missing rows' mean without the far row.
+        assert!(
+            (value - mean).abs() < 1e-3,
+            "leaf {leaf}: {value} vs {mean}"
+        );
+    }
+}
+
+/// Budget mode follows the builder's partitions, so it refuses such a view.
+#[test]
+fn budget_mode_refuses_rows_the_source_never_sketched() {
+    let refused = train_with_budget(
+        &TrainingParams::default(),
+        &unsketched_view(300),
+        &BudgetConfig::new(0.5),
+    );
+    assert_eq!(invalid_data(refused), ("weights", None));
+}
+
+/// A source-cut view keeps the feature types its source's cuts were
+/// computed for.
+#[test]
+fn source_cut_views_keep_their_sources_feature_types() {
+    let view = unsketched_view(30);
+    let refused = view.clone().with_feature_types(&[FeatureType::Categorical]);
+    assert_eq!(invalid_param(refused), "feature_types");
+    assert!(view.with_feature_types(&[FeatureType::Numerical]).is_ok());
 }

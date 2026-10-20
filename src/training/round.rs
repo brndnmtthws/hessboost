@@ -279,25 +279,25 @@ pub(super) fn grow_round(
             // Retaining the final row partitions replaces per-row tree
             // traversals of the raw feature matrix with one sequential pass
             // per leaf: the training margin update's, when every row took
-            // part, and the linear-leaf fit's. The margins read them when
-            // they route every weighted row as its values do, linear leaves
-            // only when they route every row so (see `SketchedRows`).
-            let (routed, margin_partitions, linear_rows) = match prepared {
+            // part, SGLB's leaf re-estimation, and the linear-leaf fit's.
+            // The first two read them when they route every weighted row as
+            // its values do, linear leaves only when they route every row
+            // so (see `SketchedRows`).
+            let (partitions, linear_rows) = match prepared {
                 Prepared::Hist { sketched, .. } => (
-                    true,
                     *sketched != SketchedRows::Partial,
                     params.linear_tree.is_some() && *sketched == SketchedRows::All,
                 ),
                 // The exact builder routes rows by their raw values, as
                 // prediction does.
-                Prepared::Exact(_) => (true, true, false),
-                Prepared::Approx { .. } => (false, false, false),
+                Prepared::Exact(_) => (true, false),
+                Prepared::Approx { .. } => (false, false),
             };
             // Exact leaves route every row through the finished tree, which
             // the margin update then reads instead of the builder's rows.
             let exact = run.exact_leaves.is_some();
             let margin_rows = exact
-                || margin_partitions
+                || partitions
                     && dropped.is_none()
                     && row_subset.len() == n
                     && !gradient_sampling(params)
@@ -306,9 +306,8 @@ pub(super) fn grow_round(
                 output: slot / parallel,
                 parallel: slot % parallel,
                 rows: row_subset,
-                // Leaf re-estimation (SGLB) reads the partitions too.
                 capture_rows: !exact
-                    && (margin_rows || linear_rows || (routed && run.langevin.is_some())),
+                    && (margin_rows || linear_rows || (partitions && run.langevin.is_some())),
                 margin_rows,
             }
         })

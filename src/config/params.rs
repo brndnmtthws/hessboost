@@ -342,6 +342,50 @@ pub enum MultiStrategy {
     MultiOutputTree,
 }
 
+/// How a tree's leaf values are computed once its structure is grown.
+///
+/// CatBoost's `leaf_estimation_method` (flat key `leaf_estimation_method`:
+/// `newton` or `exact`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LeafEstimation {
+    /// The Newton step of the objective's gradients and Hessians over the
+    /// leaf's rows, XGBoost's `-Tα(G) / (H + λ)` clamped to `max_delta_step`.
+    /// XGBoost default.
+    #[default]
+    Newton,
+    /// The exact minimizer of the loss over each leaf's rows, for
+    /// `reg:quantileerror` and `reg:absoluteerror`, whose smooth surrogates
+    /// still grow the structure: output `j`'s leaf value is `eta` (over
+    /// `num_parallel_tree`) times the quantile at level `alpha[j]` (for
+    /// `reg:absoluteerror`, the median) of the residuals `label - margin` of
+    /// the training rows the finished tree routes to the leaf, at the
+    /// margins the iteration's gradients came from (every tree of a forest
+    /// fits the same ones).
+    ///
+    /// Every training row takes part, sampled or not, routed by its raw
+    /// values as prediction routes it (XGBoost's adaptive leaves and
+    /// LightGBM's leaf renewal read the round's sample instead): a leaf's
+    /// estimate then rests on twice the rows at `subsample = 0.5`, half of
+    /// which did not choose its splits. The quantile is the intercept's:
+    /// linear interpolation on the `(n + 1)α` grid without sample weights,
+    /// and with them the first residual whose `f32` cumulative weight
+    /// reaches `α` of the leaf's total (XGBoost `common::Quantile` and
+    /// `WeightedQuantile`), residuals ascending by [`f32::total_cmp`] with
+    /// ties in row order. A leaf without rows or weight gets `0`.
+    ///
+    /// `lambda`, `alpha`, `gamma`, and `min_child_weight` act on the
+    /// structure only, through the surrogate's gradients; a positive
+    /// `max_delta_step` clamps the quantile to `±max_delta_step` before
+    /// `eta` scales it. Refused with `dart`, `gblinear`, Boulevard, EBMs,
+    /// monotone constraints, `linear_tree`, `path_smooth`, quantized leaf
+    /// renewal, SGLB, and `process_type = update`, which bound, replace, or
+    /// recompute the leaves themselves, and by online updates and budget
+    /// training.
+    Exact,
+}
+
 /// Whether a round grows new trees or updates existing ones.
 ///
 /// Mirrors XGBoost's `process_type`.
@@ -477,6 +521,10 @@ pub struct TrainingParams {
     /// Grow new trees or update existing ones (with the refresh updater's
     /// options). XGBoost `process_type`.
     pub process_type: ProcessType,
+    /// How leaf values are computed once a tree's structure is grown
+    /// ([`LeafEstimation`]; opt-in [`LeafEstimation::Exact`] for the quantile
+    /// and absolute-error losses). CatBoost `leaf_estimation_method`.
+    pub leaf_estimation: LeafEstimation,
 
     // ---- LightGBM tree options (opt-in) ----
     /// Extremely randomized split search (LightGBM `extra_trees`), `None`
@@ -599,6 +647,7 @@ impl Default for TrainingParams {
             balanced_bagging: None,
             multi_strategy: MultiStrategy::OneOutputPerTree,
             process_type: ProcessType::Default,
+            leaf_estimation: LeafEstimation::Newton,
             extra_trees: None,
             path_smooth: 0.0,
             linear_tree: None,
@@ -659,8 +708,9 @@ impl TrainingParams {
     ///
     /// The checks run in a fixed order (numeric ranges, reuse penalties,
     /// device, objective parameters, booster, tree shape, training modes,
-    /// tree options, SGLB and model shrinkage, Boulevard), so a
-    /// configuration that breaks several rules always reports the same one.
+    /// tree options, leaf estimation, SGLB and model shrinkage, Boulevard),
+    /// so a configuration that breaks several rules always reports the same
+    /// one.
     pub fn validate(&self) -> Result<()> {
         self.validate_ranges()?;
         self.validate_reuse_penalties()?;
@@ -682,9 +732,65 @@ impl TrainingParams {
         self.validate_bagging_by_query()?;
         self.validate_balanced_bagging()?;
         self.validate_tree_options()?;
+        self.validate_leaf_estimation()?;
         self.validate_sglb()?;
         self.validate_boulevard()?;
         self.validate_ebm()
+    }
+
+    /// Exact leaves: a loss with a closed-form leaf minimizer on a plain
+    /// `gbtree`, without the settings that would bound, replace, or
+    /// recompute its leaves.
+    fn validate_leaf_estimation(&self) -> Result<()> {
+        if self.leaf_estimation == LeafEstimation::Newton {
+            return Ok(());
+        }
+        let key = "leaf_estimation_method";
+        ensure(
+            key,
+            self.objective.leaf_quantiles().is_some(),
+            format!(
+                "`exact` leaves need `reg:quantileerror` or `reg:absoluteerror`, not `{}`",
+                self.objective.name()
+            ),
+        )?;
+        ensure(
+            key,
+            self.booster == BoosterKind::GbTree,
+            "`exact` leaves need `booster = gbtree`",
+        )?;
+        ensure(
+            key,
+            self.monotone_constraints
+                .iter()
+                .all(|&m| m == Monotone::None),
+            "`exact` leaves are not supported with monotone constraints, which bound Newton \
+             leaves",
+        )?;
+        let conflicting = [
+            ("linear_tree", self.linear_tree.is_some()),
+            ("path_smooth", self.path_smooth > 0.0),
+            (
+                "quant_train_renew_leaf",
+                self.quantized
+                    .as_ref()
+                    .is_some_and(QuantizedGrad::renew_leaf),
+            ),
+            ("langevin", self.langevin_on()),
+            (
+                "process_type",
+                matches!(self.process_type, ProcessType::Update(_)),
+            ),
+        ];
+        match conflicting.iter().find(|&&(_, on)| on) {
+            Some(&(name, _)) => Err(HessboostError::invalid_param(
+                key,
+                format!(
+                    "`exact` leaves are not supported with `{name}`, which sets the leaves itself"
+                ),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Query-level bagging: a ranking objective on a tree booster, with
@@ -1587,6 +1693,8 @@ impl TrainingParamsBuilder {
         multi_strategy: MultiStrategy => params.multi_strategy);
     setter!(/// Set whether rounds grow or update trees (`process_type`).
         process_type: ProcessType => params.process_type);
+    setter!(/// Set how leaf values are computed (`leaf_estimation_method`).
+        leaf_estimation: LeafEstimation => params.leaf_estimation);
     setter!(/// Set LightGBM's path smoothing strength (`path_smooth`, `0` = off).
         path_smooth: f64 => params.path_smooth);
     setter!(/// Set the new-feature reuse penalty `ι` (`toad_penalty_feature`).

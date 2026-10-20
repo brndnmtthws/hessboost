@@ -34,6 +34,7 @@ type _SamplingMethod = Literal["uniform", "gradient_based"]
 # validation remains authoritative for cuda:<ordinal>/gpu:<ordinal>.
 type _Device = str
 type _MultiStrategy = Literal["one_output_per_tree", "multi_output_tree"]
+type _LeafEstimation = Literal["newton", "exact"]
 
 EvalSet = Sequence[tuple[Any, ArrayLike]]
 """``(X, y)`` pairs evaluated after every round."""
@@ -84,6 +85,7 @@ class _HessboostModel(BaseEstimator):
         importance_type: ImportanceType | None = None,
         device: _Device | None = None,
         multi_strategy: _MultiStrategy | None = None,
+        leaf_estimation_method: _LeafEstimation | None = None,
         eval_metric: str | Sequence[str] | None = None,
         early_stopping_rounds: int | None = None,
         callbacks: Sequence[TrainingCallback] | None = None,
@@ -119,6 +121,7 @@ class _HessboostModel(BaseEstimator):
         self.importance_type = importance_type
         self.device = device
         self.multi_strategy = multi_strategy
+        self.leaf_estimation_method = leaf_estimation_method
         self.eval_metric = eval_metric
         self.early_stopping_rounds = early_stopping_rounds
         self.callbacks = callbacks
@@ -151,6 +154,7 @@ class _HessboostModel(BaseEstimator):
         ("interaction_constraints", "interaction_constraints"),
         ("device", "device"),
         ("multi_strategy", "multi_strategy"),
+        ("leaf_estimation_method", "leaf_estimation_method"),
         ("eval_metric", "eval_metric"),
     )
 

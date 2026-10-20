@@ -4,7 +4,7 @@
 
 use super::super::groups::ModelShrinkMode;
 use super::super::params::{
-    Device, GrowPolicy, Monotone, MultiStrategy, SamplingMethod, TreeMethod,
+    Device, GrowPolicy, LeafEstimation, Monotone, MultiStrategy, SamplingMethod, TreeMethod,
 };
 use crate::error::{HessboostError, Result};
 use crate::objective::AftDistribution;
@@ -155,6 +155,7 @@ flat_params! {
     neg_bagging_fraction: f64,
     bagging_by_query: bool,
     multi_strategy: MultiStrategy,
+    leaf_estimation_method: LeafEstimation,
     process_type: FlatProcess,
     refresh_leaf: bool,
     extra_trees: bool,

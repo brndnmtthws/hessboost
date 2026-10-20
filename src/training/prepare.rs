@@ -2,6 +2,7 @@
 //! builder (`exact`, `hist` with its backend, `approx` with its cuts).
 
 use super::dart::{round_rng, round_salt};
+use super::exact_leaves::ExactLeaves;
 use super::round::gather_output;
 use super::row_sampling::{RowMeta, gradient_sampling};
 use crate::config::{Device, GrowPolicy, TrainingParams, TreeMethod};
@@ -22,8 +23,9 @@ use crate::tree::sampler::ColumnSampler;
 use std::sync::OnceLock;
 
 /// What every boosting round of one training run reads: the parameters, the
-/// training matrix with its metadata, the objective, and the Langevin noise
-/// (`None` unless SGLB is on).
+/// training matrix with its metadata, the objective, the Langevin noise
+/// (`None` unless SGLB is on), and the exact leaves (`None` for Newton
+/// leaves).
 #[derive(Clone, Copy)]
 pub(super) struct TrainContext<'a> {
     pub(super) params: &'a TrainingParams,
@@ -31,6 +33,7 @@ pub(super) struct TrainContext<'a> {
     pub(super) info: &'a MetaInfo<'a>,
     pub(super) objective: &'a dyn Loss,
     pub(super) langevin: Option<&'a Langevin>,
+    pub(super) exact_leaves: Option<&'a ExactLeaves<'a>>,
     /// What row sampling reads of `dtrain`, gathered once per run.
     pub(super) rows: RowMeta<'a>,
 }

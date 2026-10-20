@@ -104,6 +104,7 @@ impl TrainingParams {
             bagging_by_query,
             multi_strategy,
             process_type,
+            leaf_estimation,
             extra_trees,
             path_smooth,
             linear_tree,
@@ -234,6 +235,7 @@ impl TrainingParams {
             set("neg_bagging_fraction", json(bagging.neg_fraction()));
         }
         set("multi_strategy", json(multi_strategy));
+        set("leaf_estimation_method", json(leaf_estimation));
         match process_type {
             ProcessType::Default => set("process_type", json("default")),
             ProcessType::Update(refresh) => {
@@ -314,6 +316,7 @@ impl TrainingParams {
             bagging_by_query,
             multi_strategy,
             process_type,
+            leaf_estimation,
             extra_trees,
             path_smooth,
             linear_tree,
@@ -393,6 +396,10 @@ impl TrainingParams {
         );
         differs("multi_strategy", *multi_strategy == other.multi_strategy);
         differs("process_type", *process_type == other.process_type);
+        differs(
+            "leaf_estimation_method",
+            *leaf_estimation == other.leaf_estimation,
+        );
         differs("extra_trees", *extra_trees == other.extra_trees);
         differs("path_smooth", *path_smooth == other.path_smooth);
         differs("linear_tree", *linear_tree == other.linear_tree);

@@ -77,8 +77,9 @@ fn quantile_pair(r: f32, s: f32, alpha: f32, w: f32) -> GradPair {
 
 /// XGBoost `common::Quantile`: linear interpolation on the `(n + 1)α` grid,
 /// clamped to the extremes, over the values already sorted ascending. `NaN`
-/// for no values.
-fn interpolated_quantile(alpha: f32, sorted: &[f32]) -> f32 {
+/// for no values. Also each exact leaf's quantile without sample weights
+/// ([`LeafEstimation::Exact`](crate::config::LeafEstimation::Exact)).
+pub(crate) fn interpolated_quantile(alpha: f32, sorted: &[f32]) -> f32 {
     let Some((&first, &last)) = sorted.first().zip(sorted.last()) else {
         return f32::NAN;
     };
@@ -98,26 +99,46 @@ fn interpolated_quantile(alpha: f32, sorted: &[f32]) -> f32 {
     (f64::from(v0) + d * f64::from(v1 - v0)) as f32
 }
 
-/// XGBoost `common::WeightedQuantile`: the first sorted value whose `f32`
-/// cumulative weight reaches `α · total` (no interpolation), capped at the
-/// largest value. `NaN` for no values.
-fn weighted_quantile(alpha: f32, labels: &[f32], weights: &[f32], order: &[usize]) -> f32 {
-    if order.is_empty() {
+/// XGBoost `common::WeightedQuantile` of `(value, weight)` pairs in
+/// ascending value order: the first value whose `f32` cumulative weight
+/// reaches `α · total` (no interpolation), capped at the largest value.
+/// `NaN` for no pairs. The weights are non-negative, so the cumulative
+/// weight never decreases. Also each exact leaf's quantile with sample
+/// weights ([`LeafEstimation::Exact`](crate::config::LeafEstimation::Exact)).
+pub(crate) fn weighted_step_quantile<I>(alpha: f32, sorted: I) -> f32
+where
+    I: IntoIterator<Item = (f32, f32)>,
+    I::IntoIter: Clone,
+{
+    let pairs = sorted.into_iter();
+    // XGBoost's inclusive scan: the first pair's weight, then running sums.
+    let cumulative = || {
+        pairs
+            .clone()
+            .scan(None, |acc: &mut Option<f32>, (value, weight)| {
+                let sum = acc.map_or(weight, |acc| acc + weight);
+                *acc = Some(sum);
+                Some((value, sum))
+            })
+    };
+    let Some((last, total)) = cumulative().last() else {
         return f32::NAN;
-    }
-    let mut cdf = Vec::with_capacity(order.len());
-    let mut acc = 0.0f32;
-    for (i, &row) in order.iter().enumerate() {
-        acc = if i == 0 {
-            weights[row]
-        } else {
-            acc + weights[row]
-        };
-        cdf.push(acc);
-    }
-    let thresh = (f64::from(acc) * f64::from(alpha)) as f32;
-    let idx = cdf.partition_point(|&c| c < thresh).min(order.len() - 1);
-    labels[order[idx]]
+    };
+    let thresh = (f64::from(total) * f64::from(alpha)) as f32;
+    // `partition_point(|sum| sum < thresh)` over the non-decreasing sums,
+    // including its first pair for a NaN threshold.
+    #[allow(
+        clippy::neg_cmp_op_on_partial_ord,
+        reason = "a NaN threshold must select like `partition_point(|sum| sum < thresh)`"
+    )]
+    let reached = |&(_, sum): &(f32, f32)| !(sum < thresh);
+    cumulative().find(reached).map_or(last, |(value, _)| value)
+}
+
+/// [`weighted_step_quantile`] of `labels` weighted by `weights`, in the
+/// ascending `order` of [`stable_order`](crate::data::sort::stable_order).
+fn weighted_quantile(alpha: f32, labels: &[f32], weights: &[f32], order: &[usize]) -> f32 {
+    weighted_step_quantile(alpha, order.iter().map(|&row| (labels[row], weights[row])))
 }
 
 impl Loss for Quantile {

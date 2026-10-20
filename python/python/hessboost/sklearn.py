@@ -4,9 +4,11 @@
 
 They follow XGBoost's scikit-learn wrapper (``XGBRegressor`` and friends):
 the constructor takes XGBoost's parameter names (plus ``callbacks``, a
-list of :class:`~hessboost.TrainingCallback`), ``fit`` takes sample
-weights, base margins, eval sets and ``verbose`` (live per-round output,
-``True`` or a period), and the fitted estimator exposes the
+list of :class:`~hessboost.TrainingCallback`, and
+``leaf_estimation_method``, ``"exact"`` for exact quantile leaves under the
+quantile and absolute-error objectives), ``fit`` takes sample weights,
+base margins, eval sets and ``verbose`` (live per-round output, ``True`` or
+a period), and the fitted estimator exposes the
 :class:`~hessboost.Booster`. Parameters left at ``None`` use hessboost's
 (XGBoost's) defaults; ``params`` passes any other training parameter.
 

@@ -20,7 +20,7 @@ use crate::tree::builder::{
 use crate::tree::hist::{CpuBackend, HistogramBackend};
 use crate::tree::reuse::ReuseSet;
 use crate::tree::sampler::ColumnSampler;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// What every boosting round of one training run reads: the parameters, the
 /// training matrix with its metadata, the objective, the Langevin noise
@@ -54,10 +54,12 @@ pub(super) struct TreeSample<'a> {
 /// Prepared, reusable per-round builder state, chosen by `tree_method`.
 pub(super) enum Prepared {
     Exact(SortedColumns),
-    /// Histogram method: the binned dataset plus the backend its histograms
-    /// are built on (the CPU's, or a GPU's when `device` names one).
+    /// Histogram method: the binned dataset (the matrix's cached index,
+    /// shared with every other training of it) plus the backend its
+    /// histograms are built on (the CPU's, or a GPU's when `device` names
+    /// one).
     Hist {
-        index: GHistIndex,
+        index: Arc<GHistIndex>,
         backend: Box<dyn HistogramBackend>,
         /// Every training value was sketched (no row has a zero sample
         /// weight), so the builder's row partitions equal routing each
@@ -308,12 +310,13 @@ pub(super) fn prepare_builder(
     }
     Ok(match method {
         TreeMethod::Hist => {
-            let cuts = HistCuts::from_dmatrix(dtrain, params.max_bin);
             // A host index is required for exact fallback. Uploading raw
             // floats and reading global bins back costs more than CPU binning
             // at the measured large-data shapes; CUDA still reencodes and
-            // transposes the compact global bins on device.
-            let index = GHistIndex::from_dmatrix(dtrain, cuts);
+            // transposes the compact global bins on device. The index comes
+            // from the matrix's bin cache: every training of these values
+            // with these weights and `max_bin` shares it.
+            let index = dtrain.hist_index(params.max_bin);
             let backend = hist_backend(params, &index)?;
             let rows_route_like_trees = dtrain.weights().is_none_or(|w| !w.contains(&0.0));
             Prepared::Hist {

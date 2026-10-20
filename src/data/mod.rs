@@ -2,6 +2,7 @@
 //! metrics read, the libsvm/CSV loaders, and the opt-in [`target_stats`]
 //! encoder for categorical columns.
 
+pub(crate) mod bin_cache;
 mod dmatrix;
 pub(crate) mod ghist;
 mod loaders;

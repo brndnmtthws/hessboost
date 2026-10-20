@@ -39,6 +39,11 @@ static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// words of each feature's missing bitmap.
 const BIN_BLOCK_ROWS: usize = 1024;
 
+/// Matrices of at least this many cells (rows times features) cut and bin
+/// in parallel; smaller ones run serially on the calling thread (which the
+/// bin cache relies on, see `bin_cache`).
+pub(crate) const PARALLEL_BINNING_CELLS: usize = 1 << 16;
+
 /// A bin storage width (`u8`, `u16`, `u32`), which the histogram,
 /// partition, and sweep loops specialize on.
 pub(crate) trait BinIndex: Copy + PartialEq + Send + Sync + 'static {
@@ -217,7 +222,8 @@ impl GHistIndex {
             (0..n_cols).all(|f| cuts.num_bins(f) > 0),
             "every feature of a cut table owns at least one bin"
         );
-        let parallel = rayon::current_num_threads() > 1 && n_rows.saturating_mul(n_cols) >= 65_536;
+        let parallel = rayon::current_num_threads() > 1
+            && n_rows.saturating_mul(n_cols) >= PARALLEL_BINNING_CELLS;
         let row_ptr = row_offsets(data, parallel);
         let cells = n_rows.saturating_mul(n_cols);
         let entries = row_ptr[n_rows];
@@ -774,7 +780,7 @@ pub(crate) fn transpose_dense_into<B: Copy + Default + Send + Sync>(
             }
         }
     };
-    if rayon::current_num_threads() > 1 && n_rows.saturating_mul(n_cols) >= 65_536 {
+    if rayon::current_num_threads() > 1 && n_rows.saturating_mul(n_cols) >= PARALLEL_BINNING_CELLS {
         columns
             .par_chunks_mut(GROUP * n_rows)
             .enumerate()

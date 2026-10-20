@@ -1,6 +1,9 @@
 //! The core dataset container: a feature matrix plus training metadata.
 
+use crate::data::bin_cache::{BinCache, BinKey};
+use crate::data::ghist::{GHistIndex, PARALLEL_BINNING_CELLS};
 use crate::data::meta::{FeatureType, GroupInfo, LabelBounds, Labels, MetaInfo};
+use crate::data::quantile::HistCuts;
 use crate::error::{HessboostError, Result};
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
@@ -188,12 +191,17 @@ enum Storage {
 ///
 /// Clones share the feature values: `clone` copies only the metadata
 /// (labels, weights, and the rest), and no operation on a clone changes the
-/// matrix it was cloned from.
+/// matrix it was cloned from. They also share the histogram indexes binned
+/// from those values (`hist_index`), so a binning is computed once for
+/// every copy and freed with the values.
 #[derive(Debug, Clone)]
 pub struct DMatrix {
     n_rows: usize,
     n_cols: usize,
     storage: Storage,
+    /// The histogram indexes binned from `storage`, shared exactly as it is:
+    /// new values (`map_values`, `dense_values_mut`) come with a new cache.
+    bins: Arc<BinCache>,
     missing: f32,
     /// Row-major `[row][target]`, length `n_rows * n_targets`.
     labels: Option<Vec<f32>>,
@@ -214,6 +222,7 @@ impl DMatrix {
             n_rows,
             n_cols,
             storage,
+            bins: Arc::default(),
             missing,
             labels: None,
             n_targets: NonZeroUsize::MIN,
@@ -655,14 +664,38 @@ impl DMatrix {
 
     /// Mutable row-major storage of a dense matrix, or `None` for sparse
     /// storage. Values shared with a clone are copied first, so the clone
-    /// keeps its own. Callers keep the constructors' invariant: every value
+    /// keeps its own; either way the matrix's binned indexes no longer apply
+    /// and are dropped. Callers keep the constructors' invariant: every value
     /// is finite or the missing sentinel.
     #[inline]
     pub(crate) fn dense_values_mut(&mut self) -> Option<&mut [f32]> {
         match &mut self.storage {
-            Storage::Dense(data) => Some(Arc::make_mut(data).as_mut_slice()),
+            Storage::Dense(data) => {
+                self.bins = Arc::default();
+                Some(Arc::make_mut(data).as_mut_slice())
+            }
             Storage::Csr { .. } => None,
         }
+    }
+
+    /// The histogram index of the feature values binned with `max_bin`
+    /// cuts from this matrix's sample weights, feature types and missing
+    /// value ([`HistCuts::from_dmatrix`]): built on first use, then shared
+    /// by every matrix sharing the values (clones and metadata copies,
+    /// across threads), and freed with them. See
+    /// [`bin_cache`](crate::data::bin_cache).
+    pub(crate) fn hist_index(&self, max_bin: usize) -> Arc<GHistIndex> {
+        let key = BinKey::new(
+            max_bin,
+            self.missing,
+            &self.feature_types,
+            self.weights.as_deref(),
+        );
+        let parallel = rayon::current_num_threads() > 1
+            && self.n_rows.saturating_mul(self.n_cols) >= PARALLEL_BINNING_CELLS;
+        self.bins.get_or_build(&key, parallel, || {
+            GHistIndex::from_dmatrix(self, HistCuts::from_dmatrix(self, max_bin))
+        })
     }
 
     /// Copy of this matrix, metadata included, with every non-missing stored
@@ -712,6 +745,7 @@ impl DMatrix {
         };
         let mut out = self.clone();
         out.storage = storage;
+        out.bins = Arc::default();
         out.missing = f32::NAN;
         out
     }
@@ -962,6 +996,38 @@ mod tests {
         // 3 rows x 2 cols, with a NaN missing in row 1 col 0.
         let data = vec![1.0, 2.0, f32::NAN, 5.0, 3.0, 6.0];
         DMatrix::from_dense(&data, 3, 2).unwrap()
+    }
+
+    /// A matrix and its metadata copies bin their shared values once per
+    /// `max_bin` and sample weighting; new values bin afresh (the copy
+    /// sees its own values) while the source keeps its index.
+    #[test]
+    fn copies_share_binned_indexes_until_their_values_change() {
+        let (n, cols) = (200, 2);
+        let values: Vec<f32> = (0..n * cols).map(|i| (i % 37) as f32).collect();
+        let data = DMatrix::from_dense(&values, n, cols).unwrap();
+        let index = data.hist_index(16);
+        let labels = vec![1.0; n];
+        let labeled = data.clone().with_labels(&labels).unwrap();
+        assert!(Arc::ptr_eq(&index, &labeled.hist_index(16)));
+        assert!(!Arc::ptr_eq(&index, &data.hist_index(8)));
+        let weights: Vec<f32> = (0..n).map(|r| 1.0 + (r % 3) as f32).collect();
+        let weighted = data.clone().with_weights(&weights).unwrap();
+        let weighted_index = weighted.hist_index(16);
+        assert!(!Arc::ptr_eq(&index, &weighted_index));
+        let reference = HistCuts::from_dmatrix(&weighted, 16);
+        assert_eq!(
+            serde_json::to_value(weighted_index.cuts()).unwrap(),
+            serde_json::to_value(&reference).unwrap(),
+            "the weighted copy bins with its own weights"
+        );
+        let mut changed = data.clone();
+        changed.dense_values_mut().unwrap()[0] = 1e6;
+        let changed_index = changed.hist_index(16);
+        let (_, last) = changed_index.cuts().feature_bins(0);
+        assert_eq!(changed_index.feature_bin(0, 0), Some(last as u32 - 1));
+        assert!(Arc::ptr_eq(&index, &data.hist_index(16)));
+        assert_ne!(index.feature_bin(0, 0), changed_index.feature_bin(0, 0));
     }
 
     #[test]

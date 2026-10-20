@@ -129,7 +129,7 @@ impl HistCuts {
             .map(|&t| t == FeatureType::Categorical)
             .collect();
         let parallel = n_features > 1
-            && n_rows.saturating_mul(n_features) >= 65_536
+            && n_rows.saturating_mul(n_features) >= crate::data::ghist::PARALLEL_BINNING_CELLS
             && rayon::current_num_threads() > 1;
         let per_feature: Vec<Vec<f32>> = if let Some(values) = data.dense_values() {
             let missing = data.missing();

@@ -101,8 +101,6 @@
 use crate::check::ensure;
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
-use crate::data::ghist::GHistIndex;
-use crate::data::quantile::HistCuts;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, Objective};
@@ -357,7 +355,7 @@ fn train_budget_inner(
     let base_margins = initial_intercepts(params, objective.as_ref(), &info, n_out)?;
     let mut model = new_model(params, objective.as_ref(), dtrain, base_margins);
 
-    let ghist = GHistIndex::from_dmatrix(dtrain, HistCuts::from_dmatrix(dtrain, params.max_bin));
+    let ghist = dtrain.hist_index(params.max_bin);
     let weights = dtrain.weights();
     let weight_of = |r: usize| weights.map_or(1.0, |w| f64::from(w[r]));
     let row_loss = |r: usize, margin: f32| weight_of(r) * loss_fn(margin, labels[r]);

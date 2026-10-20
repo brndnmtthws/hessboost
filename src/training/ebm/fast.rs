@@ -1,10 +1,9 @@
 //! FAST pair ranking: the interaction terms worth boosting.
 
-use crate::data::ghist::GHistIndex;
-use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
 use crate::training::prepare::{Prepared, TrainContext};
 use rayon::prelude::*;
+use std::sync::Arc;
 
 /// FAST (Lou, Caruana, Gehrke & Hooker, KDD 2013): rank every feature pair
 /// by its best four-quadrant split of `gpair` on the features' histogram
@@ -14,7 +13,8 @@ use rayon::prelude::*;
 /// mean gradient `G / (H + λ)` (the order in which a binary partition's
 /// best split is a cut, as in LightGBM's and XGBoost's categorical search).
 /// The bins are those of `tree_method = hist`'s index (`prepared`), whose
-/// cuts are `max_bin`'s; other tree methods get the same index built here.
+/// cuts are `max_bin`'s; other tree methods read the same index from the
+/// matrix's bin cache.
 pub(super) fn fast_pairs(
     run: &TrainContext,
     prepared: &Prepared,
@@ -22,12 +22,9 @@ pub(super) fn fast_pairs(
     k: usize,
 ) -> Vec<Vec<u32>> {
     let TrainContext { params, dtrain, .. } = *run;
-    let built;
-    let index = if let Prepared::Hist { index, .. } = prepared {
-        index
-    } else {
-        built = GHistIndex::from_dmatrix(dtrain, HistCuts::from_dmatrix(dtrain, params.max_bin));
-        &built
+    let index = match prepared {
+        Prepared::Hist { index, .. } => Arc::clone(index),
+        _ => dtrain.hist_index(params.max_bin),
     };
     let cuts = index.cuts();
     let lambda = params.lambda;

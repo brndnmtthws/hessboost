@@ -3,7 +3,9 @@
 Pass them to :func:`hessboost.cv` (``folds=``), or use them to hold out
 rows for early stopping or conformal calibration. :func:`forward_chaining`
 purges a fixed number of rows before each test block;
-:func:`purged_forward` purges by each row's own label window::
+:func:`purged_forward` purges by each row's own label window, and
+:class:`PurgedTail` is the purged early-stopping split of a fold's own
+training rows (:func:`hessboost.cross_validate`'s ``per_fold_stopping``)::
 
     from hessboost import folds
 
@@ -19,7 +21,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _hessboost
 
-__all__ = ["Split", "forward_chaining", "k_fold", "purged_forward"]
+__all__ = ["PurgedTail", "Split", "forward_chaining", "k_fold", "purged_forward"]
 
 Split = tuple[NDArray[np.int64], NDArray[np.int64]]
 """One fold: its ``(train_rows, test_rows)`` row indices."""
@@ -105,3 +107,73 @@ def purged_forward(
         blocks,
         min_train,
     )
+
+
+class PurgedTail:
+    """The purged chronological tail of a fold's training rows, which
+    per-fold early stopping (:func:`hessboost.cross_validate`'s
+    ``per_fold_stopping``) sizes each fold's rounds on.
+
+    ``decision_at`` and ``label_end`` hold every row's decision time and the
+    end of its label window plus any embargo, as for
+    :func:`purged_forward`. The cut is by time span (unlike
+    :func:`purged_forward`, which cuts by the count of distinct decision
+    times): for rows decided from ``first`` to ``last``, :meth:`split` starts
+    the tail at the first of their decision times at or after ``first + (1 -
+    fraction) * (last - first)``.
+    The tail is every row decided at or after it, and the early-stopping
+    fit trains on the rows decided before it whose labels end at or before
+    it (a label ending exactly at the split is kept, one ending a tick later
+    is purged). The start never moves: a split leaving a side empty is
+    refused.
+
+    Raises:
+        HessboostError: The inputs differ in length or are empty, a label
+            ends before its decision, or ``fraction`` is not in ``(0, 1)``.
+        TypeError: The times are neither integers nor ``datetime64``.
+    """
+
+    __slots__ = ("_decision_at", "_fraction", "_label_end")
+
+    def __init__(self, decision_at: ArrayLike, label_end: ArrayLike, fraction: float) -> None:
+        self._decision_at = _times(decision_at, "decision_at")
+        self._label_end = _times(label_end, "label_end")
+        self._fraction = float(fraction)
+        _hessboost.check_purged_tail(self._decision_at, self._label_end, self._fraction)
+
+    @property
+    def decision_at(self) -> NDArray[np.int64]:
+        """Every row's decision time (a copy)."""
+        return self._decision_at.copy()
+
+    @property
+    def label_end(self) -> NDArray[np.int64]:
+        """Every row's label end (a copy)."""
+        return self._label_end.copy()
+
+    @property
+    def fraction(self) -> float:
+        """The tail's share of the rows' time span."""
+        return self._fraction
+
+    def split(self, rows: ArrayLike) -> tuple[int, Split]:
+        """The split time of ``rows`` (a decision time, in the integer units
+        of ``decision_at``: nanoseconds since the epoch for ``datetime64``
+        times) and their split: ``(fit_rows, tail_rows)``, each in ``rows``
+        order.
+
+        Raises:
+            HessboostError: A row is out of bounds, or a side of the split
+                is empty.
+            TypeError: ``rows`` are not integers.
+        """
+        array = np.asarray(rows).reshape(-1)
+        if array.size and not np.issubdtype(array.dtype, np.integer):
+            raise TypeError(f"rows must be integer indices, got {array.dtype}")
+        split_at, [split] = _hessboost.purged_tail_split(
+            self._decision_at,
+            self._label_end,
+            self._fraction,
+            np.ascontiguousarray(array, dtype=np.int64),
+        )
+        return split_at, split

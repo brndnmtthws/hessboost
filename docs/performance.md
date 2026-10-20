@@ -377,7 +377,10 @@ gathers its rows of the source's index instead, so a source and its views
 share one binning pass. A `BinnedMatrix` keeps just that index and the
 metadata, so its training holds no feature values at all (the index of a
 4M x 173 panel with 42% missing values takes 1.4 GiB, against 2.6 GiB of
-`f32` values). Dense input is checked 256 values at a time without a
+`f32` values). A dense matrix may also read a caller's buffer in place
+(`DMatrix::from_dense_shared`; Python's `copy=False` for a read-only
+`float32` array, memory-mapped `.npy` files included, whose pages then stay
+file-backed). Dense input is checked 256 values at a time without a
 branch, and from 2^22 values on, checked and copied in parallel
 2^18-value blocks.
 

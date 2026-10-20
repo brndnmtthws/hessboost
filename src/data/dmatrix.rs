@@ -173,7 +173,7 @@ fn copy_dense(data: &[f32], parallel: bool) -> Vec<f32> {
 #[derive(Debug, Clone)]
 enum Storage {
     /// Row-major dense matrix of `n_cols` values per storage row.
-    Dense(Arc<Vec<f32>>),
+    Dense(DenseValues),
     /// Compressed sparse row: `indptr` has one entry per storage row, plus one.
     Csr {
         indptr: Arc<Vec<usize>>,
@@ -186,6 +186,33 @@ enum Storage {
         index: Arc<GHistIndex>,
         max_bin: usize,
     },
+}
+
+/// A dense matrix's values: its own, or a caller's buffer read in place
+/// through the owner that keeps it alive ([`DMatrix::from_dense_shared`]).
+#[derive(Clone)]
+enum DenseValues {
+    Owned(Arc<Vec<f32>>),
+    Shared(Arc<dyn AsRef<[f32]> + Send + Sync>),
+}
+
+impl DenseValues {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            DenseValues::Owned(values) => values,
+            DenseValues::Shared(values) => (**values).as_ref(),
+        }
+    }
+}
+
+impl std::fmt::Debug for DenseValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            DenseValues::Owned(_) => "Owned",
+            DenseValues::Shared(_) => "Shared",
+        };
+        write!(f, "{kind}({} values)", self.as_slice().len())
+    }
 }
 
 /// What reading the values of a matrix holding only bins does. Training is
@@ -372,7 +399,7 @@ impl DMatrix {
         Ok(Self::new(
             n_rows,
             n_cols,
-            Storage::Dense(Arc::new(data)),
+            Storage::Dense(DenseValues::Owned(Arc::new(data))),
             f32::NAN,
         ))
     }
@@ -389,7 +416,33 @@ impl DMatrix {
         Ok(Self::new(
             n_rows,
             n_cols,
-            Storage::Dense(Arc::new(values)),
+            Storage::Dense(DenseValues::Owned(Arc::new(values))),
+            missing,
+        ))
+    }
+
+    /// Builds the matrix [`DMatrix::from_dense_with_missing`] builds over
+    /// `values`'s buffer, read in place instead of copied: the matrix and
+    /// every copy or view of it holding the values keep `values` alive, and
+    /// it is dropped with the last of them. (Bins do not: a
+    /// [`BinnedMatrix`](crate::data::BinnedMatrix) or a cached histogram
+    /// index holds integers and cuts, so it outlives the buffer.) For a
+    /// buffer the caller already owns, a memory
+    /// map or another library's array, shared without a copy.
+    /// `values.as_ref()` must keep returning the same values: they are
+    /// checked once, here (as `from_dense_with_missing` checks them), and
+    /// binned once.
+    pub fn from_dense_shared(
+        values: Arc<dyn AsRef<[f32]> + Send + Sync>,
+        n_rows: usize,
+        n_cols: usize,
+        missing: f32,
+    ) -> Result<Self> {
+        check_dense((*values).as_ref(), n_rows, n_cols, missing)?;
+        Ok(Self::new(
+            n_rows,
+            n_cols,
+            Storage::Dense(DenseValues::Shared(values)),
             missing,
         ))
     }
@@ -772,7 +825,7 @@ impl DMatrix {
     pub(crate) fn dense_rows(&self) -> Option<DenseRows<'_>> {
         match &self.storage {
             Storage::Dense(values) => Some(DenseRows {
-                values,
+                values: values.as_slice(),
                 n_cols: self.n_cols,
                 rows: self.rows.as_deref(),
             }),
@@ -804,36 +857,40 @@ impl DMatrix {
 
     /// Mutable row-major values of a dense matrix, or `None` for sparse
     /// storage. Values shared with a clone (or a row view's source) are
-    /// copied first, a view's rows only, so the others keep their own;
-    /// either way the matrix's binned indexes no longer apply and are
-    /// dropped, and a [`ViewCuts::Source`] view cuts its own rows from then
-    /// on. Callers keep the constructors' invariant: every value is finite
-    /// or the missing sentinel.
+    /// copied first, a view's rows only, so the others keep their own, and
+    /// so are borrowed ones ([`DMatrix::from_dense_shared`]); either way the
+    /// matrix's binned indexes no longer apply and are dropped, and a
+    /// [`ViewCuts::Source`] view cuts its own rows from then on. Callers
+    /// keep the constructors' invariant: every value is finite or the
+    /// missing sentinel.
     #[inline]
     pub(crate) fn dense_values_mut(&mut self) -> Option<&mut [f32]> {
-        let own = match (&self.storage, &self.rows) {
-            (Storage::Csr { .. }, _) => return None,
-            (Storage::Bins { .. }, _) => no_values(),
-            (Storage::Dense(values), Some(rows)) => {
-                let n_cols = self.n_cols;
+        let values = match &mut self.storage {
+            Storage::Dense(values) => values,
+            Storage::Csr { .. } => return None,
+            Storage::Bins { .. } => no_values(),
+        };
+        let copy = match (&*values, &self.rows) {
+            (values, Some(rows)) => {
+                let (n_cols, values) = (self.n_cols, values.as_slice());
                 let mut own = Vec::with_capacity(rows.len() * n_cols);
                 for &r in rows.iter() {
                     own.extend_from_slice(&values[r * n_cols..(r + 1) * n_cols]);
                 }
                 Some(own)
             }
-            (Storage::Dense(_), None) => None,
+            (DenseValues::Shared(shared), None) => Some((**shared).as_ref().to_vec()),
+            (DenseValues::Owned(_), None) => None,
         };
-        if let Some(own) = own {
-            self.storage = Storage::Dense(Arc::new(own));
-            self.rows = None;
+        if let Some(copy) = copy {
+            *values = DenseValues::Owned(Arc::new(copy));
         }
+        self.rows = None;
         self.bins = Arc::default();
         self.cut_source = None;
-        match &mut self.storage {
-            Storage::Dense(data) => Some(Arc::make_mut(data).as_mut_slice()),
-            Storage::Csr { .. } => None,
-            Storage::Bins { .. } => no_values(),
+        match values {
+            DenseValues::Owned(data) => Some(Arc::make_mut(data).as_mut_slice()),
+            DenseValues::Shared(_) => unreachable!("borrowed values were copied above"),
         }
     }
 
@@ -969,7 +1026,7 @@ impl DMatrix {
                             .map(|(col, &v)| map(row, col, v, f32::NAN)),
                     );
                 }
-                Storage::Dense(Arc::new(mapped))
+                Storage::Dense(DenseValues::Owned(Arc::new(mapped)))
             }
             (
                 Storage::Csr {
@@ -1624,5 +1681,43 @@ mod tests {
             .with_group_weights(&[0.5, 2.0])
             .unwrap();
         assert_eq!(d.weights().unwrap(), &[0.5, 0.5, 2.0]);
+    }
+
+    /// A matrix over a shared buffer is the copied matrix: the same checks,
+    /// the same index, the same model. It holds the buffer's owner until it
+    /// and its copies are gone, and a write copies the values instead of
+    /// touching the buffer.
+    #[test]
+    fn shared_buffers_are_read_in_place_and_released_with_the_matrix() {
+        let (n, cols) = (300, 3);
+        let values: Vec<f32> = (0..n * cols)
+            .map(|i| if i % 11 == 0 { -1.0 } else { (i % 29) as f32 })
+            .collect();
+        let owner: Arc<Vec<f32>> = Arc::new(values.clone());
+        let shared = DMatrix::from_dense_shared(owner.clone(), n, cols, -1.0).unwrap();
+        let copied = DMatrix::from_dense_with_missing(&values, n, cols, -1.0).unwrap();
+        assert_eq!(Arc::strong_count(&owner), 2);
+        let labels: Vec<f32> = (0..n).map(|r| (r % 5) as f32).collect();
+        let params = crate::config::TrainingParams::builder()
+            .max_depth(3)
+            .build()
+            .unwrap();
+        let train = |data: &DMatrix| {
+            let data = data.clone().with_labels(&labels).unwrap();
+            let model = crate::training::train(&params, &data, 4).unwrap();
+            model.encode(crate::model::ModelFormat::Binary).unwrap()
+        };
+        assert_eq!(train(&shared), train(&copied));
+        let mut written = shared.select_rows(&[2, 0]).unwrap();
+        written.dense_values_mut().unwrap()[0] = 7.0;
+        assert_eq!(written.get(0, 0), Some(7.0));
+        assert_eq!(shared.get(2, 0), Some(values[6]));
+        drop((shared, written));
+        assert_eq!(Arc::strong_count(&owner), 1);
+        let infinite: Arc<Vec<f32>> = Arc::new(vec![1.0, f32::INFINITY]);
+        assert!(matches!(
+            DMatrix::from_dense_shared(infinite, 1, 2, f32::NAN),
+            Err(HessboostError::InvalidData { .. })
+        ));
     }
 }

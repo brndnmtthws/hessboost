@@ -108,10 +108,13 @@
 //!   are views of their source's values
 //!   ([`DMatrix::select_rows`](data::DMatrix::select_rows)), binned by
 //!   their own rows or by their source's cuts
-//!   ([`ViewCuts`](data::ViewCuts)). A
-//!   [`BinnedMatrix`](data::BinnedMatrix) keeps only a matrix's bins and
-//!   metadata (XGBoost's `QuantileDMatrix`), and trains as the matrix does
-//!   with `hist` growth, refusing what would read the values.
+//!   ([`ViewCuts`](data::ViewCuts)). A dense matrix can read a caller's
+//!   buffer in place
+//!   ([`DMatrix::from_dense_shared`](data::DMatrix::from_dense_shared);
+//!   Python's `copy=False`), and a [`BinnedMatrix`](data::BinnedMatrix)
+//!   keeps only a matrix's bins and metadata (XGBoost's `QuantileDMatrix`),
+//!   training as the matrix does with `hist` growth and refusing what would
+//!   read the values.
 //! - **Objectives** ([`Objective`](objective::Objective), each with its
 //!   parameters): regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)

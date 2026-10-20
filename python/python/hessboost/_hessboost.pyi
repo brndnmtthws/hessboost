@@ -47,6 +47,10 @@ class DMatrix:
     @staticmethod
     def dense(data: NDArray[np.float32], missing: float, info: Mapping[str, object]) -> DMatrix: ...
     @staticmethod
+    def borrowed(
+        data: NDArray[np.float32], missing: float, info: Mapping[str, object]
+    ) -> DMatrix: ...
+    @staticmethod
     def csr(
         csr: tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float32]],
         n_cols: int,

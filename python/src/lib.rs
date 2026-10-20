@@ -22,6 +22,7 @@
 //! for: access during an update fails fast rather than deadlock.
 
 mod booster;
+mod borrowed;
 mod codec;
 mod compact;
 mod conformal;

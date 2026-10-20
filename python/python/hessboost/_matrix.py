@@ -70,16 +70,17 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
     groups and feature metadata, as XGBoost's ``xgboost.DMatrix``.
 
     ``data`` may be a 2-D numpy array of any numeric dtype and memory
-    layout (converted to C-contiguous ``float32``, without a copy when it
-    already is), a pandas or polars ``DataFrame`` (column names become
+    layout (converted to C-contiguous ``float32``), a pandas or polars
+    ``DataFrame`` (column names become
     ``feature_names``; categorical columns (pandas ``category``, polars
     ``Enum`` and ``Categorical``) become categorical features coded by
     position in their categories, which are recorded: a polars
     ``Categorical``'s are its values, sorted), a polars ``LazyFrame``
     (collected once, by polars' default engine), a scipy
     sparse matrix (absent entries are missing), or any array-like numpy
-    accepts. Values equal to ``missing`` (every NaN by default) are missing;
-    infinities are refused.
+    accepts. The matrix keeps its own copy of the values, unless ``copy=False``
+    borrows a read-only ``float32`` array. Values equal to ``missing`` (every
+    NaN by default) are missing; infinities are refused.
 
     With a frame, the per-row metadata (``label``, ``weight``,
     ``base_margin``, ``qid`` and the label bounds) may name columns of it
@@ -124,10 +125,25 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
         feature_weights: Per-feature column-sampling weights.
         enable_categorical: Accept categorical frame columns (as XGBoost
             requires spelling out).
+        copy: With ``False``, ``data`` must be a read-only, C-contiguous
+            2-D ``float32`` numpy array (such as
+            ``np.load(path, mmap_mode="r")``, or an array after
+            ``setflags(write=False)``), which the matrix reads in place
+            instead of copying. The matrix and every copy or slice of it
+            keep the array alive; a ``BinnedMatrix`` keeps only the bins, so
+            it outlives the array. The array (with every array sharing its
+            memory) must stay unchanged while any of them lives: a write
+            there would change data training already checked. The matrix's
+            reference to the array is a native one, so a reference cycle
+            through the borrowed array (an attribute on it naming the
+            matrix, say) is not collected.
 
     Raises:
         HessboostError: The inputs do not fit together (lengths, shapes,
-            non-finite values, invalid category codes).
+            non-finite values, invalid category codes), or ``copy=False``
+            got a writeable or non-contiguous array, a read-only view of a
+            writeable array or buffer, or one another Rust extension holds a
+            mutable borrow of.
         TypeError: An input has an unsupported type or dtype.
     """
 
@@ -154,6 +170,7 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
         label_upper_bound: ArrayLike | None = None,
         feature_weights: ArrayLike | None = None,
         enable_categorical: bool = True,
+        copy: bool = True,
     ) -> None:
         data, fields = _data.take_metadata(
             data,
@@ -175,6 +192,7 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
                 enable_categorical=enable_categorical,
                 reference=None,
                 info=info,
+                copy=copy,
             )
         )
 

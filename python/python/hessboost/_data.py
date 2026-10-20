@@ -316,6 +316,7 @@ def features(
     reference: Categories | None,
     info: Mapping[str, object],
     unseen: Collection[int] = (),
+    copy: bool = True,
 ) -> Features:
     """Converts ``data`` and builds the native matrix with ``info``
     attached. ``reference`` holds a trained model's categories, to which
@@ -323,13 +324,24 @@ def features(
     except in the ``unseen`` columns, where they are coded one past its
     categories (a target encoder's unseen category). A polars ``LazyFrame``
     is collected (:func:`take_metadata` has already checked that nothing
-    needs aligning with its rows)."""
+    needs aligning with its rows). Without ``copy``, ``data`` must be a
+    2-D ``float32`` numpy array, which the matrix borrows (the native side
+    refuses it unless it is read-only, C-contiguous, and aligned)."""
     data = collect_frame(data)
     names: list[str] | None = None
     types: FeatureTypes | None = None
     categories: Categories = {}
-    csr = _sparse_csr(data)
-    if csr is not None:
+    csr = None if not copy else _sparse_csr(data)
+    if not copy:
+        if not isinstance(data, np.ndarray):
+            raise TypeError(f"copy=False borrows a numpy array, got {type(data).__name__}")
+        if data.dtype != np.float32 or data.ndim != 2:
+            raise TypeError(
+                f"copy=False borrows a 2-D float32 array, got {data.ndim}-D {data.dtype}"
+            )
+        values = data
+        n_cols = values.shape[1]
+    elif csr is not None:
         n_cols = int(csr.shape[1])
         values = None
     elif _is_pandas_frame(data):
@@ -370,7 +382,8 @@ def features(
         )
     else:
         assert values is not None
-        core = _hessboost.DMatrix.dense(values, float(missing), full_info)
+        build = _hessboost.DMatrix.dense if copy else _hessboost.DMatrix.borrowed
+        core = build(values, float(missing), full_info)
     return Features(core, names, types, categories)
 
 

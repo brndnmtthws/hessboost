@@ -82,7 +82,9 @@ missing_errors_doc = "allow"
 needless_pass_by_value = "allow"
 
 [lints.rust]
-unsafe_code = "forbid"
+# Denied, not forbidden: `borrowed` holds the crate's one audited `unsafe`
+# (a numpy buffer read in place), allowed there alone.
+unsafe_code = "deny"
 
 [profile.release]
 codegen-units = 1

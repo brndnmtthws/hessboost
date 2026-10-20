@@ -2,6 +2,7 @@
 //! `float32` arrays (the Python layer converts everything else), and
 //! `BinnedMatrix`, a matrix's histogram bins without its values.
 
+use crate::borrowed::BorrowedArray;
 use crate::errors::{DetachExt, refuse};
 use hessboost::conformal::Interval;
 use hessboost::data::{
@@ -9,11 +10,12 @@ use hessboost::data::{
 };
 use numpy::ndarray::{ArrayD, IxDyn};
 use numpy::{
-    IntoPyArray, PyArrayDyn, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray2, PyArrayDyn, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
     PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
+use std::sync::Arc;
 
 /// The elements of `array` in row-major order, borrowed. `as_slice` also
 /// accepts a Fortran-ordered buffer (in its column-major memory order),
@@ -314,6 +316,26 @@ impl DMatrix {
         let info = info.slices()?;
         let inner = py.detached(|| {
             let matrix = RustMatrix::from_dense_with_missing(values, rows, columns, missing)?;
+            info.apply(matrix)
+        })?;
+        Ok(Self { inner })
+    }
+
+    /// A dense matrix over `data`, a read-only, C-contiguous, aligned
+    /// `(rows, features)` array it keeps alive and reads in place instead of
+    /// copying; values equal to `missing` are absent.
+    #[staticmethod]
+    fn borrowed(
+        py: Python<'_>,
+        data: Bound<'_, PyArray2<f32>>,
+        missing: f32,
+        info: Info<'_>,
+    ) -> PyResult<Self> {
+        let [rows, columns] = [data.shape()[0], data.shape()[1]];
+        let values = Arc::new(BorrowedArray::new(&data)?);
+        let info = info.slices()?;
+        let inner = py.detached(|| {
+            let matrix = RustMatrix::from_dense_shared(values, rows, columns, missing)?;
             info.apply(matrix)
         })?;
         Ok(Self { inner })

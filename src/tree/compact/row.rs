@@ -19,9 +19,11 @@
 //!   form ([`NumericTest`]): a split whose missing values go right stores
 //!   its children mirrored and compares the negated value, so one unsigned
 //!   compare of the row's key for the slot routes every value, missing
-//!   ones (key `0`) to the first child. The row is keyed once per call, on
-//!   the stack (`key(v)`, `key(-v)` per feature), or for a model reading
-//!   too many features for that, value by value as the walk reads it.
+//!   ones (key `0`) to the first child. A walk of at least one tree per
+//!   [`FEATURES_PER_TREE`] features keys the row once, on the stack
+//!   (`key(v)`, `key(-v)` per feature), when a step first reads a key; a
+//!   shorter walk, or one of a model reading too many features for the
+//!   stack, keys each value as a step reads it.
 //! - the chunk's trees are walked in lockstep, one branch-free step
 //!   ([`crate::simd::step_if_greater`]) per tree and level, so their
 //!   dependent load chains overlap.
@@ -34,13 +36,13 @@
 //! padded to its chunk's depth costs as much as a full one. The compare is
 //! the arena's own (the same keys of the same values), so both walks reach
 //! the same leaf. Every other chunk is walked through the model's arena
-//! ([`CompactForest`]), with the keys this walk made, or, when one of its
-//! trees has linear leaves, through the [`RegTree`]s themselves. The walk
+//! ([`CompactForest`]), with this walk's keys, or, when one of its trees
+//! has linear leaves, through the [`RegTree`]s themselves. The walk
 //! reports leaves in tree order either way.
 
-use super::{CNode, CompactForest, NumericTest, key};
+use super::{CNode, CompactForest, NumericTest, RowKeys, key};
 use crate::tree::RegTree;
-use std::mem::{MaybeUninit, size_of};
+use std::mem::size_of;
 use std::ops::Range;
 
 /// Consecutive trees a complete chunk holds and a row walks in lockstep.
@@ -56,6 +58,11 @@ const MAX_FEATURE: u32 = (1 << 15) - 1;
 /// Keys (two per feature) a walk keeps on the stack; a model that reads
 /// more features keys each value a step reads, so the walk never allocates.
 const INLINE_KEYS: usize = 1024;
+/// Features per walked tree up to which a walk keys its row on the stack:
+/// its trees read a key per level, and keying a value as a step reads it
+/// costs several times making its key up front, so a walk of fewer trees
+/// (one row through a few trees of a wide model) keys each value it reads.
+const FEATURES_PER_TREE: usize = 8;
 /// Key of a padding split (below a leaf above the chunk's depth): no row
 /// key is greater, so its walk takes the first child, all of whose leaf
 /// slots hold that leaf.
@@ -118,7 +125,10 @@ pub(crate) struct RowForest {
 }
 
 impl RowForest {
-    pub(crate) fn from_trees(trees: &[RegTree]) -> Self {
+    /// The layout of `trees`, whose arena `arena` returns (called only when
+    /// a chunk falls back to it: the features its trees split on, which the
+    /// walk keys, are read from the arena's tree summaries).
+    pub(crate) fn from_trees<'a>(trees: &[RegTree], arena: impl Fn() -> &'a CompactForest) -> Self {
         let width = trees.first().map_or(1, RegTree::size_leaf_vector);
         let mut forest = RowForest {
             chunks: Vec::with_capacity(trees.len().div_ceil(CHUNK)),
@@ -131,25 +141,27 @@ impl RowForest {
             features: 0,
             arena: false,
         };
-        for chunk in trees.chunks(CHUNK) {
+        for (c, chunk) in trees.chunks(CHUNK).enumerate() {
             // Validation refuses linear leaves in vector-leaf trees.
             let kind = if chunk.iter().any(|tree| tree.linear_leaves().is_some()) {
                 Chunk::Tree
+            } else if let Some(depth) = forest.scan(chunk) {
+                forest.push_complete(chunk, depth)
             } else {
-                for tree in chunk {
-                    for node in tree.nodes().iter().filter(|n| !n.is_leaf()) {
-                        forest.features = forest.features.max(node.split_feature as usize + 1);
-                    }
+                let metas = &arena().trees[c * CHUNK..][..chunk.len()];
+                for meta in metas.iter().filter(|meta| meta.depth > 0) {
+                    forest.features = forest.features.max(meta.max_feature as usize + 1);
                 }
-                if let Some(depth) = forest.complete_depth(chunk) {
-                    forest.push_complete(chunk, depth)
-                } else {
-                    forest.arena = true;
-                    Chunk::Arena
-                }
+                forest.arena = true;
+                Chunk::Arena
             };
             forest.chunks.push(kind);
         }
+        // The arrays grew chunk by chunk; the walk only reads them.
+        forest.keys.shrink_to_fit();
+        forest.slots.shrink_to_fit();
+        forest.leaves.shrink_to_fit();
+        forest.leaf_vectors.shrink_to_fit();
         forest
     }
 
@@ -159,34 +171,38 @@ impl RowForest {
     }
 
     /// The depth of the deepest tree of `chunk` when the chunk fits the
-    /// complete layout: numeric splits on features up to [`MAX_FEATURE`],
-    /// at most [`MAX_DEPTH`] levels, the forest's leaf width, padding within
-    /// [`MAX_PADDING`] of the arena, and leaf-vector offsets within `u32`.
-    fn complete_depth(&self, chunk: &[RegTree]) -> Option<u32> {
+    /// complete layout (counting the features its trees split on into
+    /// [`Self::features`]): numeric splits on features up to
+    /// [`MAX_FEATURE`], at most [`MAX_DEPTH`] levels, the forest's leaf
+    /// width, padding within [`MAX_PADDING`] of the arena, and leaf-vector
+    /// offsets within `u32`. The scan stops at the first tree that does not
+    /// fit.
+    fn scan(&mut self, chunk: &[RegTree]) -> Option<u32> {
         let (mut deepest, mut nodes, mut values) = (0, 0, 0);
         for tree in chunk {
-            let depth = tree.depth();
-            if depth > MAX_DEPTH
-                || tree.size_leaf_vector() != self.width
-                || tree.has_categorical_splits()
-                || tree
-                    .nodes()
-                    .iter()
-                    .any(|n| !n.is_leaf() && n.split_feature > MAX_FEATURE)
-            {
+            if tree.size_leaf_vector() != self.width {
                 return None;
             }
-            deepest = deepest.max(depth);
+            deepest = deepest.max(depth_within(tree, 0, MAX_DEPTH)?);
+            let mut leaves = 0;
+            for node in tree.nodes() {
+                if node.is_leaf() {
+                    leaves += 1;
+                } else if node.is_categorical || node.split_feature > MAX_FEATURE {
+                    return None;
+                } else {
+                    self.features = self.features.max(node.split_feature as usize + 1);
+                }
+            }
             nodes += tree.num_nodes();
-            values += tree.num_leaves() * self.width;
+            values += leaves * self.width;
         }
         let slots = 1usize << deepest;
-        let complete = chunk.len() * ((slots - 1) * SPLIT_BYTES + slots * SLOT_BYTES);
+        let bytes = chunk.len() * ((slots - 1) * SPLIT_BYTES + slots * SLOT_BYTES);
         let offsets_fit =
             self.width == 1 || u32::try_from(self.leaf_vectors.len() + values).is_ok();
         // `deepest <= MAX_DEPTH`, so it fits.
-        (complete <= MAX_PADDING * nodes * size_of::<CNode>() && offsets_fit)
-            .then_some(deepest as u32)
+        (bytes <= MAX_PADDING * nodes * size_of::<CNode>() && offsets_fit).then_some(deepest as u32)
     }
 
     /// Lay out `chunk` as complete trees of depth `depth`.
@@ -362,18 +378,8 @@ impl<'a> RowWalk<'a> {
             row.len(),
             layout.features.saturating_sub(1)
         );
-        let mut inline = [MaybeUninit::<u32>::uninit(); INLINE_KEYS];
-        let keys = (2 * layout.features <= INLINE_KEYS).then(|| {
-            let keys = &mut inline[..2 * layout.features];
-            for (pair, &v) in keys.as_chunks_mut::<2>().0.iter_mut().zip(row) {
-                pair[0].write(key(v));
-                pair[1].write(key(-v));
-            }
-            // SAFETY: every element of `keys` was written just above
-            // (`layout.features <= row.len()` pairs), and `MaybeUninit<u32>`
-            // has `u32`'s layout.
-            unsafe { &*(std::ptr::from_ref::<[MaybeUninit<u32>]>(keys) as *const [u32]) }
-        });
+        let stack = range.len().saturating_mul(FEATURES_PER_TREE) >= layout.features;
+        let mut keys = RowKeys::<INLINE_KEYS>::new(row, layout.features, stack);
         let mut t = range.start;
         while t < range.end {
             let c = t / CHUNK;
@@ -386,10 +392,11 @@ impl<'a> RowWalk<'a> {
                     leaves,
                 } => {
                     let count = end - begin;
-                    let reached = match keys {
+                    let reached = match keys.get() {
                         // SAFETY: `slot < 2 * layout.features` (every complete
                         // slot, padding's `0` included: a padded chunk has a
-                        // split), the keyed length.
+                        // split), the keyed length (`layout.features <=
+                        // row.len()`, asserted above).
                         Some(keys) => layout.complete_leaves(depth, splits, count, |slot| unsafe {
                             *keys.get_unchecked(usize::from(slot))
                         }),
@@ -416,7 +423,7 @@ impl<'a> RowWalk<'a> {
                         end = (end + CHUNK).min(n_trees);
                     }
                     self.arena()
-                        .walk_row_keyed(row, keys, t..end.min(range.end), |tt, id| {
+                        .walk_row_keyed(&mut keys, t..end.min(range.end), |tt, id| {
                             sink(tt, Leaf::Arena(id));
                         });
                 }
@@ -429,6 +436,20 @@ impl<'a> RowWalk<'a> {
             t = end.min(range.end);
         }
     }
+}
+
+/// The depth (splits on the longest path) of the subtree under node `nid`
+/// of `tree`, when it is at most `limit`: [`RegTree::depth`] stopping past
+/// the limit, without a heap stack.
+fn depth_within(tree: &RegTree, nid: usize, limit: usize) -> Option<usize> {
+    let node = tree.node(nid);
+    if node.is_leaf() {
+        return Some(0);
+    }
+    let limit = limit.checked_sub(1)?;
+    let left = depth_within(tree, node.left as usize, limit)?;
+    let right = depth_within(tree, node.right as usize, limit)?;
+    Some(1 + left.max(right))
 }
 
 /// One tree's complete layout being written.
@@ -539,20 +560,27 @@ mod tests {
     }
 
     /// Ranges of a forest of `n` trees starting and ending at chunk
-    /// boundaries, off them, and empty.
+    /// boundaries, off them, a single tree (too few for the stack keys of a
+    /// model reading more than [`FEATURES_PER_TREE`] features), and empty.
     fn ranges(n: usize) -> Vec<Range<usize>> {
-        [0..n, 3..n, 0..n - 5, CHUNK + 1..2 * CHUNK + 3, 7..7, n..n]
-            .into_iter()
-            .map(|r| r.start.min(n)..r.end.min(n))
-            .collect()
+        [
+            0..n,
+            3..n,
+            0..n - 5,
+            CHUNK + 1..2 * CHUNK + 3,
+            2..3,
+            7..7,
+            n..n,
+        ]
+        .into_iter()
+        .map(|r| r.start.min(n)..r.end.min(n))
+        .collect()
     }
 
     /// The forest of `trees` and their arena (walk them with [`walk_of`]).
     fn layouts(trees: &[RegTree]) -> (RowForest, CompactForest) {
-        (
-            RowForest::from_trees(trees),
-            CompactForest::from_trees(trees),
-        )
+        let arena = CompactForest::from_trees(trees);
+        (RowForest::from_trees(trees, || &arena), arena)
     }
 
     fn walk_of<'a>(

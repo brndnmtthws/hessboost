@@ -49,6 +49,7 @@ pub(crate) use row::{RowForest, RowWalk};
 
 use crate::tree::oblivious::{ArenaNode, SymmetricTables};
 use crate::tree::{Node, RegTree, in_category_set, scalar_tree_output};
+use std::mem::MaybeUninit;
 
 /// Rows (or trees) walked in lockstep by the fixed-depth kernel.
 pub(crate) const LANES: usize = 16;
@@ -317,6 +318,59 @@ impl BreadthFirst {
 /// Keys (two per feature) [`CompactForest::walk_row`] keeps on the stack;
 /// a wider row is keyed value by value as the walk reads it.
 const INLINE_KEYS: usize = 256;
+
+/// One row's keys for a single-row walk: `[key(v), key(-v)]` for each of
+/// the row's first `features` features, made on the stack by the first
+/// [`Self::get`] (a walk that never reads them never makes them), when the
+/// walk asked for them and they fit in `N`. Without them, every step keys
+/// the value it reads, so a walk never allocates.
+pub(crate) struct RowKeys<'r, const N: usize> {
+    row: &'r [f32],
+    /// The number of keys (`2 * features`), or `None` for a walk that keys
+    /// each value as a step reads it.
+    len: Option<usize>,
+    made: bool,
+    keys: [MaybeUninit<u32>; N],
+}
+
+impl<'r, const N: usize> RowKeys<'r, N> {
+    /// The keys of `row`'s first `features` features (at most all of them),
+    /// made on the stack if `stack` and they fit in `N`.
+    #[inline(always)]
+    pub(crate) fn new(row: &'r [f32], features: usize, stack: bool) -> Self {
+        let len = 2 * features.min(row.len());
+        RowKeys {
+            row,
+            len: (stack && len <= N).then_some(len),
+            made: false,
+            keys: [MaybeUninit::uninit(); N],
+        }
+    }
+
+    /// The row the keys are of.
+    #[inline(always)]
+    pub(crate) fn row(&self) -> &'r [f32] {
+        self.row
+    }
+
+    /// The keys, made on the first call; `None` for a walk that keys each
+    /// value as a step reads it.
+    #[inline(always)]
+    pub(crate) fn get(&mut self) -> Option<&[u32]> {
+        let keys = &mut self.keys[..self.len?];
+        if !self.made {
+            for (pair, &v) in keys.as_chunks_mut::<2>().0.iter_mut().zip(self.row) {
+                pair[0].write(key(v));
+                pair[1].write(key(-v));
+            }
+            self.made = true;
+        }
+        // SAFETY: the first call wrote every element of `keys` (`len / 2`
+        // pairs, at most `row.len()` by `new`), and `MaybeUninit<u32>` has
+        // `u32`'s layout.
+        Some(unsafe { &*(std::ptr::from_ref::<[MaybeUninit<u32>]>(keys) as *const [u32]) })
+    }
+}
 
 /// A block of dense rows as the batch kernels consume it: the full
 /// [`LANES`]-row groups keyed lane-major (see [`fill_lanes`]) and the
@@ -944,9 +998,10 @@ impl CompactForest {
     /// with each tree's arena leaf id, in tree order. Trees are walked
     /// [`LANES`] at a time in lockstep, so a single instance still overlaps its
     /// dependent load chains (the batch kernel overlaps rows instead). A row
-    /// of up to `INLINE_KEYS / 2` features is keyed once on the stack,
-    /// `[feature][sign]`, so a node's slot maps to its key by a shift; a wider
-    /// row keys each value a step reads, so the walk never allocates.
+    /// of up to `INLINE_KEYS / 2` features walking a lockstep group is keyed
+    /// once on the stack, `[feature][sign]`, so a node's slot maps to its key
+    /// by a shift; a wider row keys each value a step reads, so the walk never
+    /// allocates.
     #[inline(always)]
     pub(crate) fn walk_row(
         &self,
@@ -954,31 +1009,22 @@ impl CompactForest {
         trees: std::ops::Range<usize>,
         sink: impl FnMut(usize, u32),
     ) {
-        let mut inline = [0u32; INLINE_KEYS];
-        let len = 2 * row.len();
-        // Only a lockstep group reads the keys.
-        let keys = (len <= INLINE_KEYS && trees.len() >= LANES).then(|| {
-            let keys = &mut inline[..len];
-            for (pair, &v) in keys.as_chunks_mut::<2>().0.iter_mut().zip(row) {
-                *pair = [key(v), key(-v)];
-            }
-            &*keys
-        });
-        self.walk_row_keyed(row, keys, trees, sink);
+        let mut keys = RowKeys::<INLINE_KEYS>::new(row, row.len(), trees.len() >= LANES);
+        self.walk_row_keyed(&mut keys, trees, sink);
     }
 
-    /// [`Self::walk_row`] given the row's keys: `keys`, when present, holds
-    /// `[key(v), key(-v)]` for the row's first `keys.len() / 2` features
-    /// (every feature a lockstep tree splits on, which the walk checks);
-    /// without them, a step keys the value it reads.
+    /// [`Self::walk_row`] of `keys`' row with those keys, which a lockstep
+    /// group reads (made on its first read) and which must cover every
+    /// feature its trees split on (the walk checks); without them, a step
+    /// keys the value it reads.
     #[inline(always)]
-    pub(crate) fn walk_row_keyed(
+    pub(crate) fn walk_row_keyed<const N: usize>(
         &self,
-        row: &[f32],
-        keys: Option<&[u32]>,
+        keys: &mut RowKeys<'_, N>,
         trees: std::ops::Range<usize>,
         mut sink: impl FnMut(usize, u32),
     ) {
+        let row = keys.row();
         assert!(trees.end <= self.trees.len());
         let begin = trees.start;
         let groups = trees.len() / LANES;
@@ -995,7 +1041,7 @@ impl CompactForest {
             for meta in group {
                 meta.check_width(row.len());
             }
-            let leaves = if let Some(keys) = keys {
+            let leaves = if let Some(keys) = keys.get() {
                 for meta in group {
                     meta.check_width(keys.len() / 2);
                 }

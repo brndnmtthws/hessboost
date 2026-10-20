@@ -381,15 +381,16 @@ trees in lockstep with the arena's compare and no child links
 (`2a + 1 + greater`). A tree of depth `D` takes `10 * 2^D - 6` bytes: 154
 for depth 4, against the arena's 496 for a full depth-4 tree; a chunk whose
 padding would exceed twice its arena bytes stays on the arena. Other chunks
-walk the model's arena (linear leaves: the trees) with the same row keys,
-made once on the stack up to 512 features and per step beyond, so the walk
-never allocates. Borrowed rows (`predict_rows`) fill the same blocks a dense
-matrix does, without building a matrix. 256-row blocks run in parallel,
-each block's sixteen-row groups stored feature-major
-(`[group][feature][lane]`); trees sum in order, bit-identical to
-sequential. Non-`NaN` sentinels scatter straight in; >4,096 sparse columns
-use per-lookup access. Categorical splits and depth-16+ trees take an
-early-exit walk.
+walk the model's arena (linear leaves: the trees) with the same row keys. A
+walk of at least one tree per eight features keys the row once on the stack
+(up to 512 features), when a step first reads a key; shorter walks and
+wider rows key each value a step reads, so the walk never allocates.
+Borrowed rows (`predict_rows`) fill the same blocks a dense matrix does,
+without building a matrix. 256-row blocks run in parallel, each block's
+sixteen-row groups stored feature-major (`[group][feature][lane]`); trees
+sum in order, bit-identical to sequential. Non-`NaN` sentinels scatter
+straight in; >4,096 sparse columns use per-lookup access. Categorical
+splits and depth-16+ trees take an early-exit walk.
 
 Symmetric trees skip the walk for full sixteen-row groups. Each level stores
 one `(slot, key)` compare plus a `2^depth` leaf table indexed by the

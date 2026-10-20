@@ -748,7 +748,7 @@ impl BoostedModel {
         let layout = self
             .layouts
             .rows
-            .get_or_init(|| RowForest::from_trees(&self.trees));
+            .get_or_init(|| RowForest::from_trees(&self.trees, || self.compact_forest()));
         let arena = layout.needs_arena().then(|| self.compact_forest());
         RowWalk::new(layout, &self.trees, arena)
     }

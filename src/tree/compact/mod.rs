@@ -357,18 +357,27 @@ impl<'r, const N: usize> RowKeys<'r, N> {
     /// value as a step reads it.
     #[inline(always)]
     pub(crate) fn get(&mut self) -> Option<&[u32]> {
-        let keys = &mut self.keys[..self.len?];
+        let len = self.len?;
         if !self.made {
-            for (pair, &v) in keys.as_chunks_mut::<2>().0.iter_mut().zip(self.row) {
-                pair[0].write(key(v));
-                pair[1].write(key(-v));
-            }
-            self.made = true;
+            self.make(len);
         }
-        // SAFETY: the first call wrote every element of `keys` (`len / 2`
-        // pairs, at most `row.len()` by `new`), and `MaybeUninit<u32>` has
-        // `u32`'s layout.
+        let keys = &self.keys[..len];
+        // SAFETY: `make` wrote every element of `keys`, and
+        // `MaybeUninit<u32>` has `u32`'s layout.
         Some(unsafe { &*(std::ptr::from_ref::<[MaybeUninit<u32>]>(keys) as *const [u32]) })
+    }
+
+    /// Write the first `len` keys: `len / 2` pairs, at most `row.len()`
+    /// (`new`). Once per walk, so kept out of the steps' code.
+    #[cold]
+    #[inline(never)]
+    fn make(&mut self, len: usize) {
+        let (pairs, _) = self.keys[..len].as_chunks_mut::<2>();
+        for (pair, &v) in pairs.iter_mut().zip(self.row) {
+            pair[0].write(key(v));
+            pair[1].write(key(-v));
+        }
+        self.made = true;
     }
 }
 

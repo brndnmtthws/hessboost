@@ -9,7 +9,7 @@ mod meta;
 pub(crate) mod quantile;
 mod rows;
 mod sketch;
-mod sort;
+pub(crate) mod sort;
 pub mod target_stats;
 
 pub use dmatrix::DMatrix;

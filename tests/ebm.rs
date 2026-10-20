@@ -1086,18 +1086,55 @@ fn eval_histories_are_identical_across_thread_counts() {
 /// fold's stages at a round of its own, is refused.
 #[test]
 fn cross_validation_early_stops_an_ebm() {
-    use hessboost::training::{CrossValidation, Fold};
-    let (_, data) = data(300, 36);
+    use hessboost::training::{CrossValidation, CvStopping, Fold, PurgedTail};
+    // Pure-noise labels, so the held-out error soon stops improving.
+    let (x, _) = data(300, 36);
+    let mut noise = lcg(5);
+    let y: Vec<f32> = (0..300).map(|_| noise()).collect();
+    let data = DMatrix::from_dense(&x, 300, 3)
+        .unwrap()
+        .with_labels(&y)
+        .unwrap();
     let params = two_bags();
     let folds = || Fold::k_fold(300, 3, 1).unwrap();
-    let results = CrossValidation::new(&params, &data, 6, folds())
-        .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
+    let report = CrossValidation::new(&params, &data, 40, folds())
+        .early_stopping(CvStopping::fold_mean(NonZeroUsize::new(2).unwrap()))
         .run()
         .unwrap();
-    let rmse = &results[0];
+    let rmse = &report.results[0];
     assert_eq!(rmse.metric, "rmse");
-    assert!((1..=12).contains(&rmse.rounds.len()));
+    let rounds = rmse.rounds.len();
+    let full = CrossValidation::new(&params, &data, 40, folds())
+        .run()
+        .unwrap()
+        .results[0]
+        .rounds
+        .len();
+    // Stopped early, so the margins come from the truncated folds.
+    assert!((1..full).contains(&rounds), "{rounds} of {full} rounds");
     assert!(rmse.rounds.iter().all(|round| round.mean.is_finite()));
+    // Each fold's margins are its EBM through the chosen EBM rounds, bit
+    // for bit the run stopped there (EBM iterations are trees, not rounds).
+    for (fold, report) in folds().iter().zip(&report.folds) {
+        let dtrain = data.select_rows(&fold.train).unwrap();
+        let dtest = data.select_rows(&fold.test).unwrap();
+        let mut completed = 0;
+        let model = Trainer::new(&params, &dtrain, 40)
+            .on_round(move |_| {
+                completed += 1;
+                if completed == rounds {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .train()
+            .unwrap()
+            .model;
+        assert_eq!(report.num_boost_round, rounds);
+        let expected = model.predict_margin(&dtest, Iterations::Best).unwrap();
+        assert_eq!(report.margins.as_slice(), expected.as_slice());
+    }
 
     let bag_stopping = classic_with(classic_ebm().outer_bags(2).early_stopping(stopping(2)))
         .build()
@@ -1105,4 +1142,12 @@ fn cross_validation_early_stops_an_ebm() {
     let cv = || CrossValidation::new(&bag_stopping, &data, 6, folds());
     assert_eq!(invalid_param(cv().run()), "ebm_early_stopping_rounds");
     assert_eq!(invalid_param(cv().refit()), "ebm_early_stopping_rounds");
+    // Per-fold stopping does not lift the refusal.
+    let at: Vec<i64> = (0..300).collect();
+    let tail = PurgedTail::new(&at, &at, 0.3).unwrap();
+    let per_fold = CvStopping::per_fold(NonZeroUsize::new(2).unwrap(), tail);
+    assert_eq!(
+        invalid_param(cv().early_stopping(per_fold).run()),
+        "ebm_early_stopping_rounds"
+    );
 }

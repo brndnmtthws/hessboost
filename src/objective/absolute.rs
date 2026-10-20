@@ -10,14 +10,39 @@ fn total_weight(weights: Option<&[f32]>, n_rows: usize) -> Option<f64> {
     if sum.abs() < 1e-6 { None } else { Some(sum) }
 }
 
+/// Rows whose terms [`row_order_sums`] forms together, so the square roots
+/// vectorize, before adding them to the sums one row at a time.
+const LANES: usize = 8;
+
+/// The `C` sums `Σᵢ f64(terms(i)[c])` over rows `0..n`, each added in row
+/// order from `-0.0` (where [`Iterator::sum`] starts), so each is bit for
+/// bit that row-order sum: the sums are separate chains, and only the terms
+/// (formed [`LANES`] rows at a time) leave row order.
+fn row_order_sums<const C: usize>(n: usize, terms: impl Fn(usize) -> [f32; C]) -> [f64; C] {
+    let mut sums = [-0.0f64; C];
+    let mut add = |row: [f32; C]| {
+        for (sum, term) in sums.iter_mut().zip(row) {
+            *sum += f64::from(term);
+        }
+    };
+    let full = n - n % LANES;
+    for start in (0..full).step_by(LANES) {
+        let block: [[f32; C]; LANES] = std::array::from_fn(|lane| terms(start + lane));
+        block.into_iter().for_each(&mut add);
+    }
+    (full..n).for_each(|i| add(terms(i)));
+    sums
+}
+
 /// XGBoost's per-output automatic residual scale, shared by the quantile and
 /// absolute-error objectives: `S_j = (Σᵢ wᵢ √|pᵢⱼ − yᵢⱼ| / Σᵢ wᵢ)²` for each of
 /// the `k` outputs of `preds` (`[row][output]`), where `label(i, j)` is the
 /// label output `j` of row `i` is fitted to. Each term `wᵢ √|r|` is formed in
-/// `f32` and summed in `f64` (XGBoost `common::Reduce`); a total weight
-/// within `1e-6` of zero (`common::CloseTo`) gives `S_j = 0`. Zero-weight
-/// rows are skipped (their term is `0`), so an overflowing residual there
-/// cannot turn the shared scale into `0 · ∞ = NaN`.
+/// `f32` and summed in `f64` in row order (XGBoost `common::Reduce`), as is
+/// the total weight (alongside output 0's terms); a total weight within
+/// `1e-6` of zero (`common::CloseTo`) gives `S_j = 0`. Zero-weight rows are
+/// skipped (their term is `0`), so an overflowing residual there cannot turn
+/// the shared scale into `0 · ∞ = NaN`.
 pub(super) fn residual_scales(
     preds: &[f32],
     weights: Option<&[f32]>,
@@ -25,20 +50,31 @@ pub(super) fn residual_scales(
     label: impl Fn(usize, usize) -> f32,
 ) -> Vec<f32> {
     let n = preds.len() / k;
-    let Some(sum_weight) = total_weight(weights, n) else {
-        return vec![0.0; k];
+    let term = |i: usize, j: usize, w: f32| {
+        if w == 0.0 {
+            0.0
+        } else {
+            w * (preds[i * k + j] - label(i, j)).abs().sqrt()
+        }
     };
-    (0..k)
-        .map(|j| {
-            let root_sum: f64 = (0..n)
-                .map(|i| {
-                    let w = weights.map_or(1.0, |ws| ws[i]);
-                    if w == 0.0 {
-                        return 0.0;
-                    }
-                    f64::from(w * (preds[i * k + j] - label(i, j)).abs().sqrt())
-                })
-                .sum();
+    let mut sum_weight = n as f64;
+    let root_sums: Vec<f64> = (0..k)
+        .map(|j| match weights {
+            None => row_order_sums(n, |i| [term(i, j, 1.0)])[0],
+            Some(ws) if j == 0 => {
+                let [root, total] = row_order_sums(n, |i| [term(i, 0, ws[i]), ws[i]]);
+                sum_weight = total;
+                root
+            }
+            Some(ws) => row_order_sums(n, |i| [term(i, j, ws[i])])[0],
+        })
+        .collect();
+    if sum_weight.abs() < 1e-6 {
+        return vec![0.0; k];
+    }
+    root_sums
+        .into_iter()
+        .map(|root_sum| {
             let root_mean = root_sum / sum_weight;
             (root_mean * root_mean) as f32
         })

@@ -47,11 +47,12 @@ use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
 use crate::tree::gain::{GradStats, RegParams, threshold_l1};
-use crate::tree::hist::feature_slices;
+use crate::tree::hist::{BinIndex, feature_slices};
 use crate::tree::sampler::{ColumnSampler, FeatureSet};
 use crate::tree::{ChildLeaf, RegTree};
 use rayon::prelude::*;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 /// XGBoost's `Driver` batch size: at most this many nodes of one depth-wise
 /// level are expanded together.
@@ -60,8 +61,16 @@ const MAX_NODE_BATCH: usize = 256;
 /// Nodes with at least this many rows search their features in parallel.
 const PARALLEL_EVALUATE_ROWS: usize = 16_384;
 
-/// Row-feature entries at which a dense histogram is built feature-parallel.
-const PARALLEL_HIST_ENTRIES: usize = 65_536;
+/// Row-feature entries (rows times pool features) from which a node's
+/// histogram may be swept feature by feature from the index's feature-major
+/// copy, rather than built row by row through its CSR bins
+/// ([`NodeHistograms::sweep_pays`] decides).
+const FEATURE_SWEEP_ENTRIES: usize = 65_536;
+
+/// Most pool features one task of the feature sweep visits together: each
+/// pass over the node's rows reads a row's split gradients once for all of
+/// them. Tasks take fewer when that keeps the node's threads busy.
+const FEATURES_PER_TASK: usize = 4;
 
 /// The gradients one vector-leaf tree is grown from, row-major
 /// `[row][target]`.
@@ -182,11 +191,24 @@ struct Expanded {
     child_valid: bool,
 }
 
+/// Builds the `[bin][target]` split-gradient histograms of one tree's nodes.
+struct NodeHistograms<'g> {
+    ghist: &'g GHistIndex,
+    /// Split gradients, `n_split` pairs per row.
+    split: &'g [GradPair],
+    n_split: usize,
+    /// The tree's feature pool ([`ColumnSampler::tree_features`]): every
+    /// node's split search scans a subset of it, so its bins are the only
+    /// ones a histogram needs.
+    pool: Arc<[u32]>,
+}
+
 /// Mutable state of one tree's growth.
 struct Grow<'g, 'a> {
     b: &'g MultiTreeBuilder<'a>,
     ghist: &'g GHistIndex,
     grad: &'g VectorGradients<'g>,
+    hists: NodeHistograms<'g>,
     tree: RegTree,
     /// `[node][split target]` statistics.
     stats: Vec<GradStats>,
@@ -238,6 +260,12 @@ impl<'a> MultiTreeBuilder<'a> {
             b: self,
             ghist,
             grad,
+            hists: NodeHistograms {
+                ghist,
+                split: grad.split,
+                n_split: s,
+                pool: sampler.tree_features(),
+            },
             tree: RegTree::with_vector_root(grad.n_outputs, root_hess),
             stats: root.clone(),
             gain: Vec::new(),
@@ -251,7 +279,7 @@ impl<'a> MultiTreeBuilder<'a> {
         grow.gain.push(self.gain_given_weights(&root, &root_weight));
         grow.weights.extend_from_slice(&root_weight);
 
-        let root_hist = grow.build_hist(rows);
+        let root_hist = grow.hists.build(rows, rayon::current_num_threads());
         let features = sampler.sample(0);
         let best = grow.evaluate(0, &root_hist, &features, None, rows.len());
         let mut queue = vec![Entry {
@@ -276,6 +304,118 @@ impl<'a> MultiTreeBuilder<'a> {
         stats.iter().zip(weights).fold(0.0, |gain, (st, &w)| {
             gain + xgb_gain_given_weight(*st, &self.config.reg, w)
         })
+    }
+}
+
+impl NodeHistograms<'_> {
+    /// The histogram of `rows` (ascending), built on up to `threads` threads
+    /// (the node's share of the pool alongside the nodes built with it).
+    /// Every bin adds its rows in ascending order, by rows or by features
+    /// alike, so neither the layout nor `threads` changes a bit. Only the
+    /// bins of the pool's features are read; the feature sweep leaves the
+    /// others zero.
+    fn build(&self, rows: &[u32], threads: usize) -> Vec<GradStats> {
+        let ghist = self.ghist;
+        let mut hist = vec![GradStats::default(); ghist.total_bins() * self.n_split];
+        let sweep = rows.len().saturating_mul(self.pool.len()) >= FEATURE_SWEEP_ENTRIES
+            && self.sweep_pays(threads);
+        match (ghist.column_bins(), ghist.missing_columns()) {
+            (Some(columns), _) if sweep => {
+                self.by_features::<false>(&columns, rows, threads, &mut hist);
+            }
+            (_, Some(columns)) if sweep => {
+                self.by_features::<true>(&columns, rows, threads, &mut hist);
+            }
+            _ => self.by_rows(rows, &mut hist),
+        }
+        hist
+    }
+
+    /// Whether sweeping a node on `threads` threads costs less than building
+    /// it by rows on one. Per row, the sweep reads an entry per pool feature,
+    /// missing ones too, each costing about 3/2 of a CSR entry (a column read
+    /// apiece, where a CSR row is contiguous), split over the threads; the
+    /// CSR loop reads the row's stored entries, the index's mean. So one
+    /// thread sweeps only pools under two thirds of a row's stored entries.
+    /// The 3/2 fits timings of depth-4 and depth-8 trees over dense and
+    /// 40%-missing indexes.
+    fn sweep_pays(&self, threads: usize) -> bool {
+        let stored = self.ghist.row_ptr().last().copied().unwrap_or(0);
+        let swept = self.pool.len().saturating_mul(self.ghist.n_rows());
+        swept.saturating_mul(3) < stored.saturating_mul(2).saturating_mul(threads)
+    }
+
+    /// [`Self::build`] by feature: tasks of one to [`FEATURES_PER_TASK`] pool
+    /// features, as few as keep `threads` threads busy, sweep their
+    /// feature-major `columns` into their disjoint slices of `hist`. `SPARSE`
+    /// columns hold [`BinIndex::MISSING`] where a row lacks the feature
+    /// ([`GHistIndex::missing_columns`]).
+    fn by_features<const SPARSE: bool>(
+        &self,
+        columns: &Bins<'_>,
+        rows: &[u32],
+        threads: usize,
+        hist: &mut [GradStats],
+    ) {
+        let (s, gp) = (self.n_split, self.split);
+        let n_rows = self.ghist.n_rows();
+        let mut features = feature_slices(self.ghist, hist, s);
+        let mut slices: Vec<PoolSlice<'_>> = self
+            .pool
+            .iter()
+            .map(|&f| {
+                let (first, slice) = &mut features[f as usize];
+                PoolSlice {
+                    feature: f as usize,
+                    first: *first,
+                    slice: std::mem::take(slice),
+                }
+            })
+            .collect();
+        let per_task = self
+            .pool
+            .len()
+            .div_ceil(threads)
+            .clamp(1, FEATURES_PER_TASK);
+        slices
+            .par_chunks_mut(per_task)
+            .for_each(|group| match columns {
+                Bins::U16(c) => sweep_group::<SPARSE, _>(c, n_rows, group, rows, gp, s),
+                Bins::U32(c) => sweep_group::<SPARSE, _>(c, n_rows, group, rows, gp, s),
+            });
+    }
+
+    /// [`Self::build`] row by row over the CSR bins, every feature's.
+    fn by_rows(&self, rows: &[u32], hist: &mut [GradStats]) {
+        let (s, gp) = (self.n_split, self.split);
+        let row_ptr = self.ghist.row_ptr();
+        let mut accumulate = |bins: &mut dyn Iterator<Item = usize>, g: &[GradPair]| {
+            for b in bins {
+                add_pairs(&mut hist[b * s..(b + 1) * s], g);
+            }
+        };
+        match self.ghist.bins() {
+            Bins::U16(bins) => {
+                for &r in rows {
+                    let r = r as usize;
+                    accumulate(
+                        &mut bins[row_ptr[r]..row_ptr[r + 1]]
+                            .iter()
+                            .map(|&b| usize::from(b)),
+                        &gp[r * s..][..s],
+                    );
+                }
+            }
+            Bins::U32(bins) => {
+                for &r in rows {
+                    let r = r as usize;
+                    accumulate(
+                        &mut bins[row_ptr[r]..row_ptr[r + 1]].iter().map(|&b| b as usize),
+                        &gp[r * s..][..s],
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -368,72 +508,6 @@ impl Grow<'_, '_> {
     fn node_stats(&self, nid: usize) -> &[GradStats] {
         let s = self.n_split();
         &self.stats[nid * s..(nid + 1) * s]
-    }
-
-    /// The `[bin][target]` split-gradient histogram of `rows`. Every bin adds
-    /// its rows in ascending order, serially or feature-parallel alike.
-    fn build_hist(&self, rows: &[u32]) -> Vec<GradStats> {
-        let s = self.n_split();
-        let ghist = self.ghist;
-        let gp = self.grad.split;
-        let mut hist = vec![GradStats::default(); ghist.total_bins() * s];
-        let add = |slot: &mut [GradStats], g: &[GradPair]| {
-            for (h, p) in slot.iter_mut().zip(g) {
-                h.grad += f64::from(p.grad);
-                h.hess += f64::from(p.hess);
-            }
-        };
-        if let Some(columns) = ghist.column_bins()
-            && rows.len().saturating_mul(ghist.n_cols()) >= PARALLEL_HIST_ENTRIES
-            && rayon_available()
-        {
-            let n_rows = ghist.n_rows();
-            feature_slices(ghist, &mut hist, s)
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(f, (fs, slice))| {
-                    let column = |r: u32| -> usize {
-                        match &columns {
-                            Bins::U16(c) => usize::from(c[f * n_rows + r as usize]),
-                            Bins::U32(c) => c[f * n_rows + r as usize] as usize,
-                        }
-                    };
-                    for &r in rows {
-                        let b = column(r) - fs;
-                        add(&mut slice[b * s..(b + 1) * s], &gp[r as usize * s..][..s]);
-                    }
-                });
-            return hist;
-        }
-        let row_ptr = ghist.row_ptr();
-        let mut accumulate = |bins: &mut dyn Iterator<Item = usize>, g: &[GradPair]| {
-            for b in bins {
-                add(&mut hist[b * s..(b + 1) * s], g);
-            }
-        };
-        match ghist.bins() {
-            Bins::U16(bins) => {
-                for &r in rows {
-                    let r = r as usize;
-                    accumulate(
-                        &mut bins[row_ptr[r]..row_ptr[r + 1]]
-                            .iter()
-                            .map(|&b| usize::from(b)),
-                        &gp[r * s..][..s],
-                    );
-                }
-            }
-            Bins::U32(bins) => {
-                for &r in rows {
-                    let r = r as usize;
-                    accumulate(
-                        &mut bins[row_ptr[r]..row_ptr[r + 1]].iter().map(|&b| b as usize),
-                        &gp[r * s..][..s],
-                    );
-                }
-            }
-        }
-        hist
     }
 
     /// XGBoost's `EvaluateSplits` for one node: the best candidate over
@@ -799,8 +873,9 @@ impl Grow<'_, '_> {
     /// subtraction) and split searches of one expanded node, as XGBoost's
     /// `AssignNodes` + `BuildHistLeftRight` + `EvaluateSplits`. `features`
     /// are sampled in XGBoost's child order (left, then right); the children
-    /// are returned in the same order.
-    fn children(&self, e: Expanded, features: [FeatureSet; 2]) -> [Entry; 2] {
+    /// are returned in the same order. The built histogram may keep `threads`
+    /// threads busy.
+    fn children(&self, e: Expanded, features: [FeatureSet; 2], threads: usize) -> [Entry; 2] {
         let Expanded {
             entry,
             children: (xl, xr),
@@ -813,7 +888,9 @@ impl Grow<'_, '_> {
         // XGBoost builds the child with the smaller summed Hessian (the left
         // one on ties, or when either sum is NaN).
         let build_right = right_hess < left_hess;
-        let built = self.build_hist(if build_right { &rows_r } else { &rows_l });
+        let built = self
+            .hists
+            .build(if build_right { &rows_r } else { &rows_l }, threads);
         let (hist_l, hist_r) = with_sibling(entry.hist, built, !build_right);
         let allowed = self
             .b
@@ -933,14 +1010,26 @@ impl Grow<'_, '_> {
                     self.record_leaf(xr, rr);
                 }
             }
+            // Each node's share of the threads, by its rows (at least one).
+            let threads = rayon::current_num_threads();
+            let level_rows: usize = work
+                .iter()
+                .map(|(e, _)| e.rows.0.len() + e.rows.1.len())
+                .sum();
+            let share = |e: &Expanded| {
+                let rows = e.rows.0.len() + e.rows.1.len();
+                (threads.saturating_mul(rows) / level_rows.max(1)).max(1)
+            };
             let parallel = work.len() > 1 && rayon_available();
             let this = &*self;
+            let grow = |(e, f): (Expanded, [FeatureSet; 2])| {
+                let threads = share(&e);
+                this.children(e, f, threads)
+            };
             let children: Vec<[Entry; 2]> = if parallel {
-                work.into_par_iter()
-                    .map(|(e, f)| this.children(e, f))
-                    .collect()
+                work.into_par_iter().map(grow).collect()
             } else {
-                work.into_iter().map(|(e, f)| this.children(e, f)).collect()
+                work.into_iter().map(grow).collect()
             };
             for child in children.into_iter().flatten() {
                 if child.best.loss_chg > K_RT_EPS_F32 {
@@ -988,6 +1077,78 @@ impl Grow<'_, '_> {
             }
         }
         (self.tree, self.leaf_rows)
+    }
+}
+
+/// Add one row's split gradients `g` to a bin's `[target]` statistics.
+#[inline(always)]
+fn add_pairs(slot: &mut [GradStats], g: &[GradPair]) {
+    for (h, p) in slot.iter_mut().zip(g) {
+        h.grad += f64::from(p.grad);
+        h.hess += f64::from(p.hess);
+    }
+}
+
+/// A pool feature's share of a feature sweep: its `[bin][target]` slice of
+/// the histogram, whose first global bin is `first`.
+struct PoolSlice<'h> {
+    feature: usize,
+    first: usize,
+    slice: &'h mut [GradStats],
+}
+
+/// Sweep `rows` into the one to [`FEATURES_PER_TASK`] pool features of
+/// `group` in one pass, their feature-major columns of `n_rows` global bins
+/// each in `columns`.
+fn sweep_group<const SPARSE: bool, B: BinIndex>(
+    columns: &[B],
+    n_rows: usize,
+    group: &mut [PoolSlice<'_>],
+    rows: &[u32],
+    gp: &[GradPair],
+    s: usize,
+) {
+    let column = |feature: usize| &columns[feature * n_rows..][..n_rows];
+    match group {
+        [a] => sweep::<1, SPARSE, B>([a.feature].map(column), [a], rows, gp, s),
+        [a, b] => sweep::<2, SPARSE, B>([a.feature, b.feature].map(column), [a, b], rows, gp, s),
+        [a, b, c] => {
+            let columns = [a.feature, b.feature, c.feature].map(column);
+            sweep::<3, SPARSE, B>(columns, [a, b, c], rows, gp, s);
+        }
+        [a, b, c, d] => {
+            let columns = [a.feature, b.feature, c.feature, d.feature].map(column);
+            sweep::<4, SPARSE, B>(columns, [a, b, c, d], rows, gp, s);
+        }
+        _ => unreachable!("tasks hold one to four features"),
+    }
+}
+
+/// Add each of `rows` (ascending, so every bin's chain is in row order) to
+/// its bin in each of the `K` features, reading the row's `s` split
+/// gradients once for all of them. The `K` bins of a row belong to different
+/// features, so every load can be issued before any store. A `SPARSE`
+/// column's [`BinIndex::MISSING`] adds nothing.
+#[inline(always)]
+fn sweep<const K: usize, const SPARSE: bool, B: BinIndex>(
+    columns: [&[B]; K],
+    features: [&mut PoolSlice<'_>; K],
+    rows: &[u32],
+    gp: &[GradPair],
+    s: usize,
+) {
+    let mut slices = features.map(|f| (f.first, &mut *f.slice));
+    for &r in rows {
+        let r = r as usize;
+        let g = &gp[r * s..][..s];
+        for (column, (first, slice)) in columns.iter().zip(&mut slices) {
+            let bin = column[r];
+            if SPARSE && bin == B::MISSING {
+                continue;
+            }
+            let at = (bin.index() - *first) * s;
+            add_pairs(&mut slice[at..at + s], g);
+        }
     }
 }
 
@@ -1174,5 +1335,91 @@ mod tests {
         let (tree, leaves) = build(&params, &ghist, &g, 2, None, 2);
         assert_eq!(tree.num_leaves(), 3);
         assert_eq!(leaves.len(), 3);
+    }
+
+    /// The feature sweep (feature-major columns, a sparse index's missing
+    /// entries skipped, only the tree's sampled pool) holds the CSR row
+    /// build's bits in every pool bin, on dense and sparse indexes of both bin
+    /// widths, wherever it pays at 1, 2, 4 and 16 threads (tasks of one to
+    /// four of the narrow pool's five features, four of the wide one's), and
+    /// every thread count grows the same tree.
+    #[test]
+    fn feature_sweep_matches_the_row_build() {
+        let s = 3;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut uniform = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let params = TrainingParams::builder().max_depth(4).build().unwrap();
+        // 16-bit bins, and 32-bit ones (300 features of up to 256 bins), each
+        // with a pool large enough to be swept.
+        for (n, cols, pool, wide) in [
+            (40_000, 8, vec![1, 2, 5, 6, 7], false),
+            (1_000, 300, (0..300).step_by(2).collect(), true),
+        ] {
+            let pool: Arc<[u32]> = Arc::from(pool);
+            // Gradients spanning 40 binary orders of magnitude, so their `f64`
+            // sums round and any reordering shows.
+            let g: Vec<GradPair> = (0..s * n)
+                .map(|_| {
+                    let scale = 2f32.powi((uniform() * 40.0) as i32 - 30);
+                    GradPair::new((uniform() - 0.4) * scale, 0.1 + uniform())
+                })
+                .collect();
+            let values: Vec<f32> = (0..n * cols).map(|_| uniform()).collect();
+            // Two of every three rows, so the subset is not contiguous.
+            let rows: Vec<u32> = (0..n as u32).filter(|r| r % 3 != 1).collect();
+            for missing in [0.0, 0.4] {
+                let x: Vec<f32> = values
+                    .iter()
+                    .map(|&v| if uniform() < missing { f32::NAN } else { v })
+                    .collect();
+                let ghist = binned(&x, n, cols);
+                assert_eq!(ghist.missing_columns().is_some(), missing > 0.0);
+                assert_eq!(matches!(ghist.bins(), Bins::U32(_)), wide);
+                let hists = NodeHistograms {
+                    ghist: &ghist,
+                    split: &g,
+                    n_split: s,
+                    pool: Arc::clone(&pool),
+                };
+                let pool_bins = |hist: &[GradStats]| -> Vec<(u64, u64)> {
+                    pool.iter()
+                        .flat_map(|&f| {
+                            let (fs, fe) = ghist.cuts().feature_bins(f as usize);
+                            hist[fs * s..fe * s].to_vec()
+                        })
+                        .map(|st| (st.grad.to_bits(), st.hess.to_bits()))
+                        .collect()
+                };
+                let mut by_rows = vec![GradStats::default(); ghist.total_bins() * s];
+                hists.by_rows(&rows, &mut by_rows);
+                let serial = pool_bins(&by_rows);
+                let grad = VectorGradients {
+                    split: &g,
+                    n_split: s,
+                    value: None,
+                    n_outputs: s,
+                };
+                let mut trees = Vec::new();
+                for threads in [1, 2, 4, 16] {
+                    let workers = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let swept = workers.install(|| pool_bins(&hists.build(&rows, threads)));
+                    assert_eq!(swept, serial);
+                    let mut sampler = ColumnSampler::new(cols, None, 0.5, 1.0, 1.0, 7);
+                    let (tree, _) = workers.install(|| {
+                        MultiTreeBuilder::new(&params).build(&ghist, &grad, &rows, &mut sampler)
+                    });
+                    trees.push(serde_json::to_string(&tree).unwrap());
+                }
+                assert!(trees.iter().all(|t| *t == trees[0]));
+            }
+        }
     }
 }

@@ -171,6 +171,13 @@ impl ColumnSampler {
             .then(|| FeatureSet::Shared(Arc::clone(&self.tree)))
     }
 
+    /// The tree's `bytree` pool, ascending. Every set [`Self::sample`]
+    /// returns is a subset of it, so a builder that only ever scans sampled
+    /// features needs histograms of these features alone.
+    pub(crate) fn tree_features(&self) -> Arc<[u32]> {
+        Arc::clone(&self.tree)
+    }
+
     /// The per-tree seed this sampler was built with. Other per-tree random
     /// streams (the `extra_trees` threshold draws) derive from it so they vary
     /// across rounds and outputs without consuming this sampler's draws.

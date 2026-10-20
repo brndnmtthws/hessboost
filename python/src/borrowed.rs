@@ -18,10 +18,13 @@
 //! read-only view of a live array, which its owner can still write), a base
 //! that is neither an array nor a buffer the buffer protocol reports as
 //! read-only (an object exposing only an array interface, as `as_strided`
-//! builds, or a capsule: either may hide writeable memory), and a buffer
-//! another extension holds a `PyReadwriteArray` of (rust-numpy's shared
-//! borrow, keyed on the array's base, taken and released by `new`). Past
-//! that, the choice of `copy=False` is the caller's promise, as documented.
+//! builds, or a capsule: either may hide writeable memory), a memory view
+//! without an exporter (`ctypes.memoryview_at`'s, or a C extension's
+//! `PyMemoryView_FromMemory`), which keeps no owner of its memory alive,
+//! and a buffer another extension holds a `PyReadwriteArray` of
+//! (rust-numpy's shared borrow, keyed on the array's base, taken and
+//! released by `new`). Past that, the choice of `copy=False` is the
+//! caller's promise, as documented.
 //!
 //! What numpy can enforce, the borrow does: `resize(refcheck=False)`, which
 //! reallocates (and frees) an owning array's buffer whatever references it,
@@ -93,10 +96,11 @@ impl BorrowedArray {
 /// something it is a view of can still write the buffer, or may: a view's
 /// own flag can be cleared while its base stays writeable, and the base's
 /// owner could then change the values a matrix reads. A memory view's `obj`
-/// is the buffer's owner (a view without one owns it), and an array over one
-/// has the view as its base; a non-array owner (a memory map, `bytes`, ...)
-/// is asked through the buffer protocol. (numpy lets any flag be set again
-/// afterwards; past this, `copy=False` is the caller's promise.)
+/// is the buffer's owner, and an array over one has the view as its base; a
+/// view without one keeps nothing alive that owns the memory, so it is
+/// refused. A non-array owner (a memory map, `bytes`, ...) is asked through
+/// the buffer protocol. (numpy lets any flag be set again afterwards; past
+/// this, `copy=False` is the caller's promise.)
 fn read_only_chain<'py>(array: &Bound<'py, PyArray2<f32>>) -> PyResult<Vec<Bound<'py, PyAny>>> {
     let mut chain = vec![array.clone().into_any()];
     for _ in 0..64 {
@@ -109,10 +113,13 @@ fn read_only_chain<'py>(array: &Bound<'py, PyArray2<f32>>) -> PyResult<Vec<Bound
             Ok(view) => {
                 let exporter = view.getattr("obj")?;
                 if exporter.is_none() {
-                    view.into_any()
-                } else {
-                    exporter
+                    return Err(refuse(
+                        "copy=False cannot borrow memory no Python object owns (data views a \
+                         memory view without an exporter, such as ctypes.memoryview_at's), \
+                         which could be freed under the matrix: pass copy=True",
+                    ));
                 }
+                exporter
             }
             Err(base) => base.into_inner(),
         };

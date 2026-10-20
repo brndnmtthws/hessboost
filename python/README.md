@@ -604,7 +604,11 @@ Every hessboost training option (`path_smooth`, `extra_trees`,
 `pos_bagging_fraction`, `neg_bagging_fraction`, `bagging_by_query`, the
 `dist:*` objectives and their `dist_gradient`, `rank:xendcg`, ...) is a
 `params` key. XE-NDCG's keyed per-round random stream differs from
-LightGBM's `rank_xendcg` stream.
+LightGBM's `rank_xendcg` stream. `leaf_estimation_method="exact"` sets every
+leaf of a `reg:quantileerror` or `reg:absoluteerror` model to the exact
+residual quantile (median) of the training rows it holds instead of the
+smooth surrogate's Newton step; the scikit-learn estimators also take it as
+a constructor parameter.
 
 ## Differences from XGBoost's Python package
 

@@ -1,5 +1,6 @@
 //! Float sort keys and the stable LSD radix sort shared by cut
-//! construction (`quantile`) and the weighted quantile sketch (`sketch`).
+//! construction (`quantile`), the weighted quantile sketch (`sketch`), and
+//! exact quantile leaves (`training::exact_leaves`).
 
 /// Below this length the comparison sort beats the radix passes' fixed cost.
 const RADIX_MIN_LEN: usize = 2048;
@@ -9,7 +10,7 @@ const RADIX_BUCKETS: usize = 1 << RADIX_BITS;
 /// Monotone map from `f32` to `u32` under [`f32::total_cmp`] order:
 /// negative values reverse all bits, others set the sign bit.
 #[inline]
-pub(super) fn sort_key(value: f32) -> u32 {
+pub(crate) fn sort_key(value: f32) -> u32 {
     let bits = value.to_bits();
     if bits & 0x8000_0000 != 0 {
         !bits
@@ -30,7 +31,7 @@ pub(super) fn unsort_key(key: u32) -> f32 {
 
 /// Buffers [`radix_sort`] reuses across calls.
 #[derive(Default)]
-pub(super) struct RadixScratch<T> {
+pub(crate) struct RadixScratch<T> {
     spare: Vec<T>,
     /// Bucket counts of the three passes, `3 × RADIX_BUCKETS`.
     counts: Vec<u32>,
@@ -40,7 +41,7 @@ pub(super) struct RadixScratch<T> {
 /// digits; a digit every key shares is skipped), ascending in the key's
 /// unsigned order. Inputs of `2^32` items or more (beyond the `u32` bucket
 /// counts) take a comparison sort by the same key instead.
-pub(super) fn radix_sort<T: Copy + Default>(
+pub(crate) fn radix_sort<T: Copy + Default>(
     items: &mut Vec<T>,
     scratch: &mut RadixScratch<T>,
     key: impl Fn(&T) -> u32,
@@ -111,11 +112,26 @@ pub(super) fn radix_sort<T: Copy + Default>(
 /// construction, so long inputs use [`radix_sort`] on [`sort_key`]
 /// (identical order to `sort_unstable_by(f32::total_cmp)`), with `scratch`
 /// reused across columns.
-pub(super) fn sort_values(values: &mut Vec<f32>, scratch: &mut RadixScratch<f32>) {
+pub(crate) fn sort_values(values: &mut Vec<f32>, scratch: &mut RadixScratch<f32>) {
     if values.len() < RADIX_MIN_LEN {
         values.sort_unstable_by(f32::total_cmp);
     } else {
         radix_sort(values, scratch, |&v| sort_key(v));
+    }
+}
+
+/// Sort `items` stably, ascending by `value` in total order (ties keep their
+/// order): [`radix_sort`] on [`sort_key`] for long inputs, a stable
+/// comparison sort by the same key below [`RADIX_MIN_LEN`].
+pub(crate) fn sort_by_value<T: Copy + Default>(
+    items: &mut Vec<T>,
+    scratch: &mut RadixScratch<T>,
+    value: impl Fn(&T) -> f32,
+) {
+    if items.len() < RADIX_MIN_LEN {
+        items.sort_by_key(|item| sort_key(value(item)));
+    } else {
+        radix_sort(items, scratch, |item| sort_key(value(item)));
     }
 }
 

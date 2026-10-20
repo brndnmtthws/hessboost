@@ -4,6 +4,7 @@
 //! gradients supplied by the objective ([`Loss::split_gradient`]).
 
 use super::dart::{dart_new_tree_weight, finish_dart, round_gradients};
+use super::exact_leaves::route_rows;
 use super::margins::{MarginCaches, TreeOutput};
 use super::prepare::TrainContext;
 use super::round::tree_eta;
@@ -146,14 +147,16 @@ pub(super) fn boost_round(
     let row_subsets = iteration_row_subsets(params, false, ctx.run.rows, ctx.all_rows, &mut rng);
     for p in 0..params.num_parallel_tree {
         let rows = row_subsets.rows(p);
-        let (tree, leaf_rows) = fit_tree(ctx, &grads, &mut rng, rows)?;
+        let (tree, leaf_rows) = fit_tree(ctx, &grads, &mut rng, rows, &margins.train)?;
         // A dropout round's gradients come from the ensemble, not the margin
         // caches, which `finish_dart` recomputes.
         if dropped.is_none() {
             // Leaf row lists identify every training row's leaf when all
-            // rows took part in growing the tree.
-            let captured =
-                (rows.len() == n && !gradient_sampling(params)).then_some(leaf_rows.as_slice());
+            // rows took part in growing the tree, or exact leaves routed
+            // them all.
+            let all_rows =
+                ctx.run.exact_leaves.is_some() || (rows.len() == n && !gradient_sampling(params));
+            let captured = all_rows.then_some(leaf_rows.as_slice());
             margins.add_tree(&tree, TreeOutput::Vector, captured);
         }
         model.push_tree_weighted(tree, weight);
@@ -178,15 +181,18 @@ struct IterationGradients<'a> {
 
 /// Grow one vector-leaf tree: gradient-based row sampling (on the split
 /// gradients, replayed on the value gradients), the tree's column sampler,
-/// the build, and `eta / num_parallel_tree` shrinkage of every leaf vector.
-/// Under SGLB the structure grows on the noisy gradients and the leaf
-/// vectors are re-estimated from `gpair` (validation guarantees
-/// `num_parallel_tree = 1` and no gradient-based sampling then).
+/// the build, exact leaves at the training `margins` when configured, and
+/// `eta / num_parallel_tree` shrinkage of every leaf vector. Under SGLB the
+/// structure grows on the noisy gradients and the leaf vectors are
+/// re-estimated from `gpair` (validation guarantees `num_parallel_tree = 1`
+/// and no gradient-based sampling then). With exact leaves the returned rows
+/// are every training row's leaf.
 fn fit_tree(
     ctx: &VectorRound,
     grads: &IterationGradients,
     rng: &mut Rng,
     rows: &[u32],
+    margins: &[f32],
 ) -> Result<(RegTree, Vec<LeafRows>)> {
     let params = ctx.run.params;
     let IterationGradients {
@@ -218,8 +224,12 @@ fn fit_tree(
         value,
         n_outputs: n_out,
     };
-    let (mut tree, leaf_rows) =
+    let (mut tree, mut leaf_rows) =
         MultiTreeBuilder::new(params).build(ctx.ghist, &grad, rows, &mut sampler);
+    if let Some(exact) = ctx.run.exact_leaves {
+        leaf_rows = route_rows(&tree, ctx.run.dtrain);
+        exact.fit(&mut tree, TreeOutput::Vector, &leaf_rows, margins);
+    }
     if let Some(langevin) = ctx.run.langevin {
         let at = LeafRenewal {
             data: ctx.run.dtrain,

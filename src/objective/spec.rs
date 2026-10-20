@@ -48,10 +48,14 @@ pub enum Objective {
     /// `reg:pseudohubererror`: the pseudo-Huber loss.
     PseudoHuber(PseudoHuber),
     /// `reg:absoluteerror`: absolute error, trained on a smooth pseudo-Huber
-    /// surrogate with ordinary Newton leaves.
+    /// surrogate with Newton leaves, or with each leaf the median residual
+    /// of its rows under
+    /// [`LeafEstimation::Exact`](crate::config::LeafEstimation::Exact).
     AbsoluteError,
     /// `reg:quantileerror`: one output per quantile, trained on a smooth
-    /// pinball surrogate with ordinary Newton leaves.
+    /// pinball surrogate with Newton leaves, or with each leaf the residual
+    /// quantile of its rows under
+    /// [`LeafEstimation::Exact`](crate::config::LeafEstimation::Exact).
     Quantile(Quantiles),
     /// `reg:expectileerror`: one output per expectile.
     Expectile(Expectiles),
@@ -165,6 +169,18 @@ pub(crate) enum LabelMatrix {
     Native,
     /// One target per row only.
     Refused,
+}
+
+/// The residual quantiles an objective's exact leaves take
+/// ([`LeafEstimation::Exact`](crate::config::LeafEstimation::Exact)).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LeafQuantiles<'a> {
+    /// `reg:quantileerror`: output `j` at level `alpha[j]`, every output's
+    /// residuals against the one label column.
+    Levels(&'a Quantiles),
+    /// `reg:absoluteerror`: every output the median of its residuals against
+    /// its own label column.
+    Medians,
 }
 
 /// What building a loss needs besides the objective: the label columns of
@@ -452,6 +468,36 @@ impl Objective {
             | Objective::Cox
             | Objective::Aft(_)
             | Objective::Dist(_) => LabelMatrix::Refused,
+        }
+    }
+
+    /// The residual quantiles exact leaves take, `None` for an objective
+    /// whose loss has no closed-form leaf minimizer.
+    pub(crate) fn leaf_quantiles(&self) -> Option<LeafQuantiles<'_>> {
+        match self {
+            Objective::Quantile(levels) => Some(LeafQuantiles::Levels(levels)),
+            Objective::AbsoluteError => Some(LeafQuantiles::Medians),
+            Objective::SquaredError(_)
+            | Objective::SquaredLogError
+            | Objective::PseudoHuber(_)
+            | Objective::Expectile(_)
+            | Objective::RegLogistic(_)
+            | Objective::BinaryLogistic(_)
+            | Objective::BinaryLogitRaw(_)
+            | Objective::BinaryHinge
+            | Objective::Softmax(_)
+            | Objective::Softprob(_)
+            | Objective::Poisson
+            | Objective::Gamma(_)
+            | Objective::Tweedie(_)
+            | Objective::RankPairwise(_)
+            | Objective::RankNdcg(_)
+            | Objective::RankMap(_)
+            | Objective::RankXendcg
+            | Objective::Cox
+            | Objective::Aft(_)
+            | Objective::Dist(_)
+            | Objective::Custom(_) => None,
         }
     }
 

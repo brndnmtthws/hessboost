@@ -84,6 +84,17 @@ fn xgboost_spellings_parse_and_round_trip() {
     ])
     .unwrap();
     assert_eq!(rank.objective, Objective::RankNdcg(LambdaRank::default()));
+    // CatBoost's key, read back from the flat form.
+    let exact = TrainingParams::from_xgboost([
+        ("objective", json!("reg:quantileerror")),
+        ("quantile_alpha", json!([0.1, 0.9])),
+        ("leaf_estimation_method", json!("exact")),
+    ])
+    .unwrap();
+    assert_eq!(exact.leaf_estimation, LeafEstimation::Exact);
+    let flat = exact.to_xgboost().unwrap();
+    assert_eq!(flat["leaf_estimation_method"], json!("exact"));
+    assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), exact);
 }
 
 /// XGBoost's `device` spellings: `cuda` and its alias `gpu`, each with an

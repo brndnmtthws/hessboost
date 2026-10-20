@@ -2,6 +2,7 @@
 
 use super::api::{TrainResult, Trainer};
 use super::eval::{EvalPlan, EvalSet, RoundReporter};
+use super::exact_leaves::ExactLeaves;
 use super::margins::MarginCaches;
 use super::prepare::{Prepared, TrainContext, prepare_builder};
 use super::round::{RoundPlan, RoundState, grow_round, refresh_round};
@@ -77,6 +78,7 @@ pub(super) fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<T
     if params.booster == BoosterKind::GbLinear {
         return train_linear(&request, num_boost_round, objective, model, report);
     }
+    let exact_leaves = ExactLeaves::new(params, &info, n_out);
     let run = Run {
         ctx: TrainContext {
             params,
@@ -84,6 +86,7 @@ pub(super) fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<T
             info: &info,
             objective,
             langevin: sglb.langevin.as_ref(),
+            exact_leaves: exact_leaves.as_ref(),
             rows: RowMeta::of(dtrain, params),
         },
         evals: &evals,

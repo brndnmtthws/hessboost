@@ -159,7 +159,8 @@ See [`python/README.md`](python/README.md).
   and `exact`, `hist`, and `approx` tree methods with native missing-value and categorical support.
 - **Objectives & metrics:** Regression (squared, log, Huber, quantile, expectile),
   binary/multiclass classification, ranking (LambdaMART, XE-NDCG), count, and survival (Cox, AFT),
-  plus typed objective and metric APIs and custom loss hooks.
+  plus typed objective and metric APIs and custom loss hooks. Quantile and absolute-error models can
+  set each leaf to the exact residual quantile of its rows (`leaf_estimation_method = exact`).
 - **Validation & workflow:** Cross-validation (including purged and forward time-series folds,
   whole-query ranking folds, per-fold target statistics, continuing a model, and refitting on all
   rows at the chosen round count), early stopping, feature importance,

@@ -5,24 +5,28 @@
 //! ranking data, per-fold ordered target statistics
 //! ([`CrossValidation::target_stats`], optionally fitted on a separate
 //! per-row target), continuing a model in every fold
-//! ([`CrossValidation::init_model`]), and retraining on every row for the
-//! round count cross-validation chose ([`CrossValidation::refit`],
-//! [`CvRefit`]).
+//! ([`CrossValidation::init_model`]), every held-out row's out-of-fold
+//! margin and each fold's round count ([`CvReport`]), leakage-safe
+//! per-fold early stopping on a purged tail of each fold's own training
+//! rows ([`CvStopping::per_fold`], [`PurgedTail`]), and retraining on
+//! every row for the round count cross-validation chose
+//! ([`CrossValidation::refit`], [`CvRefit`]).
 //!
 //! Rounds are boosting rounds as [`Trainer::on_round`] counts them; for
 //! `booster = ebm` they are EBM rounds, counted on through both stages.
 
 mod fold;
 
-pub use fold::Fold;
+pub use fold::{Fold, PurgedTail};
 
 use crate::config::{BoosterKind, TrainingParams};
 use crate::data::DMatrix;
 use crate::data::target_stats::{FittedTargetEncoder, OrderedTargetEncoder};
 use crate::error::{HessboostError, Result};
-use crate::model::BoostedModel;
-use crate::training::Trainer;
+use crate::metric::Metric;
+use crate::model::{BoostedModel, Predictions};
 use crate::training::eval::{EarlyStopping, configured_metrics};
+use crate::training::{EvalHistory, TrainResult, Trainer};
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
@@ -46,17 +50,185 @@ pub struct CvRound {
     pub std: f64,
 }
 
-/// What [`CrossValidation::refit`] returns: the cross-validation results
+/// How [`CrossValidation`] chooses the round count of each fold's model
+/// ([`CrossValidation::early_stopping`]); without one, every fold trains
+/// every round.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum CvStopping<'a> {
+    /// Early stopping on the fold-averaged metric, as in `xgboost.cv`: the
+    /// watched metric is the last one, and the best round is the one with
+    /// the best mean after which the mean fails to improve for `patience`
+    /// consecutive rounds (or the best within `num_boost_round`). The
+    /// history ([`CvReport::results`]) ends at the best round, so
+    /// `rounds.len() - 1` is its index, and every fold's model is its
+    /// iterations through that round. Unlike `xgboost.cv`, which truncates
+    /// only when patience runs out, the history is truncated whenever early
+    /// stopping is on.
+    ///
+    /// The folds still train every round: the stopping point depends on all
+    /// folds' metrics, so it was chosen with every fold's held-out labels.
+    #[non_exhaustive]
+    FoldMean {
+        /// Rounds without improvement of the fold mean before stopping.
+        patience: NonZeroUsize,
+    },
+    /// Leakage-safe early stopping per fold: each fold splits its own
+    /// training rows by `tail` ([`PurgedTail::split`]), trains on the
+    /// split's training rows while scoring the tail (the watched metric is
+    /// the last one, with [`Trainer::early_stopping_rounds`]'s rule), and
+    /// then trains its model on all its training rows for the best round's
+    /// count. No fold's round count depends on its held-out rows or on any
+    /// other fold, so with forward folds ([`Fold::purged_forward`]) no fold
+    /// uses rounds chosen with later labels. The fold-mean history is empty
+    /// (the folds' models run different round counts); each fold's scores
+    /// are in [`FoldReport::scores`].
+    #[non_exhaustive]
+    PerFold {
+        /// Rounds without improvement on a fold's tail before stopping.
+        patience: NonZeroUsize,
+        /// The times the tails are cut by, one per row of the data.
+        tail: PurgedTail<'a>,
+    },
+}
+
+impl<'a> CvStopping<'a> {
+    /// [`CvStopping::FoldMean`] with `patience`.
+    pub fn fold_mean(patience: NonZeroUsize) -> Self {
+        CvStopping::FoldMean { patience }
+    }
+
+    /// [`CvStopping::PerFold`] with `patience`, on tails cut by `tail`.
+    pub fn per_fold(patience: NonZeroUsize, tail: PurgedTail<'a>) -> Self {
+        CvStopping::PerFold { patience, tail }
+    }
+}
+
+/// What [`CrossValidation::run`] returns: the fold-mean history, and each
+/// fold's model's round count, test scores, and test-row margins.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CvReport {
+    /// The metrics' names (as [`CvResult::metric`]), in the configured
+    /// order, which [`FoldReport::scores`] follows; the last one is
+    /// watched by early stopping.
+    pub metrics: Vec<String>,
+    /// One [`CvResult`] per metric in the configured metric order: the
+    /// held-out metric per round across folds. Empty under
+    /// [`CvStopping::PerFold`], whose folds run different round counts.
+    pub results: Vec<CvResult>,
+    /// One report per fold, in fold order.
+    pub folds: Vec<FoldReport>,
+    /// The cross-validated data's row count.
+    n_rows: usize,
+}
+
+/// One fold of a [`CvReport`]: what its model was and predicted.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FoldReport {
+    /// The fold's test rows, as the fold listed them.
+    pub test: Vec<usize>,
+    /// The rounds the fold's model used: every round the fold trained
+    /// without early stopping, the best fold-mean round's count under
+    /// [`CvStopping::FoldMean`], the best tail round's count under
+    /// [`CvStopping::PerFold`].
+    pub num_boost_round: usize,
+    /// The model's test metrics after its last round, in the configured
+    /// metric order (empty for a model of no rounds).
+    pub scores: Vec<f64>,
+    /// The model's margins on the test rows, one row per entry of
+    /// [`test`](Self::test) (target-encoded by the fold's own statistics
+    /// under [`CrossValidation::target_stats`]), bit for bit those of the
+    /// fold's model trained for `num_boost_round` rounds (under
+    /// [`CvStopping::FoldMean`], a gbtree fold's first iterations; for
+    /// other boosters, whose later rounds rescale earlier trees or add
+    /// several trees per round, the fold retrained for that many rounds).
+    pub margins: Predictions,
+    /// Under [`CvStopping::PerFold`], the fold's tail split and its best
+    /// score; `None` otherwise.
+    pub stopping: Option<TailStopping>,
+}
+
+/// How [`CvStopping::PerFold`] sized one model: its tail split and the
+/// watched metric there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct TailStopping {
+    /// The split time ([`PurgedTail::split`]).
+    pub split_at: i64,
+    /// The rows the early-stopping fit trained on.
+    pub fit_rows: usize,
+    /// The tail rows it was scored on.
+    pub tail_rows: usize,
+    /// The watched metric on the tail at the best round (`NaN` for no
+    /// rounds).
+    pub best_score: f64,
+}
+
+/// Every row's out-of-fold margins ([`CvReport::out_of_fold`]).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct OutOfFold {
+    /// One row of margins per data row, from the fold that held the row
+    /// out; `NaN` for a row no fold held out.
+    pub margins: Predictions,
+    /// Per data row, the fold that held it out (`None`: no fold did).
+    pub fold: Vec<Option<usize>>,
+}
+
+impl CvReport {
+    /// Every row's margins from the fold that held it out, combining the
+    /// folds' [`margins`](FoldReport::margins) by their test rows. A row no
+    /// fold held out (forward folds never test the first rows) gets `NaN`
+    /// margins and no fold; a row one fold lists several times gets that
+    /// fold's margins.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::InvalidParameter`] (`folds`) when two folds hold
+    /// out the same row, which then has no single out-of-fold margin (each
+    /// fold's own margins stay in [`folds`](Self::folds)).
+    pub fn out_of_fold(&self) -> Result<OutOfFold> {
+        let width = self.folds.first().map_or(1, |fold| fold.margins.width());
+        let mut margins = vec![f32::NAN; self.n_rows * width];
+        let mut fold_of = vec![None; self.n_rows];
+        for (f, fold) in self.folds.iter().enumerate() {
+            for (&row, values) in fold.test.iter().zip(fold.margins.rows()) {
+                if let Some(other) = fold_of[row]
+                    && other != f
+                {
+                    return Err(HessboostError::invalid_param(
+                        "folds",
+                        format!(
+                            "row {row} is held out by folds {other} and {f}, so it has no single \
+                             out-of-fold margin"
+                        ),
+                    ));
+                }
+                fold_of[row] = Some(f);
+                margins[row * width..(row + 1) * width].copy_from_slice(values);
+            }
+        }
+        Ok(OutOfFold {
+            margins: Predictions::new(margins, self.n_rows, width),
+            fold: fold_of,
+        })
+    }
+}
+
+/// What [`CrossValidation::refit`] returns: the cross-validation report
 /// and the model retrained on every row for the chosen round count.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct CvRefit {
-    /// The cross-validation results, as [`CrossValidation::run`] returns
-    /// them.
-    pub results: Vec<CvResult>,
-    /// The chosen round count: the length of every result's `rounds` (the
-    /// best round's index plus one under early stopping, else every round
-    /// the folds ran).
+    /// The cross-validation report, as [`CrossValidation::run`] returns
+    /// it.
+    pub report: CvReport,
+    /// The chosen round count: the best round's index plus one under
+    /// [`CvStopping::FoldMean`] (the length of every result's `rounds`),
+    /// the best round on the purged tail of every row under
+    /// [`CvStopping::PerFold`], else every round the folds ran.
     pub num_boost_round: usize,
     /// The model trained on every row for `num_boost_round` rounds
     /// (continuing [`CrossValidation::init_model`] when set).
@@ -65,6 +237,9 @@ pub struct CvRefit {
     /// row, whose encoding `model` was trained on: encode new data with it
     /// before predicting. `None` otherwise.
     pub target_encoder: Option<FittedTargetEncoder>,
+    /// Under [`CvStopping::PerFold`], the tail split of every row that
+    /// sized `model`; `None` otherwise.
+    pub stopping: Option<TailStopping>,
 }
 
 /// Cross-validation over caller-supplied [`Fold`]s (XGBoost's `cv(...,
@@ -73,15 +248,20 @@ pub struct CvRefit {
 /// Each fold trains `params` for `num_boost_round` rounds on its training
 /// rows and evaluates the metrics (`params.eval_metric`, or the objective's
 /// default) on its test rows after every round; [`run`](Self::run)
-/// averages them across folds, and [`refit`](Self::refit) also retrains on
-/// every row for the chosen round count.
+/// averages them across folds and reports each fold's round count, scores,
+/// and test-row margins ([`CvReport`], whose
+/// [`out_of_fold`](CvReport::out_of_fold) gives every held-out row's
+/// margins), and [`refit`](Self::refit) also retrains on every row for the
+/// chosen round count. [`early_stopping`](Self::early_stopping) chooses the
+/// round counts on the fold means or, leakage-free, per fold on a purged
+/// tail of its training rows.
 ///
 /// On ranking data (query groups attached), each fold's training and test
-/// rows must be whole query groups ([`DMatrix::select_rows`]); the folds
-/// keep them as their own groups.
+/// rows (and each purged tail's sides) must be whole query groups
+/// ([`DMatrix::select_rows`]); the folds keep them as their own groups.
 ///
 /// ```
-/// use hessboost::training::{CrossValidation, Fold};
+/// use hessboost::training::{CrossValidation, CvStopping, Fold};
 /// use hessboost::prelude::*;
 /// use std::num::NonZeroUsize;
 ///
@@ -93,13 +273,17 @@ pub struct CvRefit {
 /// let params = TrainingParams::builder().max_depth(2).build()?;
 ///
 /// let folds = Fold::forward_chaining(data.n_rows(), 3, 3)?;
-/// let results = CrossValidation::new(&params, &data, 20, folds)
-///     .early_stopping_rounds(NonZeroUsize::new(3).unwrap())
+/// let report = CrossValidation::new(&params, &data, 20, folds)
+///     .early_stopping(CvStopping::fold_mean(NonZeroUsize::new(3).unwrap()))
 ///     .run()?;
 /// // With early stopping, the last round reported is the best one.
-/// let rmse = &results[0];
+/// let rmse = &report.results[0];
 /// assert_eq!(rmse.metric, "rmse");
 /// assert!(rmse.rounds.len() <= 20);
+/// // The first 15 rows only ever train: they have no out-of-fold margin.
+/// let oof = report.out_of_fold()?;
+/// assert!(oof.fold[..15].iter().all(Option::is_none));
+/// assert!(oof.margins.as_slice()[15..].iter().all(|m| m.is_finite()));
 /// # Ok(())
 /// # }
 /// ```
@@ -109,7 +293,7 @@ pub struct CrossValidation<'a> {
     data: &'a DMatrix,
     num_boost_round: usize,
     folds: Vec<Fold>,
-    early_stopping_rounds: Option<NonZeroUsize>,
+    stopping: Option<CvStopping<'a>>,
     target_stats: Option<(OrderedTargetEncoder, Vec<usize>)>,
     target_stats_label: Option<&'a [f32]>,
     init_model: Option<&'a BoostedModel>,
@@ -129,26 +313,26 @@ impl<'a> CrossValidation<'a> {
             data,
             num_boost_round,
             folds,
-            early_stopping_rounds: None,
+            stopping: None,
             target_stats: None,
             target_stats_label: None,
             init_model: None,
         }
     }
 
-    /// Early stopping on the fold-averaged metric, as in `xgboost.cv`: the
-    /// watched metric is the last one, and the best round is the one with
-    /// the best mean after which the mean fails to improve for `rounds`
-    /// consecutive rounds (or the best within `num_boost_round`). The
-    /// results end at the best round, so `rounds.len() - 1` is its
-    /// index. Unlike `xgboost.cv`, which truncates only when patience runs
-    /// out, they are truncated whenever early stopping is on.
+    /// Choose each fold's round count (at most `num_boost_round`) by
+    /// `stopping`: on the fold means ([`CvStopping::fold_mean`], as
+    /// `xgboost.cv`'s `early_stopping_rounds`), or per fold on a purged tail
+    /// of its own training rows ([`CvStopping::per_fold`]).
     ///
-    /// The folds still train every round: the stopping point depends on
-    /// all folds' metrics.
+    /// [`run`](Self::run) and [`refit`](Self::refit) refuse per-fold
+    /// stopping unless its tail times hold one value per row of `data`
+    /// ([`HessboostError::DimensionMismatch`]), and refuse a fold (or, in
+    /// `refit`, the data) whose tail split leaves either side empty
+    /// ([`HessboostError::InvalidParameter`] `early_stopping`).
     #[must_use]
-    pub fn early_stopping_rounds(mut self, rounds: NonZeroUsize) -> Self {
-        self.early_stopping_rounds = Some(rounds);
+    pub fn early_stopping(mut self, stopping: CvStopping<'a>) -> Self {
+        self.stopping = Some(stopping);
         self
     }
 
@@ -157,8 +341,10 @@ impl<'a> CrossValidation<'a> {
     /// ([`OrderedTargetEncoder::fit_transform`]) and the fitted statistics
     /// encode its test rows ([`FittedTargetEncoder::transform`]), so no
     /// held-out label enters any encoding the fold trains or is scored on.
-    /// Encoding the whole matrix before cross-validating would leak every
-    /// test row's label into its own encoding.
+    /// Per-fold early stopping fits its own encoder on the tail split's
+    /// training rows likewise. Encoding the whole matrix before
+    /// cross-validating would leak every test row's label into its own
+    /// encoding.
     ///
     /// The statistics are taken over the data's labels (one per row), or
     /// over [`target_stats_label`](Self::target_stats_label) when set.
@@ -187,7 +373,8 @@ impl<'a> CrossValidation<'a> {
 
     /// Continue `model` in every fold (and in [`refit`](Self::refit)) as
     /// [`Trainer::init_model`] does, with its checks of `params` and the
-    /// data against the model. The results count this run's rounds from 0.
+    /// data against the model. The results count this run's rounds from 0;
+    /// the folds' margins include the model's own iterations.
     ///
     /// [`run`](Self::run) and `refit` refuse it together with
     /// [`target_stats`](Self::target_stats)
@@ -200,28 +387,31 @@ impl<'a> CrossValidation<'a> {
         self
     }
 
-    /// Train and evaluate every fold, returning one [`CvResult`] per metric
-    /// in the configured metric order.
+    /// Train and evaluate every fold, returning the fold-mean history and
+    /// every fold's report ([`CvReport`]).
     ///
     /// Fails when there are no folds, a fold's training or test rows are
     /// empty, out of bounds, or (on ranking data) not whole query groups,
-    /// when [`target_stats_label`](Self::target_stats_label) or
-    /// [`init_model`](Self::init_model) is refused, or when encoding or
-    /// training a fold fails. An EBM that stops its bags early
-    /// ([`Ebm::early_stopping`](crate::config::Ebm::early_stopping)) is refused
-    /// ([`HessboostError::InvalidParameter`] `ebm_early_stopping_rounds`):
-    /// each fold would end its stages at a different round, so the folds'
-    /// rounds would not line up.
-    /// [`early_stopping_rounds`](Self::early_stopping_rounds) stops on the
-    /// fold means instead.
-    pub fn run(self) -> Result<Vec<CvResult>> {
-        self.results()
+    /// when [`early_stopping`](Self::early_stopping),
+    /// [`target_stats_label`](Self::target_stats_label) or
+    /// [`init_model`](Self::init_model) is refused, or when encoding,
+    /// training, or predicting a fold fails. Without per-fold stopping, an
+    /// EBM that stops its bags early
+    /// ([`Ebm::early_stopping`](crate::config::Ebm::early_stopping)) is
+    /// refused ([`HessboostError::InvalidParameter`]
+    /// `ebm_early_stopping_rounds`): each fold would end its stages at a
+    /// different round, so the folds' rounds would not line up.
+    /// [`CvStopping::fold_mean`] stops on the fold means instead.
+    pub fn run(self) -> Result<CvReport> {
+        let metrics = self.checked_metrics()?;
+        self.report(&metrics)
     }
 
     /// Cross-validate as [`run`](Self::run) does, then retrain on every row
-    /// of `data` for the chosen round count
-    /// ([`CvRefit::num_boost_round`]: through the best round under
-    /// [`early_stopping_rounds`](Self::early_stopping_rounds), else every
+    /// of `data` for the chosen round count ([`CvRefit::num_boost_round`]:
+    /// through the best fold-mean round under [`CvStopping::FoldMean`],
+    /// the best round on the purged tail of every row under
+    /// [`CvStopping::PerFold`] (sized exactly as each fold is), else every
     /// round the folds ran). The retraining continues
     /// [`init_model`](Self::init_model) when set and has no eval sets. With
     /// [`target_stats`](Self::target_stats), it trains on `data` encoded by
@@ -231,7 +421,8 @@ impl<'a> CrossValidation<'a> {
     ///
     /// The retraining is configured for all `num_boost_round` rounds and
     /// stopped through [`Trainer::on_round`] after the chosen count, so its
-    /// model equals one trained on `data` for that many rounds. For
+    /// model equals one trained on `data` for that many rounds; the folds'
+    /// models under per-fold stopping are trained the same way. For
     /// `booster = ebm` the count is of EBM rounds across both stages
     /// (`num_boost_round` still caps each stage), so the model is the one
     /// after that many rounds of the full run.
@@ -239,7 +430,7 @@ impl<'a> CrossValidation<'a> {
     /// Fails as `run` does, or when encoding or retraining on `data` fails.
     ///
     /// ```
-    /// use hessboost::training::{CrossValidation, Fold};
+    /// use hessboost::training::{CrossValidation, CvStopping, Fold};
     /// use hessboost::prelude::*;
     /// use std::num::NonZeroUsize;
     ///
@@ -250,10 +441,10 @@ impl<'a> CrossValidation<'a> {
     /// let params = TrainingParams::builder().max_depth(2).build()?;
     ///
     /// let refit = CrossValidation::new(&params, &data, 50, Fold::k_fold(90, 3, 0)?)
-    ///     .early_stopping_rounds(NonZeroUsize::new(5).unwrap())
+    ///     .early_stopping(CvStopping::fold_mean(NonZeroUsize::new(5).unwrap()))
     ///     .refit()?;
     /// // Trained on all 90 rows for as many rounds as the results report.
-    /// assert_eq!(refit.num_boost_round, refit.results[0].rounds.len());
+    /// assert_eq!(refit.num_boost_round, refit.report.results[0].rounds.len());
     /// assert_eq!(refit.model.num_boost_rounds(), refit.num_boost_round);
     /// let predictions = refit.model.predict(&data, Iterations::Best)?;
     /// assert_eq!(predictions.as_slice().len(), 90);
@@ -261,8 +452,23 @@ impl<'a> CrossValidation<'a> {
     /// # }
     /// ```
     pub fn refit(self) -> Result<CvRefit> {
-        let results = self.results()?;
-        let rounds = results.first().map_or(0, |result| result.rounds.len());
+        let metrics = self.checked_metrics()?;
+        let report = self.report(&metrics)?;
+        let (rounds, stopping) = match self.stopping {
+            Some(CvStopping::PerFold { patience, tail }) => {
+                let rows: Vec<usize> = (0..self.data.n_rows()).collect();
+                let (stopping, rounds) =
+                    self.tail_rounds(&rows, patience, &tail, maximizes(&metrics), "all rows")?;
+                (rounds, Some(stopping))
+            }
+            _ => (
+                report
+                    .results
+                    .first()
+                    .map_or(0, |result| result.rounds.len()),
+                None,
+            ),
+        };
         let (encoded, target_encoder) = match &self.target_stats {
             Some((encoder, columns)) => {
                 let (encoded, fitted) =
@@ -272,44 +478,41 @@ impl<'a> CrossValidation<'a> {
             None => (None, None),
         };
         let dtrain = encoded.as_ref().unwrap_or(self.data);
-        // The hook cannot stop before the first round.
-        let num_boost_round = if rounds == 0 { 0 } else { self.num_boost_round };
-        let mut completed = 0;
-        let model = self
-            .trainer(dtrain, num_boost_round)
-            .on_round(move |_| {
-                completed += 1;
-                if completed == rounds {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            })
-            .train()?
-            .model;
+        let model = self.train_rounds(dtrain, None, rounds)?.model;
         Ok(CvRefit {
-            results,
+            report,
             num_boost_round: rounds,
             model,
             target_encoder,
+            stopping,
         })
     }
 
-    /// The validated cross-validation results [`run`](Self::run) and
-    /// [`refit`](Self::refit) share: every fold's scores aggregated per
-    /// round, truncated at the best round under early stopping.
-    fn results(&self) -> Result<Vec<CvResult>> {
+    /// Check the configuration against the data and return its metrics
+    /// (the configured ones, or the objective's default; the last one is
+    /// watched).
+    fn checked_metrics(&self) -> Result<Vec<Box<dyn Metric>>> {
         if self.folds.is_empty() {
             return Err(HessboostError::invalid_param("folds", "no folds"));
         }
         if let BoosterKind::Ebm(ebm) = &self.params.booster
             && ebm.early_stopping().is_some()
+            && !matches!(self.stopping, Some(CvStopping::PerFold { .. }))
         {
             return Err(HessboostError::invalid_param(
                 "ebm_early_stopping_rounds",
                 "cross-validation averages the folds round by round, but stopping each \
                  fold's bags on its own held-out rows ends the folds' stages at different \
                  rounds; stop on the fold means with early_stopping_rounds instead",
+            ));
+        }
+        if let Some(CvStopping::PerFold { tail, .. }) = &self.stopping
+            && tail.n_rows() != self.data.n_rows()
+        {
+            return Err(HessboostError::dimension_mismatch(
+                "per-fold early stopping times (one per row)",
+                self.data.n_rows(),
+                tail.n_rows(),
             ));
         }
         if let Some(labels) = self.target_stats_label {
@@ -336,41 +539,50 @@ impl<'a> CrossValidation<'a> {
         }
         validate_folds(&self.folds, self.data)?;
         let objective = self.params.loss(self.data.n_targets())?;
-        let metrics = configured_metrics(self.params, objective.as_ref())?;
-        let maximize = metrics.last().is_some_and(|m| m.maximize());
-
-        let values = self.scores(metrics.len())?;
-        let mut out: Vec<CvResult> = metrics
-            .iter()
-            .zip(values)
-            .map(|(metric, per_round)| aggregate(metric.name(), &per_round))
-            .collect();
-
-        if let Some(patience) = self.early_stopping_rounds
-            && let Some(watched) = out.last()
-            && !watched.rounds.is_empty()
-        {
-            let means = watched.rounds.iter().map(|round| round.mean);
-            let end = best_round(means, patience, maximize) + 1;
-            for result in &mut out {
-                result.rounds.truncate(end);
-            }
-        }
-        Ok(out)
+        configured_metrics(self.params, objective.as_ref())
     }
 
-    /// Train on every fold in order and collect its test scores as
-    /// `values[metric][round][fold]`, grown as rounds arrive (not sized by
-    /// `num_boost_round`, which is caller input).
-    fn scores(&self, n_metrics: usize) -> Result<Vec<Vec<Vec<f64>>>> {
-        let mut values: Vec<Vec<Vec<f64>>> = vec![Vec::new(); n_metrics];
+    /// The report [`run`](Self::run) and [`refit`](Self::refit) share.
+    fn report(&self, metrics: &[Box<dyn Metric>]) -> Result<CvReport> {
+        let (results, folds) = match self.stopping {
+            Some(CvStopping::PerFold { patience, tail }) => (
+                Vec::new(),
+                self.per_fold(patience, &tail, maximizes(metrics))?,
+            ),
+            Some(CvStopping::FoldMean { patience }) => self.fold_mean(metrics, Some(patience))?,
+            None => self.fold_mean(metrics, None)?,
+        };
+        Ok(CvReport {
+            metrics: metrics
+                .iter()
+                .map(|metric| metric.name().to_string())
+                .collect(),
+            results,
+            folds,
+            n_rows: self.data.n_rows(),
+        })
+    }
+
+    /// Every fold trained for every round and scored on its test rows,
+    /// aggregated per round and, under `patience`, truncated at the best
+    /// fold-mean round, which then sizes every fold's report.
+    fn fold_mean(
+        &self,
+        metrics: &[Box<dyn Metric>],
+        patience: Option<NonZeroUsize>,
+    ) -> Result<(Vec<CvResult>, Vec<FoldReport>)> {
+        // `values[metric][round][fold]`, grown as rounds arrive (not sized
+        // by `num_boost_round`, which is caller input).
+        let mut values: Vec<Vec<Vec<f64>>> = vec![Vec::new(); metrics.len()];
+        let mut runs = Vec::with_capacity(self.folds.len());
         for fold in &self.folds {
-            let (dtrain, dtest) = self.fold_data(fold)?;
-            let res = self
+            let (dtrain, encoder) = self.train_data(&fold.train)?;
+            let dtest = self.held_out_data(&fold.test, encoder.as_ref())?;
+            let TrainResult { model, history, .. } = self
                 .trainer(&dtrain, self.num_boost_round)
                 .eval(&dtest, "test")
                 .train()?;
-            for (round, eval) in res.history.rounds().enumerate() {
+            for (round, eval) in history.rounds().enumerate() {
                 for (per_round, &value) in values.iter_mut().zip(eval.values()) {
                     if per_round.len() == round {
                         per_round.push(Vec::with_capacity(self.folds.len()));
@@ -378,8 +590,164 @@ impl<'a> CrossValidation<'a> {
                     per_round[round].push(value);
                 }
             }
+            // Without early stopping every round counts: predict now rather
+            // than select the test rows again.
+            let margins = match patience {
+                None => Some(model.predict_margin(&dtest, ..)?),
+                Some(_) => None,
+            };
+            runs.push((model, encoder, history, margins));
         }
-        Ok(values)
+        let mut results: Vec<CvResult> = metrics
+            .iter()
+            .zip(values)
+            .map(|(metric, per_round)| aggregate(metric.name(), &per_round))
+            .collect();
+        if let Some(patience) = patience
+            && let Some(watched) = results.last()
+            && !watched.rounds.is_empty()
+        {
+            let means = watched.rounds.iter().map(|round| round.mean);
+            let end = best_round(means, patience, maximizes(metrics)) + 1;
+            for result in &mut results {
+                result.rounds.truncate(end);
+            }
+        }
+        let rounds = results.first().map_or(0, |result| result.rounds.len());
+        let reports = self
+            .folds
+            .iter()
+            .zip(runs)
+            .map(|(fold, (model, encoder, history, margins))| {
+                let used = rounds.min(history.len());
+                let last = used
+                    .checked_sub(1)
+                    .and_then(|round| history.rounds().nth(round));
+                let margins = if let Some(margins) = margins {
+                    margins
+                } else {
+                    let dtest = self.held_out_data(&fold.test, encoder.as_ref())?;
+                    match last {
+                        _ if used == history.len() => model.predict_margin(&dtest, ..)?,
+                        // A gbtree round is one iteration, and its first
+                        // iterations are the shorter run's model (shrunk
+                        // ones included).
+                        Some(round) if matches!(self.params.booster, BoosterKind::GbTree) => {
+                            model.predict_margin(&dtest, ..round.iteration() + 1)?
+                        }
+                        // DART rescales earlier trees and an EBM round adds
+                        // a tree per term (and bag): replay the shorter run.
+                        _ => {
+                            let (dtrain, _) = self.train_data(&fold.train)?;
+                            self.train_rounds(&dtrain, None, used)?
+                                .model
+                                .predict_margin(&dtest, ..)?
+                        }
+                    }
+                };
+                Ok(FoldReport {
+                    test: fold.test.clone(),
+                    num_boost_round: used,
+                    scores: last.map_or_else(Vec::new, |round| round.values().to_vec()),
+                    margins,
+                    stopping: None,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok((results, reports))
+    }
+
+    /// Every fold sized on its own purged tail and retrained on all its
+    /// training rows for that many rounds ([`CvStopping::PerFold`]).
+    fn per_fold(
+        &self,
+        patience: NonZeroUsize,
+        tail: &PurgedTail<'_>,
+        maximize: bool,
+    ) -> Result<Vec<FoldReport>> {
+        self.folds
+            .iter()
+            .enumerate()
+            .map(|(f, fold)| {
+                let (stopping, rounds) =
+                    self.tail_rounds(&fold.train, patience, tail, maximize, &format!("fold {f}"))?;
+                let (dtrain, encoder) = self.train_data(&fold.train)?;
+                let dtest = self.held_out_data(&fold.test, encoder.as_ref())?;
+                let TrainResult { model, history, .. } =
+                    self.train_rounds(&dtrain, Some(&dtest), rounds)?;
+                Ok(FoldReport {
+                    test: fold.test.clone(),
+                    num_boost_round: rounds,
+                    scores: last_scores(&history),
+                    margins: model.predict_margin(&dtest, ..)?,
+                    stopping: Some(stopping),
+                })
+            })
+            .collect()
+    }
+
+    /// The round count early stopping on `rows`' purged tail selects, with
+    /// the split: train on the split's training rows, score the tail, and
+    /// take the best round's index plus one (0 for no rounds). `whose`
+    /// names the rows in a refusal.
+    fn tail_rounds(
+        &self,
+        rows: &[usize],
+        patience: NonZeroUsize,
+        tail: &PurgedTail<'_>,
+        maximize: bool,
+        whose: &str,
+    ) -> Result<(TailStopping, usize)> {
+        let (split_at, split) = tail.split_rows(rows).map_err(|reason| {
+            HessboostError::invalid_param("early_stopping", format!("{whose}: {reason}"))
+        })?;
+        let (dfit, encoder) = self.train_data(&split.train)?;
+        let dtail = self.held_out_data(&split.test, encoder.as_ref())?;
+        let trial = self
+            .trainer(&dfit, self.num_boost_round)
+            .eval(&dtail, "early_stopping")
+            .early_stopping_rounds(patience)
+            .train()?;
+        let watched: Vec<f64> = trial
+            .history
+            .rounds()
+            .map(|round| round.values().last().copied().unwrap_or(f64::NAN))
+            .collect();
+        let best = best_round(watched.iter().copied(), patience, maximize);
+        let rounds = if watched.is_empty() { 0 } else { best + 1 };
+        let stopping = TailStopping {
+            split_at,
+            fit_rows: split.train.len(),
+            tail_rows: split.test.len(),
+            best_score: watched.get(best).copied().unwrap_or(f64::NAN),
+        };
+        Ok((stopping, rounds))
+    }
+
+    /// `params` trained on `dtrain` for the first `rounds` rounds of the
+    /// full `num_boost_round` run (stopped through [`Trainer::on_round`]),
+    /// scoring `eval` when given.
+    fn train_rounds(
+        &self,
+        dtrain: &DMatrix,
+        eval: Option<&DMatrix>,
+        rounds: usize,
+    ) -> Result<TrainResult> {
+        // The hook cannot stop before the first round.
+        let num_boost_round = if rounds == 0 { 0 } else { self.num_boost_round };
+        let mut completed = 0;
+        let mut trainer = self.trainer(dtrain, num_boost_round).on_round(move |_| {
+            completed += 1;
+            if completed == rounds {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        if let Some(eval) = eval {
+            trainer = trainer.eval(eval, "test");
+        }
+        trainer.train()
     }
 
     /// A [`Trainer`] of `params` on `dtrain`, continuing the initial model
@@ -395,22 +763,47 @@ impl<'a> CrossValidation<'a> {
         }
     }
 
-    /// A fold's training and test matrices, target-encoded with statistics
-    /// of its training rows when configured.
-    fn fold_data(&self, fold: &Fold) -> Result<(DMatrix, DMatrix)> {
-        let dtrain = self.data.select_rows(&fold.train)?;
-        let dtest = self.data.select_rows(&fold.test)?;
+    /// The matrix of `rows` to train on, target-encoded with statistics of
+    /// those rows when configured (with the fitted encoder).
+    fn train_data(&self, rows: &[usize]) -> Result<(DMatrix, Option<FittedTargetEncoder>)> {
+        let dtrain = self.data.select_rows(rows)?;
         let Some((encoder, columns)) = &self.target_stats else {
-            return Ok((dtrain, dtest));
+            return Ok((dtrain, None));
         };
-        // `results` checked the length and `validate_folds` the rows.
+        // `checked_metrics` checked the length and the folds and tail
+        // splits hold rows of the data.
         let labels: Option<Vec<f32>> = self
             .target_stats_label
-            .map(|labels| fold.train.iter().map(|&row| labels[row]).collect());
+            .map(|labels| rows.iter().map(|&row| labels[row]).collect());
         let (dtrain, fitted) = fit_encoder(encoder, columns, &dtrain, labels.as_deref())?;
-        let dtest = fitted.transform(&dtest)?;
-        Ok((dtrain, dtest))
+        Ok((dtrain, Some(fitted)))
     }
+
+    /// The matrix of held-out `rows`, encoded by the statistics `encoder`
+    /// fitted on the training rows ([`train_data`](Self::train_data)).
+    fn held_out_data(
+        &self,
+        rows: &[usize],
+        encoder: Option<&FittedTargetEncoder>,
+    ) -> Result<DMatrix> {
+        let data = self.data.select_rows(rows)?;
+        match encoder {
+            Some(fitted) => fitted.transform(&data),
+            None => Ok(data),
+        }
+    }
+}
+
+/// Whether the watched (last) metric is maximized.
+fn maximizes(metrics: &[Box<dyn Metric>]) -> bool {
+    metrics.last().is_some_and(|metric| metric.maximize())
+}
+
+/// The scores of `history`'s last round (none for no rounds).
+fn last_scores(history: &EvalHistory) -> Vec<f64> {
+    history
+        .last()
+        .map_or_else(Vec::new, |round| round.values().to_vec())
 }
 
 /// `encoder` fitted on `data` with its encoding of `columns`, over `labels`
@@ -495,7 +888,8 @@ fn best_round(scores: impl Iterator<Item = f64>, patience: NonZeroUsize, maximiz
 /// `params.eval_metric` or the objective's default.
 ///
 /// For time-ordered or grouped rows, supply the folds (and optionally early
-/// stopping and per-fold target statistics) through [`CrossValidation`].
+/// stopping and per-fold target statistics) through [`CrossValidation`],
+/// which also reports each fold's margins.
 pub fn cv(
     params: &TrainingParams,
     data: &DMatrix,
@@ -504,7 +898,9 @@ pub fn cv(
     seed: u64,
 ) -> Result<Vec<CvResult>> {
     let folds = Fold::k_fold(data.n_rows(), nfold, seed)?;
-    CrossValidation::new(params, data, num_boost_round, folds).run()
+    Ok(CrossValidation::new(params, data, num_boost_round, folds)
+        .run()?
+        .results)
 }
 
 #[cfg(test)]
@@ -617,15 +1013,17 @@ mod tests {
         let folds = Fold::k_fold(d.n_rows(), 4, 3).unwrap();
         let full = CrossValidation::new(&params, &d, 40, folds.clone())
             .run()
-            .unwrap();
+            .unwrap()
+            .results;
         let rmse: Vec<f64> = full[1].rounds.iter().map(|r| r.mean).collect();
         let best = (0..rmse.len())
             .min_by(|&a, &b| rmse[a].total_cmp(&rmse[b]))
             .unwrap();
         let stopped = CrossValidation::new(&params, &d, 40, folds)
-            .early_stopping_rounds(NonZeroUsize::new(5).unwrap())
+            .early_stopping(CvStopping::fold_mean(NonZeroUsize::new(5).unwrap()))
             .run()
-            .unwrap();
+            .unwrap()
+            .results;
         // The results end at the last round that improved on every earlier
         // one before 5 rounds without improvement.
         let end = stopped[1].rounds.len();
@@ -639,9 +1037,10 @@ mod tests {
         // Patience longer than the run still ends at the best round.
         let folds = Fold::k_fold(d.n_rows(), 4, 3).unwrap();
         let long = CrossValidation::new(&params, &d, 40, folds)
-            .early_stopping_rounds(NonZeroUsize::new(100).unwrap())
+            .early_stopping(CvStopping::fold_mean(NonZeroUsize::new(100).unwrap()))
             .run()
-            .unwrap();
+            .unwrap()
+            .results;
         assert_eq!(long[1].rounds, full[1].rounds[..=best]);
     }
 
@@ -670,7 +1069,10 @@ mod tests {
                 Fold::new(train, test)
             })
             .collect();
-        let results = CrossValidation::new(&params, &d, 3, folds).run().unwrap();
+        let results = CrossValidation::new(&params, &d, 3, folds)
+            .run()
+            .unwrap()
+            .results;
         assert_eq!(results[0].metric, "ndcg@32");
         assert!(results[0].rounds.iter().all(|r| r.mean.is_finite()));
         // Shuffled row folds split the groups: refused before training.
@@ -702,7 +1104,8 @@ mod tests {
         let results = CrossValidation::new(&params, &d, 5, folds.clone())
             .target_stats(encoder.clone(), vec![0])
             .run()
-            .unwrap();
+            .unwrap()
+            .results;
 
         // The same folds encoded by hand from their training rows alone.
         let mut last = Vec::new();

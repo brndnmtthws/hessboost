@@ -49,7 +49,8 @@
 //! else all), or a Rust range of iterations: `..` for all, `..n` for the
 //! first `n`, `2..5`. Leaf, contribution, and interaction ranges must start
 //! at 0 (`Best` always does). [`BoostedModel::slice`] cuts a sub-model out
-//! of an iteration range with a step.
+//! of an iteration range with a step, and [`BoostedModel::average`] joins
+//! compatible models (a bag of seeds) into one whose margin is their mean.
 //!
 //! A model trained with per-iteration model shrinkage
 //! ([`model_shrink`](crate::config::TrainingParams::model_shrink),
@@ -373,6 +374,7 @@
 //! [`save`]: BoostedModel::save
 //! [`load`]: BoostedModel::load
 
+mod average;
 mod categories;
 pub mod compact;
 pub(crate) mod container;

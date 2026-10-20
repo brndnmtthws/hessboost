@@ -13,7 +13,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _data, _hessboost
 from hessboost._core import Uncertainty
-from hessboost._exceptions import HessboostError, InvalidDataError
+from hessboost._exceptions import HessboostError, IncompatibleModelError, InvalidDataError
 from hessboost._matrix import _matrix_for
 from hessboost._model_io import PathLike, _SchemaState, read_bytes, write_bytes
 
@@ -842,6 +842,54 @@ class Booster(_SchemaState):
             raise TypeError(f"booster indices must be int or slice, not {type(key).__name__}")
         core = self._model.slice(begin, end, step)
         return Booster._wrap(core, self._feature_names, self._feature_types, self._categories)
+
+    @staticmethod
+    def average(models: Sequence[Booster]) -> Booster:
+        """One booster whose margin is the mean of ``models``' margins: every
+        member's trees in member order with every leaf divided by the member
+        count ``k``, and each output's intercept the members' mean intercept.
+        Predictions apply the shared objective's transform to that mean
+        margin, so for log links (``count:poisson``, ``reg:gamma``,
+        ``reg:tweedie``, ``survival:cox``) the average predicts the geometric
+        mean of the members' predictions, and for ``binary:logistic`` the
+        sigmoid of their mean logit.
+
+        Each leaf ``v`` becomes the ``float32`` nearest ``v / k``; each
+        intercept is the members' intercepts summed in ``float64`` in member
+        order, divided by ``k`` and rounded to ``float32`` (``linear_tree``
+        leaf models are divided in ``float64``). The result keeps the
+        members' feature names, types and categories and has no
+        :attr:`best_iteration`.
+
+        Args:
+            models: The members, at least one.
+
+        Raises:
+            HessboostError: ``models`` is empty.
+            IncompatibleModelError: A member differs from the first in its
+                objective (with its parameters), feature count, output,
+                target or class count, ``num_parallel_tree``, vector leaves,
+                or feature names, types or categories; or a member is a
+                ``gblinear``, DART, model-shrinkage, Boulevard or EBM model, or
+                early-stopped (slice it, e.g. ``booster[: best + 1]``, first).
+        """
+        members = list(models)
+        if not members:
+            raise HessboostError("no models to average")
+        first = members[0]
+        for index, member in enumerate(members[1:], start=1):
+            if (member._feature_names, member._feature_types, member._categories) != (
+                first._feature_names,
+                first._feature_types,
+                first._categories,
+            ):
+                raise IncompatibleModelError(
+                    f"model {index}'s feature names, types or categories differ from model 0's"
+                )
+        core = _hessboost.Booster.average([member._model for member in members])
+        return Booster._wrap(
+            core, first._feature_names, first._feature_types, dict(first._categories)
+        )
 
     def copy(self) -> Booster:
         """An independent booster holding the same model."""

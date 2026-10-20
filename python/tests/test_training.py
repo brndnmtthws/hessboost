@@ -623,6 +623,82 @@ def test_cv_continues_xgb_model_in_every_fold() -> None:
         hessboost.cv(params, DMatrix(x[:, :4], y), 2, xgb_model=init)
 
 
+def test_cross_validate_sizes_each_fold_on_its_own_purged_tail() -> None:
+    """Per-fold early stopping equals each forward fold sized on the purged
+    tail of its own training rows and retrained on all of them, by hand;
+    rows no fold tests have no out-of-fold margin."""
+    x, y = regression()
+    dtrain = DMatrix(x, y)
+    params = {"max_depth": 4, "eta": 0.6, "subsample": 0.8, "seed": 2}
+    at = np.arange(400) * 60
+    end = at + 300
+    splits = hessboost.folds.purged_forward(at, end, validation_fraction=0.3, blocks=3)
+    tail = hessboost.folds.PurgedTail(at, end, 0.25)
+    report = hessboost.cross_validate(
+        params, dtrain, 60, folds=splits, early_stopping_rounds=3, per_fold_stopping=tail
+    )
+    assert report.history == {}
+    assert report.refit is None
+    oof = report.out_of_fold()
+    for index, ((train_rows, test_rows), fold) in enumerate(zip(splits, report.folds, strict=True)):
+        split_at, (fit_rows, tail_rows) = tail.split(train_rows)
+        trial = hessboost.train(
+            params,
+            dtrain.slice(fit_rows),
+            60,
+            evals=[(dtrain.slice(tail_rows), "tail")],
+            early_stopping_rounds=3,
+            verbose_eval=False,
+        )
+        assert trial.best_iteration is not None
+        assert trial.best_score is not None
+        rounds = trial.best_iteration + 1
+        model = hessboost.train(params, dtrain.slice(train_rows), rounds)
+        margins = model.predict(x[test_rows], output_margin=True)
+        np.testing.assert_array_equal(fold.test_rows, test_rows)
+        assert fold.num_boost_round == rounds
+        np.testing.assert_array_equal(fold.margins, margins)
+        assert fold.stopping == hessboost.TailStopping(
+            split_at, len(fit_rows), len(tail_rows), trial.best_score
+        )
+        assert set(fold.scores) == {"rmse"}
+        np.testing.assert_array_equal(oof.margins[test_rows], margins)
+        assert (oof.fold[test_rows] == index).all()
+    untested = oof.fold == -1
+    assert untested.sum() == 400 - sum(len(test) for _, test in splits)
+    assert np.isnan(oof.margins[untested]).all()
+
+
+def test_cross_validate_refuses_unusable_stopping() -> None:
+    x, y = regression()
+    dtrain = DMatrix(x, y)
+    at = np.arange(400)
+    tail = hessboost.folds.PurgedTail(at, at + 5, 0.25)
+    with pytest.raises(HessboostError, match="early_stopping_rounds"):
+        hessboost.cross_validate({}, dtrain, 5, per_fold_stopping=tail)
+    with pytest.raises(TypeError, match="PurgedTail"):
+        hessboost.cross_validate(
+            {},
+            dtrain,
+            5,
+            early_stopping_rounds=2,
+            per_fold_stopping=(at, at, 0.5),  # ty: ignore[invalid-argument-type]
+        )
+    short = hessboost.folds.PurgedTail(at[1:], at[1:] + 5, 0.25)
+    with pytest.raises(HessboostError):
+        hessboost.cross_validate({}, dtrain, 5, early_stopping_rounds=2, per_fold_stopping=short)
+    with pytest.raises(HessboostError, match="fraction"):
+        hessboost.folds.PurgedTail(at, at, 1.0)
+    with pytest.raises(HessboostError, match="before its decision"):
+        hessboost.folds.PurgedTail(at, at - 1, 0.5)
+    overlapping = hessboost.cross_validate(
+        {}, dtrain, 2, folds=[(range(100), [100, 101]), (range(100), [101])]
+    )
+    np.testing.assert_array_equal(overlapping.folds[1].test_rows, [101])
+    with pytest.raises(HessboostError, match="held out by folds 0 and 1"):
+        overlapping.out_of_fold()
+
+
 def test_train_with_budget_fits_and_refuses_tuned_parameters() -> None:
     x, y = regression()
     dtrain = DMatrix(x[:300], y[:300], feature_names=[f"f{i}" for i in range(x.shape[1])])

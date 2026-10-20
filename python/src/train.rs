@@ -6,10 +6,13 @@ use crate::data::{DMatrix, row_major, to_numpy};
 use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::Params;
 use crate::target_stats::{FittedTargetEncoder, OrderedTargetEncoder};
+use hessboost::error::HessboostError;
 use hessboost::metric::CustomMetric;
 use hessboost::objective::{CustomLoss, GradPair, Objective};
 use hessboost::training::budget::{self, BudgetConfig};
-use hessboost::training::{CrossValidation, CvResult, Fold, RoundEval, Trainer};
+use hessboost::training::{
+    CrossValidation, CvStopping, Fold, PurgedTail, RoundEval, TailStopping, Trainer,
+};
 use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArrayDyn, PyReadonlyArray1, ToPyArray};
 use pyo3::panic::PanicException;
@@ -481,10 +484,37 @@ pub(crate) fn train_with_budget(
 /// `(metric, per-round test means, per-round test standard deviations)`.
 type CvHistory = Vec<(String, Vec<f64>, Vec<f64>)>;
 
+/// A per-fold tail split's `(split time, fit rows, tail rows, best score)`.
+type TailStoppingTuple = (i64, usize, usize, f64);
+
+/// One fold's `(test rows, rounds, scores, margins [rows][outputs], tail
+/// stopping)`.
+type FoldTuple<'py> = (
+    Bound<'py, PyArrayDyn<i64>>,
+    usize,
+    Vec<f64>,
+    Bound<'py, PyArrayDyn<f32>>,
+    Option<TailStoppingTuple>,
+);
+
+/// Out-of-fold `(margins [rows][outputs], holding fold per row)`.
+type OutOfFoldArrays<'py> = (Bound<'py, PyArrayDyn<f32>>, Bound<'py, PyArrayDyn<i64>>);
+
+/// The refit of a run: `(booster, rounds, the encoder fitted on every row
+/// with target_stats, its tail stopping under per-fold stopping)`.
+type RefitTuple = (
+    Booster,
+    usize,
+    Option<FittedTargetEncoder>,
+    Option<TailStoppingTuple>,
+);
+
 /// One cross-validation run, passed from Python as a `dict`: explicit
 /// `(train rows, test rows)` folds, with `target_stats = (encoder, columns)`
-/// fitted inside each fold (over `target_stats_label` when given) and an
-/// `init_model` every fold continues.
+/// fitted inside each fold (over `target_stats_label` when given), an
+/// `init_model` every fold continues, and per-fold early stopping on the
+/// purged tail `per_fold_stopping = (decision_at, label_end, fraction)`
+/// (with `early_stopping_rounds` its patience).
 #[derive(FromPyObject)]
 #[pyo3(from_item_all)]
 pub(crate) struct CvRequest<'py> {
@@ -495,6 +525,8 @@ pub(crate) struct CvRequest<'py> {
     #[pyo3(default)]
     early_stopping_rounds: Option<usize>,
     #[pyo3(default)]
+    per_fold_stopping: Option<(PyReadonlyArray1<'py, i64>, PyReadonlyArray1<'py, i64>, f64)>,
+    #[pyo3(default)]
     target_stats: Option<(Py<OrderedTargetEncoder>, Vec<usize>)>,
     #[pyo3(default)]
     target_stats_label: Option<PyReadonlyArray1<'py, f32>>,
@@ -504,7 +536,7 @@ pub(crate) struct CvRequest<'py> {
 
 impl CvRequest<'_> {
     /// The configured run (a cheap builder; the work is its `run` or
-    /// `refit`), borrowing the request's matrix, labels and model.
+    /// `refit`), borrowing the request's matrix, labels, times and model.
     fn configured(&mut self) -> PyResult<CrossValidation<'_>> {
         let early_stopping_rounds = patience(self.early_stopping_rounds)?;
         let folds = std::mem::take(&mut self.folds)
@@ -522,8 +554,27 @@ impl CvRequest<'_> {
             request.num_boost_round,
             folds,
         );
-        if let Some(rounds) = early_stopping_rounds {
-            cv = cv.early_stopping_rounds(rounds);
+        let stopping = match (&request.per_fold_stopping, early_stopping_rounds) {
+            (Some((decision_at, label_end, fraction)), Some(rounds)) => {
+                let tail = PurgedTail::new(
+                    row_major(decision_at, "decision_at")?,
+                    row_major(label_end, "label_end")?,
+                    *fraction,
+                )
+                .or_raise()?;
+                Some(CvStopping::per_fold(rounds, tail))
+            }
+            (Some(_), None) => {
+                return Err(HessboostError::invalid_param(
+                    "per_fold_stopping",
+                    "needs early_stopping_rounds, the patience on each fold's tail",
+                ))
+                .or_raise();
+            }
+            (None, rounds) => rounds.map(CvStopping::fold_mean),
+        };
+        if let Some(stopping) = stopping {
+            cv = cv.early_stopping(stopping);
         }
         if let Some((encoder, columns)) = target_stats {
             cv = cv.target_stats(encoder, columns);
@@ -538,46 +589,148 @@ impl CvRequest<'_> {
     }
 }
 
-/// The Python form of `results`: one [`CvHistory`] entry per metric.
-fn history(results: Vec<CvResult>) -> CvHistory {
-    results
-        .into_iter()
-        .map(|result| {
-            let (means, stds) = result
-                .rounds
-                .iter()
-                .map(|round| (round.mean, round.std))
-                .unzip();
-            (result.metric, means, stds)
-        })
-        .collect()
+fn tail_stopping(stopping: &TailStopping) -> TailStoppingTuple {
+    (
+        stopping.split_at,
+        stopping.fit_rows,
+        stopping.tail_rows,
+        stopping.best_score,
+    )
 }
 
-/// Cross-validates as `request` describes; returns the history.
-#[pyfunction]
-pub(crate) fn cv(py: Python<'_>, mut request: CvRequest<'_>) -> PyResult<CvHistory> {
-    let cv = request.configured()?;
-    py.detached(move || cv.run()).map(history)
+/// A cross-validation report: the fold-mean history, every fold's round
+/// count, scores and test margins, and the out-of-fold margins.
+#[pyclass(frozen, module = "hessboost._hessboost")]
+pub(crate) struct CvReport {
+    inner: hessboost::training::CvReport,
 }
 
-/// Cross-validates as `request` describes, then retrains on every row for
-/// the chosen round count: `(history, booster, rounds, the encoder fitted
-/// on every row with target_stats)`.
+#[pymethods]
+impl CvReport {
+    /// One [`CvHistory`] entry per metric (none under per-fold stopping).
+    fn history(&self) -> CvHistory {
+        self.inner
+            .results
+            .iter()
+            .map(|result| {
+                let (means, stds) = result
+                    .rounds
+                    .iter()
+                    .map(|round| (round.mean, round.std))
+                    .unzip();
+                (result.metric.clone(), means, stds)
+            })
+            .collect()
+    }
+
+    /// The metrics' names, in the order of every fold's scores.
+    fn metrics(&self) -> Vec<String> {
+        self.inner.metrics.clone()
+    }
+
+    /// Every fold's report, in fold order.
+    fn folds<'py>(&self, py: Python<'py>) -> PyResult<Vec<FoldTuple<'py>>> {
+        self.inner
+            .folds
+            .iter()
+            .map(|fold| {
+                let rows = fold.test.iter().map(|&row| row as i64).collect();
+                let margins = &fold.margins;
+                Ok((
+                    to_numpy(py, rows, &[fold.test.len()])?,
+                    fold.num_boost_round,
+                    fold.scores.clone(),
+                    to_numpy(
+                        py,
+                        margins.as_slice().to_vec(),
+                        &[margins.n_rows(), margins.width()],
+                    )?,
+                    fold.stopping.as_ref().map(tail_stopping),
+                ))
+            })
+            .collect()
+    }
+
+    /// Every row's out-of-fold margins (`[rows][outputs]`, NaN where no
+    /// fold held the row out) and the fold that held it out (`-1`: none).
+    fn out_of_fold<'py>(&self, py: Python<'py>) -> PyResult<OutOfFoldArrays<'py>> {
+        let oof = self.inner.out_of_fold().or_raise()?;
+        let (rows, width) = (oof.margins.n_rows(), oof.margins.width());
+        let folds = oof
+            .fold
+            .iter()
+            .map(|fold| fold.map_or(-1, |fold| fold as i64))
+            .collect();
+        Ok((
+            to_numpy(py, oof.margins.into_vec(), &[rows, width])?,
+            to_numpy(py, folds, &[rows])?,
+        ))
+    }
+}
+
+/// Cross-validates as `request` describes; with `refit`, also retrains on
+/// every row for the chosen round count.
 #[pyfunction]
-pub(crate) fn cv_refit(
+pub(crate) fn cross_validate(
     py: Python<'_>,
     mut request: CvRequest<'_>,
-) -> PyResult<(CvHistory, Booster, usize, Option<FittedTargetEncoder>)> {
+    refit: bool,
+) -> PyResult<(CvReport, Option<RefitTuple>)> {
     let cv = request.configured()?;
+    if !refit {
+        let inner = py.detached(move || cv.run())?;
+        return Ok((CvReport { inner }, None));
+    }
     let refit = py.detached(move || cv.refit())?;
+    let stopping = refit.stopping.as_ref().map(tail_stopping);
     Ok((
-        history(refit.results),
-        Booster::new(refit.model),
-        refit.num_boost_round,
-        refit
-            .target_encoder
-            .map(|inner| FittedTargetEncoder { inner }),
+        CvReport {
+            inner: refit.report,
+        },
+        Some((
+            Booster::new(refit.model),
+            refit.num_boost_round,
+            refit
+                .target_encoder
+                .map(|inner| FittedTargetEncoder { inner }),
+            stopping,
+        )),
     ))
+}
+
+/// `(decision_at, label_end, fraction)` checked as a purged tail.
+#[pyfunction]
+pub(crate) fn check_purged_tail(
+    decision_at: PyReadonlyArray1<'_, i64>,
+    label_end: PyReadonlyArray1<'_, i64>,
+    fraction: f64,
+) -> PyResult<()> {
+    PurgedTail::new(
+        row_major(&decision_at, "decision_at")?,
+        row_major(&label_end, "label_end")?,
+        fraction,
+    )
+    .or_raise()
+    .map(|_| ())
+}
+
+/// `rows`' purged-tail split: `(split time, fit rows, tail rows)`.
+#[pyfunction]
+pub(crate) fn purged_tail_split<'py>(
+    py: Python<'py>,
+    decision_at: PyReadonlyArray1<'_, i64>,
+    label_end: PyReadonlyArray1<'_, i64>,
+    fraction: f64,
+    rows: Vec<usize>,
+) -> PyResult<(i64, FoldArrays<'py>)> {
+    let tail = PurgedTail::new(
+        row_major(&decision_at, "decision_at")?,
+        row_major(&label_end, "label_end")?,
+        fraction,
+    )
+    .or_raise()?;
+    let (split_at, fold) = tail.split(&rows).or_raise()?;
+    Ok((split_at, fold_arrays(py, vec![fold])?))
 }
 
 type FoldArrays<'py> = Vec<(Bound<'py, PyArrayDyn<i64>>, Bound<'py, PyArrayDyn<i64>>)>;

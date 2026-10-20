@@ -220,6 +220,44 @@ def test_slicing_selects_iterations(trained: tuple[Booster, np.ndarray]) -> None
         booster["a"]  # ty: ignore[invalid-argument-type]
 
 
+def test_averaging_takes_the_mean_margin() -> None:
+    """Seed bags of a log-link head average to the mean margin, so the
+    prediction is the members' geometric mean; the schema carries over."""
+    x, y = regression()
+    dtrain = DMatrix(x, np.exp(y / 4), feature_names=list("abcde"))
+    params = {"objective": "reg:tweedie", "max_depth": 3, "subsample": 0.7}
+    members = [hessboost.train(params | {"seed": seed}, dtrain, 6) for seed in range(3)]
+    average = Booster.average(members)
+    assert average.num_boosted_rounds() == 18
+    assert average.best_iteration is None
+    assert average.feature_names == list("abcde")
+    margins = np.stack([m.predict(dtrain, output_margin=True) for m in members])
+    np.testing.assert_allclose(
+        average.predict(dtrain, output_margin=True), margins.mean(axis=0), atol=1e-5
+    )
+    predictions = np.stack([m.predict(dtrain) for m in members]).astype(np.float64)
+    np.testing.assert_allclose(
+        average.predict(dtrain), np.exp(np.log(predictions).mean(axis=0)), rtol=1e-5
+    )
+
+
+def test_averaging_refuses_incompatible_members(trained: tuple[Booster, np.ndarray]) -> None:
+    booster, x = trained
+    with pytest.raises(HessboostError, match="no models"):
+        Booster.average([])
+    renamed = booster.copy()
+    renamed.feature_names = list("vwxyz")
+    with pytest.raises(hessboost.IncompatibleModelError, match="feature names"):
+        Booster.average([booster, renamed])
+    absolute = hessboost.train(
+        {"objective": "reg:absoluteerror", "max_depth": 4},
+        DMatrix(x, x[:, 0], feature_names=list("abcde")),
+        2,
+    )
+    with pytest.raises(hessboost.IncompatibleModelError, match="objective"):
+        Booster.average([booster, absolute])
+
+
 def test_shap_contributions_sum_to_the_margin(trained: tuple[Booster, np.ndarray]) -> None:
     booster, x = trained
     contribs = booster.predict(x, pred_contribs=True)

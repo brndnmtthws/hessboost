@@ -4,7 +4,9 @@ categoricals, scipy sparse matrices, and DMatrix metadata."""
 from __future__ import annotations
 
 import array
+import ctypes
 import gc
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -377,3 +379,21 @@ def test_copy_false_refuses_what_it_cannot_borrow() -> None:
         DMatrix(x.astype(np.float64), y, copy=False)
     with pytest.raises(TypeError, match="numpy array"):
         DMatrix(pd.DataFrame(x), y, copy=False)
+
+
+def test_copy_false_refuses_memory_no_python_object_owns() -> None:
+    # A memory view without an exporter (`ctypes.memoryview_at`'s) keeps no
+    # owner alive, so a matrix borrowing an array over it could outlive the
+    # memory. `owner` lives through the test: nothing here reads freed memory.
+    if sys.version_info < (3, 14):
+        pytest.skip("ctypes.memoryview_at is new in Python 3.14")
+    owner = (ctypes.c_float * 12)(*range(12))
+    view = ctypes.memoryview_at(ctypes.addressof(owner), ctypes.sizeof(owner), readonly=True)
+    unowned = np.frombuffer(view, dtype=np.float32).reshape(4, 3)
+    assert view.obj is None
+    assert not unowned.flags.writeable
+    with pytest.raises(HessboostError, match="no Python object owns"):
+        DMatrix(unowned, copy=False)
+    # The same values over memory a Python object owns are borrowed.
+    owned = np.frombuffer(bytes(owner), dtype=np.float32).reshape(4, 3)
+    assert DMatrix(owned, copy=False).num_row() == 4

@@ -145,8 +145,9 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
             non-finite values, invalid category codes), or ``copy=False``
             got a writeable or non-contiguous array, a read-only view of a
             writeable array or buffer (or of an owner exposing no buffer to
-            ask, such as an ``as_strided`` result), or one another Rust
-            extension holds a mutable borrow of.
+            ask, such as an ``as_strided`` result, or of memory no Python
+            object owns, such as ``ctypes.memoryview_at``'s), or one another
+            Rust extension holds a mutable borrow of.
         TypeError: An input has an unsupported type or dtype.
     """
 

@@ -46,7 +46,7 @@ cargo add hessboost
 For users pinning a release series in a Cargo manifest:
 
 ```toml
-hessboost = "0.3"
+hessboost = "0.4"
 ```
 
 Needs Rust 1.93 or newer and a C compiler (to build libzstd).

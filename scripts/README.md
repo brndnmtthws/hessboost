@@ -255,3 +255,42 @@ uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
 
 See [Performance](../docs/performance.md#xgboost-comparison) for the recorded
 comparison and workload definitions.
+
+
+## CPU baseline/candidate comparison
+
+`examples/bench_cpu.rs` generates deterministic synthetic regression data and
+measures warm-bin-cache training, cold training (fresh matrix construction and
+binning included), or margin prediction. Arguments:
+
+```sh
+RAYON_NUM_THREADS=1 cargo run --release --example bench_cpu -- \
+  predict 8 30 100 6 1 5 dense 10000
+# operation rows features rounds depth colsample repeats [dense|sparse] [training_rows]
+```
+
+Prediction training size is independent of batch size (at least 10,000 by
+default). `sparse` means a NaN-filled dense matrix, not CSR. Small-batch
+prediction records the per-call time over 1,000 calls. One warmup measurement
+is discarded per process. Prediction and serialized-model checksums are
+checked on every repeat, outside the timer. The warm training timer excludes
+matrix construction and reuses the prebuilt bins; `train-cold` includes both.
+Model destruction and checksum/quality validation are outside fit timing.
+
+Build this same example against both source revisions, using separate target
+directories (or force rebuilding the library when switching checkouts), then:
+
+```sh
+python scripts/bench_cpu.py --baseline /tmp/baseline-bench_cpu \
+  --candidate /tmp/candidate-bench_cpu --output /tmp/cpu-comparison \
+  --threads 1 4 --repeats 5
+```
+
+The runner executes baseline/candidate/candidate/baseline serially for each
+case and thread count, checks identical model and prediction checksums across
+both binaries and thread counts, and saves all samples, median/min/max,
+binary SHA-256s and host information. Each result contains ten recorded
+samples per binary with the command above. Select cases with `--cases`.
+Avoid competing workloads during the run; shared/virtualized hosts still
+introduce noise. These synthetic cases test specific paths, not general model
+quality or hardware-wide performance.

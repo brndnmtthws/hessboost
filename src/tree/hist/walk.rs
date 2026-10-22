@@ -282,6 +282,82 @@ pub(super) fn by_features<E: Bucket, V: RowValue<E>>(
         });
 }
 
+/// Build only a tree pool's features. Every selected bin retains the same
+/// row-order chain as the full build; unselected slices are never touched.
+pub(super) fn by_selected_features<E: Bucket, V: RowValue<E>>(
+    ghist: &GHistIndex,
+    columns: Columns<'_>,
+    rows: &SweepRows<'_>,
+    values: &[V],
+    out: &mut [E],
+    features: &[u32],
+) {
+    let mut slices: Vec<_> = feature_slices(ghist, out, 1)
+        .into_iter()
+        .enumerate()
+        .filter(|(f, _)| features.binary_search(&(*f as u32)).is_ok())
+        .map(|(f, (_, slice))| (f, slice))
+        .collect();
+    let len = match rows {
+        SweepRows::Range(range) => range.len(),
+        SweepRows::Subset(rows) => rows.len(),
+    };
+    let threads = if len >= super::PARALLEL_THRESHOLD {
+        rayon::current_num_threads()
+    } else {
+        1
+    };
+    let per_task = slices.len().div_ceil(threads).clamp(1, FEATURES_PER_PASS);
+    let build = |group: &mut [(usize, &mut [E])]| {
+        for (_, slice) in group.iter_mut() {
+            slice.fill(E::default());
+        }
+        match columns {
+            Columns::U8(set) => selected_group(set, group, rows, values),
+            Columns::U16(set) => selected_group(set, group, rows, values),
+            Columns::U32(set) => selected_group(set, group, rows, values),
+        }
+    };
+    if threads > 1 {
+        slices.par_chunks_mut(per_task).for_each(build);
+    } else {
+        slices.chunks_mut(per_task).for_each(build);
+    }
+}
+
+/// Sweep up to four possibly nonconsecutive selected features, sharing each
+/// row's gradient load and widening without changing any bin's addition order.
+#[inline(always)]
+fn selected_group<E: Bucket, V: RowValue<E>, B: BinIndex>(
+    set: ColumnSet<'_, B>,
+    group: &mut [(usize, &mut [E])],
+    rows: &SweepRows<'_>,
+    values: &[V],
+) {
+    let column = |f| {
+        let column = set.column(f);
+        debug_assert!(column.missing.is_none(), "a dense index's columns");
+        column.bins
+    };
+    match group {
+        [a] => sweep_slices([column(a.0)], [a], rows, values),
+        [a, b] => sweep_slices([column(a.0), column(b.0)], [a, b], rows, values),
+        [a, b, c] => sweep_slices(
+            [column(a.0), column(b.0), column(c.0)],
+            [a, b, c],
+            rows,
+            values,
+        ),
+        [a, b, c, d] => sweep_slices(
+            [column(a.0), column(b.0), column(c.0), column(d.0)],
+            [a, b, c, d],
+            rows,
+            values,
+        ),
+        _ => unreachable!("callers pass one to four features"),
+    }
+}
+
 /// [`by_features`] on `threads` scoped threads instead of Rayon's pool,
 /// with the same bits (each bin still has one writer adding its rows in
 /// ascending order), for a caller holding a lock that work stealing could

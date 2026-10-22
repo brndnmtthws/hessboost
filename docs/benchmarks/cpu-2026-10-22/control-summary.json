@@ -1,0 +1,53 @@
+[
+  {
+    "case": "predict_batch",
+    "threads": 4,
+    "baseline": {
+      "median": 0.0107813805,
+      "min": 0.009555308,
+      "max": 0.019093061,
+      "samples": 50
+    },
+    "candidate": {
+      "median": 0.010253122,
+      "min": 0.009415632,
+      "max": 0.015482439,
+      "samples": 50
+    },
+    "speedup": 1.0515217218716406
+  },
+  {
+    "case": "train_wide_80pct",
+    "threads": 4,
+    "baseline": {
+      "median": 0.172929576,
+      "min": 0.139067212,
+      "max": 0.239517357,
+      "samples": 50
+    },
+    "candidate": {
+      "median": 0.143459862,
+      "min": 0.124720368,
+      "max": 0.189010618,
+      "samples": 50
+    },
+    "speedup": 1.2054213184730376
+  },
+  {
+    "case": "train_full",
+    "threads": 4,
+    "baseline": {
+      "median": 0.118964882,
+      "min": 0.099792795,
+      "max": 0.164300489,
+      "samples": 50
+    },
+    "candidate": {
+      "median": 0.1174358435,
+      "min": 0.100599357,
+      "max": 0.156572109,
+      "samples": 50
+    },
+    "speedup": 1.013020202813973
+  }
+]

@@ -275,6 +275,40 @@ pub(super) fn child_histograms(
     with_sibling(parent, small, left_smaller)
 }
 
+/// Child histograms restricted to a tree's feature pool. The unused bins
+/// may stay stale throughout the tree: every descendant samples this pool.
+pub(super) fn child_histograms_for_features(
+    backend: &dyn HistogramBackend,
+    ghist: &GHistIndex,
+    gpair: &[GradPair],
+    left_rows: &[u32],
+    right_rows: &[u32],
+    mut parent: Histogram,
+    features: &[u32],
+) -> (Histogram, Histogram) {
+    if features.len() == ghist.n_cols() {
+        return child_histograms(backend, ghist, gpair, left_rows, right_rows, parent);
+    }
+    let left_smaller = left_rows.len() <= right_rows.len();
+    let mut small = zeroed(parent.len());
+    backend.build_features(
+        ghist,
+        if left_smaller { left_rows } else { right_rows },
+        gpair,
+        &mut small,
+        features,
+    );
+    for &f in features {
+        let (start, end) = ghist.cuts().feature_bins(f as usize);
+        subtract_in_place(&mut parent[start..end], &small[start..end]);
+    }
+    if left_smaller {
+        (small, parent)
+    } else {
+        (parent, small)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

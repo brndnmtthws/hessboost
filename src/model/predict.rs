@@ -113,6 +113,25 @@ impl BoostedModel {
             return;
         }
         let k = self.n_outputs();
+        if rows.n_rows() < LANES {
+            let mut block = RowBlock::new(rows);
+            if !matches!(block, RowBlock::Wide { .. }) {
+                block.load(0, rows.n_rows());
+                for (r, margin) in out.chunks_exact_mut(k).enumerate() {
+                    // Retain the initialized intercept or per-row base margin;
+                    // only add the requested trees, in their original order.
+                    self.add_row_trees(
+                        block.row(r).expect("non-wide small blocks expose rows"),
+                        trees.clone(),
+                        &(0..k),
+                        &weight,
+                        |_, _| {},
+                        margin,
+                    );
+                }
+                return;
+            }
+        }
         if self.has_vector_leaves() {
             self.traverse_blocks(
                 rows,

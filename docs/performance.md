@@ -397,8 +397,11 @@ numeric split becomes one ordered compare that is false for missing (left-
 missing stores the next-lower threshold; right-missing mirrors children and
 stores a negated threshold plus sign mask; leaves self-loop). One step: node
 load, feature load, XOR, compare, add — no data-dependent branch: each lane
-steps with `cmp` + `cinc` (`simd::step_if_greater`), since LLVM compiles a
-plain select to a branch that random rows mispredict. Sixteen rows walk in
+steps with `cmp` + `cinc` on AArch64 and `cmp` + `adc` on x86_64
+(`simd::step_if_greater`), since LLVM compiles a plain select to a branch
+that random rows mispredict on AArch64, and on x86_64 vectorizes the one-row
+walk's eight lanes, shuffling every lane's index in and out of AVX2
+registers each step. Sixteen rows walk in
 lockstep for the tree depth; batches under sixteen rows walk sixteen trees
 in lockstep instead. One row (`predict_row`, `predict_row_into`, their
 margin forms) walks a second layout, built on the first row call: chunks of

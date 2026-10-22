@@ -23,6 +23,18 @@ CASES = {
     "predict_15": ("predict", 15, 30, 100, 6, 1, "dense", 10000),
     "predict_16": ("predict", 16, 30, 100, 6, 1, "dense", 10000),
     "predict_batch": ("predict", 100000, 30, 100, 6, 1, "dense", 100000),
+    "train_cold_full": ("train-cold", 100000, 30, 20, 6, 1, "dense", 100000),
+    "train_cold_one_round": ("train-cold", 100000, 30, 1, 6, 1, "dense", 100000),
+    "train_cold_missing": ("train-cold", 50000, 30, 20, 6, 1, "sparse", 50000),
+    "bins_dense": ("bins", 100000, 30, 1, 6, 1, "dense", 100000),
+    "bins_wide": ("bins", 20000, 128, 1, 6, 1, "dense", 20000),
+    "bins_missing": ("bins", 100000, 30, 1, 6, 1, "sparse", 100000),
+    "cuts_dense": ("cuts", 100000, 30, 1, 6, 1, "dense", 100000),
+    "predict_wide_256": ("predict", 10000, 256, 10, 4, 1, "dense", 10000),
+    "predict_wide_1024": ("predict", 10000, 1024, 10, 4, 1, "dense", 10000),
+    "predict_wide_deep": ("predict", 10000, 256, 100, 6, 1, "dense", 10000),
+    "predict_64": ("predict", 64, 30, 100, 6, 1, "dense", 10000),
+    "predict_256": ("predict", 256, 30, 100, 6, 1, "dense", 10000),
 }
 
 

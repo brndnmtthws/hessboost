@@ -1,0 +1,8 @@
+
+running 1 test
+{"columns":30,"destination_capacity":15360,"iterations":1000,"operation":"fill_lanes","rows":256,"seconds_per_call":[6.5306339999999994e-6,8.83272e-6,6.7788400000000005e-6,6.168778e-6,6.286362e-6,6.522671e-6,6.199994e-6]}
+{"columns":256,"destination_capacity":131072,"iterations":1000,"operation":"fill_lanes","rows":256,"seconds_per_call":[0.00005263401,0.000054379112,0.000054663793000000004,0.000053604967,0.000056355376999999996,0.000053578908,0.000053691364]}
+{"columns":1024,"destination_capacity":524288,"iterations":1000,"operation":"fill_lanes","rows":256,"seconds_per_call":[0.00023252619799999998,0.00022952099600000002,0.000246736193,0.000249975384,0.00023508513999999999,0.000240091169,0.00026351302199999996]}
+test tree::compact::tests::profile_fill_lanes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 590 filtered out; finished in 2.14s

@@ -93,31 +93,71 @@ fn unkey(key: u32) -> f32 {
 /// ([`FEATURE_LANES`] per feature), so a lane's key sits at a fixed
 /// immediate offset from the node's slot.
 pub(crate) fn fill_lanes(lanes: &mut Vec<u32>, rows: &[f32], n_cols: usize) {
+    const TILE: usize = 32;
     let groups = rows.len() / n_cols / LANES;
     // Every slot is written below, so only slots the buffer gains are zeroed.
     lanes.resize(groups * FEATURE_LANES * n_cols, 0);
     if groups == 0 {
         return;
     }
-    // One row's keys of `v` and of `-v`, formed with contiguous (vector)
-    // arithmetic before they are scattered to their lane slots.
-    let mut keyed = vec![0u32; 2 * n_cols];
+    // Narrow groups already fit comfortably in L1. Keep their existing
+    // staging path rather than paying the tile loop's extra bounds work.
+    if n_cols <= 64 {
+        // One row's keys of `v` and of `-v`, formed with contiguous (vector)
+        // arithmetic before they are scattered to their lane slots.
+        let mut keyed = vec![0u32; 2 * n_cols];
+        let dst_groups = lanes.chunks_exact_mut(FEATURE_LANES * n_cols);
+        for (dst, src) in dst_groups.zip(rows.chunks_exact(LANES * n_cols)) {
+            for (j, row) in src.chunks_exact(n_cols).enumerate() {
+                let (pos, neg) = keyed.split_at_mut(n_cols);
+                for ((p, q), &v) in pos.iter_mut().zip(neg.iter_mut()).zip(row) {
+                    (*p, *q) = (key(v), key(-v));
+                }
+                for ((keys, &p), &q) in dst
+                    .as_chunks_mut::<FEATURE_LANES>()
+                    .0
+                    .iter_mut()
+                    .zip(&*pos)
+                    .zip(&*neg)
+                {
+                    keys[j] = p;
+                    keys[LANES + j] = q;
+                }
+            }
+        }
+        return;
+    }
+    // Keep a tile's 4 KiB of destination keys hot while its sixteen rows
+    // scatter into it. A feature-wide scatter repeatedly streams over a
+    // group larger than L1 for wide inputs. The bounded scratch also avoids
+    // allocating a new row of keys for every prediction block.
+    let mut keyed = [0u32; 2 * TILE];
     let dst_groups = lanes.chunks_exact_mut(FEATURE_LANES * n_cols);
     for (dst, src) in dst_groups.zip(rows.chunks_exact(LANES * n_cols)) {
-        for (j, row) in src.chunks_exact(n_cols).enumerate() {
-            let (pos, neg) = keyed.split_at_mut(n_cols);
-            for ((p, q), &v) in pos.iter_mut().zip(neg.iter_mut()).zip(row) {
-                (*p, *q) = (key(v), key(-v));
-            }
-            for ((keys, &p), &q) in dst
-                .as_chunks_mut::<FEATURE_LANES>()
-                .0
-                .iter_mut()
-                .zip(&*pos)
-                .zip(&*neg)
-            {
-                keys[j] = p;
-                keys[LANES + j] = q;
+        for (tile, dst) in dst.chunks_mut(FEATURE_LANES * TILE).enumerate() {
+            let first = tile * TILE;
+            let width = dst.len() / FEATURE_LANES;
+            for (j, row) in src.chunks_exact(n_cols).enumerate() {
+                // Form both signs with contiguous arithmetic, before the
+                // scatter, so the compiler can still vectorize keying.
+                let (pos, neg) = keyed.split_at_mut(TILE);
+                for ((p, q), &v) in pos[..width]
+                    .iter_mut()
+                    .zip(&mut neg[..width])
+                    .zip(&row[first..first + width])
+                {
+                    (*p, *q) = (key(v), key(-v));
+                }
+                for ((keys, &p), &q) in dst
+                    .as_chunks_mut::<FEATURE_LANES>()
+                    .0
+                    .iter_mut()
+                    .zip(&pos[..width])
+                    .zip(&neg[..width])
+                {
+                    keys[j] = p;
+                    keys[LANES + j] = q;
+                }
             }
         }
     }
@@ -1137,6 +1177,100 @@ impl CompactForest {
 mod tests {
     use super::*;
     use crate::tree::{ChildLeaf, SplitRule};
+
+    /// Manual isolated staging benchmark; run only in release mode.
+    /// The destination keeps its allocation, as prediction's block worker does.
+    #[test]
+    #[ignore = "manual fill_lanes timing; do not run alongside other CPU work"]
+    fn profile_fill_lanes() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let iterations: u32 = std::env::var("HESSBOOST_LANES_ITERS")
+            .map_or(Ok(1000), |value| value.parse())
+            .expect("HESSBOOST_LANES_ITERS must be a positive integer");
+        assert!(iterations > 0);
+        for columns in [30, 256, 1024] {
+            let rows: Vec<f32> = (0..256 * columns)
+                .map(|i| {
+                    if i % 37 == 0 {
+                        f32::NAN
+                    } else {
+                        (i % 1009) as f32 * 0.001 - 0.5
+                    }
+                })
+                .collect();
+            let mut lanes = Vec::new();
+            fill_lanes(&mut lanes, &rows, columns);
+            let reference = lanes.clone();
+            let mut seconds = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    fill_lanes(black_box(&mut lanes), black_box(&rows), columns);
+                    black_box(&lanes);
+                }
+                seconds.push(start.elapsed().as_secs_f64() / f64::from(iterations));
+                assert_eq!(lanes, reference);
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "operation": "fill_lanes", "rows": 256, "columns": columns,
+                    "iterations": iterations, "seconds_per_call": seconds,
+                    "destination_capacity": lanes.capacity(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn tiled_lanes_match_scalar_keys_across_boundaries() {
+        let probes = [
+            f32::NEG_INFINITY,
+            -f32::MAX,
+            -f32::MIN_POSITIVE,
+            -f32::from_bits(1),
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+            f32::from_bits(0xFFC0_1234),
+            f32::from_bits(0x7F80_0001),
+        ];
+        // Retain the same destination across growing and shrinking blocks:
+        // stale scratch or destination values must not leak into a new tile.
+        let mut lanes = vec![u32::MAX; 4096];
+        for n_cols in [1, 15, 16, 17, 30, 31, 32, 33, 63, 64, 65, 256, 1024] {
+            for n_rows in [0, 1, 15, 16, 17, 31, 32, 33, 256, 257, 16] {
+                let rows: Vec<f32> = (0..n_rows * n_cols)
+                    .map(|i| {
+                        if i % 2 == 0 {
+                            probes[(i / 2 + n_rows + n_cols) % probes.len()]
+                        } else {
+                            f32::from_bits((i as u32).wrapping_mul(2_654_435_761))
+                        }
+                    })
+                    .collect();
+                fill_lanes(&mut lanes, &rows, n_cols);
+                let groups = n_rows / LANES;
+                assert_eq!(lanes.len(), groups * FEATURE_LANES * n_cols);
+                for g in 0..groups {
+                    for feature in 0..n_cols {
+                        for lane in 0..LANES {
+                            let value = rows[(g * LANES + lane) * n_cols + feature];
+                            let slot = (g * n_cols + feature) * FEATURE_LANES + lane;
+                            assert_eq!(lanes[slot], key(value));
+                            assert_eq!(lanes[slot + LANES], key(-value));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn tree() -> RegTree {
         // Root splits on f0 < 0.5 (missing left); left child splits on f1 < 2

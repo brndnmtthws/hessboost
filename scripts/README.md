@@ -261,7 +261,8 @@ comparison and workload definitions.
 
 `examples/bench_cpu.rs` generates deterministic synthetic regression data and
 measures warm-bin-cache training, cold training (fresh matrix construction and
-binning included), or margin prediction. Arguments:
+binning included), margin prediction, cut construction (`cuts`), or bin
+assignment with precomputed cuts (`bins`, including the cuts clone). Arguments:
 
 ```sh
 RAYON_NUM_THREADS=1 cargo run --release --example bench_cpu -- \
@@ -271,11 +272,15 @@ RAYON_NUM_THREADS=1 cargo run --release --example bench_cpu -- \
 
 Prediction training size is independent of batch size (at least 10,000 by
 default). `sparse` means a NaN-filled dense matrix, not CSR. Small-batch
-prediction records the per-call time over 1,000 calls. One warmup measurement
+prediction below 16 rows records the per-call time over 1,000 calls; 16–1,023
+rows averages 100 calls, and larger batches time one call. One warmup measurement
 is discarded per process. Prediction and serialized-model checksums are
 checked on every repeat, outside the timer. The warm training timer excludes
 matrix construction and reuses the prebuilt bins; `train-cold` includes both.
 Model destruction and checksum/quality validation are outside fit timing.
+For `cuts` and `bins`, `checksum` hashes the cut values or assigned bins,
+respectively, and the legacy `model_checksum` field holds the cuts hash, not
+a model hash. Cut construction is outside the `bins` timer.
 
 Build this same example against both source revisions, using separate target
 directories (or force rebuilding the library when switching checkouts), then:

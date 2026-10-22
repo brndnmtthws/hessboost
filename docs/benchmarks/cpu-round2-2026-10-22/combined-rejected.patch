@@ -1,0 +1,451 @@
+--- a/src/data/ghist.rs
++++ b/src/data/ghist.rs
+@@ -935,0 +936,9 @@
++    if let Some(dense_rows) = data.dense_rows() {
++        // A dense row contributes at most n_cols entries. Equality for the
++        // block proves that every cell is present, including in row views
++        // and complete blocks of an otherwise sparse matrix.
++        if block.row_bins.len() == block.rows.len() * data.n_cols() {
++            return bin_dense_block::<true, R, C>(data, dense_rows, search, row_ptr, block);
++        }
++        return bin_dense_block::<false, R, C>(data, dense_rows, search, row_ptr, block);
++    }
+@@ -942 +950,0 @@
+-    let base = row_ptr[rows.start];
+@@ -944,16 +952,22 @@
+-    if let Some(dense_rows) = data.dense_rows() {
+-        // Feature by feature, each feature's search tables stay hot across
+-        // the block's rows, which stay in cache across its features; each
+-        // row's entries land in feature order at its own cursor. A whole
+-        // matrix's block is one contiguous stretch; a view's rows are read
+-        // through their slices.
+-        let missing = data.missing();
+-        let contiguous = dense_rows
+-            .contiguous()
+-            .map(|values| &values[rows.start * n_cols..rows.end * n_cols]);
+-        let block_rows: Vec<&[f32]> = match contiguous {
+-            Some(_) => Vec::new(),
+-            None => rows.clone().map(|r| dense_rows.row(r)).collect(),
+-        };
+-        let mut cursor: Vec<usize> = row_ptr[rows.clone()].iter().map(|&p| p - base).collect();
+-        for f in 0..n_cols {
++    // CSR rows: every bit starts missing and each stored entry clears
++    // its own.
++    let len = rows.len();
++    if let Some(bits) = columns.as_mut().and_then(|c| c.missing.as_mut()) {
++        for part in bits.iter_mut() {
++            for (w, word) in part.iter_mut().enumerate() {
++                let valid = (len - w * 64).min(64);
++                *word = if valid == 64 {
++                    u64::MAX
++                } else {
++                    (1 << valid) - 1
++                };
++            }
++        }
++    }
++    let mut at = 0;
++    for (i, row) in rows.enumerate() {
++        let (mut stored, mut in_order) = (0usize, true);
++        data.for_row_entry(row, |f, v| {
++            let f = f as usize;
++            in_order &= f == stored;
++            stored += 1;
+@@ -961,12 +975,5 @@
+-            let first = feature.first_bin();
+-            let mut column = columns.as_mut().map(|c| {
+-                let bits = c.missing.as_mut().map(|m| &mut *m[f]);
+-                (&mut *c.bins[f], bits)
+-            });
+-            let mut bin = |i: usize, v: f32| {
+-                if is_missing(v, missing) {
+-                    dense = false;
+-                    if let Some((_, Some(bits))) = column.as_mut() {
+-                        bits[i >> 6] |= 1 << (i & 63);
+-                    }
+-                    return;
++            let local = feature.local_bin_of(v);
++            if let Some(columns) = columns.as_mut() {
++                columns.bins[f][i] = C::from_bin(local);
++                if let Some(bits) = columns.missing.as_mut() {
++                    bits[f][i >> 6] &= !(1 << (i & 63));
+@@ -974,3 +981,58 @@
+-                let local = feature.local_bin_of(v);
+-                if let Some((bins, _)) = column.as_mut() {
+-                    bins[i] = C::from_bin(local);
++            }
++            row_bins[at] = R::from_bin(feature.first_bin() + local);
++            at += 1;
++        });
++        dense &= in_order && stored == n_cols;
++    }
++    dense
++}
++
++/// Dense storage, with missing entries handled by per-row cursors unless
++/// row offsets prove the whole block complete. Complete blocks need neither
++/// cursor allocation nor per-cell missing checks; both paths perform the
++/// same per-feature searches and write the same two bin layouts.
++fn bin_dense_block<const COMPLETE: bool, R: BinIndex, C: BinIndex>(
++    data: &DMatrix,
++    dense_rows: crate::data::dmatrix::DenseRows<'_>,
++    search: &BinSearch<'_>,
++    row_ptr: &[usize],
++    block: BinBlock<'_, R, C>,
++) -> bool {
++    let BinBlock {
++        rows,
++        row_bins,
++        mut columns,
++    } = block;
++    let n_cols = data.n_cols();
++    let base = row_ptr[rows.start];
++    let mut dense = true;
++    // Feature by feature, each feature's search tables stay hot across
++    // the block's rows, which stay in cache across its features; each
++    // row's entries land in feature order at its own cursor. A whole
++    // matrix's block is one contiguous stretch; a view's rows are read
++    // through their slices.
++    let missing = data.missing();
++    let contiguous = dense_rows
++        .contiguous()
++        .map(|values| &values[rows.start * n_cols..rows.end * n_cols]);
++    let block_rows: Vec<&[f32]> = match contiguous {
++        Some(_) => Vec::new(),
++        None => rows.clone().map(|r| dense_rows.row(r)).collect(),
++    };
++    let mut cursor: Vec<usize> = if COMPLETE {
++        Vec::new()
++    } else {
++        row_ptr[rows.clone()].iter().map(|&p| p - base).collect()
++    };
++    for f in 0..n_cols {
++        let feature = search.feature(f);
++        let first = feature.first_bin();
++        let mut column = columns.as_mut().map(|c| {
++            let bits = c.missing.as_mut().map(|m| &mut *m[f]);
++            (&mut *c.bins[f], bits)
++        });
++        let mut bin = |i: usize, v: f32| {
++            if !COMPLETE && is_missing(v, missing) {
++                dense = false;
++                if let Some((_, Some(bits))) = column.as_mut() {
++                    bits[i >> 6] |= 1 << (i & 63);
+@@ -978 +1040,10 @@
+-                row_bins[cursor[i]] = R::from_bin(first + local);
++                return;
++            }
++            let local = feature.local_bin_of(v);
++            if let Some((bins, _)) = column.as_mut() {
++                bins[i] = C::from_bin(local);
++            }
++            let at = if COMPLETE {
++                i * n_cols + f
++            } else {
++                let at = cursor[i];
+@@ -979,0 +1051 @@
++                at
+@@ -981,10 +1053,6 @@
+-            match contiguous {
+-                Some(block) => {
+-                    for (i, &v) in block[f..].iter().step_by(n_cols).enumerate() {
+-                        bin(i, v);
+-                    }
+-                }
+-                None => {
+-                    for (i, row) in block_rows.iter().enumerate() {
+-                        bin(i, row[f]);
+-                    }
++            row_bins[at] = R::from_bin(first + local);
++        };
++        match contiguous {
++            Some(block) => {
++                for (i, &v) in block[f..].iter().step_by(n_cols).enumerate() {
++                    bin(i, v);
+@@ -993,14 +1061,3 @@
+-        }
+-    } else {
+-        // CSR rows: every bit starts missing and each stored entry clears
+-        // its own.
+-        let len = rows.len();
+-        if let Some(bits) = columns.as_mut().and_then(|c| c.missing.as_mut()) {
+-            for part in bits.iter_mut() {
+-                for (w, word) in part.iter_mut().enumerate() {
+-                    let valid = (len - w * 64).min(64);
+-                    *word = if valid == 64 {
+-                        u64::MAX
+-                    } else {
+-                        (1 << valid) - 1
+-                    };
++            None => {
++                for (i, row) in block_rows.iter().enumerate() {
++                    bin(i, row[f]);
+@@ -1010,20 +1066,0 @@
+-        let mut at = 0;
+-        for (i, row) in rows.enumerate() {
+-            let (mut stored, mut in_order) = (0usize, true);
+-            data.for_row_entry(row, |f, v| {
+-                let f = f as usize;
+-                in_order &= f == stored;
+-                stored += 1;
+-                let feature = search.feature(f);
+-                let local = feature.local_bin_of(v);
+-                if let Some(columns) = columns.as_mut() {
+-                    columns.bins[f][i] = C::from_bin(local);
+-                    if let Some(bits) = columns.missing.as_mut() {
+-                        bits[f][i >> 6] &= !(1 << (i & 63));
+-                    }
+-                }
+-                row_bins[at] = R::from_bin(feature.first_bin() + local);
+-                at += 1;
+-            });
+-            dense &= in_order && stored == n_cols;
+-        }
+@@ -1139,0 +1177,81 @@
++    /// The no-missing specialization is exactly the cursor-based path,
++    /// including nonzero block starts, row-mapped views, category bins,
++    /// both common column widths, and an allocated missing bitmap.
++    #[test]
++    fn complete_dense_blocks_match_general_binning() {
++        fn run<const COMPLETE: bool, R: BinIndex + Default, C: BinIndex + Default>(
++            data: &DMatrix,
++            cuts: &HistCuts,
++            keep_columns: bool,
++        ) -> Binned<R, C> {
++            let rows = BIN_BLOCK_ROWS..data.n_rows();
++            let len = rows.len();
++            let row_ptr = row_offsets(data, false);
++            let mut bins = vec![R::default(); row_ptr[rows.end] - row_ptr[rows.start]];
++            let mut columns =
++                vec![C::default(); if keep_columns { len * data.n_cols() } else { 0 }];
++            let mut missing = keep_columns.then(|| vec![0u64; len.div_ceil(64) * data.n_cols()]);
++            let block = BinBlock {
++                rows,
++                row_bins: &mut bins,
++                columns: keep_columns.then(|| BlockColumns {
++                    bins: columns.chunks_mut(len).collect(),
++                    missing: missing
++                        .as_mut()
++                        .map(|bits| bits.chunks_mut(len.div_ceil(64)).collect()),
++                }),
++            };
++            let dense = bin_dense_block::<COMPLETE, R, C>(
++                data,
++                data.dense_rows().unwrap(),
++                &BinSearch::new(cuts),
++                &row_ptr,
++                block,
++            );
++            Binned {
++                rows: bins,
++                columns,
++                missing,
++                dense,
++            }
++        }
++        fn check<R: BinIndex + Default, C: BinIndex + Default>(data: &DMatrix, max_bin: usize) {
++            let cuts = HistCuts::from_dmatrix(data, max_bin);
++            for keep_columns in [false, true] {
++                let fast = run::<true, R, C>(data, &cuts, keep_columns);
++                let general = run::<false, R, C>(data, &cuts, keep_columns);
++                assert!(fast.dense && general.dense);
++                assert_eq!(fast.missing, general.missing);
++                assert!(fast.rows == general.rows);
++                assert!(fast.columns == general.columns);
++            }
++        }
++        let (n, f) = (2 * BIN_BLOCK_ROWS + 17, 6);
++        let mut values: Vec<_> = (0..n * f)
++            .map(|i| {
++                if i % f == 1 {
++                    (i / f % 5) as f32
++                } else {
++                    ((i * 79) % 1009) as f32
++                }
++            })
++            .collect();
++        // The complete block must still specialize when another block has a
++        // missing cell and the whole index therefore keeps a missing bitmap.
++        values[0] = -999.0;
++        values[BIN_BLOCK_ROWS * f + 2] = -0.0;
++        values[BIN_BLOCK_ROWS * f + 3] = 0.0;
++        let mut types = vec![FeatureType::Numerical; f];
++        types[1] = FeatureType::Categorical;
++        let data = DMatrix::from_dense_with_missing(&values, n, f, -999.0)
++            .unwrap()
++            .with_feature_types(&types)
++            .unwrap();
++        let view = data.select_rows(&(1..n).rev().collect::<Vec<_>>()).unwrap();
++        for source in [&data, &view] {
++            check::<u16, u8>(source, 32);
++            check::<u32, u16>(source, 600);
++            check::<u32, u32>(source, 600);
++        }
++    }
++
+@@ -1155 +1273,17 @@
+-        for (name, data, max_bin) in tables() {
++        let mut cases = tables();
++        // Exercise actual production parallel dispatch with both complete
++        // blocks and a mix of complete and missing-aware blocks.
++        let (n, f) = (PARALLEL_BINNING_CELLS / 6 + 37, 6);
++        let mut values: Vec<_> = (0..n * f).map(|i| ((i * 79) % 1009) as f32).collect();
++        cases.push((
++            "parallel dense",
++            DMatrix::from_dense(&values, n, f).unwrap(),
++            256,
++        ));
++        values[0] = f32::NAN;
++        cases.push((
++            "parallel mixed blocks",
++            DMatrix::from_dense(&values, n, f).unwrap(),
++            256,
++        ));
++        for (name, data, max_bin) in cases {
+--- a/src/tree/compact/mod.rs
++++ b/src/tree/compact/mod.rs
+@@ -95,0 +96 @@
++    const TILE: usize = 32;
+@@ -102,3 +103,5 @@
+-    // One row's keys of `v` and of `-v`, formed with contiguous (vector)
+-    // arithmetic before they are scattered to their lane slots.
+-    let mut keyed = vec![0u32; 2 * n_cols];
++    // Keep a tile's 4 KiB of destination keys hot while its sixteen rows
++    // scatter into it. A feature-wide scatter repeatedly streams over a
++    // group larger than L1 for wide inputs. The bounded scratch also avoids
++    // allocating a new row of keys for every prediction block.
++    let mut keyed = [0u32; 2 * TILE];
+@@ -107,14 +110,24 @@
+-        for (j, row) in src.chunks_exact(n_cols).enumerate() {
+-            let (pos, neg) = keyed.split_at_mut(n_cols);
+-            for ((p, q), &v) in pos.iter_mut().zip(neg.iter_mut()).zip(row) {
+-                (*p, *q) = (key(v), key(-v));
+-            }
+-            for ((keys, &p), &q) in dst
+-                .as_chunks_mut::<FEATURE_LANES>()
+-                .0
+-                .iter_mut()
+-                .zip(&*pos)
+-                .zip(&*neg)
+-            {
+-                keys[j] = p;
+-                keys[LANES + j] = q;
++        for (tile, dst) in dst.chunks_mut(FEATURE_LANES * TILE).enumerate() {
++            let first = tile * TILE;
++            let width = dst.len() / FEATURE_LANES;
++            for (j, row) in src.chunks_exact(n_cols).enumerate() {
++                // Form both signs with contiguous arithmetic, before the
++                // scatter, so the compiler can still vectorize keying.
++                let (pos, neg) = keyed.split_at_mut(TILE);
++                for ((p, q), &v) in pos[..width]
++                    .iter_mut()
++                    .zip(&mut neg[..width])
++                    .zip(&row[first..first + width])
++                {
++                    (*p, *q) = (key(v), key(-v));
++                }
++                for ((keys, &p), &q) in dst
++                    .as_chunks_mut::<FEATURE_LANES>()
++                    .0
++                    .iter_mut()
++                    .zip(&pos[..width])
++                    .zip(&neg[..width])
++                {
++                    keys[j] = p;
++                    keys[LANES + j] = q;
++                }
+@@ -1139,0 +1153,94 @@
++
++    /// Manual isolated staging benchmark; run only in release mode.
++    /// The destination keeps its allocation, as prediction's block worker does.
++    #[test]
++    #[ignore = "manual fill_lanes timing; do not run alongside other CPU work"]
++    fn profile_fill_lanes() {
++        use std::hint::black_box;
++        use std::time::Instant;
++
++        let iterations: u32 = std::env::var("HESSBOOST_LANES_ITERS")
++            .map_or(Ok(1000), |value| value.parse())
++            .expect("HESSBOOST_LANES_ITERS must be a positive integer");
++        assert!(iterations > 0);
++        for columns in [30, 256, 1024] {
++            let rows: Vec<f32> = (0..256 * columns)
++                .map(|i| {
++                    if i % 37 == 0 {
++                        f32::NAN
++                    } else {
++                        (i % 1009) as f32 * 0.001 - 0.5
++                    }
++                })
++                .collect();
++            let mut lanes = Vec::new();
++            fill_lanes(&mut lanes, &rows, columns);
++            let reference = lanes.clone();
++            let mut seconds = Vec::new();
++            for _ in 0..7 {
++                let start = Instant::now();
++                for _ in 0..iterations {
++                    fill_lanes(black_box(&mut lanes), black_box(&rows), columns);
++                    black_box(&lanes);
++                }
++                seconds.push(start.elapsed().as_secs_f64() / f64::from(iterations));
++                assert_eq!(lanes, reference);
++            }
++            println!(
++                "{}",
++                serde_json::json!({
++                    "operation": "fill_lanes", "rows": 256, "columns": columns,
++                    "iterations": iterations, "seconds_per_call": seconds,
++                    "destination_capacity": lanes.capacity(),
++                })
++            );
++        }
++    }
++
++    #[test]
++    fn tiled_lanes_match_scalar_keys_across_boundaries() {
++        let probes = [
++            f32::NEG_INFINITY,
++            -f32::MAX,
++            -f32::MIN_POSITIVE,
++            -f32::from_bits(1),
++            -0.0,
++            0.0,
++            f32::from_bits(1),
++            f32::MIN_POSITIVE,
++            f32::MAX,
++            f32::INFINITY,
++            f32::NAN,
++            f32::from_bits(0xFFC0_1234),
++            f32::from_bits(0x7F80_0001),
++        ];
++        // Retain the same destination across growing and shrinking blocks:
++        // stale scratch or destination values must not leak into a new tile.
++        let mut lanes = vec![u32::MAX; 4096];
++        for n_cols in [1, 15, 16, 17, 30, 31, 32, 33, 63, 64, 65, 256, 1024] {
++            for n_rows in [0, 1, 15, 16, 17, 31, 32, 33, 256, 257, 16] {
++                let rows: Vec<f32> = (0..n_rows * n_cols)
++                    .map(|i| {
++                        if i % 2 == 0 {
++                            probes[(i / 2 + n_rows + n_cols) % probes.len()]
++                        } else {
++                            f32::from_bits((i as u32).wrapping_mul(2_654_435_761))
++                        }
++                    })
++                    .collect();
++                fill_lanes(&mut lanes, &rows, n_cols);
++                let groups = n_rows / LANES;
++                assert_eq!(lanes.len(), groups * FEATURE_LANES * n_cols);
++                for g in 0..groups {
++                    for feature in 0..n_cols {
++                        for lane in 0..LANES {
++                            let value = rows[(g * LANES + lane) * n_cols + feature];
++                            let slot = (g * n_cols + feature) * FEATURE_LANES + lane;
++                            assert_eq!(lanes[slot], key(value));
++                            assert_eq!(lanes[slot + LANES], key(-value));
++                        }
++                    }
++                }
++            }
++        }
++    }

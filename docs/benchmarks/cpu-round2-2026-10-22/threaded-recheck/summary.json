@@ -1,0 +1,36 @@
+[
+  {
+    "case": "train_wide_sampled",
+    "threads": 4,
+    "baseline": {
+      "median": 0.08729250599999999,
+      "min": 0.06000285,
+      "max": 0.108435959,
+      "samples": 60
+    },
+    "candidate": {
+      "median": 0.08196819350000001,
+      "min": 0.054178664,
+      "max": 0.100212249,
+      "samples": 60
+    },
+    "speedup": 1.064955835582737
+  },
+  {
+    "case": "predict_wide_256",
+    "threads": 4,
+    "baseline": {
+      "median": 0.0013884545,
+      "min": 0.001224542,
+      "max": 0.002230009,
+      "samples": 60
+    },
+    "candidate": {
+      "median": 0.0008071645,
+      "min": 0.000713516,
+      "max": 0.001965959,
+      "samples": 60
+    },
+    "speedup": 1.720162990319817
+  }
+]

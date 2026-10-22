@@ -1,0 +1,48 @@
+--- a/src/data/sort.rs
++++ b/src/data/sort.rs
+@@ -8 +8,2 @@
+-const RADIX_BITS: u32 = 11;
++const RADIX_BITS: u32 = 8;
++const RADIX_PASSES: usize = 4;
+@@ -37 +38 @@
+-    /// Bucket counts of the three passes, `3 × RADIX_BUCKETS`.
++    /// Bucket counts of the four passes, `RADIX_PASSES × RADIX_BUCKETS`.
+@@ -41,2 +42,2 @@
+-/// Stable three-pass LSD radix sort of `items` by `key` (11, 11, and 10 bit
+-/// digits; a digit every key shares is skipped), ascending in the key's
++/// Stable four-pass LSD radix sort of `items` by `key` (8-bit digits;
++/// a digit every key shares is skipped), ascending in the key's
+@@ -61 +62 @@
+-    counts.resize(3 * RADIX_BUCKETS, 0);
++    counts.resize(RADIX_PASSES * RADIX_BUCKETS, 0);
+@@ -162,0 +164,30 @@
++
++    /// Stable payload order and every skipped-pass parity, including the
++    /// highest byte: all 32 key bits participate in the four-pass sort.
++    #[test]
++    fn radix_sort_keeps_ties_and_all_key_bits() {
++        let mut scratch = RadixScratch::default();
++        for n in [0, 1, 63, RADIX_MIN_LEN - 1, RADIX_MIN_LEN, 10_007] {
++            for varying in [
++                0,
++                0xff,
++                0xff00,
++                0xff_0000,
++                0xff00_0000,
++                0xffff,
++                0xff_ffff,
++                u32::MAX,
++            ] {
++                let mut items: Vec<(u32, usize)> = (0..n)
++                    .map(|i| {
++                        let key = (i as u32).wrapping_mul(2_654_435_761) & varying;
++                        (key | (0xa5a5_a5a5 & !varying), i)
++                    })
++                    .collect();
++                let mut expected = items.clone();
++                expected.sort_by_key(|&(key, _)| key);
++                radix_sort(&mut items, &mut scratch, |&(key, _)| key);
++                assert_eq!(items, expected, "n={n}, mask={varying:x}");
++            }
++        }
++    }

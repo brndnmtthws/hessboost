@@ -1,0 +1,138 @@
+[
+  {
+    "case": "cuts_dense",
+    "threads": 1,
+    "baseline": {
+      "median": 0.0770047445,
+      "min": 0.074613506,
+      "max": 0.079682677,
+      "samples": 20
+    },
+    "candidate": {
+      "median": 0.088100858,
+      "min": 0.08194814,
+      "max": 0.094497124,
+      "samples": 20
+    },
+    "speedup": 0.8740521516827906
+  },
+  {
+    "case": "cuts_dense",
+    "threads": 4,
+    "baseline": {
+      "median": 0.026037306,
+      "min": 0.021941517,
+      "max": 0.039934812,
+      "samples": 20
+    },
+    "candidate": {
+      "median": 0.028250842499999998,
+      "min": 0.023842309,
+      "max": 0.03494698,
+      "samples": 20
+    },
+    "speedup": 0.9216470623840688
+  },
+  {
+    "case": "train_cold_one_round",
+    "threads": 1,
+    "baseline": {
+      "median": 0.1192594965,
+      "min": 0.112615565,
+      "max": 0.13149077,
+      "samples": 20
+    },
+    "candidate": {
+      "median": 0.12801696950000002,
+      "min": 0.122887945,
+      "max": 0.133790738,
+      "samples": 20
+    },
+    "speedup": 0.9315913114159446
+  },
+  {
+    "case": "train_cold_one_round",
+    "threads": 4,
+    "baseline": {
+      "median": 0.041979176,
+      "min": 0.035266043,
+      "max": 0.05882967,
+      "samples": 20
+    },
+    "candidate": {
+      "median": 0.044909459,
+      "min": 0.038615651,
+      "max": 0.052221914,
+      "samples": 20
+    },
+    "speedup": 0.9347513182022522
+  },
+  {
+    "case": "train_cold_full",
+    "threads": 1,
+    "baseline": {
+      "median": 0.2939458265,
+      "min": 0.27835099,
+      "max": 0.321330183,
+      "samples": 20
+    },
+    "candidate": {
+      "median": 0.301950103,
+      "min": 0.283568875,
+      "max": 0.320061234,
+      "samples": 20
+    },
+    "speedup": 0.9734913933776668
+  },
+  {
+    "case": "train_cold_full",
+    "threads": 4,
+    "baseline": {
+      "median": 0.1225206985,
+      "min": 0.107354357,
+      "max": 0.146380533,
+      "samples": 20
+    },
+    "candidate": {
+      "median": 0.1394497005,
+      "min": 0.118621861,
+      "max": 0.164188049,
+      "samples": 20
+    },
+    "speedup": 0.878601374263977
+  },
+  {
+    "case": "train_cold_missing",
+    "threads": 1,
+    "baseline": {
+      "median": 0.1747369195,
+      "min": 0.161157272,
+      "max": 0.190768152,
+      "samples": 20
+    },
+    "candidate": {
+      "median": 0.165212202,
+      "min": 0.163239282,
+      "max": 0.174661334,
+      "samples": 20
+    },
+    "speedup": 1.0576514166913653
+  },
+  {
+    "case": "train_cold_missing",
+    "threads": 4,
+    "baseline": {
+      "median": 0.0988729615,
+      "min": 0.086304991,
+      "max": 0.108943077,
+      "samples": 20
+    },
+    "candidate": {
+      "median": 0.095767058,
+      "min": 0.084994156,
+      "max": 0.113473115,
+      "samples": 20
+    },
+    "speedup": 1.0324318566829107
+  }
+]

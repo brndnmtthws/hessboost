@@ -222,8 +222,11 @@ pub(crate) fn prefetch_read<T>(value: &T) {
 /// Tree walks step to `left + (key > threshold)` for rows whose outcomes
 /// are data-dependent and unpredictable; LLVM's AArch64 backend lowers that
 /// select (in any spelling) to a conditional branch, which such rows
-/// mispredict about a quarter of the time. The AArch64 path pins the
-/// conditional increment in one instruction.
+/// mispredict about a quarter of the time. On `x86_64` LLVM's SLP vectorizer
+/// instead packs the eight lanes of the one-row walk into AVX2 registers,
+/// and every step then moves each lane's index out for its loads and the
+/// loaded values back in. Both paths pin the step in two scalar
+/// instructions: `cmp` + `cinc` on AArch64, `cmp` + `adc` on `x86_64`.
 #[inline(always)]
 pub(crate) fn step_if_greater(base: usize, a: u32, b: u32) -> usize {
     #[cfg(target_arch = "aarch64")]
@@ -245,7 +248,25 @@ pub(crate) fn step_if_greater(base: usize, a: u32, b: u32) -> usize {
         }
         out
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut out = base;
+        // SAFETY: a compare and an add with carry of registers; no memory
+        // access, and `preserves_flags` is not claimed. `cmp b, a` sets the
+        // carry flag when `b < a` unsigned, that is when `a > b`.
+        unsafe {
+            std::arch::asm!(
+                "cmp {b:e}, {a:e}",
+                "adc {out}, 0",
+                a = in(reg) a,
+                b = in(reg) b,
+                out = inout(reg) out,
+                options(pure, nomem, nostack)
+            );
+        }
+        out
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         base + usize::from(a > b)
     }

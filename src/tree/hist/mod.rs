@@ -75,6 +75,20 @@ pub trait HistogramBackend: Send + Sync {
     /// `out` is overwritten (not added to).
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]);
 
+    /// Build the bins of the sorted, unique `features` tree pool. Other bins
+    /// may be left untouched; callers must never read them. The default
+    /// builds every bin, preserving compatibility with other backends.
+    fn build_features(
+        &self,
+        ghist: &GHistIndex,
+        rows: &[u32],
+        gpair: &[GradPair],
+        out: &mut [GradStats],
+        _features: &[u32],
+    ) {
+        self.build(ghist, rows, gpair, out);
+    }
+
     /// Announce the gradient slice the following [`build`](Self::build) calls
     /// of this tree will read. Called once per tree, before any `build`.
     /// Backends that stage the gradients (a GPU) upload them here; the
@@ -471,6 +485,28 @@ impl CpuBackend {
 }
 
 impl HistogramBackend for CpuBackend {
+    fn build_features(
+        &self,
+        ghist: &GHistIndex,
+        rows: &[u32],
+        gpair: &[GradPair],
+        out: &mut [GradStats],
+        features: &[u32],
+    ) {
+        let Some(columns) = dense_columns(ghist).filter(|_| features.len() < ghist.n_cols()) else {
+            self.build(ghist, rows, gpair, out);
+            return;
+        };
+        let range = contiguous_range(rows);
+        if sum_order(true, ghist.n_rows(), rows.len(), range.is_some()) != SumOrder::Chain {
+            // A feature sweep would reassociate this node's fixed blocks.
+            self.build(ghist, rows, gpair, out);
+            return;
+        }
+        let rows = range.map_or(SweepRows::Subset(rows), SweepRows::Range);
+        walk::by_selected_features(ghist, columns, &rows, gpair, out, features);
+    }
+
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
         if rows.len() < PARALLEL_THRESHOLD {
             out.fill(GradStats::default());
@@ -590,6 +626,110 @@ mod tests {
     use crate::data::DMatrix;
     use crate::data::ghist::Bins;
     use crate::data::quantile::HistCuts;
+
+    /// Restricted column sweeps keep the full backend's exact bits, including
+    /// NaNs, cancellation, subset rows, and the large-index blocked fallback.
+    #[test]
+    fn selected_features_match_full_histogram_bits() {
+        let features = [1, 3];
+        for (n, max_bin) in [
+            (PARALLEL_THRESHOLD + 19, 32),
+            (PARALLEL_THRESHOLD + 19, 512),
+            (GATHER_MAX_ROWS + 1, 32),
+        ] {
+            let data = DMatrix::from_dense(
+                &(0..n * 5).map(|i| (i % 1009) as f32).collect::<Vec<_>>(),
+                n,
+                5,
+            )
+            .unwrap();
+            let ghist = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, max_bin));
+            let mut gpair: Vec<_> = (0..n)
+                .map(|i| {
+                    let scale = 2f32.powi((i % 61) as i32 - 30);
+                    GradPair::new(if i % 2 == 0 { scale } else { -scale }, scale)
+                })
+                .collect();
+            gpair[11].grad = f32::from_bits(0x7fc0_1234);
+            gpair[17].grad = -0.0;
+            let all: Vec<_> = (0..n as u32).collect();
+            let subset: Vec<_> = all.iter().copied().filter(|r| r % 3 != 1).collect();
+            for rows in [
+                all.as_slice(),
+                subset.as_slice(),
+                &all[..0],
+                &all[..127],
+                &[3, 1, 3, 2],
+            ] {
+                let mut expected = zeroed(ghist.total_bins());
+                let pool = |threads| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap()
+                };
+                pool(1).install(|| CpuBackend.build(&ghist, rows, &gpair, &mut expected));
+                for threads in [1, 4] {
+                    let sentinel = GradStats::new(123.0, -456.0);
+                    let mut got = vec![sentinel; ghist.total_bins()];
+                    pool(threads).install(|| {
+                        CpuBackend.build_features(&ghist, rows, &gpair, &mut got, &features);
+                    });
+                    let optimized =
+                        sum_order(true, n, rows.len(), contiguous_range(rows).is_some())
+                            == SumOrder::Chain;
+                    for f in 0..5 {
+                        let (start, end) = ghist.cuts().feature_bins(f);
+                        for i in start..end {
+                            let want = if optimized && !features.contains(&(f as u32)) {
+                                sentinel
+                            } else {
+                                expected[i]
+                            };
+                            assert_eq!(
+                                (got[i].grad.to_bits(), got[i].hess.to_bits()),
+                                (want.grad.to_bits(), want.hess.to_bits()),
+                                "n={n} rows={} threads={threads} feature={f} bin={i}",
+                                rows.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_features_support_sparse_and_default_backends() {
+        struct DefaultBackend;
+        impl HistogramBackend for DefaultBackend {
+            fn build(
+                &self,
+                ghist: &GHistIndex,
+                rows: &[u32],
+                gpair: &[GradPair],
+                out: &mut [GradStats],
+            ) {
+                CpuBackend.build(ghist, rows, gpair, out);
+            }
+        }
+        let n = PARALLEL_THRESHOLD + 1;
+        let ghist = sparse_index(&(0..n).map(|i| (i % 7) as f32).collect::<Vec<_>>());
+        let rows: Vec<_> = (0..n as u32).collect();
+        let gpair = vec![GradPair::new(1.0, 2.0); n];
+        let mut expected = zeroed(ghist.total_bins());
+        CpuBackend.build(&ghist, &rows, &gpair, &mut expected);
+        for backend in [&CpuBackend as &dyn HistogramBackend, &DefaultBackend] {
+            let mut got = zeroed(ghist.total_bins());
+            backend.build_features(&ghist, &rows, &gpair, &mut got, &[0]);
+            for (a, b) in got.iter().zip(&expected) {
+                assert_eq!(
+                    (a.grad.to_bits(), a.hess.to_bits()),
+                    (b.grad.to_bits(), b.hess.to_bits())
+                );
+            }
+        }
+    }
 
     #[test]
     fn subtraction_identity() {

@@ -10,7 +10,7 @@ mod device;
 mod search;
 
 use super::lightgbm::{SplitOptions, finalize_smoothed_leaves};
-use super::partition::{child_histograms, partition_rows};
+use super::partition::{child_histograms_for_features, partition_rows};
 use super::shared::{
     BuilderConfig, InteractionState, LeafRows, finalize_leaf_values, rayon_available, sum_rows,
     xgb_calc_weight,
@@ -30,6 +30,7 @@ use crate::tree::sampler::{ColumnSampler, FeatureSet};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::Arc;
 
 /// Queued loss-guided nodes whose children are built together, in parallel
 /// (see [`HistTreeBuilder::speculative_features`]).
@@ -64,6 +65,8 @@ pub(super) struct NodeCtx {
 
 /// A node awaiting or undergoing expansion.
 struct NodeEntry {
+    /// Every descendant samples this tree pool; bins outside it are never read.
+    pool: Arc<[u32]>,
     nid: usize,
     depth: usize,
     /// The node's rows on the host (empty when `seg` holds them).
@@ -311,7 +314,13 @@ impl<'a> HistTreeBuilder<'a> {
                 // (parallel) root histogram instead of before it.
                 let build_hist = || {
                     let mut root_hist = zeroed(total_bins);
-                    self.backend.build(ghist, row_subset, gpair, &mut root_hist);
+                    self.backend.build_features(
+                        ghist,
+                        row_subset,
+                        gpair,
+                        &mut root_hist,
+                        &sampler.tree_features(),
+                    );
                     root_hist
                 };
                 let (root_stats, root_hist) = if rayon_available() {
@@ -344,6 +353,7 @@ impl<'a> HistTreeBuilder<'a> {
         let (root_feats, root_ctx) = self.root_context(sampler, root_stats, rows);
         let best = self.evaluate(ghist, &root_hist, &root_feats, None, root_ctx);
         NodeEntry {
+            pool: sampler.tree_features(),
             hist: root_hist,
             ..Self::root_node(root_ctx.tree_seed, best)
         }
@@ -373,6 +383,7 @@ impl<'a> HistTreeBuilder<'a> {
     /// The root's entry with split `best`, no rows and no histogram.
     fn root_node(tree_seed: u64, best: BestSplit) -> NodeEntry {
         NodeEntry {
+            pool: Arc::from([]),
             nid: 0,
             depth: 0,
             rows: Vec::new(),
@@ -536,6 +547,7 @@ impl<'a> HistTreeBuilder<'a> {
             b.child_bounds(entry.bounds, self.config.cons.dir(b.feature as usize));
         let split = PendingSplit {
             entry: NodeEntry {
+                pool: Arc::clone(&entry.pool),
                 nid: entry.nid,
                 depth: entry.depth,
                 rows: entry.rows.clone(),
@@ -639,13 +651,14 @@ impl<'a> HistTreeBuilder<'a> {
             (left_quant, right_quant) = (Some(lq), Some(rq));
             (lh, rh)
         } else {
-            child_histograms(
+            child_histograms_for_features(
                 self.backend,
                 ghist,
                 gpair,
                 &left_rows,
                 &right_rows,
                 parent_hist,
+                &split.entry.pool,
             )
         };
         let child = |rows: Vec<u32>, hist, quant| Child {
@@ -754,12 +767,14 @@ impl<'a> HistTreeBuilder<'a> {
             ..
         } = split;
         let NodeEntry {
+            pool,
             depth: parent_depth,
             tree_seed,
             ..
         } = entry;
 
         let left = NodeEntry {
+            pool: Arc::clone(&pool),
             nid: left_id,
             depth: parent_depth + 1,
             rows: left.rows,
@@ -773,6 +788,7 @@ impl<'a> HistTreeBuilder<'a> {
             slot: None,
         };
         let right = NodeEntry {
+            pool,
             nid: right_id,
             depth: parent_depth + 1,
             rows: right.rows,
@@ -869,6 +885,107 @@ mod tests {
     use crate::config::TrainingParams;
     use crate::data::DMatrix;
     use crate::tree::builder::all_rows;
+
+    /// The default backend hook still builds all bins. Compare it with the
+    /// optimized backend across growth policies, thread counts and samples;
+    /// poisoned unused bins prove no descendant searches outside its pool.
+    #[test]
+    fn sampled_histograms_match_full_backend() {
+        struct FullBackend;
+        impl HistogramBackend for FullBackend {
+            fn build(
+                &self,
+                ghist: &GHistIndex,
+                rows: &[u32],
+                gp: &[GradPair],
+                out: &mut [GradStats],
+            ) {
+                CpuBackend.build(ghist, rows, gp, out);
+            }
+        }
+        struct PoisonBackend;
+        impl HistogramBackend for PoisonBackend {
+            fn build(
+                &self,
+                ghist: &GHistIndex,
+                rows: &[u32],
+                gp: &[GradPair],
+                out: &mut [GradStats],
+            ) {
+                CpuBackend.build(ghist, rows, gp, out);
+            }
+            fn build_features(
+                &self,
+                ghist: &GHistIndex,
+                rows: &[u32],
+                gp: &[GradPair],
+                out: &mut [GradStats],
+                features: &[u32],
+            ) {
+                self.build(ghist, rows, gp, out);
+                for f in 0..ghist.n_cols() {
+                    if !features.contains(&(f as u32)) {
+                        let (start, end) = ghist.cuts().feature_bins(f);
+                        out[start..end].fill(GradStats::new(f64::NAN, f64::NAN));
+                    }
+                }
+            }
+        }
+        let (n, features) = (10_000, 12);
+        let values: Vec<f32> = (0..n * features)
+            .map(|i| ((i / features * 17 + i % features * 29) % 97) as f32 / 97.0)
+            .collect();
+        let gradients: Vec<_> = values
+            .chunks_exact(features)
+            .map(|row| gp(row.iter().sum::<f32>() - 6.0, 1.0))
+            .collect();
+        let data = DMatrix::from_dense(&values, n, features).unwrap();
+        let ghist = binned(&data, 32);
+        let rows = all_rows(n);
+        for policy in [GrowPolicy::DepthWise, GrowPolicy::LossGuide] {
+            for (bylevel, bynode) in [(1.0, 1.0), (0.75, 0.75)] {
+                let params = TrainingParams::builder()
+                    .max_depth(4)
+                    .grow_policy(policy)
+                    .build()
+                    .unwrap();
+                let sampler = || ColumnSampler::new(features, None, 0.5, bylevel, bynode, 42);
+                let pool = |threads| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap()
+                };
+                let reference = pool(1).install(|| {
+                    HistTreeBuilder::new(&params)
+                        .with_backend(&FullBackend)
+                        .build(&ghist, &gradients, &rows, &mut sampler())
+                });
+                let expected = serde_json::to_vec(&reference).unwrap();
+                let poisoned = pool(1).install(|| {
+                    HistTreeBuilder::new(&params)
+                        .with_backend(&PoisonBackend)
+                        .build(&ghist, &gradients, &rows, &mut sampler())
+                });
+                assert_eq!(serde_json::to_vec(&poisoned).unwrap(), expected);
+                for threads in [1, 4] {
+                    let actual = pool(threads).install(|| {
+                        HistTreeBuilder::new(&params).build(
+                            &ghist,
+                            &gradients,
+                            &rows,
+                            &mut sampler(),
+                        )
+                    });
+                    assert_eq!(
+                        serde_json::to_vec(&actual).unwrap(),
+                        expected,
+                        "{policy:?} {bylevel} {bynode} {threads}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn splits_on_separating_feature() {

@@ -115,6 +115,20 @@ uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
 Workload selection and a quick harness check are in the
 [script docs](../scripts/README.md#xgboost-comparison).
 
+## CPU feature-pool and small-batch optimizations
+
+On the shared x86-64 cloud host measured on 2026-10-22, restricting dense
+histograms to the tree's sampled feature pool improved the 25%-feature,
+20k x 128 case by 2.03–2.46x with cached bins, or 1.62–1.70x including fresh
+matrix construction and binning. Reusing the single-row layout for sub-16-row
+margin batches improved 1/8/15-row batches by 1.75–1.88x. Default full-feature
+training and larger prediction batches are not claimed wins.
+
+See [the complete baseline/candidate report](benchmarks/cpu-2026-10-22/README.md)
+for settings, raw samples, variability, noisy-control reruns, checksums and
+reproduction. These are synthetic workloads on an exposed AMD EPYC 9V74,
+not a dedicated host or a cross-platform performance claim.
+
 ## Quantized-gradient training (opt-in)
 
 `use_quantized_grad` (LightGBM-style quantized training, not XGBoost
@@ -388,6 +402,13 @@ file-backed). Dense input is checked 256 values at a time without a
 branch, and from 2^22 values on, checked and copied in parallel
 2^18-value blocks.
 
+Dense CPU scalar-tree histograms with column sampling restrict chain-order
+construction to the tree's feature pool. Groups of up to four selected columns
+share gradient loads, and sibling subtraction visits only the pool's bins.
+Level/node sampling can only narrow this pool, so stale bins are never searched.
+Fixed-block summation, sparse indexes and other backends retain their original
+histogram construction paths; no summation order changes.
+
 ### Prediction
 
 `BoostedModel` derives its prediction layouts lazily on first use, drops
@@ -402,9 +423,9 @@ steps with `cmp` + `cinc` on AArch64 and `cmp` + `adc` on x86_64
 that random rows mispredict on AArch64, and on x86_64 vectorizes the one-row
 walk's eight lanes, shuffling every lane's index in and out of AVX2
 registers each step. Sixteen rows walk in
-lockstep for the tree depth; batches under sixteen rows walk sixteen trees
-in lockstep instead. One row (`predict_row`, `predict_row_into`, their
-margin forms) walks a second layout, built on the first row call: chunks of
+lockstep for the tree depth. Margin batches under sixteen rows (except very
+wide CSR) and single rows (`predict_row`, `predict_row_into`, their margin
+forms) share a second layout, built on first use: chunks of
 eight consecutive trees that are numeric, constant-leaf, and at most eight
 levels deep become complete binary trees in heap order, padded to the
 chunk's deepest tree (`u32` threshold keys, `u16` feature-and-mirror slots,

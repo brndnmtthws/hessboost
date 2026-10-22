@@ -369,6 +369,8 @@ fn rows_predict_what_every_batch_predicts() {
                 "{name}: rows"
             );
 
+            check_small_batches(&model, &data, &x, iterations, name);
+
             let (mut row_margins, mut row_values) = (vec![0.0; k], vec![0.0; width]);
             for (r, row) in x.chunks(n_cols).enumerate() {
                 let one = model
@@ -406,6 +408,69 @@ fn rows_predict_what_every_batch_predicts() {
                     assert_eq!(value.to_bits(), want[0].to_bits(), "{name}: row {r}");
                 }
             }
+        }
+    }
+}
+
+/// Small batches use the single-row layout but retain each row's existing
+/// base margin. Compare against a full batch using the independent batch walk,
+/// across direct views, gathered rows, a finite missing sentinel and CSR.
+fn check_small_batches(
+    model: &BoostedModel,
+    data: &DMatrix,
+    x: &[f32],
+    iterations: Iterations,
+    name: &str,
+) {
+    let k = model.n_outputs();
+    let cols = data.n_cols();
+    let base: Vec<f32> = (0..data.n_rows() * k)
+        .map(|i| (i % 17) as f32 * 0.13 - 0.7)
+        .collect();
+    let full = data.clone().with_base_margin(&base).unwrap();
+    let expected = model.predict_margin(&full, iterations).unwrap();
+    let plain = model.predict_margin(data, iterations).unwrap();
+    for n in [1, 8, 15] {
+        let values = &x[..n * cols];
+        let borrowed = model.predict_margin_rows(values, iterations).unwrap();
+        assert_eq!(
+            bits(borrowed.as_slice()),
+            bits(&plain.as_slice()[..n * k]),
+            "{name}: borrowed {n}"
+        );
+        let dense = DMatrix::from_dense(values, n, cols).unwrap();
+        let sentinel: Vec<f32> = values
+            .iter()
+            .map(|&v| if v.is_nan() { -999.0 } else { v })
+            .collect();
+        let sentinel = DMatrix::from_dense_with_missing(&sentinel, n, cols, -999.0).unwrap();
+        let mut indptr = vec![0];
+        let mut indices = Vec::new();
+        let mut stored = Vec::new();
+        for row in values.chunks_exact(cols) {
+            for (f, &v) in row.iter().enumerate() {
+                if !v.is_nan() {
+                    indices.push(f as u32);
+                    stored.push(v);
+                }
+            }
+            indptr.push(indices.len());
+        }
+        let csr = DMatrix::from_csr(indptr, indices, stored, cols).unwrap();
+        let view = data.select_rows(&(0..n).collect::<Vec<_>>()).unwrap();
+        for (kind, small) in [
+            ("dense", dense),
+            ("sentinel", sentinel),
+            ("csr", csr),
+            ("view", view),
+        ] {
+            let small = small.with_base_margin(&base[..n * k]).unwrap();
+            let result = model.predict_margin(&small, iterations).unwrap();
+            assert_eq!(
+                bits(result.as_slice()),
+                bits(&expected.as_slice()[..n * k]),
+                "{name}: {kind} {n} with base margins"
+            );
         }
     }
 }

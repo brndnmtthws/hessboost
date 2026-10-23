@@ -31,6 +31,18 @@ fn cases(family: DistFamily) -> Vec<(Vec<f64>, f64)> {
             (vec![2.5, 1.0], 30.0),
             (vec![1.0, 6.0], 1.0),
         ],
+        // Margins `(μ, ln s, κ = ln(ν - 1))` at degrees of freedom 5, 1.5, 2,
+        // 50, 1e4 (where the `κ` terms cancel to `O(1/ν)`), 3 with a label at
+        // the centre, and 1.05 (near the link's lower end `ν = 1`).
+        DistFamily::StudentT => vec![
+            (vec![0.3, -0.2, 4f64.ln()], 1.1),
+            (vec![-2.0, 0.7, 0.5f64.ln()], -4.5),
+            (vec![5.0, 1.5, 0.0], 9.0),
+            (vec![1.0, 0.0, 49f64.ln()], 0.4),
+            (vec![0.0, 0.3, 9_999f64.ln()], -1.2),
+            (vec![0.5, -1.0, 2f64.ln()], 0.5),
+            (vec![0.2, 0.1, 0.05f64.ln()], 3.0),
+        ],
     }
 }
 
@@ -117,8 +129,8 @@ fn fisher_information_matches_monte_carlo() {
             let fisher = family.fisher(&eta);
             let k = family.n_params();
             let mut rng = Rng::new(7);
-            let mut outer = [[Moments::default(); 2]; 2];
-            let mut hess = [Moments::default(); 2];
+            let mut outer = [[Moments::default(); MAX_PARAMS]; MAX_PARAMS];
+            let mut hess = [Moments::default(); MAX_PARAMS];
             for _ in 0..n {
                 let y = dist.sample(|| rng.next_u64());
                 let g = family.gradient(&eta, y);
@@ -140,12 +152,14 @@ fn fisher_information_matches_monte_carlo() {
                     );
                 }
             }
-            if k == 2 {
-                let (mean, se) = outer[0][1].mean_se(n);
-                assert!(
-                    mean.abs() <= 5.0 * se,
-                    "{family:?} {eta:?} E[g0 g1] = {mean} ± {se}"
-                );
+            for (i, row) in outer.iter().enumerate().take(k) {
+                for (j, cell) in row.iter().enumerate().take(k).skip(i + 1) {
+                    let (mean, se) = cell.mean_se(n);
+                    assert!(
+                        mean.abs() <= 5.0 * se,
+                        "{family:?} {eta:?} E[g{i} g{j}] = {mean} ± {se}"
+                    );
+                }
             }
         }
     }
@@ -173,8 +187,8 @@ fn intercepts_are_the_marginal_mle() {
                     .map(|(i, &y)| weight(i) * family.nll(eta, f64::from(y)))
                     .sum()
             };
-            let mut score = [0.0f64; 2];
-            let mut curvature = [0.0f64; 2];
+            let mut score = [0.0f64; MAX_PARAMS];
+            let mut curvature = [0.0f64; MAX_PARAMS];
             for (i, &y) in labels.iter().enumerate() {
                 let g = family.gradient(&eta, f64::from(y));
                 let f = family.fisher(&eta);
@@ -448,7 +462,7 @@ fn counts_are_normalized_and_consistent_with_the_cdf() {
 }
 
 /// One distribution per family, away from the parameter bounds.
-fn one_per_family() -> [Dist; 5] {
+fn one_per_family() -> [Dist; 6] {
     [
         Dist::Normal {
             mu: 2.0,
@@ -466,6 +480,11 @@ fn one_per_family() -> [Dist; 5] {
         Dist::NegativeBinomial {
             mean: 4.0,
             size: 3.0,
+        },
+        Dist::StudentT {
+            loc: 1.0,
+            scale: 2.0,
+            df: 10.0,
         },
     ]
 }
@@ -860,4 +879,450 @@ fn gamma_quantiles_reach_the_deep_lower_tail() {
     let q = dist.quantile(1e-300);
     assert!(close(q, 1.414_213_562_373_095e-150, 1e-12, 0.0), "{q}");
     assert!(close(dist.cdf(q), 1e-300, 1e-11, 0.0), "{}", dist.cdf(q));
+}
+
+// Student-t.
+
+/// Simpson's rule weight of node `i` of `0..=n`.
+fn simpson_weight(i: u32, n: u32) -> f64 {
+    if i == 0 || i == n {
+        1.0
+    } else if i % 2 == 1 {
+        4.0
+    } else {
+        2.0
+    }
+}
+
+/// `E[f(Y)]` under a Student-t `dist` by Simpson's rule in `u` with
+/// `Y = loc + scale sinh(u)` on `[-80, 80]`, where even `df = 1/2` tails
+/// decay like `e^{-|u|/2}`.
+fn student_t_expectation<const N: usize>(dist: &Dist, f: impl Fn(f64) -> [f64; N]) -> [f64; N] {
+    let Dist::StudentT { loc, scale, .. } = *dist else {
+        panic!("not a Student-t: {dist:?}")
+    };
+    let (half_width, n) = (80.0f64, 40_000u32);
+    let h = 2.0 * half_width / f64::from(n);
+    let mut sum = [0.0; N];
+    for i in 0..=n {
+        let u = -half_width + f64::from(i) * h;
+        let y = loc + scale * u.sinh();
+        let density = dist.log_prob(y).exp() * scale * u.cosh();
+        if density == 0.0 {
+            continue;
+        }
+        let weight = simpson_weight(i, n) * density * h / 3.0;
+        for (s, v) in sum.iter_mut().zip(f(y)) {
+            *s += weight * v;
+        }
+    }
+    sum
+}
+
+/// The score covariance `E[g gᵀ]` and the expected exact Hessian are both
+/// the analytic Fisher diagonal, with zero off-diagonal entries (the
+/// orthogonal scale `s`), by quadrature at every test case's degrees of
+/// freedom (0.5 to 1e4).
+#[test]
+fn student_t_fisher_matches_quadrature() {
+    let family = DistFamily::StudentT;
+    let k = MAX_PARAMS;
+    for (eta, _) in cases(family) {
+        let dist = family.dist_from_margins(&eta);
+        let fisher = family.fisher(&eta);
+        let moments = student_t_expectation(&dist, |y| {
+            let (g, h) = (family.gradient(&eta, y), family.hessian(&eta, y));
+            std::array::from_fn::<f64, 18, _>(|m| {
+                let (i, j) = ((m % 9) / k, m % k);
+                if m < 9 { g[i] * g[j] } else { h[i][j] }
+            })
+        });
+        for (m, &got) in moments.iter().enumerate() {
+            let (i, j) = ((m % 9) / k, m % k);
+            let want = if i == j { fisher[i] } else { 0.0 };
+            let tol = 1e-9 * (fisher[i] * fisher[j]).sqrt();
+            let what = if m < 9 { "E[g gᵀ]" } else { "E[H]" };
+            assert!(
+                (got - want).abs() <= tol,
+                "{eta:?} {what}[{i}][{j}] = {got} vs {want}"
+            );
+        }
+    }
+}
+
+/// Cauchy (`df = 1`) and `df = 2` CDFs and quantiles in closed form, the
+/// round trip down to `p = 1e-60`, and the normal limit.
+#[test]
+fn student_t_cdf_and_quantile_match_closed_forms() {
+    use std::f64::consts::PI;
+    let t = |df: f64| Dist::StudentT {
+        loc: 0.0,
+        scale: 1.0,
+        df,
+    };
+    // Lower tails, to full relative precision.
+    let cauchy_cdf = |z: f64| f64::atan2(1.0, -z) / PI;
+    let two_cdf = |z: f64| {
+        let r = (2.0 + z * z).sqrt();
+        1.0 / (r * (r + z.abs()))
+    };
+    let lower_tails: [(f64, &dyn Fn(f64) -> f64); 2] = [(1.0, &cauchy_cdf), (2.0, &two_cdf)];
+    for z in [-1e8f64, -30.0, -2.5, -0.3, 0.0, 0.7, 4.0, 1e5] {
+        for (df, lower) in lower_tails {
+            let got = t(df).cdf(z);
+            if z <= 0.0 {
+                assert!(close(got, lower(z), 1e-13, 0.0), "df={df} z={z}: {got}");
+            } else {
+                assert!(close(got, 1.0 - lower(-z), 1e-14, 1e-16), "df={df} z={z}");
+            }
+        }
+    }
+    for p in [1e-300f64, 1e-12, 1e-4, 0.1, 0.3, 0.49, 0.5, 0.75, 0.999] {
+        let tail = p.min(1.0 - p);
+        let sign = if p < 0.5 { -1.0 } else { 1.0 };
+        let cauchy = sign
+            * if tail <= 0.25 {
+                1.0 / (PI * tail).tan()
+            } else {
+                (PI * (0.5 - tail)).tan()
+            };
+        let two = (2.0 * p - 1.0) / (2.0 * p * (1.0 - p)).sqrt();
+        let (q1, q2) = (t(1.0).quantile(p), t(2.0).quantile(p));
+        assert!(close(q1, cauchy, 1e-12, 1e-300), "p={p}: {q1} vs {cauchy}");
+        assert!(close(q2, two, 1e-12, 1e-300), "p={p}: {q2} vs {two}");
+    }
+    for df in [0.3, 0.5, 1.0, 3.0, 50.0, 9_999.0, 1e4, 1e9] {
+        for p in [1e-60, 1e-12, 1e-4, 0.1, 0.3, 0.49, 0.5, 0.75, 0.999_999] {
+            let q = t(df).quantile(p);
+            assert!(q.is_finite(), "df={df} p={p}");
+            let back = t(df).cdf(q);
+            assert!(
+                close(back, p, 1e-11, 0.0),
+                "df={df} p={p}: q={q}, cdf {back}"
+            );
+        }
+    }
+    // A quantile beyond the largest double (about -3e331).
+    assert_eq!(t(0.3).quantile(1e-100), f64::NEG_INFINITY);
+    assert!(t(0.3).cdf(-f64::MAX) > 1e-100);
+    // Location and scale, and the ends.
+    let shifted = Dist::StudentT {
+        loc: 1.5,
+        scale: 2.0,
+        df: 4.0,
+    };
+    assert_eq!(shifted.quantile(0.5), 1.5);
+    assert!(close(
+        shifted.quantile(0.1),
+        1.5 + 2.0 * t(4.0).quantile(0.1),
+        1e-15,
+        0.0
+    ));
+    assert_eq!(shifted.quantile(0.0), f64::NEG_INFINITY);
+    assert_eq!(shifted.quantile(1.0), f64::INFINITY);
+    assert!(shifted.quantile(1.5).is_nan() && shifted.quantile(f64::NAN).is_nan());
+    assert_eq!(shifted.cdf(f64::NEG_INFINITY), 0.0);
+    assert_eq!(shifted.cdf(f64::INFINITY), 1.0);
+    assert!(shifted.cdf(f64::NAN).is_nan());
+    // The normal limit, and no step where the tail switches from the
+    // incomplete beta function to Hill's transformation.
+    let wide = t(1e15);
+    for z in [-8.0, -1.0, 0.5, 3.0] {
+        assert!(
+            close(wide.cdf(z), special::norm_cdf(z), 1e-12, 1e-16),
+            "z={z}"
+        );
+    }
+    for p in [1e-10, 0.2, 0.9] {
+        assert!(
+            close(wide.quantile(p), special::norm_ppf(p), 1e-12, 0.0),
+            "p={p}"
+        );
+    }
+    let (below, above) = (t(9_999.999_999).cdf(-3.0), t(1e4).cdf(-3.0));
+    assert!(close(below, above, 2e-12, 0.0), "{below} vs {above}");
+}
+
+/// `∫ (F(x) - 1{x >= y})² dx` for a Student-t by Simpson's rule in `u` on
+/// either side of `y`, with `x = y ∓ scale sinh(u)` (the integrand decays
+/// like `e^{(1 - 2 df)|u|}`), the upper side as `F(2 loc - x)²`.
+fn student_t_crps_by_quadrature(dist: &Dist, y: f64) -> f64 {
+    let Dist::StudentT { loc, scale, .. } = *dist else {
+        panic!("not a Student-t: {dist:?}")
+    };
+    let (half_width, n) = (60.0f64, 12_000u32);
+    let h = half_width / f64::from(n);
+    let side = |sign: f64| -> f64 {
+        (0..=n)
+            .map(|i| {
+                let u = f64::from(i) * h;
+                let x = y + sign * scale * u.sinh();
+                let gap = if sign < 0.0 {
+                    dist.cdf(x)
+                } else {
+                    dist.cdf(2.0 * loc - x)
+                };
+                simpson_weight(i, n) * gap * gap * scale * u.cosh()
+            })
+            .sum::<f64>()
+            * h
+            / 3.0
+    };
+    side(-1.0) + side(1.0)
+}
+
+/// The closed-form CRPS against the integral, also for `1/2 < df <= 1`
+/// (where the closed form is continued analytically) and through `df = 1`;
+/// the Cauchy closed form; the normal limit; `+∞` for `df <= 1/2`.
+#[test]
+fn student_t_crps_matches_numeric_integration() {
+    let at = |df: f64| Dist::StudentT {
+        loc: 0.5,
+        scale: 1.5,
+        df,
+    };
+    for df in [0.8, 1.0, 1.0005, 1.5, 3.0, 30.0, 2e4] {
+        for y in [-4.0, 0.5, 2.2] {
+            let (closed, numeric) = (at(df).crps(y), student_t_crps_by_quadrature(&at(df), y));
+            assert!(
+                close(closed, numeric, 1e-8, 0.0),
+                "df={df} y={y}: closed {closed} vs numeric {numeric}"
+            );
+        }
+    }
+    let normal = Dist::Normal {
+        mu: 0.5,
+        sigma: 1.5,
+    };
+    for y in [-4.0f64, 0.5, 2.2] {
+        // Cauchy: σ [(2/π) z atan z + ln(4/(1 + z²))/π].
+        let z = (y - 0.5) / 1.5;
+        let cauchy = 1.5 * (2.0 * z * z.atan() + (4.0 / (1.0 + z * z)).ln()) / std::f64::consts::PI;
+        assert!(close(at(1.0).crps(y), cauchy, 1e-13, 0.0), "y={y}");
+        assert!(close(at(1e15).crps(y), normal.crps(y), 1e-11, 0.0), "y={y}");
+    }
+    assert_eq!(at(0.5).crps(0.0), f64::INFINITY);
+    assert_eq!(at(0.3).crps(0.0), f64::INFINITY);
+    assert_eq!(at(3.0).crps(f64::INFINITY), f64::INFINITY);
+}
+
+/// Moments (with their existence rules), densities in closed form, and
+/// parameter validation.
+#[test]
+fn student_t_moments_densities_and_validation() {
+    let at = |df: f64| Dist::StudentT {
+        loc: 1.5,
+        scale: 2.0,
+        df,
+    };
+    assert!(at(0.8).mean().is_nan() && at(1.0).mean().is_nan());
+    assert!(at(0.8).variance().is_nan() && at(1.0).variance().is_nan());
+    assert_eq!(at(1.5).mean(), 1.5);
+    assert_eq!(at(1.5).variance(), f64::INFINITY);
+    assert_eq!(at(2.0).variance(), f64::INFINITY);
+    assert!(close(at(4.0).variance(), 8.0, 1e-15, 0.0));
+    assert!(close(at(4.0).std_dev(), 8f64.sqrt(), 1e-15, 0.0));
+    let normal = Dist::Normal {
+        mu: 1.5,
+        sigma: 2.0,
+    };
+    for y in [-30.0f64, 0.0, 1.5, 4.0] {
+        let z = (y - 1.5) / 2.0;
+        let cauchy = -(std::f64::consts::PI * 2.0 * (1.0 + z * z)).ln();
+        assert!(close(at(1.0).log_prob(y), cauchy, 1e-14, 1e-15), "y={y}");
+        let two = -1.5 * (2.0 + z * z).ln() - 2f64.ln();
+        assert!(close(at(2.0).log_prob(y), two, 1e-14, 1e-15), "y={y}");
+        if z.abs() < 3.0 {
+            // The `O(z⁴/df)` difference is below the tolerance here.
+            let (wide, limit) = (at(1e15).log_prob(y), normal.log_prob(y));
+            assert!(close(wide, limit, 0.0, 1e-12), "y={y}: {wide} vs {limit}");
+        }
+    }
+    assert_eq!(at(3.0).log_prob(f64::INFINITY), f64::NEG_INFINITY);
+    // A finite label so far out that `z²` overflows: the Cauchy log density
+    // `-ln(π σ (1 + z²))` and CRPS `σ[(2/π) z atan z + ln(4/(1 + z²))/π]`
+    // stay finite.
+    let cauchy = Dist::StudentT {
+        loc: 0.0,
+        scale: 1.0,
+        df: 1.0,
+    };
+    let far = 1e200f64;
+    let lp = cauchy.log_prob(far);
+    let want = -std::f64::consts::PI.ln() - 2.0 * far.ln();
+    assert!(close(lp, want, 1e-14, 0.0), "{lp} vs {want}");
+    let crps = cauchy.crps(far);
+    assert!(close(crps, far, 1e-14, 0.0), "{crps}");
+    for df in [0.7, 3.0, 1e6] {
+        let d = Dist::StudentT {
+            loc: 0.0,
+            scale: 1.0,
+            df,
+        };
+        assert!(d.log_prob(far).is_finite(), "df={df}");
+        assert!(
+            close(d.crps(-far), far, 1e-12, 0.0),
+            "df={df}: {}",
+            d.crps(-far)
+        );
+    }
+    let family = DistFamily::StudentT;
+    assert_eq!(family.objective_name(), "dist:student_t");
+    assert_eq!(family.param_names(), ["loc", "scale", "df"]);
+    assert_eq!(family.n_params(), 3);
+    assert!(!family.is_discrete());
+    let d = Dist::new(family, &[-1.0, 0.5, 7.0]).unwrap();
+    assert_eq!(d.params(), vec![-1.0, 0.5, 7.0]);
+    assert_eq!(d.family(), family);
+    for bad in [
+        &[0.0, 1.0][..],
+        &[0.0, 1.0, 0.0],
+        &[0.0, -1.0, 3.0],
+        &[f64::NAN, 1.0, 3.0],
+        &[0.0, 1.0, f64::INFINITY],
+    ] {
+        assert!(Dist::new(family, bad).is_err(), "{bad:?}");
+    }
+}
+
+/// The intercept recovers the parameters of heavy-tailed labels, runs
+/// `κ = ln(ν - 1)` to its bound for light-tailed ones, and handles constant
+/// labels.
+#[test]
+fn student_t_intercepts() {
+    let family = DistFamily::StudentT;
+    let truth = Dist::StudentT {
+        loc: -1.0,
+        scale: 0.5,
+        df: 3.0,
+    };
+    let mut rng = Rng::new(11);
+    let labels: Vec<f32> = (0..20_000)
+        .map(|_| truth.sample(|| rng.next_u64()) as f32)
+        .collect();
+    let eta = family.mle_margins(&labels, None);
+    let Dist::StudentT { loc, scale, df } = family.dist_from_margins(&eta) else {
+        panic!("not a Student-t")
+    };
+    assert!((loc + 1.0).abs() < 0.03, "loc {loc}");
+    assert!((scale / 0.5 - 1.0).abs() < 0.05, "scale {scale}");
+    assert!((df / 3.0 - 1.0).abs() < 0.15, "df {df}");
+    // Three points: lighter tails than any Student-t, so the normal fit.
+    let eta = family.mle_margins(&[1.0, 2.0, 6.0], None);
+    assert_eq!(eta[2], LOG_LINK_BOUND, "{eta:?}");
+    assert!(close(eta[0], 3.0, 1e-12, 0.0), "{eta:?}");
+    assert!(
+        close(eta[1], (14.0f64 / 3.0).sqrt().ln(), 1e-9, 0.0),
+        "{eta:?}"
+    );
+    assert_eq!(
+        family.mle_margins(&[2.0, 2.0], None),
+        vec![2.0, -LOG_LINK_BOUND, LOG_LINK_BOUND]
+    );
+}
+
+/// The loss writes three pairs per row (each mode pairing the gradient
+/// with its curvature), predictions report the natural scale
+/// `σ = s ν/(ν + 1)`, and natural parameters map back to the margins.
+#[test]
+fn student_t_loss_pairs_and_transforms() {
+    let family = DistFamily::StudentT;
+    let preds = [0.4f32, 0.3, 1.2, -0.5, -0.2, 3.0];
+    let labels = [1.5f32, -2.0];
+    let weights = [2.0f32, 0.5];
+    for mode in [
+        DistGradient::Fisher,
+        DistGradient::Hessian,
+        DistGradient::Natural,
+    ] {
+        let objective = DistLoss::new(family, mode);
+        assert_eq!(objective.n_outputs(), 3);
+        let out = gradient_pairs(&objective, &preds, &labels, Some(&weights));
+        assert_eq!(out.len(), 6);
+        for i in 0..2 {
+            let eta: Vec<f64> = preds[3 * i..3 * i + 3]
+                .iter()
+                .map(|&v| f64::from(v))
+                .collect();
+            let (y, w) = (f64::from(labels[i]), f64::from(weights[i]));
+            let (g, fisher, hess) = (
+                family.gradient(&eta, y),
+                family.fisher(&eta),
+                family.hessian(&eta, y),
+            );
+            // The Fisher and natural modes floor the `κ` information at
+            // the magnitude of the observed curvature.
+            let mut floored = fisher;
+            floored[2] = floored[2].max(hess[2][2].abs());
+            assert_eq!(family.fisher_curvature(&eta, y), floored);
+            for j in 0..3 {
+                let (eg, eh) = match mode {
+                    DistGradient::Fisher => (g[j], floored[j]),
+                    DistGradient::Hessian => (g[j], hess[j][j].max(MIN_CURVATURE)),
+                    DistGradient::Natural => (g[j] / floored[j], 1.0),
+                };
+                let pair = out[3 * i + j];
+                assert!(close(f64::from(pair.grad), w * eg, 1e-6, 1e-9), "{mode:?}");
+                assert!(close(f64::from(pair.hess), w * eh, 1e-6, 1e-9), "{mode:?}");
+            }
+        }
+    }
+    let objective = DistLoss::new(family, DistGradient::Fisher);
+    // Margins (0.4, ln 2, ln 3): ν = 1 + 3 = 4, σ = 2·4/5 = 1.6.
+    let mut natural = [0.4f32, 2f32.ln(), 3f32.ln()];
+    objective.pred_transform(&mut natural);
+    assert_eq!(natural[0], 0.4);
+    assert!((natural[1] - 1.6).abs() < 1e-6, "{natural:?}");
+    assert!((natural[2] - 4.0).abs() < 1e-6, "{natural:?}");
+    let dist = Dist::from_row(family, &natural);
+    assert!(close(dist.params()[1], 1.6, 1e-6, 0.0), "{dist:?}");
+    assert!(close(dist.params()[2], 4.0, 1e-6, 0.0), "{dist:?}");
+    objective.probs_to_margins(&mut natural);
+    assert_eq!(natural[0], 0.4);
+    assert!((natural[1] - 2f32.ln()).abs() < 1e-6, "{natural:?}");
+    assert!((natural[2] - 3f32.ln()).abs() < 1e-6, "{natural:?}");
+    // A non-positive scale, and degrees of freedom outside the link's
+    // range `ν > 1`.
+    for bad_df in [-1.0f32, 0.5, 1.0] {
+        let mut bad = [0.0f32, 1.0, bad_df];
+        objective.probs_to_margins(&mut bad);
+        assert!(bad[1].is_nan() && bad[2].is_nan(), "{bad_df}");
+    }
+    let mut bad = [0.0f32, -1.0, 3.0];
+    objective.probs_to_margins(&mut bad);
+    assert!(bad[1].is_nan() && !bad[2].is_nan());
+    // The link never fits `ν <= 1`, however far down the margin runs.
+    let floor = family.dist_from_margins(&[0.0, 0.0, -1e3]);
+    assert!(floor.params()[2] > 1.0 && floor.mean() == 0.0, "{floor:?}");
+    assert!(objective.validate_base_score(1.0).is_err());
+}
+
+/// The natural-gradient `κ` step stays of order one at both ends of the
+/// link, where the Fisher information vanishes faster than the score: as
+/// `ν → 1` (`κ = -20, -10`, where the observed curvature is negative near
+/// `z² = 1`) and at large `ν` for labels near the centre and far out. With
+/// the expected information alone the steps reach `1e14` (and `2e4` at
+/// `κ = -10`, `z = 1` with a signed `H₂₂` floor).
+#[test]
+fn student_t_natural_steps_stay_bounded_at_the_link_ends() {
+    let family = DistFamily::StudentT;
+    let objective = DistLoss::new(family, DistGradient::Natural);
+    for kappa in [-20.0f32, -10.0, 2f32.ln(), 49f32.ln(), 9_999f32.ln(), 18.4] {
+        let eta = [0.0f32, 0.0, kappa];
+        let margins = eta.map(f64::from);
+        let Dist::StudentT { scale, df, .. } = family.dist_from_margins(&margins) else {
+            panic!("not a Student-t")
+        };
+        for z in [0.0f64, 0.5, 1.0, 2.0, 5.0, 50.0] {
+            let label = (z * scale) as f32;
+            let out = gradient_pairs(&objective, &eta, &[label], None);
+            let step = f64::from(out[2].grad);
+            assert!(step.abs() <= 5.0, "κ={kappa} df={df} z={z}: step {step}");
+            let unfloored =
+                family.gradient(&margins, f64::from(label))[2] / family.fisher(&margins)[2];
+            if kappa <= -10.0 && z == 1.0 {
+                assert!(unfloored.abs() > 1e4, "κ={kappa}: {unfloored}");
+            }
+        }
+    }
 }

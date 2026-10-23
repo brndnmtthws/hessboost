@@ -180,7 +180,7 @@ See [`python/README.md`](python/README.md).
   - [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/): Finite-sample coverage guarantees.
   - [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/): Asymptotic confidence and prediction intervals for `f(x)`.
   - [Explainable boosting machines](https://docs.rs/hessboost/latest/hessboost/ebm/): Interpretable cyclic GAM/GA²M models with shape-function confidence bands.
-  - [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/): Full predictive distributions per row (`dist:normal`, `dist:gamma`, etc.).
+  - [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/): Full predictive distributions per row (`dist:normal`, `dist:gamma`, `dist:student_t` for heavy-tailed targets with learned degrees of freedom, etc.).
   - [Uncertainty & virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/): SGLB posterior sampling and model shrinkage.
   - [Generative tabular modeling](https://docs.rs/hessboost/latest/hessboost/diffusion/): Tree-based conditional diffusion, flow matching, and ForestFlow synthetic data and imputation.
   - [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/): Fast incremental learning and exact or approximate unlearning.

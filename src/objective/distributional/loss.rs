@@ -1,6 +1,6 @@
 //! [`DistLoss`]: the `dist:*` training loss.
 
-use super::{DistFamily, DistGradient, DistSplitDirection, LOG_LINK_BOUND};
+use super::{DistFamily, DistGradient, DistSplitDirection, MAX_PARAMS};
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use crate::objective::{GradPair, Loss, MIN_HESS, SplitGradient, check_label_domain};
@@ -59,17 +59,28 @@ impl DistLoss {
     }
 
     /// One row's `(gradient, curvature)` per parameter, before row weights.
-    fn row_pairs(self, eta: &[f64], y: f64) -> ([f64; 2], [f64; 2]) {
+    /// The Fisher and natural modes take
+    /// [`DistFamily::fisher_curvature`] (the Fisher diagonal, with the
+    /// Student-t `κ` entry floored at the magnitude of its observed curvature).
+    fn row_pairs(self, eta: &[f64], y: f64) -> ([f64; MAX_PARAMS], [f64; MAX_PARAMS]) {
         let g = self.family.gradient(eta, y);
         match self.gradient {
-            DistGradient::Fisher => (g, self.family.fisher(eta).map(|v| v.max(MIN_CURVATURE))),
+            DistGradient::Fisher => (
+                g,
+                self.family
+                    .fisher_curvature(eta, y)
+                    .map(|v| v.max(MIN_CURVATURE)),
+            ),
             DistGradient::Hessian => {
                 let h = self.family.hessian(eta, y);
-                (g, [h[0][0], h[1][1]].map(|v| v.max(MIN_CURVATURE)))
+                (g, std::array::from_fn(|j| h[j][j].max(MIN_CURVATURE)))
             }
             DistGradient::Natural => {
-                let i = self.family.fisher(eta).map(|v| v.max(MIN_CURVATURE));
-                ([g[0] / i[0], g[1] / i[1]], [1.0; 2])
+                let i = self
+                    .family
+                    .fisher_curvature(eta, y)
+                    .map(|v| v.max(MIN_CURVATURE));
+                (std::array::from_fn(|j| g[j] / i[j]), [1.0; MAX_PARAMS])
             }
         }
     }
@@ -111,7 +122,7 @@ impl Loss for DistLoss {
                         out_row.fill(GradPair::default());
                         continue;
                     }
-                    let mut eta = [0.0; 2];
+                    let mut eta = [0.0; MAX_PARAMS];
                     for (e, &m) in eta.iter_mut().zip(row) {
                         *e = f64::from(m);
                     }
@@ -124,23 +135,43 @@ impl Loss for DistLoss {
         );
     }
 
-    /// Margins to natural parameters (the log links, clamped).
+    /// Margins to natural parameters (the log links, clamped; the
+    /// Student-t scale from its orthogonal margin).
     fn pred_transform(&self, preds: &mut [f32]) {
         let k = self.family.n_params();
+        let mut eta = [0.0; MAX_PARAMS];
         for row in preds.chunks_exact_mut(k) {
-            for (j, v) in row.iter_mut().enumerate() {
-                if self.family.log_link(j) {
-                    *v = f64::from(*v).clamp(-LOG_LINK_BOUND, LOG_LINK_BOUND).exp() as f32;
-                }
+            for (e, &m) in eta.iter_mut().zip(row.iter()) {
+                *e = f64::from(m);
+            }
+            let natural = self.family.natural_params(&eta[..k]);
+            for (v, p) in row.iter_mut().zip(natural) {
+                *v = p as f32;
             }
         }
     }
 
-    /// Natural parameters to margins (inverse links; a non-positive
-    /// parameter maps to `NaN`, which training rejects).
+    /// Natural parameters to margins (inverse links; a parameter outside
+    /// the link's range maps to `NaN`, which training rejects). The
+    /// Student-t margins are `ln s = ln σ + ln(1 + 1/ν)` and
+    /// `κ = ln(ν - 1)` (`NaN` for `ν <= 1`).
     fn probs_to_margins(&self, scores: &mut [f32]) {
         let k = self.family.n_params();
         for row in scores.chunks_exact_mut(k) {
+            if self.family == DistFamily::StudentT {
+                let (sigma, df) = (f64::from(row[1]), f64::from(row[2]));
+                row[1] = if sigma > 0.0 && df > 1.0 {
+                    (sigma.ln() + df.recip().ln_1p()) as f32
+                } else {
+                    f32::NAN
+                };
+                row[2] = if df > 1.0 {
+                    (df - 1.0).ln() as f32
+                } else {
+                    f32::NAN
+                };
+                continue;
+            }
             for (j, v) in row.iter_mut().enumerate() {
                 if self.family.log_link(j) {
                     *v = if *v > 0.0 { v.ln() } else { f32::NAN };

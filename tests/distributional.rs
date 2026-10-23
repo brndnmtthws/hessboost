@@ -292,6 +292,156 @@ fn every_family_and_gradient_mode_learns() {
     }
 }
 
+/// Heavy-tailed regression, `y = 3 x₀ + (0.2 + x₁) T` with `T` Student-t
+/// with 3 degrees of freedom: `dist:student_t` recovers the degrees of
+/// freedom roughly, beats `dist:normal` on the held-out NLL, and gives
+/// calibrated intervals; `predict` reports `(loc, scale, df)`.
+#[test]
+fn student_t_fits_heavy_tailed_labels_better_than_normal() {
+    let truth = |a: f64, b: f64| Dist::StudentT {
+        loc: 3.0 * a,
+        scale: 0.2 + b,
+        df: 3.0,
+    };
+    let dtrain = sampled(4000, 41, truth);
+    let dvalid = sampled(2000, 42, truth);
+    let dtest = sampled(4000, 43, truth);
+    let student = fit(
+        &params(dist(DistFamily::StudentT)).build().unwrap(),
+        &dtrain,
+        &dvalid,
+    );
+    let normal = fit(
+        &params(dist(DistFamily::Normal)).build().unwrap(),
+        &dtrain,
+        &dvalid,
+    );
+    assert_eq!(student.n_outputs(), 3);
+    let dists = student
+        .predict_distribution(&dtest, Iterations::Best)
+        .unwrap();
+    let (nll_t, nll_normal) = (
+        mean_nll(&dists, &dtest),
+        mean_nll(
+            &normal
+                .predict_distribution(&dtest, Iterations::Best)
+                .unwrap(),
+            &dtest,
+        ),
+    );
+    // The best normal approximation of a t(3) costs about 0.19 nats.
+    assert!(
+        nll_t < nll_normal - 0.05,
+        "student-t {nll_t} vs normal {nll_normal}"
+    );
+    let mut df: Vec<f64> = dists.iter().map(|d| d.params()[2]).collect();
+    df.sort_by(f64::total_cmp);
+    let median_df = df[df.len() / 2];
+    assert!((1.5..10.0).contains(&median_df), "median df {median_df}");
+    let labels = dtest.labels().unwrap();
+    for nominal in [0.5, 0.9] {
+        let got = coverage(dists.iter().map(|d| d.interval(nominal)), labels);
+        assert!(
+            (got - nominal).abs() < 0.05,
+            "coverage {got} of nominal {nominal}"
+        );
+    }
+    let natural = student.predict(&dtest, Iterations::Best).unwrap();
+    for (row, d) in natural.rows().zip(&dists) {
+        for (&v, p) in row.iter().zip(d.params()) {
+            assert!((f64::from(v) - p).abs() <= 1e-5 * p.abs().max(1.0));
+        }
+    }
+}
+
+/// `y = 3 x₁ + (0.2 + |x₀|) T`, `T` Student-t with 3 degrees of freedom,
+/// `x ~ U(-1, 1)²`.
+fn heavy_tailed(n: usize, seed: u64) -> DMatrix {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let t3 = Dist::StudentT {
+        loc: 0.0,
+        scale: 1.0,
+        df: 3.0,
+    };
+    let mut x = Vec::with_capacity(2 * n);
+    let mut y = Vec::with_capacity(n);
+    for _ in 0..n {
+        let f: [f32; 2] = [
+            2.0 * rng.random::<f32>() - 1.0,
+            2.0 * rng.random::<f32>() - 1.0,
+        ];
+        let noise = t3.sample(|| rng.next_u64());
+        y.push((3.0 * f64::from(f[1]) + (0.2 + f64::from(f[0]).abs()) * noise) as f32);
+        x.extend(f);
+    }
+    labeled_dense(&x, 2, &y)
+}
+
+/// Long Student-t training is stable in every gradient mode. An
+/// outlier's `κ = ln(ν - 1)` score grows like `ν` while the expected
+/// information vanishes like `1/ν²`, so without the observed-curvature
+/// floor the Fisher and natural steps threw `κ` between its bounds; and
+/// with `ν` free to fall below 1 the location and scale steps blew up near
+/// the centre. With the floor and the `ν > 1` link the training NLL
+/// decreases every round under Fisher scoring and the exact Hessian (up to
+/// `1e-3`: second-order steps on a non-quadratic loss) and nearly so under
+/// the natural gradient (unit-Hessian least-squares fits with no line
+/// search, up to `0.1`), ends below its value at round 100, and every
+/// held-out degrees of freedom stays finite and above the link's lower end,
+/// one. (Leaves whose labels look normal may take `ν` to the link's upper
+/// clamp `1 + e^30`, the normal limit; the natural gradient's unit-Hessian
+/// steps reach it where the likelihood is flat in `κ`.)
+#[test]
+fn student_t_training_is_stable_in_every_gradient_mode() {
+    let dtrain = heavy_tailed(1000, 51);
+    let dtest = heavy_tailed(500, 52);
+    for (mode, rise) in [
+        (DistGradient::Fisher, 1e-3),
+        (DistGradient::Natural, 0.1),
+        (DistGradient::Hessian, 1e-3),
+    ] {
+        let p = TrainingParams::builder()
+            .objective(Objective::Dist(
+                Distributional::new(DistFamily::StudentT).with_gradient(mode),
+            ))
+            .tree_method(TreeMethod::Hist)
+            .max_depth(2)
+            .eta(0.1)
+            .seed(3)
+            .build()
+            .unwrap();
+        let result = Trainer::new(&p, &dtrain, 1000)
+            .eval(&dtrain, "train")
+            .train()
+            .unwrap();
+        let nll: Vec<f64> = result.history.series("train", "nll").unwrap().collect();
+        assert_eq!(nll.len(), 1000, "{mode:?}");
+        for (round, pair) in nll.windows(2).enumerate() {
+            assert!(
+                pair[1] <= pair[0] + rise,
+                "{mode:?}: training nll {} -> {} at round {}",
+                pair[0],
+                pair[1],
+                round + 1
+            );
+        }
+        assert!(
+            nll[999] < nll[100],
+            "{mode:?}: {} vs {}",
+            nll[999],
+            nll[100]
+        );
+        let dists = result
+            .model
+            .predict_distribution(&dtest, Iterations::Best)
+            .unwrap();
+        for d in &dists {
+            let df = d.params()[2];
+            assert!(1.0 < df && df.is_finite(), "{mode:?}: df {df}");
+        }
+    }
+}
+
 #[test]
 fn dist_poisson_trains_like_count_poisson_without_max_delta_step() {
     let d = sampled(2000, 8, |a, b| Dist::Poisson {

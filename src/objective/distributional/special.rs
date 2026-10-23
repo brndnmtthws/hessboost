@@ -1,5 +1,6 @@
 //! Special functions for the distributional objectives, in `f64`: log-gamma,
-//! digamma/trigamma (with cancellation-free large-argument forms),
+//! digamma/trigamma (with cancellation-free large-argument forms, and the
+//! half-shift differences the Student-t likelihood needs),
 //! regularized incomplete gamma and beta functions, and the standard normal
 //! CDF and quantile. Also [`erf_glibc`], glibc's `erf`, which the AFT
 //! objective's normal CDF uses to match XGBoost on Linux.
@@ -302,6 +303,118 @@ pub(crate) fn trigamma_minus_inv(x: f64) -> f64 {
         trigamma_minus_inv_asymptotic(x)
     } else {
         trigamma(x) - 1.0 / x
+    }
+}
+
+/// `u - ln(1 + u)` for `u > -1`, accurate in relative terms near `u = 0`
+/// (the series of `log1p_gap` on `[-1/2, 1]`, the direct difference
+/// outside, where it does not cancel).
+pub(crate) fn ln1p_gap(u: f64) -> f64 {
+    if (-0.5..=1.0).contains(&u) {
+        log1p_gap(u)
+    } else {
+        u - u.ln_1p()
+    }
+}
+
+/// `ln(1 + q) - q/(1 + q)` for `q >= 0`, accurate in relative terms near
+/// `q = 0` (where it is `q²/2 + ...`): with `v = -q/(1 + q)` it is
+/// `v - ln(1 + v)`, taken from [`ln1p_gap`] for `q <= 1`.
+pub(crate) fn ln1p_minus_ratio(q: f64) -> f64 {
+    if q <= 1.0 {
+        ln1p_gap(-q / (1.0 + q))
+    } else {
+        q.ln_1p() - q / (1.0 + q)
+    }
+}
+
+/// `T_k = (4^k - 1) B_{2k}` for `k = 1..=12` (`B` the Bernoulli numbers;
+/// `|T_k|` is half the Genocchi number `G_{2k}`): the coefficients of the
+/// asymptotic series of `ψ(x) - ψ(x + 1/2)` and `ψ'(x) - ψ'(x + 1/2)` in
+/// `ν = 2x`.
+const HALF_SHIFT_SERIES: [f64; 12] = [
+    0.5,
+    -0.5,
+    1.5,
+    -8.5,
+    77.5,
+    -1_036.5,
+    19_113.5,
+    -464_784.5,
+    14_410_309.5,
+    -554_826_452.5,
+    25_971_640_865.5,
+    -1_452_575_521_240.5,
+];
+/// `ν` from which [`half_digamma_gap`] and [`half_trigamma_gap`] use their
+/// series (twelve terms there are below `1e-16` relative); smaller `ν`
+/// are shifted up by the recurrences in steps of 2.
+const HALF_SHIFT_FROM: f64 = 20.0;
+
+/// `ψ(ν/2) - ψ((ν + 1)/2) + 1/ν` for `ν > 0`, twice the derivative of
+/// `ln Γ(ν/2) - ln Γ((ν + 1)/2) + ln(ν)/2` (the Student-t normalization).
+/// Both digamma differences cancel to `-1/(2ν²)` at large `ν`, so it is
+/// the series `-Σ_k T_k / (k ν^{2k})` from `ν = 20`, reached from below by
+/// `E(ν) = E(ν + 2) - 2/(ν (ν + 1) (ν + 2))` (all terms negative).
+pub(crate) fn half_digamma_gap(nu: f64) -> f64 {
+    let (mut x, mut acc) = (nu, 0.0);
+    while x < HALF_SHIFT_FROM {
+        acc -= 2.0 / (x * (x + 1.0) * (x + 2.0));
+        x += 2.0;
+    }
+    let inv2 = 1.0 / (x * x);
+    let series = HALF_SHIFT_SERIES
+        .iter()
+        .enumerate()
+        .rev()
+        .fold(0.0, |sum, (i, &t)| sum * inv2 + t / (i + 1) as f64);
+    acc - series * inv2
+}
+
+/// `R(ν) = [ψ'(ν/2) - ψ'((ν + 1)/2)]/4 - (ν + 3)/(2ν(ν + 1)²)` for
+/// `ν > 0`. It is the Student-t information on `ν` at fixed orthogonal
+/// scale (`(ν - 1)² R(ν)` that of the margin `κ = ln(ν - 1)`); the two
+/// terms cancel to `3/(2ν⁴)` at large `ν`, so it is
+/// `(3ν + 1)/(2ν³(ν + 1)²) + Σ_{k>=2} T_k ν^{-2k-1}` from `ν = 20`,
+/// reached from below by
+/// `R(ν) = R(ν + 2) + 6(2ν + 3)/(ν²(ν + 1)(ν + 2)(ν + 3)²)` (all terms
+/// positive).
+pub(crate) fn half_trigamma_gap(nu: f64) -> f64 {
+    let (mut x, mut acc) = (nu, 0.0);
+    while x < HALF_SHIFT_FROM {
+        acc += 6.0 * (2.0 * x + 3.0) / (x * x * (x + 1.0) * (x + 2.0) * (x + 3.0).powi(2));
+        x += 2.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    let series = HALF_SHIFT_SERIES[1..]
+        .iter()
+        .rev()
+        .fold(0.0, |sum, &t| sum * inv2 + t);
+    acc + (3.0 * x + 1.0) / (2.0 * x.powi(3) * (x + 1.0).powi(2)) + series * inv.powi(5)
+}
+
+/// `[ln Γ(b) - ln Γ(a)]/(b - a)` for nearby `a, b > 0`: the mean of `ψ`
+/// over `[a, b]` by three-point Gauss–Legendre (error below `1e-15` for
+/// `|b - a| <= 0.005` from `a = 1/2`).
+fn ln_gamma_slope(a: f64, b: f64) -> f64 {
+    // √(3/5) / 2: the outer nodes' offset from the midpoint of [0, 1].
+    const HALF_SPREAD: f64 = 0.387_298_334_620_741_7;
+    let at = |t: f64| digamma(a + t * (b - a));
+    (5.0 * (at(0.5 - HALF_SPREAD) + at(0.5 + HALF_SPREAD)) + 8.0 * at(0.5)) / 18.0
+}
+
+/// `Λ(ν)/(ν - 1)` for `ν > 1/2`, with
+/// `Λ(ν) = ln Γ((ν + 1)/2) - ln Γ(ν/2) - ln Γ(ν) + ln Γ(ν - 1/2)`, which
+/// vanishes at `ν = 1` (the Student-t CRPS constant). Within `0.01` of
+/// `ν = 1` it is half the difference of the divided differences of
+/// `ln Γ` over `[ν/2, ν - 1/2]` and `[(ν + 1)/2, ν]` (both of width
+/// `(ν - 1)/2`), so it stays exact through `ν = 1` (where it is `-ln 2`).
+pub(crate) fn half_ln_gamma_slope(nu: f64) -> f64 {
+    if (nu - 1.0).abs() < 0.01 {
+        0.5 * (ln_gamma_slope(0.5 * nu, nu - 0.5) - ln_gamma_slope(f64::midpoint(nu, 1.0), nu))
+    } else {
+        (ln_gamma_ratio(0.5 * nu, 0.5) - ln_gamma_ratio(nu - 0.5, 0.5)) / (nu - 1.0)
     }
 }
 
@@ -838,6 +951,43 @@ mod tests {
             digamma(3.0) - 3f64.ln(),
             1e-15
         ));
+    }
+
+    /// The half-shift digamma and trigamma differences across the switch
+    /// to their series, near zero, and where the plain differences cancel
+    /// completely (mpmath, 80 digits). `E(1/2) = 2 - π`.
+    #[test]
+    fn half_shift_gaps_match_reference_values() {
+        for (nu, e, r) in [
+            (1e-10, -9_999_999_998.613_707, 9.999_999_998_5e19),
+            (0.5, 2.0 - PI, 2.108_306_821_153_320_7),
+            (3.0, -0.052_961_027_786_557_285, 0.009_967_033_424_113_219),
+            (19.5, -0.001_313_204_360_096_675_2, 9.371_229_382_003_072e-6),
+            (20.5, -0.001_188_359_117_076_558, 7.710_012_740_041_578e-6),
+            (1e6, -4.999_999_999_997_5e-13, 1.499_997_000_003_5e-24),
+        ] {
+            assert!(close(half_digamma_gap(nu), e, 1e-14), "E({nu})");
+            assert!(close(half_trigamma_gap(nu), r, 1e-14), "R({nu})");
+        }
+        for (nu, m) in [
+            (0.6, -2.276_851_193_116_833),
+            (0.995, -0.699_368_721_021_364_6),
+            (1.0, -std::f64::consts::LN_2),
+            (1.003, -0.689_464_915_904_384_5),
+            (2.0, -0.241_564_475_270_490_44),
+            (7.0, -0.054_317_214_211_996_45),
+        ] {
+            let got = half_ln_gamma_slope(nu);
+            assert!(close(got, m, 1e-13), "M({nu}) = {got}");
+        }
+        // ln(1 + q) - q/(1 + q) ≈ q²/2 - 2q³/3 near zero.
+        let q = 1e-9;
+        assert!(close(
+            ln1p_minus_ratio(q),
+            0.5 * q * q - 2.0 * q * q * q / 3.0,
+            1e-12
+        ));
+        assert!(close(ln1p_minus_ratio(3.0), 4f64.ln() - 0.75, 1e-15));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::family::nb_size_score;
+use super::family::{KAPPA_STEP_CAP, STUDENT_T_KAPPA_FLOOR, nb_size_score};
 use super::loss::MIN_CURVATURE;
 use super::*;
 use crate::objective::gradient_pairs;
@@ -1251,9 +1251,12 @@ fn student_t_loss_pairs_and_transforms() {
                 family.hessian(&eta, y),
             );
             // The Fisher and natural modes floor the `κ` information at
-            // the magnitude of the observed curvature.
+            // the magnitude of the observed curvature and at a tenth of the
+            // score.
             let mut floored = fisher;
-            floored[2] = floored[2].max(hess[2][2].abs());
+            floored[2] = floored[2]
+                .max(hess[2][2].abs())
+                .max(g[2].abs() / KAPPA_STEP_CAP);
             assert_eq!(family.fisher_curvature(&eta, y), floored);
             for j in 0..3 {
                 let (eg, eh) = match mode {
@@ -1299,7 +1302,7 @@ fn student_t_loss_pairs_and_transforms() {
 
 /// The natural-gradient `κ` step stays of order one at both ends of the
 /// link, where the Fisher information vanishes faster than the score: as
-/// `ν → 1` (`κ = -20, -10`, where the observed curvature is negative near
+/// `ν → 1` (`κ` at its floor and `-10`, where the observed curvature is negative near
 /// `z² = 1`) and at large `ν` for labels near the centre and far out. With
 /// the expected information alone the steps reach `1e14` (and `2e4` at
 /// `κ = -10`, `z = 1` with a signed `H₂₂` floor).
@@ -1307,7 +1310,8 @@ fn student_t_loss_pairs_and_transforms() {
 fn student_t_natural_steps_stay_bounded_at_the_link_ends() {
     let family = DistFamily::StudentT;
     let objective = DistLoss::new(family, DistGradient::Natural);
-    for kappa in [-20.0f32, -10.0, 2f32.ln(), 49f32.ln(), 9_999f32.ln(), 18.4] {
+    let floor = STUDENT_T_KAPPA_FLOOR as f32;
+    for kappa in [floor, -10.0, 2f32.ln(), 49f32.ln(), 9_999f32.ln(), 18.4] {
         let eta = [0.0f32, 0.0, kappa];
         let margins = eta.map(f64::from);
         let Dist::StudentT { scale, df, .. } = family.dist_from_margins(&margins) else {
@@ -1324,5 +1328,83 @@ fn student_t_natural_steps_stay_bounded_at_the_link_ends() {
                 assert!(unfloored.abs() > 1e4, "κ={kappa}: {unfloored}");
             }
         }
+    }
+}
+
+/// Predictions report `ν` as `f32`: at and below the `κ` floor it is
+/// `1 + 2⁻²³`, the smallest `f32` above 1 (not `1.0`, as `1 + e^{-30}`
+/// rounds), and the reported row maps back to finite margins that
+/// reproduce it, location and degrees of freedom bit for bit, the scale
+/// within one `f32` ulp (its margin `ln s` is rounded to `f32` too).
+#[test]
+fn student_t_f32_predictions_stay_above_one_and_round_trip() {
+    let objective = DistLoss::new(DistFamily::StudentT, DistGradient::Fisher);
+    let floor = STUDENT_T_KAPPA_FLOOR;
+    for kappa in [-1e3, -30.0, floor - 1.0, floor, floor + 1.0, 0.0] {
+        let mut row = [0.3f32, 2f32.ln(), kappa as f32];
+        objective.pred_transform(&mut row);
+        assert!(row[2] > 1.0, "κ={kappa}: {row:?}");
+        assert!(row[1].is_finite() && row[1] > 0.0, "κ={kappa}: {row:?}");
+        if kappa <= floor {
+            assert_eq!(row[2], 1.0 + f32::EPSILON, "κ={kappa}");
+        }
+        let mut margins = row;
+        objective.probs_to_margins(&mut margins);
+        assert!(
+            margins.iter().all(|m| m.is_finite()),
+            "κ={kappa}: {margins:?}"
+        );
+        let mut again = margins;
+        objective.pred_transform(&mut again);
+        assert_eq!(again[0].to_bits(), row[0].to_bits(), "κ={kappa}");
+        assert_eq!(again[2].to_bits(), row[2].to_bits(), "κ={kappa}");
+        let ulps = again[1].to_bits().abs_diff(row[1].to_bits());
+        assert!(ulps <= 1, "κ={kappa}: {row:?} -> {again:?}");
+    }
+}
+
+/// The observed `κ` curvature `H₂₂` crosses zero where the score does not
+/// (near `z = 1.47 √ν` at large `ν`, `z = 1.41 √ν` at `ν = 10`): at the
+/// root, located by bisection, the `|H₂₂|` floor alone leaves the step
+/// `g₂/max(I₂, |H₂₂|)` at `1e2` to `1e31`; the `|g₂|/10` floor caps it at
+/// 10.
+#[test]
+fn student_t_kappa_steps_are_capped_where_the_observed_curvature_vanishes() {
+    let family = DistFamily::StudentT;
+    for kappa in [9f64.ln(), 49f64.ln(), 9_999f64.ln(), 1e8f64.ln(), 25.0] {
+        let eta = [0.0, 0.0, kappa];
+        let Dist::StudentT { scale, df, .. } = family.dist_from_margins(&eta) else {
+            panic!("not a Student-t")
+        };
+        let at = |r: f64| r * df.sqrt() * scale;
+        let h = |r: f64| family.hessian(&eta, at(r))[2][2];
+        let (mut lo, mut hi) = (1.3, 1.7);
+        assert!(h(lo) < 0.0 && h(hi) > 0.0, "κ={kappa}");
+        for _ in 0..200 {
+            let mid = f64::midpoint(lo, hi);
+            if h(mid) < 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let y = at(lo);
+        let g = family.gradient(&eta, y)[2];
+        let fisher = family.fisher(&eta)[2];
+        let uncapped = g / fisher.max(h(lo).abs());
+        assert!(uncapped.abs() > 100.0, "κ={kappa}: {uncapped}");
+        let step = g / family.fisher_curvature(&eta, y)[2];
+        assert!(
+            step.abs() <= KAPPA_STEP_CAP * (1.0 + 1e-12),
+            "κ={kappa}: {step}"
+        );
+        let natural = DistLoss::new(family, DistGradient::Natural);
+        let margins = eta.map(|e| e as f32);
+        let out = gradient_pairs(&natural, &margins, &[y as f32], None);
+        let pair = f64::from(out[2].grad);
+        assert!(
+            pair.abs() <= KAPPA_STEP_CAP * (1.0 + 1e-5),
+            "κ={kappa}: {pair}"
+        );
     }
 }

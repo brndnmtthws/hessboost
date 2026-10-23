@@ -442,6 +442,34 @@ fn student_t_training_is_stable_in_every_gradient_mode() {
     }
 }
 
+/// Labels with tails heavier than the Cauchy's (Student-t, 1/2 degree of
+/// freedom) send `κ = ln(ν - 1)` to its floor. The `f32` predictions must
+/// still report `ν > 1` (the floor `1 + 2⁻²³`, the smallest `f32` above 1,
+/// not `1.0`), so every reported row is a valid distribution with a mean.
+#[test]
+fn student_t_f32_predictions_keep_df_above_one_at_the_floor() {
+    let d = sampled(500, 61, |_, _| Dist::StudentT {
+        loc: 0.0,
+        scale: 0.01,
+        df: 0.5,
+    });
+    let p = params(dist(DistFamily::StudentT)).build().unwrap();
+    let model = train(&p, &d, 20).unwrap();
+    let natural = model.predict(&d, Iterations::Best).unwrap();
+    let floor = 1.0 + f32::EPSILON;
+    let mut at_floor = 0;
+    for row in natural.rows() {
+        assert!(row[2] > 1.0, "{row:?}");
+        if row[2] == floor {
+            at_floor += 1;
+        }
+        let params: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+        let dist = Dist::new(DistFamily::StudentT, &params).unwrap();
+        assert!(dist.mean().is_finite(), "{row:?}");
+    }
+    assert!(at_floor > 0, "no row reached the degrees-of-freedom floor");
+}
+
 #[test]
 fn dist_poisson_trains_like_count_poisson_without_max_delta_step() {
     let d = sampled(2000, 8, |a, b| Dist::Poisson {

@@ -61,7 +61,8 @@ impl DistLoss {
     /// One row's `(gradient, curvature)` per parameter, before row weights.
     /// The Fisher and natural modes take
     /// [`DistFamily::fisher_curvature`] (the Fisher diagonal, with the
-    /// Student-t `κ` entry floored at the magnitude of its observed curvature).
+    /// Student-t `κ` entry floored at the magnitude of its observed curvature
+    /// and at a tenth of its score).
     fn row_pairs(self, eta: &[f64], y: f64) -> ([f64; MAX_PARAMS], [f64; MAX_PARAMS]) {
         let g = self.family.gradient(eta, y);
         match self.gradient {

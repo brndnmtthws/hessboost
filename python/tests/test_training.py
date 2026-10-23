@@ -236,6 +236,23 @@ def test_student_t_objective_fits_heavy_tails() -> None:
     assert student_nll < normal_nll
 
 
+def test_student_t_predicted_df_stays_above_one() -> None:
+    # Tails heavier than the Cauchy's send the degrees of freedom to their
+    # floor, the smallest float32 above 1: `predict` must never report 1.
+    rng = np.random.default_rng(13)
+    x = rng.uniform(-1, 1, size=(500, 2))
+    y = 0.01 * rng.standard_t(0.5, 500)
+    booster = hessboost.train(
+        {"objective": "dist:student_t", "max_depth": 2, "eta": 0.1}, DMatrix(x, y), 20
+    )
+    natural = booster.predict(x)
+    assert natural.shape == (500, 3)
+    df = natural[:, 2]
+    assert np.all(df > 1)
+    assert np.any(df == np.float32(1) + np.finfo(np.float32).eps)
+    assert np.all(np.isfinite(booster.predict_distribution(x).mean()))
+
+
 def test_virtual_ensembles_and_uncertainty() -> None:
     x, y = regression(rows=300)
     params = {"posterior_sampling": True, "max_depth": 3}

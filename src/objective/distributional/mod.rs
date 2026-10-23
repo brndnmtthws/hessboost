@@ -21,7 +21,7 @@
 //! | `dist:gamma` | `Gamma` | `(ln m, ln a)` | mean `m`, shape `a` (rate `a / m`) |
 //! | `dist:poisson` | `Poisson` | `ln λ` | rate `λ` |
 //! | `dist:negbinomial` | `NegativeBinomial` | `(ln m, ln r)` | mean `m`, size `r` (variance `m + m²/r`) |
-//! | `dist:student_t` | `StudentT` | `(μ, ln s, ln(ν - 1))` | location `μ`, scale `σ = s ν/(ν + 1)`, degrees of freedom `ν > 1` |
+//! | `dist:student_t` | `StudentT` | `(μ, ln s, ln(ν - 1))` | location `μ`, scale `σ = s ν/(ν + 1)`, degrees of freedom `ν >= 1 + 2⁻²³` |
 //!
 //! The parameterizations are chosen *orthogonal*: the Fisher information of
 //! each family is diagonal in its margins, so the diagonal Fisher that fits
@@ -34,7 +34,11 @@
 //! is always above 1: as `ν → 0` the likelihood degenerates (it is
 //! unbounded as `σ → 0` at any label) and the location and scale steps
 //! grow without bound near the centre (like `ν^{-1/2}` and `ν^{-1}`), and
-//! the mean (the point prediction) needs `ν > 1`. Distributions built
+//! the mean (the point prediction) needs `ν > 1`. `κ` is clamped to
+//! `[ln 2⁻²³, 30]` (`ln 2⁻²³ ≈ -15.94`) rather than `[-30, 30]`: predictions
+//! report the natural parameters as `f32`, where `1 + e^{-30}` rounds to
+//! `1.0`; `1 + 2⁻²³` is the smallest `f32` above 1, so every reported `ν`
+//! stays above 1 and maps back to a finite margin. Distributions built
 //! directly ([`Dist::new`]) take any `ν > 0`.
 //!
 //! # Gradients and the "Hessian" (`dist_gradient`)
@@ -59,19 +63,23 @@
 //!   squares, and `eta` is the step size (no line search).
 //!
 //! One exception to the expected information: the Student-t `κ` entry
-//! of the Fisher and natural modes is `max(I₂, |H₂₂|)`, the Fisher
-//! information floored at the magnitude of the row's exact observed
-//! curvature. `I₂ = (ν - 1)² R(ν)` vanishes at both ends of the link,
-//! like `(ν - 1)²` as `ν → 1` and like `3/(2ν²)` as `ν → ∞`, faster than
-//! the score: `g₂` scales like `ν - 1` near `ν = 1`, and the score of a
-//! label far from the centre is unbounded at large `ν`
-//! (`g₂ ≈ (ν/2)(ln q - 1)`, `q = z²/ν`). The expected-information steps
-//! `-Σg₂/(ΣI₂ + λ)` and `g₂/I₂` would then be huge (up to `1e14` per row,
-//! throwing `κ` between its bounds and the training NLL up). `|H₂₂|`
-//! follows `|g₂|` in both regimes and keeps the per-row step `g₂/I₂*` of
-//! order one; its magnitude is taken because the observed curvature is
-//! negative there for many labels (`z² ≈ 1` as `ν → 1`, labels near the
-//! centre at large `ν`). Fisher scoring keeps its fixed point `Σg = 0`; the
+//! of the Fisher and natural modes is `max(I₂, |H₂₂|, |g₂|/10)`, the
+//! Fisher information floored at the magnitude of the row's exact
+//! observed curvature and at a tenth of its score. `I₂ = (ν - 1)² R(ν)`
+//! vanishes at both ends of the link, like `(ν - 1)²` as `ν → 1` and like
+//! `3/(2ν²)` as `ν → ∞`, faster than the score: `g₂` scales like `ν - 1`
+//! near `ν = 1`, and the score of a label far from the centre is
+//! unbounded at large `ν` (`g₂ ≈ (ν/2)(ln q - 1)`, `q = z²/ν`). The
+//! expected-information steps `-Σg₂/(ΣI₂ + λ)` and `g₂/I₂` would then be
+//! huge (`1e14` and more per row, throwing `κ` between its bounds and the
+//! training NLL up). `|H₂₂|` mostly follows `|g₂|` in both regimes and
+//! keeps the per-row step `g₂/I₂*` of order one (at most about 5.3); its
+//! magnitude is taken because the observed curvature is negative there
+//! for many labels (`z² ≈ 1` as `ν → 1`, labels near the centre at large
+//! `ν`). But `H₂₂` crosses zero where `g₂` does not (near `q ≈ 2.16` at
+//! large `ν`, with `g₂ ≈ 0.23ν`; the step there is about `2e4` at `ν = 50`
+//! and `2e11` at `ν = 1e4`), and the `|g₂|/10` floor caps the steps of
+//! those labels at 10. Fisher scoring keeps its fixed point `Σg = 0`; the
 //! natural gradient's becomes the curvature-weighted `Σ g/I* = 0`. The
 //! location and scale entries need no floor: their steps are at most the
 //! normal family's for `z² >= 3`, and stay bounded near the centre for
@@ -129,7 +137,7 @@
 //! Labels with lighter tails than the normal's (and normal labels about
 //! half the time) send the Student-t `κ` to its bound `30`, where it is
 //! practically normal; labels with tails heavier than the Cauchy's send
-//! it to `-30` (`ν → 1`). A scalar `base_score` is only
+//! it to its floor `ln 2⁻²³` (`ν = 1 + 2⁻²³`). A scalar `base_score` is only
 //! accepted for the one-parameter `dist:poisson` (as its rate).
 //!
 //! # Shared trees: parallel gradient boosting
@@ -194,7 +202,7 @@ pub enum DistGradient {
     /// information as Hessian (Fisher scoring; a natural-gradient Newton
     /// step for the orthogonal parameterizations used). The Student-t
     /// `κ = ln(ν - 1)` entry is floored at the magnitude of the observed
-    /// curvature (see the module docs).
+    /// curvature and at a tenth of the score (see the module docs).
     #[default]
     Fisher,
     /// Gradient with the diagonal of the exact (observed) Hessian, floored

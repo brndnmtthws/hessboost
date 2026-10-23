@@ -18,6 +18,25 @@ use super::special::{
 /// family's [`DistFamily::n_params`] are zero.
 pub(crate) const MAX_PARAMS: usize = 3;
 
+/// Lower clamp of the Student-t margin `κ = ln(ν - 1)`: `ln(f32::EPSILON)`
+/// `= -23 ln 2`, so the link's smallest `ν = 1 + 2⁻²³` is the smallest
+/// `f32` above 1. Predictions report natural parameters as `f32`; a lower
+/// clamp at [`LOG_LINK_BOUND`] would round `ν = 1 + e^{-30}` to `1.0`,
+/// which is not `> 1` and has no margin to map back to. The upper clamp
+/// is [`LOG_LINK_BOUND`].
+pub(crate) const STUDENT_T_KAPPA_FLOOR: f64 = -15.942_385_152_878_742;
+
+/// The largest per-row Student-t `κ` step `|g₂/I₂*|` of the Fisher and
+/// natural modes: their `κ` curvature is floored at `|g₂|` over it (see
+/// `StudentLikelihood::fisher_curvature`).
+pub(crate) const KAPPA_STEP_CAP: f64 = 10.0;
+
+/// `ν - 1 = e^κ` of the Student-t margin `κ`, clamped to
+/// `[STUDENT_T_KAPPA_FLOOR, LOG_LINK_BOUND]`.
+fn student_t_excess(kappa: f64) -> f64 {
+    kappa.clamp(STUDENT_T_KAPPA_FLOOR, LOG_LINK_BOUND).exp()
+}
+
 /// Declares the distribution families once: the [`DistFamily`] variant, its
 /// objective name, and the [`Dist`] variant whose fields are the natural
 /// parameters in output order ([`DistFamily::param_names`]). Generates
@@ -158,12 +177,15 @@ dist_families! {
     /// freedom, margins `(μ, ln s, κ = ln(ν - 1))` with the orthogonal scale
     /// `s = σ (ν + 1)/ν` (`dist:student_t`). The link keeps every fitted
     /// `ν > 1`: as `ν → 0` the likelihood degenerates and the location and
-    /// scale steps grow without bound, and the mean needs `ν > 1`. Under
+    /// scale steps grow without bound, and the mean needs `ν > 1`. `κ` is
+    /// clamped below at `ln 2⁻²³` (`STUDENT_T_KAPPA_FLOOR`) so the `f32`
+    /// predictions keep `ν >= 1 + 2⁻²³ > 1` and map back to a margin. Under
     /// [`DistGradient::Fisher`](super::DistGradient::Fisher) and
     /// [`DistGradient::Natural`](super::DistGradient::Natural) the `κ`
     /// curvature is the Fisher information floored at the magnitude of the
-    /// row's exact observed curvature: the information vanishes at both
-    /// ends of the link (like `(ν - 1)²` and `1/ν²`) faster than the score.
+    /// row's exact observed curvature and at a tenth of its score: the
+    /// information vanishes at both ends of the link (like `(ν - 1)²` and
+    /// `1/ν²`) faster than the score.
     StudentT = "dist:student_t",
     /// Student-t: `(y - loc)/scale` follows Student's t distribution with
     /// `df` degrees of freedom (heavier tails for smaller `df`, the normal
@@ -218,7 +240,7 @@ impl DistFamily {
             };
         }
         if self == DistFamily::StudentT {
-            out[2] += 1.0;
+            out[2] = 1.0 + student_t_excess(eta[2]);
             out[1] = student_t_scale(out[1], out[2]);
         }
         out
@@ -288,7 +310,8 @@ impl DistFamily {
     /// The curvature of the [`DistGradient::Fisher`](super::DistGradient::Fisher)
     /// and [`DistGradient::Natural`](super::DistGradient::Natural) modes: the
     /// Fisher diagonal, with the Student-t `κ` entry floored at the
-    /// magnitude of the row's exact observed curvature (see the module docs).
+    /// magnitude of the row's exact observed curvature and at
+    /// `|g₂|/KAPPA_STEP_CAP` (see the module docs).
     pub(crate) fn fisher_curvature(self, eta: &[f64], y: f64) -> [f64; MAX_PARAMS] {
         if self == DistFamily::StudentT {
             StudentLikelihood::at_margins(eta).fisher_curvature(y)
@@ -440,7 +463,7 @@ impl StudentLikelihood {
             mu,
             sigma,
             nu,
-            excess: eta[2].clamp(-LOG_LINK_BOUND, LOG_LINK_BOUND).exp(),
+            excess: student_t_excess(eta[2]),
             digamma_gap: half_digamma_gap(nu),
             trigamma_gap: half_trigamma_gap(nu),
             ln_peak: ln_gamma_ratio(0.5 * nu, 0.5) - 0.5 * (nu * PI).ln() - sigma.ln(),
@@ -484,21 +507,30 @@ impl StudentLikelihood {
     }
 
     /// [`Self::fisher`] with the `κ` entry floored at the magnitude of the
-    /// exact observed curvature, `max(I₂, |H₂₂|)`. `I₂ = (ν - 1)² R(ν)`
-    /// vanishes at both ends of the link, like `(ν - 1)²` as `ν → 1` and
-    /// like `3/(2ν²)` as `ν → ∞`, faster than the score `g₂` (like `ν - 1`,
-    /// and like `ν` for a label far out): the step `g₂/I₂` reached `1e14`.
-    /// There `|H₂₂|` follows `|g₂|` (it is the derivative of a score that
-    /// scales with `ν - 1` or `1/ν`), so `|g₂/I₂*|` stays of order one;
-    /// the observed curvature is often negative there (as `ν → 1` for
-    /// `z² ≈ 1`, and for labels near the centre at large `ν`), hence its
-    /// magnitude. The location and scale entries are left as they are:
+    /// exact observed curvature and at `|g₂|/KAPPA_STEP_CAP`:
+    /// `I₂* = max(I₂, |H₂₂|, |g₂|/10)`. `I₂ = (ν - 1)² R(ν)` vanishes at
+    /// both ends of the link, like `(ν - 1)²` as `ν → 1` and like `3/(2ν²)`
+    /// as `ν → ∞`, faster than the score `g₂` (like `ν - 1`, and like `ν`
+    /// for a label far out): the step `g₂/I₂` reached `1e14`. There `|H₂₂|`
+    /// mostly follows `|g₂|` (it is the derivative of a score that scales
+    /// with `ν - 1` or `1/ν`), so `|g₂/I₂*|` stays of order one; the observed
+    /// curvature is often negative there (as `ν → 1` for `z² ≈ 1`, and for
+    /// labels near the centre at large `ν`), hence its magnitude. But `H₂₂`
+    /// changes sign where `g₂` does not (at large `ν` near `q = z²/ν ≈ 2.16`,
+    /// where `g₂ ≈ 0.23 ν`, and at moderate `ν` too), so `|H₂₂|` alone
+    /// leaves holes: at the root the step is about `1e2` at `ν = 10`, `2e4`
+    /// at `ν = 50`, `2e11` at `ν = 1e4`, and more beyond. The `|g₂|/10`
+    /// floor caps every per-row step at 10, above the about 5.3 that rows
+    /// away from those roots reach (`ν` from `1 + 2⁻²³` to `1 + e^30`).
+    /// The location and scale entries are left as they are:
     /// their steps `g/I` are at most the normal family's for `z² >= 3`
     /// (outliers are down-weighted by `w = (ν + 1)/(ν + z²)`), and with
     /// `ν > 1` they stay bounded near the centre too.
     pub(super) fn fisher_curvature(&self, y: f64) -> [f64; MAX_PARAMS] {
         let mut curvature = self.fisher();
-        curvature[2] = curvature[2].max(self.hessian(y)[2][2].abs());
+        let observed = self.hessian(y)[2][2].abs();
+        let capped = self.gradient(y)[2].abs() / KAPPA_STEP_CAP;
+        curvature[2] = curvature[2].max(observed).max(capped);
         curvature
     }
 
@@ -594,8 +626,8 @@ fn newton_step(
 /// the summed NLL, until the margins move less than `1e-13` relative. A log
 /// margin at its bound whose score points past it stays there: labels with
 /// lighter tails than the normal's send `κ` to `+LOG_LINK_BOUND`, labels
-/// with tails heavier than the Cauchy's send it to
-/// `-LOG_LINK_BOUND` (`ν → 1`). The likelihood is unbounded as `σ → 0` at
+/// with tails heavier than the Cauchy's send it to its floor
+/// `STUDENT_T_KAPPA_FLOOR` (`ν = 1 + 2⁻²³`). The likelihood is unbounded as `σ → 0` at
 /// a label holding enough of the weight, so this is the local maximum
 /// reached from the robust start; constant labels give
 /// `(y, -LOG_LINK_BOUND, LOG_LINK_BOUND)`.
@@ -618,11 +650,14 @@ fn student_t_mle(labels: &[f32], w: &dyn Fn(usize) -> f64, sum_w: f64) -> Vec<f6
     if spread.is_nan() || spread <= 0.0 {
         return vec![mu, -LOG_LINK_BOUND, LOG_LINK_BOUND];
     }
-    let clamp = |e: f64| e.clamp(-LOG_LINK_BOUND, LOG_LINK_BOUND);
+    // Lower bounds of the margins (`μ` is unbounded); all share the upper
+    // bound `LOG_LINK_BOUND`.
+    let lower = [f64::NEG_INFINITY, -LOG_LINK_BOUND, STUDENT_T_KAPPA_FLOOR];
+    let clamp = |e: f64, floor: f64| e.clamp(floor, LOG_LINK_BOUND);
     let start_df = 5.0f64;
     let mut eta = [
         mu,
-        clamp((spread * (start_df + 1.0) / start_df).ln()),
+        clamp((spread * (start_df + 1.0) / start_df).ln(), lower[1]),
         (start_df - 1.0).ln(),
     ];
     let total_nll = |eta: &[f64; MAX_PARAMS]| -> f64 {
@@ -655,7 +690,7 @@ fn student_t_mle(labels: &[f32], w: &dyn Fn(usize) -> f64, sum_w: f64) -> Vec<f6
         // A log margin at its bound whose score points past it stays put.
         for j in 1..MAX_PARAMS {
             let outward = (eta[j] >= LOG_LINK_BOUND && grad[j] < 0.0)
-                || (eta[j] <= -LOG_LINK_BOUND && grad[j] > 0.0);
+                || (eta[j] <= lower[j] && grad[j] > 0.0);
             if outward {
                 grad[j] = 0.0;
                 hess[j] = [0.0; MAX_PARAMS];
@@ -676,8 +711,8 @@ fn student_t_mle(labels: &[f32], w: &dyn Fn(usize) -> f64, sum_w: f64) -> Vec<f6
         for _ in 0..LINE_SEARCH_HALVINGS {
             let next = [
                 eta[0] + scale * step[0],
-                clamp(eta[1] + scale * step[1]),
-                clamp(eta[2] + scale * step[2]),
+                clamp(eta[1] + scale * step[1], lower[1]),
+                clamp(eta[2] + scale * step[2], lower[2]),
             ];
             let value = total_nll(&next);
             if value.is_finite() && (value <= current || scale * decrease <= tolerance) {

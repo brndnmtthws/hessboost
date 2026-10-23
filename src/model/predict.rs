@@ -3,7 +3,9 @@ use crate::data::{DMatrix, Rows, check_len, rejects_dense, rejects_dense_values}
 use crate::error::{HessboostError, Result};
 use crate::objective::Objective;
 use crate::objective::distributional::Dist;
-use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, LaneBlock, fill_lanes, key};
+use crate::tree::compact::{
+    CompactForest, FEATURE_LANES, LANES, LaneBlock, fill_lanes, fill_selected_lanes, key,
+};
 use crate::tree::scalar_tree_output;
 use rayon::prelude::*;
 use std::ops::{Bound, Range, RangeBounds};
@@ -217,7 +219,7 @@ impl BoostedModel {
                 |block, (bi, out_block)| {
                     let start = bi * PREDICT_BLOCK_ROWS;
                     let rows = out_block.len() / stride;
-                    block.load(start, rows);
+                    block.load_for_forest(start, rows, forest);
                     for ti in trees.clone() {
                         tree_op(block, forest, ti, rows, out_block, stride);
                     }
@@ -1120,6 +1122,24 @@ impl<'a> RowBlock<'a> {
 
     /// Point the block at rows `start..start + rows`.
     pub(super) fn load(&mut self, start: usize, rows: usize) {
+        self.load_with_slots(start, rows, None);
+    }
+
+    /// Load a prediction block, omitting unused dense feature/sign slots
+    /// when the forest's cached plan is sparse enough. The ordinary lane
+    /// layout and complete raw tail are retained for every walker.
+    fn load_for_forest(&mut self, start: usize, rows: usize, forest: &CompactForest) {
+        let slots = match self {
+            RowBlock::View { n_cols, .. } => forest.selected_lane_slots(*n_cols),
+            RowBlock::Scratch { source, n_cols, .. } if source.dense_rows().is_some() => {
+                forest.selected_lane_slots(*n_cols)
+            }
+            RowBlock::Scratch { .. } | RowBlock::Wide { .. } => None,
+        };
+        self.load_with_slots(start, rows, slots);
+    }
+
+    fn load_with_slots(&mut self, start: usize, rows: usize, slots: Option<&[u32]>) {
         match self {
             RowBlock::Wide { start: s, .. } => *s = start,
             RowBlock::View {
@@ -1130,11 +1150,17 @@ impl<'a> RowBlock<'a> {
             } => {
                 *s = start;
                 let n_cols = *n_cols;
-                fill_lanes(
-                    lanes,
-                    &data[start * n_cols..(start + rows) * n_cols],
-                    n_cols,
-                );
+                if let Some(slots) = slots {
+                    fill_selected_lanes(lanes, n_cols, rows, slots, |r, f| {
+                        data[(start + r) * n_cols + f]
+                    });
+                } else {
+                    fill_lanes(
+                        lanes,
+                        &data[start * n_cols..(start + rows) * n_cols],
+                        n_cols,
+                    );
+                }
             }
             RowBlock::Scratch {
                 source,
@@ -1147,6 +1173,18 @@ impl<'a> RowBlock<'a> {
                 let missing = source.missing();
                 let groups = rows / LANES;
                 *tail_start = groups * LANES;
+                if let (Some(slots), Some(dense)) = (slots, source.dense_rows()) {
+                    let value = |r, f| {
+                        let v = dense.row(start + r)[f];
+                        if v == missing { f32::NAN } else { v }
+                    };
+                    fill_selected_lanes(lanes, n_cols, rows, slots, value);
+                    scratch.clear();
+                    for r in groups * LANES..rows {
+                        scratch.extend((0..n_cols).map(|f| value(r, f)));
+                    }
+                    return;
+                }
                 lanes.clear();
                 lanes.resize(groups * FEATURE_LANES * n_cols, key(f32::NAN));
                 scratch.clear();
@@ -1407,5 +1445,174 @@ impl<'a> RowBlock<'a> {
                 out[r * stride] += weight * forest.leaf_value(leaf);
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ModelObjective, ModelSpec};
+    use crate::tree::{ChildLeaf, RegTree, SplitRule};
+
+    const COLS: usize = 257;
+
+    fn sparse_tree(feature: u32, vector: bool, categorical: bool) -> RegTree {
+        let mut tree = if vector {
+            RegTree::with_vector_root(2, 1.0)
+        } else {
+            RegTree::with_root(1.0)
+        };
+        let split = if categorical {
+            SplitRule::categorical(feature, &[0, 2, 3], false)
+        } else {
+            SplitRule::numeric(feature, 0.0, false)
+        };
+        let (l, r) = tree.expand(
+            0,
+            split,
+            ChildLeaf::new(-0.3, 1.0),
+            ChildLeaf::new(0.7, 1.0),
+        );
+        if vector {
+            tree.set_leaf_vector(l, &[-0.3, 0.13]);
+            tree.set_leaf_vector(r, &[0.7, -0.21]);
+        }
+        tree
+    }
+
+    fn sparse_model(vector: bool) -> BoostedModel {
+        let outputs = if vector { 2 } else { 1 };
+        let trees = [3, 251, 5, 253]
+            .into_iter()
+            .enumerate()
+            .map(|(i, feature)| sparse_tree(feature, vector, i == 1))
+            .collect();
+        BoostedModel::from_parts(
+            trees,
+            vec![0.9, 0.3, 1.1, 0.7],
+            vec![0.17; outputs],
+            ModelSpec {
+                objective: ModelObjective::new(Objective::default()).unwrap(),
+                max_delta_step: 0.0,
+                num_class: 0,
+                n_outputs: outputs,
+                n_targets: outputs,
+                n_features: COLS,
+            },
+        )
+    }
+
+    fn assert_scalar_oracle(model: &BoostedModel, data: &DMatrix) {
+        assert!(model.compact_forest().selected_lane_slots(COLS).is_some());
+        let count = model.num_trees();
+        let width = model.n_outputs();
+        for range in [0..count, 1..count, 1..3, 0..0] {
+            let mut expected = model.initial_margins(data.into());
+            for r in 0..data.n_rows() {
+                for t in range.clone() {
+                    let tree = &model.trees[t];
+                    let leaf = tree.leaf_id_with(|f| data.get(r, f as usize));
+                    for (o, &v) in tree.leaf_vector(leaf).iter().enumerate() {
+                        expected[r * width + o] += model.tree_weight(t) * v;
+                    }
+                }
+            }
+            let got = model.predict_margin(data, range).unwrap();
+            assert_eq!(
+                got.as_slice()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        for end in [3, count] {
+            let ids = model.predict_leaf(data, ..end).unwrap();
+            for r in 0..data.n_rows() {
+                for t in 0..end {
+                    assert_eq!(
+                        ids.as_slice()[r * end + t] as usize,
+                        model.trees[t].leaf_id_with(|f| data.get(r, f as usize))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_staging_preserves_dense_sentinels_views_csr_and_vectors() {
+        // Two whole prediction blocks and a tail. Odd widths and values
+        // straddling zero exercise signs, missing values, and categories.
+        let rows = 2 * PREDICT_BLOCK_ROWS + 1;
+        let probes = [
+            -0.0,
+            0.0,
+            -f32::from_bits(1),
+            f32::from_bits(1),
+            -2.0,
+            2.0,
+            3.0,
+            3.5,
+            f32::NAN,
+        ];
+        let values: Vec<f32> = (0..rows * COLS)
+            .map(|i| probes[(i + i / COLS) % probes.len()])
+            .collect();
+        let dense = DMatrix::from_dense(&values, rows, COLS).unwrap();
+        let sentinel_values: Vec<f32> = values
+            .iter()
+            .map(|&v| if v.is_nan() { -999.0 } else { v })
+            .collect();
+        let sentinel =
+            DMatrix::from_dense_with_missing(&sentinel_values, rows, COLS, -999.0).unwrap();
+        let row_map: Vec<usize> = (0..rows).map(|r| (r * 37) % rows).collect();
+        let view = dense.select_rows(&row_map).unwrap();
+        let sentinel_view = sentinel.select_rows(&row_map).unwrap();
+        let mut indptr = vec![0];
+        let mut indices = Vec::new();
+        let mut stored = Vec::new();
+        for row in values.as_chunks::<COLS>().0 {
+            for (f, &v) in row.iter().enumerate() {
+                if !v.is_nan() {
+                    indices.push(f as u32);
+                    stored.push(v);
+                }
+            }
+            indptr.push(indices.len());
+        }
+        let csr = DMatrix::from_csr(indptr, indices, stored, COLS).unwrap();
+        let csr_view = csr.select_rows(&row_map).unwrap();
+        for vector in [false, true] {
+            let model = sparse_model(vector);
+            for data in [&dense, &sentinel, &view, &sentinel_view, &csr, &csr_view] {
+                let base: Vec<f32> = (0..rows * model.n_outputs())
+                    .map(|i| (i % 11) as f32 * 0.03 - 0.13)
+                    .collect();
+                assert_scalar_oracle(&model, &data.clone().with_base_margin(&base).unwrap());
+                // Per-row consumers such as SHAP and compact prediction
+                // still receive every feature, including unstaged ones.
+                let mut block = RowBlock::single_rows(data.into());
+                block.load(17, 1);
+                for (f, &v) in block.row(0).unwrap().iter().enumerate() {
+                    assert_eq!(v.to_bits(), data.get(17, f).unwrap_or(f32::NAN).to_bits());
+                }
+            }
+            let borrowed = model.predict_margin_rows(&values, ..).unwrap();
+            assert_eq!(borrowed, model.predict_margin(&dense, ..).unwrap());
+        }
+    }
+
+    #[test]
+    fn selected_staging_rebuilds_after_appending_and_replacing_trees() {
+        let values: Vec<f32> = (0..33 * COLS).map(|i| (i % 7) as f32 - 3.0).collect();
+        let data = DMatrix::from_dense(&values, 33, COLS).unwrap();
+        let mut model = sparse_model(false);
+        assert_scalar_oracle(&model, &data);
+        model.push_tree_weighted(sparse_tree(255, false, false), 0.23);
+        assert_scalar_oracle(&model, &data);
+        model.trees_mut()[0] = sparse_tree(256, false, true);
+        assert_scalar_oracle(&model, &data);
+        let sliced = model.slice(1.., 1).unwrap();
+        assert_scalar_oracle(&sliced, &data);
     }
 }

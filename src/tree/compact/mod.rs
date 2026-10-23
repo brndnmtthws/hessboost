@@ -50,6 +50,7 @@ pub(crate) use row::{RowForest, RowWalk};
 use crate::tree::oblivious::{ArenaNode, SymmetricTables};
 use crate::tree::{Node, RegTree, in_category_set, scalar_tree_output};
 use std::mem::MaybeUninit;
+use std::sync::OnceLock;
 
 /// Rows (or trees) walked in lockstep by the fixed-depth kernel.
 pub(crate) const LANES: usize = 16;
@@ -158,6 +159,32 @@ pub(crate) fn fill_lanes(lanes: &mut Vec<u32>, rows: &[f32], n_cols: usize) {
                     keys[j] = p;
                     keys[LANES + j] = q;
                 }
+            }
+        }
+    }
+}
+
+/// Stage only the feature/sign slots a forest reads, retaining the ordinary
+/// lane layout. Every selected slot is overwritten; the others remain stale
+/// and must not be read by that forest. New slots are initialized, and the
+/// selection includes slot zero, which fixed-depth leaf self-loops read.
+pub(crate) fn fill_selected_lanes(
+    lanes: &mut Vec<u32>,
+    n_cols: usize,
+    n_rows: usize,
+    slots: &[u32],
+    value: impl Fn(usize, usize) -> f32,
+) {
+    let groups = n_rows / LANES;
+    lanes.resize(groups * FEATURE_LANES * n_cols, 0);
+    for (g, dst) in lanes.chunks_exact_mut(FEATURE_LANES * n_cols).enumerate() {
+        for &slot in slots {
+            let slot = slot as usize;
+            let feature = slot / FEATURE_LANES;
+            let mask = if slot & LANES == 0 { 0 } else { SIGN };
+            for (lane, out) in dst[slot..slot + LANES].iter_mut().enumerate() {
+                let v = value(g * LANES + lane, feature);
+                *out = key(f32::from_bits(v.to_bits() ^ mask));
             }
         }
     }
@@ -428,7 +455,8 @@ impl<'r, const N: usize> RowKeys<'r, N> {
 pub(crate) struct LaneBlock<'a> {
     /// The full groups, `[group][feature][lane]` as [`key`]s of `v` then of
     /// `-v` ([`FEATURE_LANES`] per feature, `n_cols * FEATURE_LANES` per
-    /// group).
+    /// group). Every slot read by the paired forest must be current;
+    /// selective staging leaves the other, initialized slots stale.
     pub(crate) lanes: &'a [u32],
     /// The remaining rows, row-major with stride `n_cols` (`NaN` = missing).
     pub(crate) tail: &'a [f32],
@@ -450,6 +478,11 @@ pub(crate) struct CompactForest {
     leaf_vectors: Vec<f32>,
     trees: Vec<TreeMeta>,
     symmetric: SymmetricTables,
+    /// Sorted, unique feature/sign slots read by any node, including leaf
+    /// self-loops. Built only for wide dense batch staging, not the row,
+    /// sparse, or GPU paths. Kept with the arena so rebuilding it also
+    /// rebuilds the plan; iteration subranges use the same superset safely.
+    lane_slots: OnceLock<Vec<u32>>,
 }
 
 /// The forest's raw buffers for GPU upload: the node arena as bytes (each
@@ -602,11 +635,67 @@ impl CompactForest {
             leaf_vectors: Vec::new(),
             trees: Vec::with_capacity(trees.len()),
             symmetric: SymmetricTables::default(),
+            lane_slots: OnceLock::new(),
         };
         for tree in trees {
             forest.push_tree(tree);
         }
         forest
+    }
+
+    /// Selective staging is worthwhile only for wide rows with a sparse
+    /// set of used feature/sign slots. Keep the contiguous, vectorizable
+    /// tiled path when more than a quarter of the two-sign slots are used.
+    /// The comparison divides the width rather than multiplying the slot
+    /// count, avoiding overflow even for unusually wide matrices.
+    pub(crate) fn selected_lane_slots(&self, n_cols: usize) -> Option<&[u32]> {
+        if n_cols <= 64 {
+            return None;
+        }
+        let slots = self.lane_slots.get_or_init(|| self.collect_lane_slots());
+        (slots.len() <= n_cols / 2).then_some(slots.as_slice())
+    }
+
+    /// Words for a packed feature/sign bitmap, when its temporary allocation
+    /// fits the old node-slot vector's size rounded to one word. Each bit
+    /// represents `slot / LANES`, so a word covers 32 features, both signs.
+    /// The tree summaries bound the span without another node scan. A huge
+    /// feature id in a small forest instead keeps the sparse sort fallback.
+    fn lane_slot_bitmap_words(&self) -> Option<usize> {
+        let max_feature = self.trees.iter().map(|tree| tree.max_feature).max()? as usize;
+        let words = max_feature / (u64::BITS as usize / 2) + 1;
+        (words <= self.nodes.len().div_ceil(2)).then_some(words)
+    }
+
+    /// Collect the exact, sorted node slots without sorting a copy of every
+    /// node when the feature-id span is reasonably dense. Numeric signs,
+    /// categorical positive slots, and leaf slot zero share the same bitmap.
+    fn collect_lane_slots(&self) -> Vec<u32> {
+        let Some(words) = self.lane_slot_bitmap_words() else {
+            let mut slots: Vec<u32> = self.nodes.iter().map(|node| node.slot).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            slots.shrink_to_fit();
+            return slots;
+        };
+        let mut used = vec![0u64; words];
+        for node in &self.nodes {
+            let bit = node.slot as usize / LANES;
+            used[bit / u64::BITS as usize] |= 1 << (bit % u64::BITS as usize);
+        }
+        let count = used.iter().map(|word| word.count_ones() as usize).sum();
+        let mut slots = Vec::with_capacity(count);
+        for (word, mut bits) in used.into_iter().enumerate() {
+            while bits != 0 {
+                let bit = word * u64::BITS as usize + bits.trailing_zeros() as usize;
+                // Every set bit came from a node's original encoded slot.
+                // MAX_SLOT_FEATURE ensures reconstructing it fits u32 (and
+                // usize even on a 32-bit target).
+                slots.push((bit * LANES) as u32);
+                bits &= bits - 1;
+            }
+        }
+        slots
     }
 
     fn push_tree(&mut self, tree: &RegTree) {
@@ -1268,6 +1357,233 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_lanes_match_scalar_walks_and_reuse() {
+        let probes = [
+            f32::NEG_INFINITY,
+            -f32::MAX,
+            -f32::MIN_POSITIVE,
+            -f32::from_bits(1),
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            1.0,
+            2.0,
+            3.0,
+            3.5,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+            f32::from_bits(0xFFC0_1234),
+            f32::from_bits(0x7F80_0001),
+        ];
+        // Poison unused slots and retain the destination across different
+        // forests, widths, block sizes, values, and sign selections. Only
+        // selected slots may be read, even by parked leaf self-loops.
+        let mut lanes = vec![u32::MAX; 4096];
+        for n_cols in [65, 256, 1024] {
+            let mut trees = vec![RegTree::with_root(1.0)];
+            for default_left in [false, true] {
+                let mut numeric = RegTree::with_root(1.0);
+                let (l, _) = numeric.expand(
+                    0,
+                    SplitRule::numeric(n_cols as u32 - 2, 0.0, default_left),
+                    ChildLeaf::new(-1.0, 1.0),
+                    ChildLeaf::new(1.0, 1.0),
+                );
+                numeric.expand(
+                    l,
+                    SplitRule::numeric(3, f32::MIN_POSITIVE, !default_left),
+                    ChildLeaf::new(-0.3, 1.0),
+                    ChildLeaf::new(0.7, 1.0),
+                );
+                trees.push(numeric);
+                let mut categorical = RegTree::with_root(1.0);
+                categorical.expand(
+                    0,
+                    SplitRule::categorical(n_cols as u32 - 1, &[0, 2, 3], default_left),
+                    ChildLeaf::new(-0.7, 1.0),
+                    ChildLeaf::new(0.3, 1.0),
+                );
+                trees.push(categorical);
+            }
+            // A symmetric tree reads its level slots outside the ordinary
+            // per-node walker; use a feature/sign no other tree reads.
+            let mut symmetric = RegTree::with_root(1.0);
+            let children = symmetric.expand(
+                0,
+                SplitRule::numeric(5, 0.0, false),
+                ChildLeaf::new(0.0, 1.0),
+                ChildLeaf::new(0.0, 1.0),
+            );
+            for child in [children.0, children.1] {
+                symmetric.expand(
+                    child,
+                    SplitRule::numeric(7, 1.0, true),
+                    ChildLeaf::new(-0.1, 1.0),
+                    ChildLeaf::new(0.9, 1.0),
+                );
+            }
+            trees.push(symmetric);
+            let symmetric_index = trees.len() - 1;
+            // Deep, asymmetric trees take the early-exit keyed walker.
+            let mut deep = RegTree::with_root(1.0);
+            let mut node = 0;
+            for level in 0..=MAX_FIXED_DEPTH {
+                node = deep
+                    .expand(
+                        node,
+                        SplitRule::numeric(11, level as f32 - 8.0, level % 2 == 0),
+                        ChildLeaf::new(-0.13, 1.0),
+                        ChildLeaf::new(0.23, 1.0),
+                    )
+                    .0;
+            }
+            trees.push(deep);
+            let forest = CompactForest::from_trees(&trees);
+            assert!(forest.is_symmetric(symmetric_index));
+            assert!(!forest.trees[trees.len() - 1].lockstep_ok());
+            let slots = forest.selected_lane_slots(n_cols).unwrap();
+            assert_eq!(slots[0], 0, "include the leaf self-loop's slot");
+            assert!(slots.windows(2).all(|pair| pair[0] < pair[1]));
+            let cat_slot = (n_cols as u32 - 1) * FEATURE_LANES as u32;
+            assert!(slots.contains(&cat_slot));
+            assert!(!slots.contains(&(cat_slot + LANES as u32)));
+            assert!(forest.selected_lane_slots(64).is_none());
+            for n_rows in [0, 1, 15, 16, 17, 31, 32, 33, 256, 257, 16] {
+                let values: Vec<f32> = (0..n_rows * n_cols)
+                    .map(|i| probes[(i + i / n_cols + n_rows) % probes.len()])
+                    .collect();
+                fill_selected_lanes(&mut lanes, n_cols, n_rows, slots, |r, f| {
+                    values[r * n_cols + f]
+                });
+                let groups = n_rows / LANES;
+                assert_eq!(lanes.len(), groups * FEATURE_LANES * n_cols);
+                for (g, group) in lanes.chunks_exact(FEATURE_LANES * n_cols).enumerate() {
+                    for &slot in slots {
+                        let slot = slot as usize;
+                        for lane in 0..LANES {
+                            let value = values[(g * LANES + lane) * n_cols + slot / FEATURE_LANES];
+                            let value = if slot & LANES == 0 { value } else { -value };
+                            assert_eq!(group[slot + lane], key(value));
+                        }
+                    }
+                }
+                let block = LaneBlock {
+                    lanes: &lanes,
+                    tail: &values[groups * LANES * n_cols..],
+                    n_cols,
+                    rows: n_rows,
+                };
+                for (t, tree) in trees.iter().enumerate() {
+                    let mut ids = vec![u32::MAX; n_rows];
+                    let mut margins = vec![0.17; n_rows];
+                    forest.original_leaf_ids(t, block, &mut ids, 1);
+                    forest.accumulate(t, block, -0.37, &mut margins, 1);
+                    for (r, row) in values.chunks_exact(n_cols).enumerate() {
+                        let leaf = tree.leaf_id_dense(row, f32::NAN);
+                        assert_eq!(ids[r] as usize, leaf);
+                        assert_eq!(
+                            margins[r].to_bits(),
+                            (0.17 + -0.37 * tree.node(leaf).leaf_value).to_bits()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_lane_slots_keep_dense_usage_on_the_tiled_path() {
+        let stump = |feature| {
+            let mut tree = RegTree::with_root(1.0);
+            tree.expand(
+                0,
+                SplitRule::numeric(feature, 0.0, true),
+                ChildLeaf::new(-1.0, 1.0),
+                ChildLeaf::new(1.0, 1.0),
+            );
+            tree
+        };
+        // Thirty-one positive split slots plus the leaf self-loop: the
+        // largest selected plan at 65 columns, but never at 64 columns.
+        let mut trees: Vec<RegTree> = (1..32).map(stump).collect();
+        let forest = CompactForest::from_trees(&trees);
+        assert!(forest.lane_slots.get().is_none());
+        assert!(forest.selected_lane_slots(64).is_none());
+        assert!(
+            forest.lane_slots.get().is_none(),
+            "narrow rows never build a plan"
+        );
+        assert!(forest.selected_lane_slots(65).is_some());
+        assert_eq!(forest.lane_slots.get().unwrap().len(), 32);
+        trees.push(stump(32));
+        let forest = CompactForest::from_trees(&trees);
+        assert!(forest.selected_lane_slots(65).is_none());
+        assert_eq!(forest.lane_slots.get().unwrap().len(), 33);
+        assert!(forest.selected_lane_slots(66).is_some());
+    }
+
+    #[test]
+    fn selected_lane_slot_discovery_matches_sorted_nodes() {
+        let stump = |feature, default_left, categorical| {
+            let mut tree = RegTree::with_root(1.0);
+            let split = if categorical {
+                SplitRule::categorical(feature, &[1, 3], default_left)
+            } else {
+                SplitRule::numeric(feature, 0.0, default_left)
+            };
+            tree.expand(
+                0,
+                split,
+                ChildLeaf::new(-1.0, 1.0),
+                ChildLeaf::new(1.0, 1.0),
+            );
+            tree
+        };
+        // Feature/sign pairs straddle every kind of bitmap word boundary;
+        // repeat them heavily, as a deep forest does, without growing span.
+        let mut repeated = Vec::new();
+        for _ in 0..16 {
+            for feature in [0, 1, 31, 32, 33, 63, 64, 127, 255, 256, 511, 1023] {
+                repeated.push(stump(feature, true, false));
+                repeated.push(stump(feature, false, false));
+                repeated.push(stump(feature, false, true));
+            }
+        }
+        for (trees, bitmap) in [
+            (Vec::new(), false),
+            (vec![RegTree::with_root(1.0); 64], true),
+            (repeated, true),
+            // Two words fit the three-node vector's rounded byte budget;
+            // three words do not. Both paths must match the sorted oracle.
+            (vec![stump(63, false, false)], true),
+            (vec![stump(64, false, false)], false),
+            (
+                vec![
+                    stump(MAX_SLOT_FEATURE, false, false),
+                    stump(MAX_SLOT_FEATURE, false, true),
+                    stump(1, true, false),
+                ],
+                false,
+            ),
+        ] {
+            let forest = CompactForest::from_trees(&trees);
+            assert_eq!(forest.lane_slot_bitmap_words().is_some(), bitmap);
+            if let Some(words) = forest.lane_slot_bitmap_words() {
+                assert!(words <= forest.nodes.len().div_ceil(2));
+            }
+            let mut expected: Vec<u32> = forest.nodes.iter().map(|node| node.slot).collect();
+            expected.sort_unstable();
+            expected.dedup();
+            assert_eq!(forest.collect_lane_slots(), expected);
+            if !trees.is_empty() {
+                assert_eq!(expected[0], 0, "retain the leaf self-loop's slot");
             }
         }
     }

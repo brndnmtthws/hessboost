@@ -34,6 +34,7 @@ __all__ = [
     "honest_refit",
     "k_fold",
     "purged_forward",
+    "purged_forward_at",
     "purged_tail_split",
     "samples_crps",
     "samples_mean",
@@ -532,6 +533,12 @@ def purged_forward(
     label_end: NDArray[np.int64],
     validation_fraction: float,
     blocks: int,
+    min_train: int,
+) -> list[tuple[NDArray[np.int64], NDArray[np.int64]]]: ...
+def purged_forward_at(
+    decision_at: NDArray[np.int64],
+    label_end: NDArray[np.int64],
+    block_starts: NDArray[np.int64],
     min_train: int,
 ) -> list[tuple[NDArray[np.int64], NDArray[np.int64]]]: ...
 def samples_mean(samples: NDArray[np.float32]) -> NDArray[np.float64]: ...

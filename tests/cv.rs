@@ -1,6 +1,7 @@
 //! `CrossValidation`: refitting on every row, continuing a model in every
 //! fold, per-fold target statistics over a separate per-row target, each
-//! fold's margins and round count, and per-fold early stopping.
+//! fold's margins and round count, and per-fold early stopping; purged
+//! forward folds at given block starts.
 
 use hessboost::data::FeatureType;
 use hessboost::data::target_stats::OrderedTargetEncoder;
@@ -512,6 +513,219 @@ fn per_fold_stopping_encodes_the_trial_on_its_fit_rows() {
             got.margins,
             model.predict_margin(&dtest, Iterations::Best).unwrap()
         );
+    }
+}
+
+const DAY: i64 = 86_400;
+
+/// Two rows a day for 10 days (rows `2d` and `2d + 1` decided on day `d`),
+/// each label ending two days after its decision.
+fn daily() -> (Vec<i64>, Vec<i64>) {
+    let decision_at: Vec<i64> = (0..20).map(|i| (i / 2) * DAY).collect();
+    let label_end = decision_at.iter().map(|at| at + 2 * DAY).collect();
+    (decision_at, label_end)
+}
+
+/// [`daily`]'s rows decided on days `first` to `end - 1`.
+fn days(first: usize, end: usize) -> Vec<usize> {
+    (2 * first..2 * end).collect()
+}
+
+/// The reason of the `purged folds` refusal `result` must hold.
+fn purged_refusal(result: hessboost::error::Result<Vec<Fold>>) -> String {
+    match result {
+        Err(HessboostError::InvalidParameter {
+            name: "purged folds",
+            reason,
+            ..
+        }) => reason,
+        other => panic!("expected a purged-folds refusal, got {other:?}"),
+    }
+}
+
+/// Each block tests the rows decided from its start to the next block's
+/// (the last, to the end) and trains on the rows decided before it whose
+/// labels end by its start, in row order. Rows decided before the first
+/// start are never tested, and starts need not be decision times.
+#[test]
+fn purged_forward_at_tests_each_block_and_trains_before_it() {
+    let (decision_at, label_end) = daily();
+    let starts = [5 * DAY, 7 * DAY, 8 * DAY];
+    let folds = Fold::purged_forward_at(&decision_at, &label_end, &starts, 1).unwrap();
+    // Labels end two days later: a block starting on day d trains days 0 to
+    // d - 2.
+    assert_eq!(
+        folds,
+        [
+            Fold::new(days(0, 4), days(5, 7)),
+            Fold::new(days(0, 6), days(7, 8)),
+            Fold::new(days(0, 7), days(8, 10)),
+        ]
+    );
+    // Days 0 to 4 are never tested.
+    let tested: Vec<usize> = folds
+        .iter()
+        .flat_map(|fold| fold.test.iter().copied())
+        .collect();
+    assert_eq!(tested, days(5, 10));
+    // A start at noon on day 4 tests from day 5 and trains labels ending
+    // by then: days 0 to 2.
+    let noon = 4 * DAY + DAY / 2;
+    let folds = Fold::purged_forward_at(&decision_at, &label_end, &[noon], 1).unwrap();
+    assert_eq!(folds, [Fold::new(days(0, 3), days(5, 10))]);
+    // Row order is irrelevant: reversed, row `i` is row `19 - i`.
+    let reversed: Vec<i64> = decision_at.iter().rev().copied().collect();
+    let reversed_ends: Vec<i64> = label_end.iter().rev().copied().collect();
+    let folds = Fold::purged_forward_at(&reversed, &reversed_ends, &[8 * DAY], 1).unwrap();
+    assert_eq!(folds, [Fold::new((6..20).collect(), (0..4).collect())]);
+}
+
+/// The purge keeps a label ending exactly at a block start and drops one
+/// ending a tick later, from that block's fold alone.
+#[test]
+fn purged_forward_at_keeps_a_label_ending_at_the_block_start() {
+    let (decision_at, mut label_end) = daily();
+    let starts = [5 * DAY, 7 * DAY];
+    // Row 7, decided on day 3, ends exactly at the first block's start.
+    let folds = Fold::purged_forward_at(&decision_at, &label_end, &starts, 1).unwrap();
+    assert_eq!(folds[0].train, days(0, 4));
+    label_end[7] += 1;
+    let folds = Fold::purged_forward_at(&decision_at, &label_end, &starts, 1).unwrap();
+    assert_eq!(folds[0].train, [0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(folds[1].train, days(0, 6));
+}
+
+/// Given the starts `purged_forward` chooses (its folds' first test
+/// decision times), `purged_forward_at` returns its folds, also when
+/// `min_train` moved the start and rows share decision times.
+#[test]
+fn purged_forward_at_reproduces_purged_forward() {
+    let (minutes, minute_ends) = schedule();
+    // Six rows a day for 20 days, labels ending eight days later: 60
+    // training rows move the start from day 16 to day 17.
+    let six_a_day: Vec<i64> = (0..120).map(|i| (i / 6) * DAY).collect();
+    let six_a_day_ends: Vec<i64> = six_a_day.iter().map(|at| at + 8 * DAY).collect();
+    for (decision_at, label_end, fraction, blocks, min_train) in [
+        (&minutes, &minute_ends, 0.4, 3, 20),
+        (&six_a_day, &six_a_day_ends, 0.2, 1, 1),
+        (&six_a_day, &six_a_day_ends, 0.2, 2, 60),
+    ] {
+        let forward =
+            Fold::purged_forward(decision_at, label_end, fraction, blocks, min_train).unwrap();
+        let starts: Vec<i64> = forward
+            .iter()
+            .map(|fold| fold.test.iter().map(|&row| decision_at[row]).min().unwrap())
+            .collect();
+        let at = Fold::purged_forward_at(decision_at, label_end, &starts, min_train).unwrap();
+        assert_eq!(at, forward, "{starts:?}");
+    }
+}
+
+/// Unusable times and blocks are refused, naming the block at fault.
+#[test]
+fn purged_forward_at_refuses_unusable_blocks() {
+    let (decision_at, label_end) = daily();
+    let refusal = |starts: &[i64], min_train: usize| {
+        purged_refusal(Fold::purged_forward_at(
+            &decision_at,
+            &label_end,
+            starts,
+            min_train,
+        ))
+    };
+    assert!(matches!(
+        Fold::purged_forward_at(&decision_at, &label_end[1..], &[5 * DAY], 1),
+        Err(HessboostError::DimensionMismatch { .. })
+    ));
+    assert_eq!(
+        purged_refusal(Fold::purged_forward_at(&[], &[], &[0], 1)),
+        "no rows"
+    );
+    assert_eq!(
+        purged_refusal(Fold::purged_forward_at(&[5, 6], &[5, 5], &[6], 1)),
+        "row 1's label ends before its decision"
+    );
+    assert_eq!(refusal(&[], 1), "no test block starts");
+    for starts in [[5 * DAY, 7 * DAY, 7 * DAY], [5 * DAY, 7 * DAY, 6 * DAY]] {
+        let reason = refusal(&starts, 1);
+        assert_eq!(
+            reason,
+            format!(
+                "block starts must strictly increase; test block 2's start {} does not follow \
+                 block 1's {}",
+                starts[2],
+                7 * DAY
+            )
+        );
+    }
+    // Nothing is decided from a second after day 5 to day 6, nor after
+    // day 9.
+    for (starts, block) in [
+        ([5 * DAY, 5 * DAY + 1, 6 * DAY], 1),
+        ([5 * DAY, 6 * DAY, 10 * DAY], 2),
+    ] {
+        assert_eq!(
+            refusal(&starts, 1),
+            format!(
+                "test block {block} starting at {} has no rows decided in it",
+                starts[block]
+            )
+        );
+    }
+    // A block on day 5 trains days 0 to 3, eight rows; one on day 1 none,
+    // which even a `min_train` of 0 refuses.
+    let folds = Fold::purged_forward_at(&decision_at, &label_end, &[5 * DAY], 8).unwrap();
+    assert_eq!(folds[0].train.len(), 8);
+    for (starts, min_train, trained, needed) in
+        [([5 * DAY, 7 * DAY], 9, 8, 9), ([DAY, 5 * DAY], 0, 0, 1)]
+    {
+        assert_eq!(
+            refusal(&starts, min_train),
+            format!(
+                "test block 0 starting at {} leaves {trained} purged training rows; it needs \
+                 at least {needed}",
+                starts[0]
+            )
+        );
+    }
+}
+
+/// Folds at given block starts cross-validate as `purged_forward`'s do:
+/// per-fold stopping sizes each on the purged tail of its own training
+/// rows, bit for bit the folds trained by hand.
+#[test]
+fn per_fold_stopping_sizes_folds_at_given_starts() {
+    let data = regression();
+    let params = params();
+    let (decision_at, label_end) = schedule();
+    // Blocks of 20 minutes from minute 90.
+    let starts = [90 * 60, 110 * 60, 130 * 60];
+    let folds = || Fold::purged_forward_at(&decision_at, &label_end, &starts, 20).unwrap();
+    let tail = PurgedTail::new(&decision_at, &label_end, 0.3).unwrap();
+    let patience = NonZeroUsize::new(3).unwrap();
+    let report = CrossValidation::new(&params, &data, 40, folds())
+        .early_stopping(CvStopping::per_fold(patience, tail))
+        .run()
+        .unwrap();
+    assert_eq!(report.folds.len(), starts.len());
+    for (fold, got) in folds().iter().zip(&report.folds) {
+        let (rounds, best, split_at, fit_rows, tail_rows) =
+            tail_stopping(&params, &data, &tail, &fold.train);
+        let (model, scores) = trained(&params, &data, &fold.train, &fold.test, rounds);
+        let dtest = data.select_rows(&fold.test).unwrap();
+        assert_eq!(got.test, fold.test);
+        assert_eq!(got.num_boost_round, rounds);
+        assert_eq!(got.scores, scores);
+        assert_eq!(
+            got.margins,
+            model.predict_margin(&dtest, Iterations::Best).unwrap()
+        );
+        let tail_stop = got.stopping.unwrap();
+        assert_eq!(
+            (tail_stop.split_at, tail_stop.fit_rows, tail_stop.tail_rows),
+            (split_at, fit_rows, tail_rows)
+        );
+        assert_eq!(tail_stop.best_score, best);
     }
 }
 

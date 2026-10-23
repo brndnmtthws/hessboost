@@ -3,9 +3,11 @@
 Pass them to :func:`hessboost.cv` (``folds=``), or use them to hold out
 rows for early stopping or conformal calibration. :func:`forward_chaining`
 purges a fixed number of rows before each test block;
-:func:`purged_forward` purges by each row's own label window, and
-:class:`PurgedTail` is the purged early-stopping split of a fold's own
-training rows (:func:`hessboost.cross_validate`'s ``per_fold_stopping``)::
+:func:`purged_forward` purges by each row's own label window,
+:func:`purged_forward_at` does the same at caller-given block starts
+(walk-forward validation by calendar period), and :class:`PurgedTail` is
+the purged early-stopping split of a fold's own training rows
+(:func:`hessboost.cross_validate`'s ``per_fold_stopping``)::
 
     from hessboost import folds
 
@@ -21,7 +23,14 @@ from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _hessboost
 
-__all__ = ["PurgedTail", "Split", "forward_chaining", "k_fold", "purged_forward"]
+__all__ = [
+    "PurgedTail",
+    "Split",
+    "forward_chaining",
+    "k_fold",
+    "purged_forward",
+    "purged_forward_at",
+]
 
 Split = tuple[NDArray[np.int64], NDArray[np.int64]]
 """One fold: its ``(train_rows, test_rows)`` row indices."""
@@ -105,6 +114,65 @@ def purged_forward(
         _times(label_end, "label_end"),
         float(validation_fraction),
         blocks,
+        min_train,
+    )
+
+
+def purged_forward_at(
+    decision_at: ArrayLike,
+    label_end: ArrayLike,
+    block_starts: ArrayLike,
+    *,
+    min_train: int = 1,
+) -> list[Split]:
+    """Forward folds over timestamped rows with test blocks starting at
+    caller-given times, purged by each row's label window: walk-forward
+    validation by calendar period (one fold per day, week or month).
+
+    ``decision_at[i]`` is row ``i``'s decision (feature) time and
+    ``label_end[i]`` the end of its label window plus any embargo;
+    ``block_starts`` are the test blocks' start times, strictly increasing.
+    All are integers on one time scale (e.g. epoch seconds) or
+    ``datetime64`` values. Rows may come in any order and share times.
+
+    Fold ``j`` tests on every row decided in
+    ``[block_starts[j], block_starts[j + 1])`` (the last block: every row
+    decided at or after its start) and trains on every row decided before
+    ``block_starts[j]`` whose ``label_end`` is at or before it: a label
+    ending exactly at the block start is kept, one ending a tick later is
+    purged. Rows decided before ``block_starts[0]`` are never tested.
+
+    Args:
+        decision_at: Each row's decision time.
+        label_end: Each row's label-window end (plus embargo), on the same
+            time scale as ``decision_at``.
+        block_starts: The test blocks' start times, strictly increasing.
+        min_train: The fewest purged training rows any fold may have
+            (at least 1). Defaults to 1.
+
+    Returns:
+        One ``(train_rows, test_rows)`` split per block start, in order.
+
+    Raises:
+        HessboostError: The inputs differ in length or are empty, a label
+            ends before its decision, ``block_starts`` is empty or not
+            strictly increasing, a block has no test rows, or a block's
+            purged training set has fewer than ``max(min_train, 1)`` rows.
+        TypeError: The times are neither integers nor ``datetime64``.
+
+    Example:
+        Daily blocks over the last three days of hourly rows whose labels
+        end an hour after their decision::
+
+            day = 86_400
+            at = np.arange(10 * 24) * 3_600
+            splits = folds.purged_forward_at(at, at + 3_600, [7 * day, 8 * day, 9 * day])
+            result = hessboost.cv(params, dtrain, 50, folds=splits)
+    """
+    return _hessboost.purged_forward_at(
+        _times(decision_at, "decision_at"),
+        _times(label_end, "label_end"),
+        _times(block_starts, "block_starts"),
         min_train,
     )
 

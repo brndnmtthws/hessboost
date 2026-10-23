@@ -1,7 +1,8 @@
 //! Cross-validation, mirroring `xgboost.cv`: shuffled k-fold ([`cv`]) or
 //! caller-supplied folds ([`CrossValidation`], [`Fold`]), including
 //! forward-chaining folds for time-ordered rows, forward folds purged by
-//! each row's label window ([`Fold::purged_forward`]), whole-query folds of
+//! each row's label window ([`Fold::purged_forward`], or at given test-block
+//! starts with [`Fold::purged_forward_at`]), whole-query folds of
 //! ranking data, per-fold ordered target statistics
 //! ([`CrossValidation::target_stats`], optionally fitted on a separate
 //! per-row target), continuing a model in every fold

@@ -11,7 +11,8 @@
 //! decodes a fresh model outside timing, then times its first call (one call per
 //! sample, including lazy layout construction). For example:
 //! `cargo run --release --example bench_cpu_round3 -- --case w1024_p1_d4_t10_b256`.
-//! Standard output is JSONL; saved/import fixtures are embedded in the binary.
+//! Standard output is JSONL; the import fixture ships in the repository and the
+//! saved model is read from the newest `tests/data/saved/` directory.
 //! The separate comparison script runs already-built binaries in ABBA order.
 use hessboost::model::{BoostedModel, ModelFormat, Predictions};
 use hessboost::prelude::DMatrix;
@@ -82,9 +83,20 @@ impl Case {
 
     fn description(self) -> Value {
         let (source, model) = match self.source {
-            Source::Synthetic(model) => ("synthetic_native_json", Some(model)),
-            Source::SavedVector => ("tests/data/saved/0.4.1/vector_leaves.bin", None),
-            Source::ImportedLightgbm => ("tests/data/lightgbm-4.7.0-binary.txt", None),
+            Source::Synthetic(model) => ("synthetic_native_json".to_owned(), Some(model)),
+            Source::SavedVector => (
+                saved_model_path("vector_leaves.bin").map_or_else(
+                    |_| "tests/data/saved".to_owned(),
+                    |path| {
+                        path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string()
+                    },
+                ),
+                None,
+            ),
+            Source::ImportedLightgbm => ("tests/data/lightgbm-4.7.0-binary.txt".to_owned(), None),
         };
         json!({"case": self.name, "rows": self.rows, "layout": self.layout,
             "matrix_layout": self.matrix_layout, "source": source, "requested_model": model})
@@ -489,11 +501,45 @@ fn synthetic_model(model: Synthetic, layout: Layout) -> BenchResult<BoostedModel
     Ok(BoostedModel::decode(bytes, ModelFormat::Json)?)
 }
 
+/// The newest saved-model directory's copy of `file`: the release process writes
+/// the current release's directory and drops older ones its writer reproduces,
+/// so no single version directory is permanent.
+fn saved_model_path(file: &str) -> BenchResult<std::path::PathBuf> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/saved");
+    let mut newest: Option<(Vec<u64>, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(&root)? {
+        let directory = entry?.path();
+        let Some(name) = directory.file_name().and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        let Ok(version) = name
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            continue;
+        };
+        let candidate = directory.join(file);
+        if !candidate.is_file() {
+            continue;
+        }
+        if newest
+            .as_ref()
+            .is_none_or(|(current, _)| version > *current)
+        {
+            newest = Some((version, candidate));
+        }
+    }
+    newest
+        .map(|(_, path)| path)
+        .ok_or_else(|| format!("no saved model {file} under {}", root.display()).into())
+}
+
 fn load_model(case: Case) -> BenchResult<BoostedModel> {
     Ok(match case.source {
         Source::Synthetic(model) => return synthetic_model(model, case.layout),
         Source::SavedVector => BoostedModel::decode(
-            include_bytes!("../tests/data/saved/0.4.1/vector_leaves.bin"),
+            std::fs::read(saved_model_path("vector_leaves.bin")?)?,
             ModelFormat::Binary,
         )?,
         Source::ImportedLightgbm => BoostedModel::decode(

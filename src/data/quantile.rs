@@ -15,7 +15,7 @@ use crate::data::DMatrix;
 use crate::data::dmatrix::DenseRows;
 use crate::data::meta::FeatureType;
 use crate::data::sketch::WQSketch;
-use crate::data::sort::{RadixScratch, sort_values};
+use crate::data::sort::{RadixScratch, sort_column_by_value, sort_values};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -646,7 +646,10 @@ impl ColumnCuts {
                 mut sketch,
                 mut pairs,
             } => {
-                pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+                // Both adaptive comparison sorting and the sampled radix
+                // path retain the exact total order, including equal-value
+                // weights that the sorted summary adds in sequence.
+                sort_column_by_value(&mut pairs, &mut RadixScratch::default(), |&(v, _)| v);
                 sketch.push_sorted(&pairs);
                 sketch.cut_values(&mut out);
             }
@@ -809,6 +812,67 @@ mod tests {
                         whole,
                         "case {case}, {threads} threads"
                     );
+                }
+            }
+        }
+    }
+
+    /// Sorted approximate cuts keep the comparison sort's exact weight
+    /// order, including duplicate values, signed zeros, missing entries,
+    /// and unequal or zero weights, above and below the radix threshold.
+    #[test]
+    fn sorted_weighted_cuts_match_stable_comparison_bits() {
+        let cols = 4;
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for n in [2_047, 2_048, 10_007] {
+            for missing in [f32::NAN, -999.0] {
+                let values: Vec<f32> = (0..n * cols)
+                    .map(|i| {
+                        let (r, f) = (i / cols, i % cols);
+                        match (r * 37 + f * 17) % 13 {
+                            0 if n != 2_048 => missing,
+                            _ if f == 0 => ((r * 7_919) % 10_009) as f32 / 17.0,
+                            1 => -0.0,
+                            2 => 0.0,
+                            _ if f == 1 => ((r * 31) % 97) as f32 - 48.0,
+                            _ => ((r / 7 * 11 + f * 3) % 5) as f32 - 2.0,
+                        }
+                    })
+                    .collect();
+                let weights: Vec<f32> = (0..n)
+                    .map(|r| [0.0, 1e-20, 0.125, 1.0, 3.5, 1e8][r % 6])
+                    .collect();
+                let hessians: Vec<f32> = (0..n)
+                    .map(|r| 0.01 + (r % 1_009) as f32 / 4_040.0)
+                    .collect();
+                let data = DMatrix::from_dense_with_missing(&values, n, cols, missing)
+                    .unwrap()
+                    .with_weights(&weights)
+                    .unwrap();
+                let expected = whole_column_cuts(
+                    &data,
+                    64,
+                    |r| hessians[r] * weights[r],
+                    Ingest {
+                        sorted: true,
+                        unit_weights: false,
+                    },
+                );
+                for threads in [1, 4] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let actual = pool
+                        .install(|| HistCuts::from_dmatrix_weighted(&data, 64, &hessians, true));
+                    for (f, expected) in expected.iter().enumerate() {
+                        let (start, end) = actual.feature_bins(f);
+                        assert_eq!(
+                            bits(&actual.cut_values[start..end]),
+                            bits(expected),
+                            "{n} rows, feature {f}, {threads} threads, missing {missing}"
+                        );
+                    }
                 }
             }
         }

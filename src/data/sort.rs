@@ -136,6 +136,60 @@ pub(crate) fn sort_by_value<T: Copy + Default>(
     }
 }
 
+/// Whether a small, evenly spaced sample suggests a long, unordered,
+/// high-cardinality column. Comparison sorting exploits ordered runs and
+/// repeated keys; radix sorting instead pays for full-column scatter passes.
+/// This heuristic chooses only the algorithm, never the resulting stable
+/// total order. It deliberately favors comparison sorting on uncertainty.
+fn sample_prefers_radix<T>(items: &[T], value: impl Fn(&T) -> f32) -> bool {
+    const SAMPLE: usize = 128;
+    const MAX_DIRECTION_CHANGES: usize = 8;
+    if items.len() < RADIX_MIN_LEN {
+        return false;
+    }
+    // 128 samples detect repeats more reliably than 64 for columns with
+    // hundreds of distinct values, without allocating or scanning the column.
+    let step = (items.len() - 1) / (SAMPLE - 1);
+    let remainder = (items.len() - 1) % (SAMPLE - 1);
+    let mut keys: [u32; SAMPLE] = std::array::from_fn(|i| {
+        // Equivalent to i * (len - 1) / (SAMPLE - 1), without overflow.
+        let at = i * step + i * remainder / (SAMPLE - 1);
+        sort_key(value(&items[at]))
+    });
+    let mut previous = std::cmp::Ordering::Equal;
+    let mut changes = 0;
+    for pair in keys.windows(2) {
+        let direction = pair[0].cmp(&pair[1]);
+        if direction != std::cmp::Ordering::Equal {
+            changes += usize::from(previous != std::cmp::Ordering::Equal && previous != direction);
+            previous = direction;
+        }
+    }
+    // Few direction changes suggest long monotone runs, including descending
+    // or organ-pipe inputs, that the comparison sort handles adaptively.
+    if changes <= MAX_DIRECTION_CHANGES {
+        return false;
+    }
+    keys.sort_unstable();
+    !keys.windows(2).any(|pair| pair[0] == pair[1])
+}
+
+/// Stable total-order column sort, retaining the comparison sort's adaptive
+/// behavior on small, ordered, and sampled low-cardinality inputs. Unordered
+/// columns whose sample has no repeated key take the stable radix path.
+/// Equal keys retain their input order under either algorithm.
+pub(crate) fn sort_column_by_value<T: Copy + Default>(
+    items: &mut Vec<T>,
+    scratch: &mut RadixScratch<T>,
+    value: impl Fn(&T) -> f32,
+) {
+    if sample_prefers_radix(items, &value) {
+        radix_sort(items, scratch, |item| sort_key(value(item)));
+    } else {
+        items.sort_by(|a, b| value(a).total_cmp(&value(b)));
+    }
+}
+
 /// The rows of finite `values` in ascending order under `<`, rows of equal
 /// values (`-0.0` and `0.0` included) in row order: what a stable
 /// comparison sort by `partial_cmp` gives (XGBoost `StableSort` with
@@ -187,6 +241,119 @@ mod tests {
             sort_values(&mut values, &mut RadixScratch::default());
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&values), bits(&expected));
+        }
+    }
+
+    /// Sorting weighted pairs retains the comparison sort's tie order,
+    /// including signed zeros and non-finite values under total order.
+    #[test]
+    fn sorted_pairs_preserve_stable_weight_order() {
+        let bits = |pairs: &[(f32, f32)]| {
+            pairs
+                .iter()
+                .map(|&(v, w)| [v.to_bits(), w.to_bits()])
+                .collect::<Vec<_>>()
+        };
+        for n in [RADIX_MIN_LEN - 1, RADIX_MIN_LEN, 10_007] {
+            let mut pairs: Vec<(f32, f32)> = (0..n)
+                .map(|i| {
+                    let value = match i % 11 {
+                        0 => -0.0,
+                        1 => 0.0,
+                        2 => f32::NEG_INFINITY,
+                        3 => f32::INFINITY,
+                        4 => f32::from_bits(0x7fc0_0001),
+                        5 => f32::from_bits(0xffc0_0001),
+                        _ => ((i * 7_919) % 97) as f32 - 48.0,
+                    };
+                    (value, i as f32)
+                })
+                .collect();
+            let mut expected = pairs.clone();
+            expected.sort_by(|a, b| a.0.total_cmp(&b.0));
+            sort_by_value(&mut pairs, &mut RadixScratch::default(), |&(v, _)| v);
+            assert_eq!(bits(&pairs), bits(&expected), "{n} pairs");
+        }
+    }
+
+    #[test]
+    fn adaptive_column_sort_selects_ordered_and_low_cardinality_routes() {
+        let n = 10_007;
+        let value = |v: &f32| *v;
+        let mut ordered: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        assert!(!sample_prefers_radix(&ordered, value));
+        ordered.reverse();
+        assert!(!sample_prefers_radix(&ordered, value));
+        ordered.reverse();
+        ordered.swap(n / 3, n / 3 + 1);
+        ordered.swap(2 * n / 3, 2 * n / 3 + 1);
+        assert!(!sample_prefers_radix(&ordered, value));
+        assert!(!sample_prefers_radix(&vec![0.0; n], value));
+        let two_runs: Vec<f32> = (0..n).map(|i| ((i + n / 2) % n) as f32).collect();
+        assert!(!sample_prefers_radix(&two_runs, value));
+        let organ_pipe: Vec<f32> = (0..n)
+            .map(|i| {
+                if i < n / 2 {
+                    (2 * i) as f32
+                } else {
+                    (2 * (n - i) - 1) as f32
+                }
+            })
+            .collect();
+        assert!(!sample_prefers_radix(&organ_pipe, value));
+        for cardinality in [64, 256, 1_024] {
+            let values: Vec<f32> = (0..n).map(|i| ((i * 7_919) % cardinality) as f32).collect();
+            assert!(!sample_prefers_radix(&values, value), "{cardinality} keys");
+        }
+        let mut rng = crate::rng::Rng::new(419);
+        for len in [RADIX_MIN_LEN - 1, RADIX_MIN_LEN, n] {
+            let mut shuffled: Vec<f32> = (0..len).map(|i| i as f32).collect();
+            for i in (1..len).rev() {
+                let other = rng.range(0..i + 1);
+                shuffled.swap(i, other);
+            }
+            assert_eq!(sample_prefers_radix(&shuffled, value), len >= RADIX_MIN_LEN);
+        }
+    }
+
+    #[test]
+    fn adaptive_column_sort_preserves_comparison_bits_on_both_routes() {
+        let bits = |pairs: &[(f32, f32)]| {
+            pairs
+                .iter()
+                .map(|&(v, w)| [v.to_bits(), w.to_bits()])
+                .collect::<Vec<_>>()
+        };
+        let mut rng = crate::rng::Rng::new(941);
+        for n in [RADIX_MIN_LEN - 1, RADIX_MIN_LEN, 10_007] {
+            let mut unique: Vec<f32> = (0..n).map(|i| i as f32 - n as f32 / 2.0).collect();
+            for i in (1..n).rev() {
+                let other = rng.range(0..i + 1);
+                unique.swap(i, other);
+            }
+            for case in 0..5 {
+                let mut pairs: Vec<(f32, f32)> = (0..n)
+                    .map(|i| {
+                        let v = match case {
+                            0 => unique[i],
+                            1 => i as f32,
+                            2 => (n - i) as f32,
+                            _ => match i % 7 {
+                                0 => -0.0,
+                                1 => 0.0,
+                                2 if case == 4 => f32::from_bits(0x7fc0_0001),
+                                3 if case == 4 => f32::NEG_INFINITY,
+                                _ => ((i * 7_919) % 97) as f32 - 48.0,
+                            },
+                        };
+                        (v, [0.0, 1e-20, 0.125, 1.0, 3.5, 1e8][i % 6])
+                    })
+                    .collect();
+                let mut expected = pairs.clone();
+                expected.sort_by(|a, b| a.0.total_cmp(&b.0));
+                sort_column_by_value(&mut pairs, &mut RadixScratch::default(), |&(v, _)| v);
+                assert_eq!(bits(&pairs), bits(&expected), "{n} pairs, case {case}");
+            }
         }
     }
 

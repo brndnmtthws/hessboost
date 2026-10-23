@@ -623,7 +623,10 @@ fn newton_step(
 /// median absolute deviations (the standard deviation if that is zero),
 /// and `ν = 5`: Newton's method on the summed exact Hessian (Fisher scoring
 /// where it is not positive definite) with a backtracking line search on
-/// the summed NLL, until the margins move less than `1e-13` relative. A log
+/// the summed NLL, until every margin has converged on its own scale: `μ`
+/// to `1e-13` of the scale `s` (or to its last few bits where `|μ|`
+/// dwarfs `s`), `ln s` and `κ` to `1e-13 (1 + |η|)`, so translating the
+/// labels does not loosen the fit of the others. A log
 /// margin at its bound whose score points past it stays there: labels with
 /// lighter tails than the normal's send `κ` to `+LOG_LINK_BOUND`, labels
 /// with tails heavier than the Cauchy's send it to its floor
@@ -724,15 +727,19 @@ fn student_t_mle(labels: &[f32], w: &dyn Fn(usize) -> f64, sum_w: f64) -> Vec<f6
         let Some((next, value)) = accepted else {
             break;
         };
-        let moved = next
-            .iter()
-            .zip(&eta)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f64::max);
-        let size = 1.0 + eta.iter().map(|&e| e.abs()).fold(0.0, f64::max);
+        // Location in units of the scale (at least a few ulps of `μ`, which
+        // is all it can resolve); the log margins, which are unitless,
+        // on their own.
+        let scale = eta[1].clamp(-LOG_LINK_BOUND, LOG_LINK_BOUND).exp();
+        let converged = (next[0] - eta[0]).abs()
+            <= 4.0 * f64::EPSILON * eta[0].abs() + 1e-13 * scale
+            && next[1..]
+                .iter()
+                .zip(&eta[1..])
+                .all(|(a, b)| (a - b).abs() <= 1e-13 * (1.0 + b.abs()));
         eta = next;
         current = value;
-        if moved <= 1e-13 * size {
+        if converged {
             break;
         }
     }

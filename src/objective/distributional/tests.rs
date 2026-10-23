@@ -1221,6 +1221,45 @@ fn student_t_intercepts() {
     );
 }
 
+/// The intercept is equivariant under translation and scaling: labels
+/// `2⁴⁷ + 2²⁴ k` (exact in `f32`) fit `μ = 2⁴⁷`, `ln s` shifted by
+/// `24 ln 2`, and the same `κ` as the labels `k`. A stopping rule relative
+/// to `|μ| ≈ 1.4e14` once stopped after the first step, with `ln s` and
+/// `κ` off by O(1).
+#[test]
+fn student_t_intercept_is_translation_equivariant() {
+    let family = DistFamily::StudentT;
+    let ks: [i32; 21] = [
+        -13, -8, -6, -5, -4, -3, -2, -2, -1, -1, 0, 1, 1, 2, 2, 3, 4, 5, 6, 8, 13,
+    ];
+    let small: Vec<f32> = ks.iter().map(|&k| k as f32).collect();
+    let (offset, unit) = (2f64.powi(47), 2f64.powi(24));
+    let large: Vec<f32> = ks
+        .iter()
+        .map(|&k| (offset + unit * f64::from(k)) as f32)
+        .collect();
+    for (&l, &k) in large.iter().zip(&ks) {
+        assert_eq!(
+            f64::from(l),
+            offset + unit * f64::from(k),
+            "{k} is not exact"
+        );
+    }
+    let base = family.mle_margins(&small, None);
+    assert!(
+        STUDENT_T_KAPPA_FLOOR < base[2] && base[2] < LOG_LINK_BOUND,
+        "κ must be interior: {base:?}"
+    );
+    let moved = family.mle_margins(&large, None);
+    assert!((moved[0] - offset).abs() <= 1e-6 * unit, "{moved:?}");
+    let ln_unit = 24.0 * std::f64::consts::LN_2;
+    assert!(
+        close(moved[1], base[1] + ln_unit, 0.0, 1e-9),
+        "{moved:?} vs {base:?}"
+    );
+    assert!(close(moved[2], base[2], 0.0, 1e-9), "{moved:?} vs {base:?}");
+}
+
 /// The loss writes three pairs per row (each mode pairing the gradient
 /// with its curvature), predictions report the natural scale
 /// `σ = s ν/(ν + 1)`, and natural parameters map back to the margins.

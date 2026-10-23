@@ -6,11 +6,14 @@ description: >-
 runs:
   using: composite
   steps:
-    # ImageOS and ImageVersion name the hosted runner image: the packages apt
-    # resolved on one install as is on every runner of that image.
+    # The key names the runner image (ImageOS and ImageVersion), on which apt
+    # resolves the same packages every time, and the installer's hash, so a
+    # change to the packages it installs downloads a new set.
     - id: key
       shell: bash
-      run: echo "key=lavapipe-${ImageOS:?}-${ImageVersion:?}-$(dpkg --print-architecture)" >> "$GITHUB_OUTPUT"
+      run: |
+        installer="$(sha256sum "$GITHUB_WORKSPACE/.github/scripts/install-lavapipe.sh" | cut -c1-16)"
+        echo "key=lavapipe-${ImageOS:?}-${ImageVersion:?}-$(dpkg --print-architecture)-$installer" >> "$GITHUB_OUTPUT"
     - id: restore
       uses: actions/cache/restore@v6
       with:

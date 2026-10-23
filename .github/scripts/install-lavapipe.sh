@@ -4,7 +4,7 @@
 # Linux runner without a GPU, and set HESSBOOST_REQUIRE_WGPU so they fail
 # instead of skipping when the backend is unavailable. Run as a GitHub
 # Actions step (it appends to GITHUB_ENV), through .github/actions/lavapipe,
-# which caches DEBS per runner image.
+# which caches DEBS per runner image and version of this script.
 #
 # Usage: install-lavapipe.sh DEBS
 #

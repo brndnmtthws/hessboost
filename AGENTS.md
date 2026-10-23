@@ -102,8 +102,8 @@ Metal or wgpu kernels do not compile, and the `cuda-kernels` job checks the
 CUDA PTX;
 the Linux runners also install Mesa's lavapipe and set
 `HESSBOOST_REQUIRE_WGPU=1` (`.github/actions/lavapipe`, which caches the
-packages per runner image), so `tests/wgpu.rs` and the `backend::wgpu` unit
-tests run the GPU paths there)
+packages per runner image and installer version), so `tests/wgpu.rs` and the
+`backend::wgpu` unit tests run the GPU paths there)
 under the `ci` Cargo profile (`Cargo.toml`: `dev` at opt-level 1, debug
 assertions and overflow checks on; about ten times faster than opt-level
 0). The parity job caches uv's XGBoost source build per uv release. Every

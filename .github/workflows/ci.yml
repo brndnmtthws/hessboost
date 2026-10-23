@@ -86,6 +86,7 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: clippy-${{ matrix.name }}
+          save-on-pull-request: true
       # Lint levels (pedantic) live in Cargo.toml's [lints] table.
       - run: mbx clippy --all-targets --all-features -- -D warnings
       - run: mbx clippy --manifest-path python/Cargo.toml --all-targets -- -D warnings
@@ -126,6 +127,7 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: test-ci
+          save-on-pull-request: true
       # The `ci` Cargo profile (Cargo.toml): opt-level 1 with debug
       # assertions, about ten times faster than `dev` for this suite.
       # nextest's own `--profile` would pick a nextest profile.
@@ -151,6 +153,7 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: docs
+          save-on-pull-request: true
       - run: mbx doc --no-deps --all-features
 
   msrv:
@@ -175,6 +178,7 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: msrv
+          save-on-pull-request: true
       - run: mbx build --all-features
 
   parity:
@@ -191,6 +195,7 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: parity
+          save-on-pull-request: true
       # uv's cache keeps the XGBoost wheel it builds from the source tarball
       # (over three minutes with CMake). `uv cache prune --ci` below drops
       # what uv can download again, so the saved cache is mostly that wheel.
@@ -231,6 +236,7 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: semver
+          save-on-pull-request: true
       # Compares the public API against the latest crates.io release; fails
       # when Cargo.toml's version is too small a bump for the changes.
       - run: mbx semver-checks --verbose
@@ -255,6 +261,7 @@ jobs:
         with:
           working-directory: fuzz
           cache-generation: fuzz
+          save-on-pull-request: true
       - name: Run each fuzz target for 10 seconds
         working-directory: fuzz
         run: mise exec -- ./run.sh 10
@@ -377,6 +384,7 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: python-${{ matrix.wheel }}
+          save-on-pull-request: true
       - name: Install the build interpreter
         id: build-python
         run: |
@@ -493,6 +501,7 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: python-cuda
+          save-on-pull-request: true
       # Without the release profile's LTO and single codegen unit (see the
       # python job): uv builds hessboost and the runtime at once.
       - name: Build the CUDA runtime
@@ -525,6 +534,7 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: python-sdist
+          save-on-pull-request: true
       - name: Build source distribution
         uses: PyO3/maturin-action@v1
         with:

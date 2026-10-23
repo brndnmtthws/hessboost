@@ -389,11 +389,10 @@ jobs:
       - if: runner.os == 'Linux'
         uses: ./.github/actions/lavapipe
       # Rust and uv from mise.toml: maturin runs mise's cargo, which goes
-      # through mbx (see the header). Not on Windows, where the libzstd build
-      # of zstd-sys's build script, which mbx does not cache there, took four
-      # to six minutes instead of under one in a third of the builds under
-      # mbx (never without it): Windows builds with the toolchain's own
-      # cargo, uncached.
+      # through mbx (see the header). Not on Windows: there mbx does not
+      # cache zstd-sys's build script, and under mbx its libzstd build at
+      # times took minutes instead of under one, so Windows builds with the
+      # toolchain's own cargo, uncached.
       - uses: jdx/mise-action@v4
       - if: runner.os == 'Windows'
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"

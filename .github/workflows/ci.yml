@@ -255,13 +255,17 @@ jobs:
           cache_key_prefix: mise-v1-fuzz
           working_directory: fuzz
       # cargo-fuzz builds in fuzz/target. mbx does not cache its sanitizer
-      # compiles, so this job keeps the `target` payload, which Cargo reuses
-      # as is: fuzz/'s tree, pruned to fuzz/'s own `cargo metadata`.
-      - uses: jdx/mr-boxington-action@v1
+      # compiles, and mr-boxington-action's `target` payload does not find
+      # nightly Cargo's build-directory layout (`build/<package>/<hash>/`),
+      # so the job caches the directory itself: restored on every run,
+      # saved after a push to main without the outputs of hessboost and the
+      # fuzz targets, which every change to the crate rebuilds.
+      - id: fuzz-target
+        uses: actions/cache/restore@v6
         with:
-          working-directory: fuzz
-          cache-generation: fuzz
-          save-on-pull-request: true
+          path: fuzz/target
+          key: fuzz-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/mise.toml') }}-${{ github.sha }}
+          restore-keys: fuzz-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/mise.toml') }}-
       - name: Run each fuzz target for 10 seconds
         working-directory: fuzz
         run: mise exec -- ./run.sh 10
@@ -275,6 +279,18 @@ jobs:
             base64 -w0 "$input"
             echo
           done
+      # TEMP (measurement): also save from this pull request.
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+        name: Leave hessboost's and the fuzz targets' outputs out of the cache
+        run: |
+          rm -rf target/*/release/build/hessboost target/*/release/build/hessboost-fuzz
+          find target -mindepth 3 -maxdepth 3 -path 'target/*/release/*' -type f -delete
+        working-directory: fuzz
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/target
+          key: ${{ steps.fuzz-target.outputs.cache-primary-key }}
 
   # The CUDA kernels are Rust (cuda-kernels/), compiled to PTX by cuda-oxide,
   # and the two PTX modules src/backend/cuda/ embeds are committed. Rebuild

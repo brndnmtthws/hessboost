@@ -363,3 +363,5 @@ pub mod internals {
     pub use crate::tree::hist::{CpuBackend, HistogramBackend, zeroed};
     pub use crate::tree::sampler::ColumnSampler;
 }
+
+// TEMP (CI measurement): a source change, so the warm run rebuilds hessboost.

@@ -531,18 +531,6 @@ fn days(first: usize, end: usize) -> Vec<usize> {
     (2 * first..2 * end).collect()
 }
 
-/// The reason of the `purged folds` refusal `result` must hold.
-fn purged_refusal(result: hessboost::error::Result<Vec<Fold>>) -> String {
-    match result {
-        Err(HessboostError::InvalidParameter {
-            name: "purged folds",
-            reason,
-            ..
-        }) => reason,
-        other => panic!("expected a purged-folds refusal, got {other:?}"),
-    }
-}
-
 /// Each block tests the rows decided from its start to the next block's
 /// (the last, to the end) and trains on the rows decided before it whose
 /// labels end by its start, in row order. Rows decided before the first
@@ -621,72 +609,58 @@ fn purged_forward_at_reproduces_purged_forward() {
     }
 }
 
-/// Unusable times and blocks are refused, naming the block at fault.
+/// Unusable times and blocks are refused, each case breaking one rule.
 #[test]
 fn purged_forward_at_refuses_unusable_blocks() {
     let (decision_at, label_end) = daily();
-    let refusal = |starts: &[i64], min_train: usize| {
-        purged_refusal(Fold::purged_forward_at(
-            &decision_at,
-            &label_end,
-            starts,
-            min_train,
-        ))
+    let at = |starts: &[i64], min_train: usize| {
+        Fold::purged_forward_at(&decision_at, &label_end, starts, min_train)
     };
     assert!(matches!(
         Fold::purged_forward_at(&decision_at, &label_end[1..], &[5 * DAY], 1),
-        Err(HessboostError::DimensionMismatch { .. })
+        Err(HessboostError::DimensionMismatch {
+            expected: 20,
+            got: 19,
+            ..
+        })
     ));
     assert_eq!(
-        purged_refusal(Fold::purged_forward_at(&[], &[], &[0], 1)),
-        "no rows"
+        invalid_param(Fold::purged_forward_at(&[], &[], &[0], 1)),
+        "purged folds"
     );
+    // Row 1's label ends before its decision; its block trains row 0.
     assert_eq!(
-        purged_refusal(Fold::purged_forward_at(&[5, 6], &[5, 5], &[6], 1)),
-        "row 1's label ends before its decision"
+        invalid_param(Fold::purged_forward_at(&[5, 6], &[5, 5], &[6], 1)),
+        "purged folds"
     );
-    assert_eq!(refusal(&[], 1), "no test block starts");
-    for starts in [[5 * DAY, 7 * DAY, 7 * DAY], [5 * DAY, 7 * DAY, 6 * DAY]] {
-        let reason = refusal(&starts, 1);
-        assert_eq!(
-            reason,
-            format!(
-                "block starts must strictly increase; test block 2's start {} does not follow \
-                 block 1's {}",
-                starts[2],
-                7 * DAY
-            )
-        );
+    assert!(Fold::purged_forward_at(&[5, 6], &[5, 6], &[6], 1).is_ok());
+    assert_eq!(invalid_param(at(&[], 1)), "purged folds");
+    // A repeated or earlier start empties the block before it, but the same
+    // starts deduplicated and sorted are accepted, so their order is at fault.
+    for (starts, ordered) in [
+        ([5 * DAY, 7 * DAY, 7 * DAY], &[5 * DAY, 7 * DAY][..]),
+        (
+            [5 * DAY, 7 * DAY, 6 * DAY],
+            &[5 * DAY, 6 * DAY, 7 * DAY][..],
+        ),
+    ] {
+        assert_eq!(invalid_param(at(&starts, 1)), "purged folds");
+        assert!(at(ordered, 1).is_ok());
     }
     // Nothing is decided from a second after day 5 to day 6, nor after
-    // day 9.
-    for (starts, block) in [
-        ([5 * DAY, 5 * DAY + 1, 6 * DAY], 1),
-        ([5 * DAY, 6 * DAY, 10 * DAY], 2),
+    // day 9; every other block tests and trains rows.
+    for starts in [
+        [5 * DAY, 5 * DAY + 1, 6 * DAY],
+        [5 * DAY, 6 * DAY, 10 * DAY],
     ] {
-        assert_eq!(
-            refusal(&starts, 1),
-            format!(
-                "test block {block} starting at {} has no rows decided in it",
-                starts[block]
-            )
-        );
+        assert_eq!(invalid_param(at(&starts, 1)), "purged folds");
     }
     // A block on day 5 trains days 0 to 3, eight rows; one on day 1 none,
-    // which even a `min_train` of 0 refuses.
-    let folds = Fold::purged_forward_at(&decision_at, &label_end, &[5 * DAY], 8).unwrap();
+    // which even a `min_train` of 0 refuses. The other block trains enough.
+    let folds = at(&[5 * DAY], 8).unwrap();
     assert_eq!(folds[0].train.len(), 8);
-    for (starts, min_train, trained, needed) in
-        [([5 * DAY, 7 * DAY], 9, 8, 9), ([DAY, 5 * DAY], 0, 0, 1)]
-    {
-        assert_eq!(
-            refusal(&starts, min_train),
-            format!(
-                "test block 0 starting at {} leaves {trained} purged training rows; it needs \
-                 at least {needed}",
-                starts[0]
-            )
-        );
+    for (starts, min_train) in [([5 * DAY, 7 * DAY], 9), ([DAY, 5 * DAY], 0)] {
+        assert_eq!(invalid_param(at(&starts, min_train)), "purged folds");
     }
 }
 

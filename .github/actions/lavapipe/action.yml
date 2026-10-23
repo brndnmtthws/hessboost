@@ -1,0 +1,25 @@
+name: Install lavapipe
+description: >-
+  Install Mesa's lavapipe software Vulkan adapter on an Ubuntu runner from
+  packages cached per runner image, and set HESSBOOST_REQUIRE_WGPU
+  (.github/scripts/install-lavapipe.sh).
+runs:
+  using: composite
+  steps:
+    # ImageOS and ImageVersion name the hosted runner image: the packages apt
+    # resolved on one install as is on every runner of that image.
+    - id: key
+      shell: bash
+      run: echo "key=lavapipe-${ImageOS:?}-${ImageVersion:?}-$(dpkg --print-architecture)" >> "$GITHUB_OUTPUT"
+    - id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ runner.temp }}/lavapipe-debs
+        key: ${{ steps.key.outputs.key }}
+    - shell: bash
+      run: sh "$GITHUB_WORKSPACE/.github/scripts/install-lavapipe.sh" "$RUNNER_TEMP/lavapipe-debs"
+    - if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ runner.temp }}/lavapipe-debs
+        key: ${{ steps.key.outputs.key }}

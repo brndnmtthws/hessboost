@@ -17,14 +17,16 @@ changelog: release notes are written at release time.
 
 `mise install` provides Rust, `mbx` (build cache), cargo-nextest, uv,
 shellcheck, and ruff at the versions `mise.toml` pins; after changing one,
-refresh `mise.lock` with `mise lock`. MSRV 1.93. `Cargo.lock` is
+refresh `mise.lock` with `mise lock`, which keeps the lockfile's platforms
+(Windows x64 included, for CI's Python jobs). MSRV 1.93. `Cargo.lock` is
 gitignored: never pass `--locked`.
 libzstd needs a C compiler for every build target. The `cuda` feature (so
 `--all-features` on Linux) needs CUDA 13's driver and cuRAND headers
 (`CUDA_HOME` or `CUDA_TOOLKIT_PATH`) and libclang: `cuda-bindings`' build
 script runs bindgen over them. `.github/scripts/install-cuda-headers.sh`
-installs both as CI does, taking the headers from NVIDIA's pip wheels;
-given a directory, it runs inside maturin-action's manylinux container. docs.rs
+installs the headers as CI does, from NVIDIA's pip wheels (the Ubuntu
+runner images' clang ships libclang); given a directory, it runs inside
+maturin-action's manylinux container and installs libclang too. docs.rs
 builds only Linux (no Apple SDK for `zstd-sys`) and without `cuda` (no
 CUDA headers), so the Metal and CUDA APIs render only in a local
 `cargo doc --features metal` (macOS) or `--features cuda` (Linux).
@@ -91,36 +93,42 @@ cargo bench --features cuda --bench training -- cuda
 
 CI (`.github/workflows/ci.yml`) runs the Rust checks through `mbx` with
 `RUSTFLAGS=-D warnings`. mise-action caches mise's tools; `MISE_ENV=ci`
-loads `mise.ci.toml`, which moves rustup's toolchains into that cache. Rust
+loads `mise.ci.toml`, which moves rustup's toolchains into that cache.
+mr-boxington-action caches what mbx compiled (`github-cache-mode: objects`,
+saved on pushes to main; the fuzz job keeps fuzz/'s `target` tree). Rust
 tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal and CUDA
 tests needing a device skip without one; guard tests still fail if the
 Metal or wgpu kernels do not compile, and the `cuda-kernels` job checks the
 CUDA PTX;
 the Linux runners also install Mesa's lavapipe and set
-`HESSBOOST_REQUIRE_WGPU=1` (`.github/scripts/install-lavapipe.sh`), so
-`tests/wgpu.rs` and the `backend::wgpu` unit tests run the GPU paths there)
+`HESSBOOST_REQUIRE_WGPU=1` (`.github/actions/lavapipe`, which caches the
+packages per runner image), so `tests/wgpu.rs` and the `backend::wgpu` unit
+tests run the GPU paths there)
 under the `ci` Cargo profile (`Cargo.toml`: `dev` at opt-level 1, debug
 assertions and overflow checks on; about ten times faster than opt-level
-0). The parity job caches uv's XGBoost source build. Every Linux job that
-builds the root crate's `cuda` feature (clippy, test, docs, MSRV,
+0). The parity job caches uv's XGBoost source build per uv release. Every
+Linux job that builds the root crate's `cuda` feature (clippy, test, docs, MSRV,
 `semver compatibility` (cargo-semver-checks enables `cuda`), and
 `publish.yml`'s Rust test and `cargo publish --all-features`) first runs
-`.github/scripts/install-cuda-headers.sh`: apt's `libclang-dev`, NVIDIA's
-pinned CUDA 13 header wheels through uv, and `CUDA_HOME` in `GITHUB_ENV`.
+`.github/scripts/install-cuda-headers.sh`: NVIDIA's pinned CUDA 13 header
+wheels through uv and `CUDA_HOME` in `GITHUB_ENV` (bindgen loads the libclang
+of the runner image's clang).
 `publish.yml`'s CUDA runtime wheels run it with a directory in their
 manylinux container: dnf's `clang-devel`, `CUDA_HOME` exported.
-Its Python jobs build, on x86_64/aarch64 Linux, aarch64 macOS, and x86_64
-Windows (without the release profile's LTO and single codegen unit), the
+Its Python jobs build with maturin through mise's cargo (so through mbx), on
+x86_64/aarch64 Linux, aarch64 macOS, and x86_64 Windows (without the release
+profile's LTO and single codegen unit), the
 abi3 wheel, tested on CPython 3.12 and 3.14, and the abi3t wheel, tested on
 3.15 and free-threaded 3.15t, with `.github/scripts/test-wheel.sh`, plus
 the free-threaded 3.14t wheel on x86_64 Linux and pyright's public-type
 check (which also fails on a public function or class without a docstring),
 a ruff/ty lint job over all of the repository's Python, and an sdist round
 trip (with the release profile). The Linux Python jobs install lavapipe too
-(`install-lavapipe.sh`), so `python/tests/test_gpu.py` runs its wgpu tests.
-The `python-cuda` job builds the CUDA runtime (`python/runtime-cuda/`)
-into the project environment (`uv sync --locked --extra cuda`; no wheel,
-so nothing is uploaded) and runs `uv run --locked --extra cuda pytest`,
+(`.github/actions/lavapipe`), so `python/tests/test_gpu.py` runs its wgpu
+tests. The `python-cuda` job builds the CUDA runtime (`python/runtime-cuda/`)
+into the project environment (`uv sync --locked --extra cuda`, without the
+release profile's LTO; no wheel, so nothing is uploaded) and runs
+`uv run --locked --extra cuda pytest`,
 which fails unless the package runs on the runtime's extension (CUDA
 device tests skip without a GPU).
 `python/uv.lock` pins polars 2.x; the

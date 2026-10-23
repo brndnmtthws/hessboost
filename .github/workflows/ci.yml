@@ -30,6 +30,16 @@ env:
 # set finished first. Both actions authenticate their GitHub downloads with
 # the job's token by default (mise-action exports it as MISE_GITHUB_TOKEN
 # for later mise calls), so they are not rate limited.
+#
+# mise's `mr_boxington` option makes its cargo, which maturin runs too, go
+# through mbx. mr-boxington-action saves the objects mbx compiled
+# (`github-cache-mode: objects`) after a push to main, and each job restores
+# the latest entry of its `cache-generation`. Those cover every target
+# directory a job builds in and every feature; the default `target` payload
+# keeps only the dependencies of the default features, which these
+# `--all-features` builds would compile again. `cache-links` also caches
+# linked build scripts and proc macros. The fuzz job keeps fuzz/'s `target`
+# payload: mbx does not cache its sanitizer builds.
 
 jobs:
   fmt:
@@ -64,13 +74,17 @@ jobs:
       - uses: jdx/mise-action@v4
       # `--features cuda` (in --all-features) builds `cuda-bindings`, whose
       # build script runs bindgen over CUDA 13's `cuda.h` and `curand.h`:
-      # the script installs them from NVIDIA's pip wheels with mise's uv,
-      # plus libclang, and sets CUDA_HOME. On macOS `cuda` enables nothing
-      # (its dependencies are Linux-only).
+      # the script installs them from NVIDIA's pip wheels with mise's uv and
+      # sets CUDA_HOME, and bindgen loads the libclang of the runner image's
+      # clang. On macOS `cuda` enables nothing (its dependencies are
+      # Linux-only).
       - if: runner.os == 'Linux'
         run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
           cache-generation: clippy-${{ matrix.name }}
       # Lint levels (pedantic) live in Cargo.toml's [lints] table.
       - run: mbx clippy --all-targets --all-features -- -D warnings
@@ -94,20 +108,23 @@ jobs:
         with:
           persist-credentials: false
       # Mesa's lavapipe is a software Vulkan adapter: the wgpu backend's
-      # tests run their GPU paths on it, and the script's
+      # tests run their GPU paths on it, and the action's
       # `HESSBOOST_REQUIRE_WGPU` makes `tests/wgpu.rs` fail instead of
       # skipping when the backend is not available. The hosted macOS runners
       # have no GPU (Metal and wgpu tests skip there; their guard tests still
       # check the kernels).
       - if: runner.os == 'Linux'
-        run: sh .github/scripts/install-lavapipe.sh
+        uses: ./.github/actions/lavapipe
       - uses: jdx/mise-action@v4
-      # The CUDA 13 headers and libclang `--features cuda` builds with (see
-      # the clippy job).
+      # The CUDA 13 headers `--features cuda` builds with (see the clippy
+      # job).
       - if: runner.os == 'Linux'
         run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
           cache-generation: test-ci
       # The `ci` Cargo profile (Cargo.toml): opt-level 1 with debug
       # assertions, about ten times faster than `dev` for this suite.
@@ -130,6 +147,9 @@ jobs:
       - run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
           cache-generation: docs
       - run: mbx doc --no-deps --all-features
 
@@ -151,6 +171,9 @@ jobs:
       - run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
           cache-generation: msrv
       - run: mbx build --all-features
 
@@ -164,15 +187,22 @@ jobs:
       - uses: jdx/mise-action@v4
       - uses: jdx/mr-boxington-action@v1
         with:
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
           cache-generation: parity
       # uv's cache keeps the XGBoost wheel it builds from the source tarball
       # (over three minutes with CMake). `uv cache prune --ci` below drops
       # what uv can download again, so the saved cache is mostly that wheel.
+      # Each uv release reads its own versioned cache buckets, so the key
+      # names the uv that built the wheel.
+      - id: uv
+        run: echo "version=$(uv --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6
         with:
           path: ~/.cache/uv
-          key: uv-parity-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/requirements-*.txt') }}
-          restore-keys: uv-parity-${{ runner.os }}-${{ runner.arch }}-
+          key: uv-parity-${{ runner.os }}-${{ runner.arch }}-${{ steps.uv.outputs.version }}-${{ hashFiles('scripts/requirements-*.txt') }}
+          restore-keys: uv-parity-${{ runner.os }}-${{ runner.arch }}-${{ steps.uv.outputs.version }}-
       - name: Generate fixtures from XGBoost 3.4.2
         run: uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
       - name: Generate LightGBM import fixtures from LightGBM 4.7.0
@@ -197,6 +227,9 @@ jobs:
       - run: bash .github/scripts/install-cuda-headers.sh
       - uses: jdx/mr-boxington-action@v1
         with:
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
           cache-generation: semver
       # Compares the public API against the latest crates.io release; fails
       # when Cargo.toml's version is too small a bump for the changes.
@@ -205,10 +238,6 @@ jobs:
   fuzz:
     name: fuzz (smoke)
     runs-on: ubuntu-latest
-    env:
-      # mr-boxington-action caches the root `target/`; build there so the
-      # warm target tree also covers the sanitizer compiles mbx bypasses.
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v7
         with:
@@ -219,8 +248,12 @@ jobs:
         with:
           cache_key_prefix: mise-v1-fuzz
           working_directory: fuzz
+      # cargo-fuzz builds in fuzz/target. mbx does not cache its sanitizer
+      # compiles, so this job keeps the `target` payload, which Cargo reuses
+      # as is: fuzz/'s tree, pruned to fuzz/'s own `cargo metadata`.
       - uses: jdx/mr-boxington-action@v1
         with:
+          working-directory: fuzz
           cache-generation: fuzz
       - name: Run each fuzz target for 10 seconds
         working-directory: fuzz
@@ -331,13 +364,19 @@ jobs:
         with:
           persist-credentials: false
       # Lavapipe runs tests/test_gpu.py's wgpu tests without a GPU (see the
-      # test job); with the script's HESSBOOST_REQUIRE_WGPU they fail instead
+      # test job); with the action's HESSBOOST_REQUIRE_WGPU they fail instead
       # of skipping when the backend is unavailable.
       - if: runner.os == 'Linux'
-        run: sh .github/scripts/install-lavapipe.sh
-      - uses: astral-sh/setup-uv@v10.2.0
+        uses: ./.github/actions/lavapipe
+      # Rust, mbx, and uv from mise.toml: maturin runs mise's cargo, which
+      # goes through mbx (see the header).
+      - uses: jdx/mise-action@v4
+      - uses: jdx/mr-boxington-action@v1
         with:
-          working-directory: python
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
+          cache-generation: python-${{ matrix.wheel }}
       - name: Install the build interpreter
         id: build-python
         run: |
@@ -347,15 +386,11 @@ jobs:
       # change neither behavior nor results but serialize the build (over
       # a minute of it). python-sdist and publish.yml build with them.
       - name: Build wheel
-        uses: PyO3/maturin-action@v1
         env:
           CARGO_PROFILE_RELEASE_LTO: "false"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-        with:
-          command: build
-          manylinux: ${{ matrix.wheel == 'cp314t' && 'off' || '' }}
-          args: --release --locked --out dist -i "${{ steps.build-python.outputs.path }}"
-          working-directory: python
+        run: uvx --from 'maturin>=1.15,<2' maturin build --release --locked --out dist -i "${{ steps.build-python.outputs.path }}"
+        working-directory: python
       - name: Test abi3 wheel on Python 3.14
         if: matrix.wheel == 'abi3'
         run: sh ../.github/scripts/test-wheel.sh 3.14 'dist/*cp312-abi3*.whl'
@@ -447,11 +482,23 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # Rust and uv from mise.toml: maturin's build runs cargo.
+      # Rust and uv from mise.toml: maturin's build runs mise's cargo, which
+      # goes through mbx (see the header).
       - uses: jdx/mise-action@v4
       # For `--features cuda` (see the clippy job).
       - run: bash .github/scripts/install-cuda-headers.sh
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
+          cache-generation: python-cuda
+      # Without the release profile's LTO and single codegen unit (see the
+      # python job): uv builds hessboost and the runtime at once.
       - name: Build the CUDA runtime
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: uv sync --locked --extra cuda
         working-directory: python
       - run: uv run --locked --extra cuda pytest
@@ -462,6 +509,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       UV_MANAGED_PYTHON: "1"
+      UV_PYTHON: "3.12"
     defaults:
       run:
         shell: bash
@@ -469,10 +517,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v10.2.0
+      # Rust, mbx, and uv from mise.toml (see the python job).
+      - uses: jdx/mise-action@v4
+      - uses: jdx/mr-boxington-action@v1
         with:
-          python-version: "3.12"
-          working-directory: python
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
+          cache-generation: python-sdist
       - name: Build source distribution
         uses: PyO3/maturin-action@v1
         with:

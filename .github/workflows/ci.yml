@@ -398,6 +398,9 @@ jobs:
           isolate-objects-cache: true
           cache-links: true
           cache-generation: python-${{ matrix.wheel }}
+      # uv's default cache is on C: on Windows, the checkout on D:. On one
+      # volume, uv hard-links the packages it installs instead of copying.
+      - run: echo "UV_CACHE_DIR=$RUNNER_TEMP/uv-cache" >> "$GITHUB_ENV"
       - name: Install the build interpreter
         id: build-python
         run: |

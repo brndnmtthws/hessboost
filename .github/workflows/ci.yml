@@ -472,6 +472,51 @@ jobs:
         run: sh ../.github/scripts/test-wheel.sh 3.14t 'dist/*cp314-cp314t*.whl'
         working-directory: python
 
+  # TEMP (measurement): repeated Windows wheel builds, to compare zstd-sys's
+  # build-script time with and without mbx's wrappers. Remove before merge.
+  windows-probe:
+    name: TEMP windows probe / ${{ matrix.arm }} / ${{ matrix.n }}
+    runs-on: windows-latest
+    env:
+      UV_MANAGED_PYTHON: "1"
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [cc0, bse0, nombx]
+        n: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+      - if: matrix.arm != 'nombx'
+        uses: jdx/mr-boxington-action@v1
+        with:
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
+          cache-generation: python-abi3
+      - if: matrix.arm == 'nombx'
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - run: echo "UV_CACHE_DIR=$RUNNER_TEMP/uv-cache" >> "$GITHUB_ENV"
+      - id: build-python
+        run: |
+          uv python install 3.12
+          echo "path=$(uv python find 3.12)" >> "$GITHUB_OUTPUT"
+      - name: Build wheel
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          MBX_CC: "0"
+          MBX_BUILD_SCRIPT_EXECUTION: ${{ matrix.arm == 'bse0' && '0' || '1' }}
+        run: |
+          which cargo
+          uvx --from 'maturin>=1.15,<2' maturin build --release --locked --out dist -i "${{ steps.build-python.outputs.path }}"
+        working-directory: python
+
   python-lint:
     name: Python lint (ruff, ty)
     runs-on: ubuntu-latest

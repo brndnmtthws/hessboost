@@ -249,7 +249,7 @@ jobs:
       # wheels uploaded below; the environment lives in /venv instead.
       # scikit-learn has no musllinux wheels, so test-wheel.sh leaves it and
       # its tests out there. Alpine's lavapipe (mesa-vulkan-swrast) runs the
-      # wgpu tests, as install-lavapipe.sh does on the glibc runners.
+      # wgpu tests, as .github/actions/lavapipe does on the glibc runners.
       - name: Test musllinux wheels on Alpine
         if: ${{ matrix.musl }}
         run: |

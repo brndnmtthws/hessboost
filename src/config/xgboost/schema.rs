@@ -31,6 +31,7 @@ pub(super) const FIXED: &[(&str, &str)] = &[
     ("lambdarank_pair_method", "\"topk\""),
     ("max_cat_to_onehot", "4"),
     ("max_cat_threshold", "64"),
+    ("verbosity", "0"),
 ];
 
 /// XGBoost's `booster` names.

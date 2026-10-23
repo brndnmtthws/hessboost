@@ -267,7 +267,6 @@ fn binned_training_refuses_what_reads_values() {
         &[("tree_method", json!("approx"))][..],
         &[("tree_method", json!("exact"))],
         &[("booster", json!("dart"))],
-        &[("booster", json!("gblinear"))],
         &[("linear_tree", json!(true))],
         &[("toad_penalty_feature", json!(0.1))],
         &[("langevin", json!(true))],
@@ -275,6 +274,17 @@ fn binned_training_refuses_what_reads_values() {
     ] {
         assert_eq!(refused(keys), "dtrain", "{keys:?}");
     }
+    // gblinear refuses the categorical column first; typed numerical, the
+    // binned matrix is what it refuses.
+    let numeric = dense(true)
+        .with_feature_types(&[FeatureType::Numerical; 5])
+        .unwrap();
+    let numeric = BinnedMatrix::new(&numeric, MAX_BIN).unwrap();
+    let gblinear = params(&[("booster", json!("gblinear"))]);
+    assert_eq!(
+        invalid_param(hessboost::prelude::train(&gblinear, &numeric, 2)),
+        "dtrain"
+    );
     let params = params(&[]);
     let model = hessboost::prelude::train(&params, &data, 2).unwrap();
     let continued = Trainer::new(&params, &binned, 2).init_model(&model).train();

@@ -1728,3 +1728,53 @@ fn exact_interaction_constraints_confine_each_path() {
         visit(tree, 0, &mut Vec::new());
     }
 }
+
+/// gblinear refuses categorical features, in the training matrix, an eval
+/// set, and cross-validation folds, as XGBoost does; gbtree trains on the
+/// same data, and gblinear on it with the column typed numerical.
+#[test]
+fn gblinear_refuses_categorical_features() {
+    use crate::data::FeatureType;
+    use crate::training::cv;
+    let x: Vec<f32> = (0..200u16).map(|i| f32::from(i % 4)).collect();
+    let y: Vec<f32> = x.iter().map(|&c| c * 0.5).collect();
+    let categorical = labeled_dense(&x, 200, 1, &y)
+        .with_feature_types(&[FeatureType::Categorical])
+        .unwrap();
+    let codes = labeled_dense(&x, 200, 1, &y);
+    let linear = TrainingParams::builder()
+        .objective(Objective::SquaredError(RegLoss::default()))
+        .booster(BoosterKind::GbLinear)
+        .build()
+        .unwrap();
+    let refused_in = |result: Result<_>| match result {
+        Err(HessboostError::InvalidData {
+            input: "feature_types",
+            dataset,
+            ..
+        }) => dataset,
+        Err(other) => panic!("expected an invalid-`feature_types` rejection, got {other:?}"),
+        Ok(()) => panic!("expected an invalid-`feature_types` rejection, got Ok"),
+    };
+    assert_eq!(
+        refused_in(train(&linear, &categorical, 5).map(drop)).as_deref(),
+        Some("dtrain")
+    );
+    assert_eq!(
+        refused_in(
+            Trainer::new(&linear, &codes, 5)
+                .eval(&categorical, "valid")
+                .train()
+                .map(drop)
+        )
+        .as_deref(),
+        Some("valid")
+    );
+    refused_in(cv(&linear, &categorical, 5, 2, 0).map(drop));
+    assert!(train(&linear, &codes, 5).is_ok());
+    let trees = TrainingParams::builder()
+        .objective(Objective::SquaredError(RegLoss::default()))
+        .build()
+        .unwrap();
+    assert!(train(&trees, &categorical, 5).is_ok());
+}

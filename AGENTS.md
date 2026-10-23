@@ -421,7 +421,8 @@ request, not the docs.
   ("Not implemented" in `lib.rs`) are not `TrainingParams` fields;
   `TrainingParams::from_xgboost` (`FIXED` in `config/xgboost/schema.rs`) accepts
   `updater`, `feature_selector`, `lambdarank_pair_method`,
-  `max_cat_to_onehot`, and `max_cat_threshold` at that setting only, so
+  `max_cat_to_onehot`, `max_cat_threshold`, and `verbosity` at that setting
+  only, so
   parity fixtures that set them otherwise fail.
 - **Formats:** every file written since 0.2.0 loads in every later release;
   0.1.x files are refused. `BoostedModel` persists through

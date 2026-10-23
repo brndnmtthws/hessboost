@@ -38,7 +38,7 @@ def dtrain() -> DMatrix:
         ({"lambdarank_pair_method": "mean"}, r"only implemented as \"topk\""),
         ({"max_cat_to_onehot": 8}, r"only implemented as 4"),
         ({"updater": "coord_descent"}, r"gblinear's updater"),
-        ({"verbosity": 0}, r"unknown parameter `verbosity`"),
+        ({"verbosity": 1}, r"only implemented as 0"),
         ({"objective": "reg:nonsense"}, r"reg:nonsense"),
         ({"monotone_constraints": "(1,x)"}, r"bad entry `x`"),
         ({"monotone_constraints": [2]}, r"-1, 0 or 1"),

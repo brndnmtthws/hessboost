@@ -284,11 +284,14 @@
 //!   `ndcg_exp_gain`); DART has no `sample_type` or `normalize_type` (it
 //!   samples uniformly and normalizes by `tree`); categorical splits use
 //!   XGBoost's defaults
-//!   `max_cat_to_onehot = 4` and `max_cat_threshold = 64`.
+//!   `max_cat_to_onehot = 4` and `max_cat_threshold = 64`; and, writing no
+//!   log output, hessboost takes `verbosity = 0` only.
 //! - The metrics `gamma-deviance`, `error@t` (XGBoost's classification
 //!   threshold suffix), and the `-` variants of the ranking metrics
 //!   (`ndcg-`, `ndcg@k-`, `map-`, `map@k-`); these names are refused.
 //! - XGBoost import and export of gblinear models.
+//! - gblinear on categorical features: refused, as XGBoost refuses it
+//!   (type the column numerical to fit its codes as one weight).
 //! - `scale_pos_weight = 0`: XGBoost's bound is `>= 0`; hessboost's
 //!   [`RegLoss::new`](objective::RegLoss::new) needs a positive weight, so
 //!   configurations and XGBoost files with `0` are refused.

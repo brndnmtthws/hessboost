@@ -178,6 +178,23 @@ def test_gblinear_and_dart() -> None:
     assert rmse(dart.predict(x), y) < 0.5
 
 
+def test_gblinear_refuses_categorical_features() -> None:
+    x, y = regression()
+    codes = np.floor(np.abs(x) * 4) % 4
+    types = ["c"] + ["q"] * (x.shape[1] - 1)
+    with pytest.raises(InvalidDataError, match="categorical"):
+        hessboost.train({"booster": "gblinear"}, DMatrix(codes, y, feature_types=types), 5)
+    hessboost.train({"booster": "gblinear"}, DMatrix(codes, y), 5)
+    hessboost.train({}, DMatrix(codes, y, feature_types=types), 5)
+
+
+def test_verbosity_zero_only() -> None:
+    x, y = regression()
+    hessboost.train({"verbosity": 0}, DMatrix(x, y), 2)
+    with pytest.raises(HessboostError, match="is only implemented as 0, got 1"):
+        hessboost.train({"verbosity": 1}, DMatrix(x, y), 2)
+
+
 def test_distributional_objective_predicts_distributions() -> None:
     rng = np.random.default_rng(7)
     x = rng.uniform(-1, 1, size=(600, 2))

@@ -843,3 +843,23 @@ pub(crate) fn purged_forward<'py>(
     })?;
     fold_arrays(py, folds)
 }
+
+/// Forward folds at caller-given block starts, purging every training row
+/// whose label window reaches past its fold's block start.
+#[pyfunction]
+pub(crate) fn purged_forward_at<'py>(
+    py: Python<'py>,
+    decision_at: PyReadonlyArray1<'_, i64>,
+    label_end: PyReadonlyArray1<'_, i64>,
+    block_starts: PyReadonlyArray1<'_, i64>,
+    min_train: usize,
+) -> PyResult<FoldArrays<'py>> {
+    let (decision_at, label_end, block_starts) = (
+        row_major(&decision_at, "decision_at")?,
+        row_major(&label_end, "label_end")?,
+        row_major(&block_starts, "block_starts")?,
+    );
+    let folds =
+        py.detached(|| Fold::purged_forward_at(decision_at, label_end, block_starts, min_train))?;
+    fold_arrays(py, folds)
+}

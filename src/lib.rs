@@ -158,8 +158,10 @@
 //!   binary with [`EmbeddedModel`](model::EmbeddedModel).
 //! - **Validation:** cross-validation ([`cv`](training::cv)), custom,
 //!   forward-chaining (time-ordered, purged by a row gap), or purged forward
-//!   (timestamped rows, purged by each label window,
-//!   [`Fold::purged_forward`](training::Fold::purged_forward))
+//!   (timestamped rows, purged by each label window, in test blocks of the
+//!   last decision times or starting at given times such as calendar
+//!   periods: [`Fold::purged_forward`](training::Fold::purged_forward),
+//!   [`Fold::purged_forward_at`](training::Fold::purged_forward_at))
 //!   [`Fold`](training::Fold)s with fold-mean or leakage-safe per-fold
 //!   early stopping on a purged tail of each fold's training rows
 //!   ([`CrossValidation`](training::CrossValidation),

@@ -1,6 +1,6 @@
 //! [`Fold`] builders: caller-supplied, shuffled k-fold, forward-chaining,
-//! and purged forward folds; [`PurgedTail`], the per-fold early-stopping
-//! split.
+//! and purged forward folds (at chosen or given block starts);
+//! [`PurgedTail`], the per-fold early-stopping split.
 
 use crate::error::{HessboostError, Result};
 use crate::rng::Rng;
@@ -11,8 +11,9 @@ use crate::rng::Rng;
 ///
 /// Build folds with [`Fold::new`] (grouped or any other custom split),
 /// [`Fold::k_fold`] (what [`cv`](super::cv()) uses), [`Fold::forward_chaining`]
-/// (time-ordered rows), or [`Fold::purged_forward`] (timestamped rows with
-/// label windows).
+/// (time-ordered rows), [`Fold::purged_forward`] (timestamped rows with
+/// label windows), or [`Fold::purged_forward_at`] (the same, with test
+/// blocks starting at given times, such as calendar periods).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Fold {
@@ -162,28 +163,14 @@ impl Fold {
         blocks: usize,
         min_train: usize,
     ) -> Result<Vec<Fold>> {
-        let refuse = |reason: String| HessboostError::invalid_param("purged folds", reason);
-        if decision_at.len() != label_end.len() {
-            return Err(HessboostError::dimension_mismatch(
-                "label_end length (one per decision time)",
-                decision_at.len(),
-                label_end.len(),
-            ));
-        }
-        if decision_at.is_empty() {
-            return Err(refuse("no rows".to_string()));
-        }
+        check_purged_rows(decision_at, label_end)?;
         if !(validation_fraction > 0.0 && validation_fraction < 1.0) || blocks == 0 {
-            return Err(refuse(format!(
+            return Err(purged_refusal(format!(
                 "need a validation fraction in (0, 1) and at least one block, got \
                  {validation_fraction} and {blocks}"
             )));
         }
-        if let Some(row) = (0..decision_at.len()).find(|&row| label_end[row] < decision_at[row]) {
-            return Err(refuse(format!(
-                "row {row}'s label ends before its decision"
-            )));
-        }
+        check_purged_labels(decision_at, label_end)?;
         let mut times = decision_at.to_vec();
         times.sort_unstable();
         times.dedup();
@@ -212,7 +199,7 @@ impl Fold {
         while trainable(times[split]) < min_train {
             split += 1;
             if split + blocks > count {
-                return Err(refuse(format!(
+                return Err(purged_refusal(format!(
                     "no test start leaves {min_train} purged training rows and {blocks} test \
                      decision times"
                 )));
@@ -220,7 +207,7 @@ impl Fold {
         }
         let tail = &times[split..];
         if tail.len() < blocks {
-            return Err(refuse(format!(
+            return Err(purged_refusal(format!(
                 "{blocks} test blocks need {blocks} distinct decision times; the tail has {}",
                 tail.len()
             )));
@@ -230,24 +217,156 @@ impl Fold {
             .collect();
         let mut folds = Vec::with_capacity(blocks);
         for (block, &start) in starts.iter().enumerate() {
-            let end = starts.get(block + 1).copied();
-            let test: Vec<usize> = (0..decision_at.len())
-                .filter(|&row| {
-                    decision_at[row] >= start && end.is_none_or(|end| decision_at[row] < end)
-                })
-                .collect();
-            let train: Vec<usize> = (0..decision_at.len())
-                .filter(|&row| decision_at[row] < start && label_end[row] <= start)
-                .collect();
-            if train.is_empty() || test.is_empty() {
-                return Err(refuse(format!(
+            let fold = purged_fold(
+                decision_at,
+                label_end,
+                start,
+                starts.get(block + 1).copied(),
+            );
+            if fold.train.is_empty() || fold.test.is_empty() {
+                return Err(purged_refusal(format!(
                     "test block {block} leaves no training or test rows"
                 )));
             }
-            folds.push(Fold::new(train, test));
+            folds.push(fold);
         }
         Ok(folds)
     }
+
+    /// Forward, purged folds whose test blocks start at given times, for
+    /// walk-forward validation by calendar period (a block per week, month,
+    /// or quarter) over rows whose labels span a time window.
+    ///
+    /// `decision_at[i]` and `label_end[i]` are row `i`'s decision (feature)
+    /// time and the end of its label window plus any embargo, as for
+    /// [`Fold::purged_forward`]; rows may come in any order and share times.
+    /// `block_starts` are strictly increasing times on the same scale,
+    /// which need not be decision times. Fold `j` tests on every row decided
+    /// in `[block_starts[j], block_starts[j + 1])` (the last fold, on every
+    /// row decided at or after its start) and trains on every row decided
+    /// before `block_starts[j]` whose `label_end` is at or before it:
+    /// `purged_forward`'s purge, so a label ending exactly at the block start
+    /// is kept and one ending a tick later is purged. Both lists are in row
+    /// order. Rows decided before `block_starts[0]` are never tested, only
+    /// trained on. Given the starts `purged_forward` chooses (each of its
+    /// folds' first test decision time), this returns its folds.
+    ///
+    /// Unlike `purged_forward`, no start moves: a block whose purge leaves
+    /// fewer than `max(min_train, 1)` training rows is refused.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] when `decision_at` and
+    /// `label_end` differ in length; [`HessboostError::InvalidParameter`]
+    /// (`purged folds`) when they are empty, a label ends before its
+    /// decision, `block_starts` is empty or not strictly increasing, or a
+    /// block has no test rows or fewer than `max(min_train, 1)` purged
+    /// training rows (the message names the block and its start).
+    ///
+    /// ```
+    /// use hessboost::training::Fold;
+    ///
+    /// # fn main() -> hessboost::error::Result<()> {
+    /// // Two rows per day for 10 days; each label ends a day later.
+    /// let day = 86_400;
+    /// let decision_at: Vec<i64> = (0..20).map(|i| (i / 2) * day).collect();
+    /// let label_end: Vec<i64> = decision_at.iter().map(|at| at + day).collect();
+    /// // Test days 6 and 7, then days 8 and 9; days 0 to 5 are never tested.
+    /// let starts = [6 * day, 8 * day];
+    /// let folds = Fold::purged_forward_at(&decision_at, &label_end, &starts, 1)?;
+    /// assert_eq!(folds[0].test, (12..16).collect::<Vec<_>>());
+    /// assert_eq!(folds[1].test, (16..20).collect::<Vec<_>>());
+    /// // Day 5's labels end exactly at day 6, so they train the first fold;
+    /// // ending a second later, they would be purged from it.
+    /// assert_eq!(folds[0].train, (0..12).collect::<Vec<_>>());
+    /// assert_eq!(folds[1].train, (0..16).collect::<Vec<_>>());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn purged_forward_at(
+        decision_at: &[i64],
+        label_end: &[i64],
+        block_starts: &[i64],
+        min_train: usize,
+    ) -> Result<Vec<Fold>> {
+        check_purged_rows(decision_at, label_end)?;
+        check_purged_labels(decision_at, label_end)?;
+        if block_starts.is_empty() {
+            return Err(purged_refusal("no test block starts"));
+        }
+        if let Some(previous) = block_starts.windows(2).position(|pair| pair[1] <= pair[0]) {
+            let block = previous + 1;
+            return Err(purged_refusal(format!(
+                "block starts must strictly increase; test block {block}'s start {} does not \
+                 follow block {previous}'s {}",
+                block_starts[block], block_starts[previous]
+            )));
+        }
+        let min_train = min_train.max(1);
+        let mut folds = Vec::with_capacity(block_starts.len());
+        for (block, &start) in block_starts.iter().enumerate() {
+            let end = block_starts.get(block + 1).copied();
+            let fold = purged_fold(decision_at, label_end, start, end);
+            if fold.test.is_empty() {
+                return Err(purged_refusal(format!(
+                    "test block {block} starting at {start} has no rows decided in it"
+                )));
+            }
+            if fold.train.len() < min_train {
+                return Err(purged_refusal(format!(
+                    "test block {block} starting at {start} leaves {} purged training rows; \
+                     it needs at least {min_train}",
+                    fold.train.len()
+                )));
+            }
+            folds.push(fold);
+        }
+        Ok(folds)
+    }
+}
+
+/// The purged fold builders' refusal, for `reason`.
+fn purged_refusal(reason: impl Into<String>) -> HessboostError {
+    HessboostError::invalid_param("purged folds", reason)
+}
+
+/// Refuses decision and label-end times that differ in length or hold no
+/// rows.
+fn check_purged_rows(decision_at: &[i64], label_end: &[i64]) -> Result<()> {
+    if decision_at.len() != label_end.len() {
+        return Err(HessboostError::dimension_mismatch(
+            "label_end length (one per decision time)",
+            decision_at.len(),
+            label_end.len(),
+        ));
+    }
+    if decision_at.is_empty() {
+        return Err(purged_refusal("no rows"));
+    }
+    Ok(())
+}
+
+/// Refuses the first row whose label ends before its decision.
+fn check_purged_labels(decision_at: &[i64], label_end: &[i64]) -> Result<()> {
+    match (0..decision_at.len()).find(|&row| label_end[row] < decision_at[row]) {
+        Some(row) => Err(purged_refusal(format!(
+            "row {row}'s label ends before its decision"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The purged forward fold testing on the rows decided from `start` until
+/// `end` (to the last row without one) and training on the rows decided
+/// before `start` whose labels end at or before it, both in row order.
+fn purged_fold(decision_at: &[i64], label_end: &[i64], start: i64, end: Option<i64>) -> Fold {
+    let test = (0..decision_at.len())
+        .filter(|&row| decision_at[row] >= start && end.is_none_or(|end| decision_at[row] < end))
+        .collect();
+    let train = (0..decision_at.len())
+        .filter(|&row| decision_at[row] < start && label_end[row] <= start)
+        .collect();
+    Fold::new(train, test)
 }
 
 /// The purged chronological tail of a set of timestamped rows, the

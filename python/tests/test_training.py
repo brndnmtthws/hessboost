@@ -829,6 +829,80 @@ def test_purged_forward_folds_purge_by_each_rows_label_window() -> None:
         hessboost.folds.purged_forward([0.5], [1.0], validation_fraction=0.5)
 
 
+def test_purged_forward_at_tests_each_given_block_and_purges_at_its_start() -> None:
+    day = 86_400
+    # Three rows per day for 10 days; labels end two days after decision.
+    decision_at = np.repeat(np.arange(10) * day, 3)
+    label_end = decision_at + 2 * day
+    starts = [6 * day, 8 * day, 9 * day]
+    folds = hessboost.folds.purged_forward_at(decision_at, label_end, starts)
+    assert len(folds) == 3
+    # Day-aligned blocks: [6, 8), [8, 9), and day 9 onwards.
+    expected_days = [[6, 7], [8], [9]]
+    for (train_rows, test_rows), start, days in zip(folds, starts, expected_days, strict=True):
+        assert sorted(set(decision_at[test_rows] // day)) == days
+        assert len(test_rows) == 3 * len(days)
+        # Labels ending exactly at the block start train; later ones are purged.
+        assert (label_end[train_rows] <= start).all()
+        assert np.max(decision_at[train_rows]) == start - 2 * day
+    # Rows decided before the first start are never tested.
+    tested = np.concatenate([test_rows for _, test_rows in folds])
+    assert decision_at[tested].min() == 6 * day
+    # One tick past the block start purges one more day.
+    ((train_rows, _),) = hessboost.folds.purged_forward_at(decision_at, label_end + 1, [8 * day])
+    assert np.max(decision_at[train_rows]) == 5 * day
+    # Equivalent to purged_forward given the starts it chose.
+    chosen = hessboost.folds.purged_forward(
+        decision_at, label_end, validation_fraction=0.4, blocks=2
+    )
+    at_starts = hessboost.folds.purged_forward_at(
+        decision_at, label_end, [decision_at[test].min() for _, test in chosen]
+    )
+    assert len(at_starts) == len(chosen)
+    for (train_a, test_a), (train_b, test_b) in zip(chosen, at_starts, strict=True):
+        np.testing.assert_array_equal(np.sort(train_a), np.sort(train_b))
+        np.testing.assert_array_equal(np.sort(test_a), np.sort(test_b))
+    # datetime64 times and starts.
+    epoch = np.datetime64("2026-01-01")
+    stamps = epoch + decision_at.astype("timedelta64[s]")
+    ends = epoch + label_end.astype("timedelta64[s]")
+    dated = hessboost.folds.purged_forward_at(
+        stamps, ends, epoch + np.array(starts).astype("timedelta64[s]")
+    )
+    for (train_a, test_a), (train_b, test_b) in zip(folds, dated, strict=True):
+        np.testing.assert_array_equal(train_a, train_b)
+        np.testing.assert_array_equal(test_a, test_b)
+    # Refusals.
+    with pytest.raises(HessboostError):
+        hessboost.folds.purged_forward_at(decision_at, label_end, [8 * day, 8 * day])
+    with pytest.raises(HessboostError):
+        hessboost.folds.purged_forward_at(decision_at, label_end, [9 * day, 8 * day])
+    with pytest.raises(HessboostError):
+        hessboost.folds.purged_forward_at(decision_at, label_end, np.array([], dtype=np.int64))
+    with pytest.raises(HessboostError):
+        # No row is decided inside [8.5 days, 9 days).
+        hessboost.folds.purged_forward_at(decision_at, label_end, [8 * day + day // 2, 9 * day])
+    with pytest.raises(HessboostError):
+        hessboost.folds.purged_forward_at(decision_at, label_end, [8 * day], min_train=100)
+    with pytest.raises(HessboostError, match="before its decision"):
+        hessboost.folds.purged_forward_at([5, 6], [4, 7], [6])
+    with pytest.raises(HessboostError):
+        hessboost.folds.purged_forward_at([0, 1], [1, 2, 3], [1])
+    with pytest.raises(TypeError, match="integer times"):
+        hessboost.folds.purged_forward_at([0.5], [1.0], [0])
+    with pytest.raises(TypeError, match="integer times"):
+        hessboost.folds.purged_forward_at([0], [1], [0.5])
+
+
+def test_purged_forward_at_folds_drive_cv() -> None:
+    x, y = regression()
+    at = np.arange(400) * 3_600
+    folds = hessboost.folds.purged_forward_at(at, at + 7_200, [300 * 3_600, 350 * 3_600])
+    result = hessboost.cv({}, DMatrix(x, y), 5, folds=folds)
+    assert result["test-rmse-mean"].shape == (5,)
+    assert np.all(np.isfinite(result["test-rmse-mean"]))
+
+
 class Recorder(hessboost.TrainingCallback):
     """Records every call; stops at ``stop_at``."""
 

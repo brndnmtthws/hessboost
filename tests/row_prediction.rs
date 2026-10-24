@@ -192,7 +192,8 @@ fn cases() -> Vec<Case> {
             vec![("model_shrink_rate", json!(0.05))],
             signal,
         ),
-        case("gblinear", vec![("booster", json!("gblinear"))], signal),
+        // gblinear refuses categorical features, as XGBoost does.
+        numeric("gblinear", vec![("booster", json!("gblinear"))], signal),
         Case {
             targets: 2,
             ..case("label matrix", vec![], signal)

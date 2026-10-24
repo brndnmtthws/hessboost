@@ -347,7 +347,8 @@ pub fn refuses_unsupported_models<B: GpuBackend>() {
             .booster(BoosterKind::GbLinear)
             .build()
             .unwrap(),
-        &data,
+        // gblinear refuses categorical features, as XGBoost does.
+        &dataset_with(2_000, 5, true, false),
         4,
     )
     .unwrap();

@@ -570,6 +570,10 @@ fn unsupported_settings_are_refused_by_name() {
             r#"invalid parameter `lambdarank_pair_method`: is only implemented as "topk""#,
         ),
         (json!({"updater": "coord_descent"}), "gblinear's updater"),
+        (
+            json!({"verbosity": 1}),
+            "invalid parameter `verbosity`: is only implemented as 0, got 1",
+        ),
         (json!({"monotone_constraints": "(1,x)"}), "bad entry `x`"),
         (json!({"monotone_constraints": [2]}), "-1, 0 or 1"),
         (json!({"subsample": 1.5}), "invalid parameter `subsample`"),
@@ -582,6 +586,15 @@ fn unsupported_settings_are_refused_by_name() {
         "unknown parameter `zzz`"
     );
     assert!(refused(json!({"booster": "gblinear", "updater": "coord_descent"})).is_none());
+    assert!(refused(json!({"verbosity": 0})).is_none());
+    // A one-setting option leaves no trace in the flat form, like the others.
+    let quiet = TrainingParams::from_xgboost([("verbosity", json!(0))]).unwrap();
+    assert_eq!(quiet, TrainingParams::default());
+    assert!(!quiet.to_xgboost().unwrap().contains_key("verbosity"));
+    assert_eq!(
+        quiet.changed_keys(&TrainingParams::default()),
+        [] as [&str; 0]
+    );
     assert!(refused(json!({"base_score": null, "max_delta_step": null})).is_none());
 }
 

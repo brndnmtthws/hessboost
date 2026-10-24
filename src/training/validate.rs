@@ -2,7 +2,7 @@
 
 use super::eval::EvalSet;
 use crate::config::{BoosterKind, Device, ProcessType, TrainingParams, TreeMethod};
-use crate::data::DMatrix;
+use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::Loss;
@@ -255,11 +255,26 @@ fn validate_constraints(params: &TrainingParams, n_features: usize) -> Result<()
 }
 
 /// The booster- and process-specific refusals: feature weights where no
-/// columns are sampled, then Boulevard's and the EBM's data requirements.
+/// columns are sampled, categorical features (in the training matrix or an
+/// eval set) under gblinear, as XGBoost refuses them, then Boulevard's and
+/// the EBM's data requirements.
 fn validate_booster(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
     let &TrainRequest { params, dtrain, .. } = request;
     if params.booster == BoosterKind::GbLinear {
         reject_feature_weights(dtrain, "gblinear does not sample columns")?;
+        let dtrain_set = EvalSet {
+            data: dtrain,
+            name: "dtrain",
+        };
+        for set in std::iter::once(dtrain_set).chain(request.evals.iter().copied()) {
+            if set.data.feature_types().contains(&FeatureType::Categorical) {
+                return Err(HessboostError::invalid_data(
+                    "feature_types",
+                    "gblinear doesn't support categorical features",
+                )
+                .in_dataset(set.name));
+            }
+        }
     }
     if matches!(params.process_type, ProcessType::Update(_)) {
         reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;

@@ -597,7 +597,8 @@ impl TrainingParams {
     /// XGBoost options hessboost implements at one setting only
     /// (`updater = "coord_descent"` with `booster = gblinear`,
     /// `feature_selector = "cyclic"`, `lambdarank_pair_method = "topk"`,
-    /// `max_cat_to_onehot = 4`, `max_cat_threshold = 64`) are accepted at
+    /// `max_cat_to_onehot = 4`, `max_cat_threshold = 64`, and `verbosity = 0`,
+    /// since hessboost writes no log output) are accepted at
     /// that setting. XGBoost's `0` for `max_depth`, `max_leaves`, and
     /// `nthread` reads as `None` (no limit, the global pool), and
     /// `max_delta_step` as a [`MaxDeltaStep`]: absent or `null` is

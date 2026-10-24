@@ -310,8 +310,9 @@ class HessboostDistributionRegressor(RegressorMixin, _HessboostModel):
     full conditional distribution per row.
 
     The objective defaults to ``dist:normal``; ``dist:lognormal``,
-    ``dist:gamma``, ``dist:poisson`` and ``dist:negbinomial`` are the other
-    families. :meth:`predict` returns the distributions' means and
+    ``dist:gamma``, ``dist:poisson``, ``dist:negbinomial`` and
+    ``dist:student_t`` (heavy-tailed, with learned degrees of freedom) are the
+    other families. :meth:`predict` returns the distributions' means and
     :meth:`predict_distribution` the distributions themselves.
     """
 

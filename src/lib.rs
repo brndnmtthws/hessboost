@@ -218,8 +218,9 @@
 //!     unlearning) for trained hist models, exact or approximate
 //!     ([`training::online`]);
 //!   - distributional boosting (NGBoost / XGBoostLSS style): `dist:normal`,
-//!     `dist:lognormal`, `dist:gamma`, `dist:poisson`, `dist:negbinomial`
-//!     per-row distributions
+//!     `dist:lognormal`, `dist:gamma`, `dist:poisson`, `dist:negbinomial`,
+//!     `dist:student_t` (heavy-tailed location-scale with learned degrees of
+//!     freedom) per-row distributions
 //!     ([`predict_distribution`](model::BoostedModel::predict_distribution),
 //!     [`objective::distributional`]), scored by `nll` / `crps`;
 //!   - CatBoost's Stochastic Gradient Langevin Boosting and model shrinkage

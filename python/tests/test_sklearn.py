@@ -215,6 +215,30 @@ def test_distribution_regressor() -> None:
         HessboostDistributionRegressor(objective="reg:squarederror").fit(x, y)
 
 
+def test_distribution_regressor_student_t() -> None:
+    rng = np.random.default_rng(5)
+    x = rng.uniform(-1, 1, size=(1200, 2))
+    y = 2 * x[:, 1] + (0.3 + np.abs(x[:, 0])) * rng.standard_t(3, 1200)
+    train, test = slice(0, 900), slice(900, None)
+    settings: dict[str, Any] = {"n_estimators": 300, "learning_rate": 0.03, "max_depth": 2}
+    model = HessboostDistributionRegressor(objective="dist:student_t", **settings)
+    model.fit(x[train], y[train])
+    dists = model.predict_distribution(x[test])
+    assert dists.family == "dist:student_t"
+    assert dists.param_names == ["loc", "scale", "df"]
+    assert dists.params.shape == (300, 3)
+    assert np.all(dists.params[:, 1:] > 0)
+    for p in (0.05, 0.5, 0.95):
+        q = dists.quantile(p)
+        assert np.all(np.isfinite(q))
+        np.testing.assert_allclose(dists.cdf(q.astype(np.float32)), p, atol=1e-3)
+    normal = HessboostDistributionRegressor(objective="dist:normal", **settings)
+    normal.fit(x[train], y[train])
+    student_nll = -np.mean(dists.log_prob(y[test]))
+    normal_nll = -np.mean(normal.predict_distribution(x[test]).log_prob(y[test]))
+    assert student_nll < normal_nll
+
+
 def test_estimators_work_in_model_selection_and_pickle() -> None:
     x, y = regression()
     search = GridSearchCV(

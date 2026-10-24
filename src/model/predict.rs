@@ -981,7 +981,7 @@ impl BoostedModel {
             .as_slice()
             .chunks_exact(family.n_params())
             .map(|row| {
-                let mut eta = [0.0; 2];
+                let mut eta = [0.0; crate::objective::distributional::MAX_PARAMS];
                 for (e, &m) in eta.iter_mut().zip(row) {
                     *e = f64::from(m);
                 }

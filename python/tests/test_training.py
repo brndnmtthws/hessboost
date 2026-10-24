@@ -229,6 +229,47 @@ def test_distributional_objective_predicts_distributions() -> None:
         point.predict_distribution(x)
 
 
+def test_student_t_objective_fits_heavy_tails() -> None:
+    rng = np.random.default_rng(11)
+    x = rng.uniform(-1, 1, size=(1500, 2))
+    y = 3 * x[:, 1] + (0.2 + np.abs(x[:, 0])) * rng.standard_t(3, 1500)
+    dtrain = DMatrix(x[:1000], y[:1000])
+    xt, yt = x[1000:], y[1000:]
+    params: dict[str, Any] = {"max_depth": 2, "eta": 0.03}
+    student = hessboost.train({**params, "objective": "dist:student_t"}, dtrain, 300)
+    dists = student.predict_distribution(xt)
+    assert dists.family == "dist:student_t"
+    assert dists.param_names == ["loc", "scale", "df"]
+    assert dists.params.shape == (500, 3)
+    assert np.all(dists.params[:, 1] > 0)
+    assert np.all(dists.params[:, 2] > 0)
+    for p in (0.05, 0.5, 0.95):
+        q = dists.quantile(p)
+        assert np.all(np.isfinite(q))
+        np.testing.assert_allclose(dists.cdf(q.astype(np.float32)), p, atol=1e-3)
+    normal = hessboost.train({**params, "objective": "dist:normal"}, dtrain, 300)
+    student_nll = -np.mean(dists.log_prob(yt))
+    normal_nll = -np.mean(normal.predict_distribution(xt).log_prob(yt))
+    assert student_nll < normal_nll
+
+
+def test_student_t_predicted_df_stays_above_one() -> None:
+    # Tails heavier than the Cauchy's send the degrees of freedom to their
+    # floor, the smallest float32 above 1: `predict` must never report 1.
+    rng = np.random.default_rng(13)
+    x = rng.uniform(-1, 1, size=(500, 2))
+    y = 0.01 * rng.standard_t(0.5, 500)
+    booster = hessboost.train(
+        {"objective": "dist:student_t", "max_depth": 2, "eta": 0.1}, DMatrix(x, y), 20
+    )
+    natural = booster.predict(x)
+    assert natural.shape == (500, 3)
+    df = natural[:, 2]
+    assert np.all(df > 1)
+    assert np.any(df == np.float32(1) + np.finfo(np.float32).eps)
+    assert np.all(np.isfinite(booster.predict_distribution(x).mean()))
+
+
 def test_virtual_ensembles_and_uncertainty() -> None:
     x, y = regression(rows=300)
     params = {"posterior_sampling": True, "max_depth": 3}

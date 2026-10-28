@@ -547,9 +547,10 @@ pub struct TrainingParams {
     /// leaf models fit the objective's gradient/Hessian Newton step; for
     /// `reg:absoluteerror` and `reg:quantileerror` that is the step of their
     /// smooth surrogates (for the L1 surrogate an iteratively reweighted
-    /// least-squares step). Linear-leaf models use the native
-    /// formats only: SHAP, XGBoost export, and the compact format refuse
-    /// them.
+    /// least-squares step). [`LinearTree::clamp`] (`linear_clamp`) bounds
+    /// extrapolation: each leaf clamps its inputs to the ranges it was fit
+    /// on. Linear-leaf models use the native formats only: SHAP, XGBoost
+    /// export, and the compact format refuse them.
     pub linear_tree: Option<LinearTree>,
     /// Train on quantized gradients (LightGBM `use_quantized_grad`), `None`
     /// for full precision. Needs `tree_method` `hist`/`approx` (or `auto`)

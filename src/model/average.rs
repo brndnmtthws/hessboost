@@ -24,11 +24,12 @@ impl BoostedModel {
     /// leaf `v` becomes the `f32` nearest `v / k` (computed as `f64` division
     /// rounded to `f32`, which is correctly rounded for `k < 2^24`); each
     /// `linear_tree` leaf model's `f64` intercept and slopes are divided by
-    /// `k` in `f64`; each output's intercept is the members' intercepts
-    /// summed in `f64` in member order, divided by `k` in `f64`, and rounded
-    /// to `f32` (so members with equal intercepts keep it exactly). The
-    /// average's margin is the members' mean margin up to that rounding and
-    /// to its `f32` sum over the concatenated trees. Every member iteration
+    /// `k` in `f64` (input ranges, when it clamps, are kept); each output's
+    /// intercept is the members' intercepts summed in `f64` in member order,
+    /// divided by `k` in `f64`, and rounded to `f32` (so members with equal
+    /// intercepts keep it exactly). The average's margin is the members'
+    /// mean margin up to that rounding and to its `f32` sum over the
+    /// concatenated trees. Every member iteration
     /// stays an iteration (the average has the members' iteration counts
     /// summed), covers (`sum_hess`) and split gains are kept, and the result
     /// has no `best_iteration`.

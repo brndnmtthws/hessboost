@@ -948,8 +948,9 @@ fn linear_leaves(
     }
     let mut intercepts = vec![0.0; n_internal];
     intercepts.extend(constants);
+    // LightGBM's leaves extrapolate along their slopes: no input ranges.
     Ok(LinearLeaves::from_parts(
-        offsets, intercepts, features, coeffs,
+        offsets, intercepts, features, coeffs, None,
     ))
 }
 

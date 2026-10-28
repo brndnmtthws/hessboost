@@ -441,9 +441,11 @@ request, not the docs.
     rather than skip it, and default its absence to reproduce older files
     (objective parameters: the objective's defaults; the optional
     `boulevard.*` sections: not a Boulevard fit; the optional `ebm.*`
-    sections: not an EBM). Readers refuse
+    sections: not an EBM; the `REQUIRED` `leaf_linear.lower`/`upper`,
+    written only when a tree's linear leaves clamp (`tree.has_linear` 2):
+    no clamping). Readers refuse
     anything undefined inside known sections (unknown `node.flags` bits,
-    `tree.has_linear` not 0/1, trailing bytes), which is what makes new flag
+    `tree.has_linear` not 0/1/2, trailing bytes), which is what makes new flag
     bits safe. Changing a section's meaning or the container layout bumps
     `CONTAINER_VERSION` and needs a reader for the previous version (only
     the current one is accepted). A save whose frame would exceed the
@@ -472,8 +474,9 @@ request, not the docs.
     `deserialize_with = "Option::deserialize"` (a plain `Option` would
     default when absent); exceptions: a tree may omit `size_leaf_vector`
     (0) except in multi-output models, and `leaf_vectors`; an absent
-    `best_iteration` means none, and an absent `shrinkage` means no model
-    shrinkage. Writers emit every field.
+    `best_iteration` means none, an absent `shrinkage` means no model
+    shrinkage, and a `linear` without `ranges` does not clamp. Writers emit
+    every field.
   - Compact (`HBTD`, `model/compact/`): section-table metadata; a bit
     stream change bumps its version byte (1).
   - Diffusion (`HBDM`, `diffusion/format.rs`): the shared container framing
@@ -667,7 +670,8 @@ interaction constraints, forests, feature weights, and base margins, draws
 each classic tree's rows from its outer bag (by class under balanced
 bagging, by query under query bagging), and calls `on_round` after every round of both stages; `ebm_boulevard` adds
 Boulevard's refusals plus outer bags, early stopping, and `base_score`, and
-its loaders check the stage-contiguous round-robin tree layout. Slices and exports drop the `EbmInfo`. Linear-leaf models predict through `tree::linear`;
+its loaders check the stage-contiguous round-robin tree layout. Slices and exports drop the `EbmInfo`. Linear-leaf models predict through `tree::linear`
+(clamping each term's input to its fit's range under `linear_clamp`);
 XGBoost export, SHAP, and compact refuse them.
 
 ## When changing behavior

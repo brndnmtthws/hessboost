@@ -1,7 +1,9 @@
 //! Fitting the linear leaves of [`LinearLeaves`](super::LinearLeaves): every
 //! leaf's ridge-regularized Newton step on the numerical features along its
-//! path, as the [`linear`](super::linear) module describes.
+//! path, as the [`linear`](super::linear) module describes, with each term's
+//! input range when the leaves clamp their inputs.
 
+use crate::config::LinearTree;
 use crate::data::{DMatrix, FeatureType};
 use crate::objective::GradPair;
 use crate::tree::builder::LeafRows;
@@ -14,14 +16,15 @@ use rayon::prelude::*;
 const ZERO_THRESHOLD: f64 = 1e-35_f32 as f64;
 
 /// Fit a linear model in every leaf of `tree` from the training rows `rows`
-/// of `data` and their gradients (`gpair`, indexed by row), with slope
-/// penalty `lambda`, before shrinkage. Single-leaf trees are left constant.
+/// of `data` and their gradients (`gpair`, indexed by row), as `linear`
+/// configures them (slope penalty, input clamping), before shrinkage.
+/// Single-leaf trees are left constant.
 pub(crate) fn fit_linear_leaves(
     tree: &mut RegTree,
     data: &DMatrix,
     gpair: &[GradPair],
     rows: &[u32],
-    lambda: f64,
+    linear: LinearTree,
 ) {
     let nodes = tree.nodes();
     if nodes.len() == 1 {
@@ -36,7 +39,7 @@ pub(crate) fn fit_linear_leaves(
     for (&r, &leaf) in rows.iter().zip(&leaves) {
         members[leaf as usize].push(r);
     }
-    fit_leaf_members(tree, data, gpair, &members, lambda);
+    fit_leaf_members(tree, data, gpair, &members, linear);
 }
 
 /// [`fit_linear_leaves`] from the rows the tree builder partitioned into
@@ -47,7 +50,7 @@ pub(crate) fn fit_captured_linear_leaves(
     data: &DMatrix,
     gpair: &[GradPair],
     leaf_rows: &[LeafRows],
-    lambda: f64,
+    linear: LinearTree,
 ) {
     let n_nodes = tree.num_nodes();
     if n_nodes == 1 {
@@ -57,7 +60,27 @@ pub(crate) fn fit_captured_linear_leaves(
     for leaf in leaf_rows {
         members[leaf.node] = &leaf.rows;
     }
-    fit_leaf_members(tree, data, gpair, &members, lambda);
+    fit_leaf_members(tree, data, gpair, &members, linear);
+}
+
+/// One leaf's model: its intercept, its non-negligible `(feature, slope)`
+/// terms, and, when the leaves clamp, each term's input range (empty
+/// otherwise).
+struct LeafModel {
+    intercept: f64,
+    terms: Vec<(u32, f64)>,
+    ranges: Vec<[f32; 2]>,
+}
+
+impl LeafModel {
+    /// A leaf (or internal node) without terms.
+    fn constant(intercept: f64) -> Self {
+        LeafModel {
+            intercept,
+            terms: Vec::new(),
+            ranges: Vec::new(),
+        }
+    }
 }
 
 /// Fit every leaf's model from its training rows, `members[leaf]`.
@@ -66,18 +89,18 @@ fn fit_leaf_members(
     data: &DMatrix,
     gpair: &[GradPair],
     members: &[impl AsRef<[u32]> + Sync],
-    lambda: f64,
+    linear: LinearTree,
 ) {
     let nodes = tree.nodes();
     let features = path_features(nodes, data.feature_types());
-    let models: Vec<(f64, Vec<(u32, f64)>)> = (0..nodes.len())
+    let models: Vec<LeafModel> = (0..nodes.len())
         .into_par_iter()
         .map(|id| {
             if !nodes[id].is_leaf() {
-                return (0.0, Vec::new());
+                return LeafModel::constant(0.0);
             }
-            fit_leaf(&features[id], members[id].as_ref(), data, gpair, lambda)
-                .unwrap_or((f64::from(nodes[id].leaf_value), Vec::new()))
+            fit_leaf(&features[id], members[id].as_ref(), data, gpair, linear)
+                .unwrap_or_else(|| LeafModel::constant(f64::from(nodes[id].leaf_value)))
         })
         .collect();
 
@@ -85,13 +108,15 @@ fn fit_leaf_members(
     let mut intercepts = Vec::with_capacity(nodes.len());
     let mut term_features = Vec::new();
     let mut term_coeffs = Vec::new();
+    let mut term_ranges = Vec::new();
     offsets.push(0);
-    for (intercept, terms) in models {
-        intercepts.push(intercept);
-        for (f, c) in terms {
+    for model in models {
+        intercepts.push(model.intercept);
+        for (f, c) in model.terms {
             term_features.push(f);
             term_coeffs.push(c);
         }
+        term_ranges.extend(model.ranges);
         offsets.push(term_features.len() as u32);
     }
     tree.set_linear_leaves(LinearLeaves::from_parts(
@@ -99,6 +124,7 @@ fn fit_leaf_members(
         intercepts,
         term_features,
         term_coeffs,
+        linear.clamp().then_some(term_ranges),
     ));
 }
 
@@ -129,14 +155,16 @@ fn path_features(nodes: &[Node], types: &[FeatureType]) -> Vec<Vec<u32>> {
 
 /// Solve one leaf's ridge system. `None` keeps the constant leaf: too few
 /// complete rows, or a singular / non-finite solution. Otherwise returns the
-/// intercept and the non-negligible `(feature, slope)` terms.
+/// intercept, the non-negligible `(feature, slope)` terms, and, when
+/// `linear` clamps, their input ranges: each feature's smallest and largest
+/// value among the complete rows with a nonzero gradient or Hessian.
 fn fit_leaf(
     features: &[u32],
     rows: &[u32],
     data: &DMatrix,
     gpair: &[GradPair],
-    lambda: f64,
-) -> Option<(f64, Vec<(u32, f64)>)> {
+    linear: LinearTree,
+) -> Option<LeafModel> {
     let p = features.len();
     let dim = p + 1;
     // Upper triangle of XᵀHX (row-major) and Xᵀg, accumulated in row order in
@@ -145,6 +173,9 @@ fn fit_leaf(
     let mut xtg = vec![0.0f64; dim];
     let mut x = vec![0.0f32; dim];
     x[p] = 1.0;
+    // Widened by comparison, so equal values (`-0.0` and `0.0`) keep the
+    // first row's bits whatever the platform's `min`/`max`.
+    let mut ranges = vec![[f32::INFINITY, f32::NEG_INFINITY]; if linear.clamp() { p } else { 0 }];
     let mut complete = 0usize;
     'rows: for &r in rows {
         for (slot, &f) in x.iter_mut().zip(features) {
@@ -155,6 +186,18 @@ fn fit_leaf(
         }
         complete += 1;
         let GradPair { grad, hess } = gpair[r as usize];
+        // A row whose pair is zero (a zero-weight row) adds nothing to the
+        // system: the model is not fit on its values.
+        if grad != 0.0 || hess != 0.0 {
+            for (range, &v) in ranges.iter_mut().zip(&x) {
+                if v < range[0] {
+                    range[0] = v;
+                }
+                if v > range[1] {
+                    range[1] = v;
+                }
+            }
+        }
         let mut k = 0;
         for i in 0..dim {
             let xi = f64::from(x[i]);
@@ -178,18 +221,23 @@ fn fit_leaf(
             k += 1;
         }
         if i < p {
-            a[i * dim + i] += lambda;
+            a[i * dim + i] += linear.lambda();
         }
     }
     let rhs: Vec<f64> = xtg.iter().map(|v| -v).collect();
+    // A solution exists only if some row's pair was nonzero (otherwise the
+    // intercept's row of the system is zero) and every value was finite (an
+    // infinite one makes the solution non-finite), so a fitted leaf's ranges
+    // are finite and ordered.
     let beta = solve_full_pivot(a, rhs)?;
-    let terms = features
-        .iter()
-        .zip(&beta)
-        .filter(|&(_, c)| c.abs() > ZERO_THRESHOLD)
-        .map(|(&f, &c)| (f, c))
-        .collect();
-    Some((beta[p], terms))
+    let mut model = LeafModel::constant(beta[p]);
+    for (i, (&f, &c)) in features.iter().zip(&beta).enumerate() {
+        if c.abs() > ZERO_THRESHOLD {
+            model.terms.push((f, c));
+            model.ranges.extend(ranges.get(i));
+        }
+    }
+    Some(model)
 }
 
 /// Solve `A x = b` for a square row-major `A` by Gaussian elimination with
@@ -312,7 +360,13 @@ mod tests {
         let rows = [0, 1, 2, 3, 4];
         let lambda = 2.0;
         let mut tree = stump(true);
-        fit_linear_leaves(&mut tree, &data, &gpair, &rows, lambda);
+        fit_linear_leaves(
+            &mut tree,
+            &data,
+            &gpair,
+            &rows,
+            LinearTree::new(lambda).unwrap(),
+        );
         let (sxx, sx, n, sxy, sy) = (30.0 + lambda, 10.0, 4.0, 70.0, 24.0);
         let det = sxx * n - sx * sx;
         let slope = (n * sxy - sx * sy) / det;
@@ -326,7 +380,7 @@ mod tests {
         assert_eq!(tree.predict_row(&data, 0), -0.5);
         // Without a penalty the fit recovers the line.
         let mut exact = stump(true);
-        fit_linear_leaves(&mut exact, &data, &gpair, &rows, 0.0);
+        fit_linear_leaves(&mut exact, &data, &gpair, &rows, LinearTree::default());
         for (r, &v) in x.iter().enumerate().skip(1) {
             assert!((exact.predict_row(&data, r) - (2.0 * v + 1.0)).abs() < 1e-5);
         }
@@ -341,12 +395,51 @@ mod tests {
         // The missing row's gradient would dominate the fit if it were used.
         gpair[3] = GradPair::new(1e6, 1.0);
         let mut tree = stump(false);
-        fit_linear_leaves(&mut tree, &data, &gpair, &[0, 1, 2, 3, 4, 5], 0.0);
+        let all = [0, 1, 2, 3, 4, 5];
+        fit_linear_leaves(&mut tree, &data, &gpair, &all, LinearTree::default());
         assert_eq!(tree.predict_row(&data, 3), 0.25);
         for r in [1, 2, 4, 5] {
             let want = 2.0 * x[r] + 1.0;
             assert!((tree.predict_row(&data, r) - want).abs() < 1e-5, "row {r}");
         }
+    }
+
+    /// A clamping fit records each term's range over the rows that entered
+    /// it (a zero-weight row's value does not widen it), predicts those rows
+    /// bit for bit as the unclamped fit does, and is flat beyond the range.
+    #[test]
+    fn clamped_fits_record_their_rows_ranges_and_stay_flat_beyond_them() {
+        // Right-leaf rows x = 1, 2, 3, 4, and a zero-weight row at x = 50.
+        let x = [-1.0f32, 1.0, 2.0, 3.0, 50.0, 4.0];
+        let data = column(&x);
+        let mut gpair = line_gradients(&x);
+        gpair[4] = GradPair::new(0.0, 0.0);
+        let rows = [0, 1, 2, 3, 4, 5];
+        let mut plain = stump(true);
+        fit_linear_leaves(&mut plain, &data, &gpair, &rows, LinearTree::default());
+        let mut clamped = stump(true);
+        let clamp = LinearTree::default().with_clamp(true);
+        fit_linear_leaves(&mut clamped, &data, &gpair, &rows, clamp);
+        let (linear, unclamped) = (
+            clamped.linear_leaves().unwrap(),
+            plain.linear_leaves().unwrap(),
+        );
+        assert_eq!(linear.ranges(2), Some(&[[1.0f32, 4.0]][..]));
+        // The single left row cannot fit a model: no terms, no ranges.
+        assert_eq!(linear.ranges(1), Some(&[][..]));
+        assert_eq!(unclamped.ranges(2), None);
+        assert_eq!(linear.terms(2), unclamped.terms(2));
+        for r in [0, 1, 2, 3, 5] {
+            assert_eq!(
+                clamped.predict_row(&data, r).to_bits(),
+                plain.predict_row(&data, r).to_bits(),
+                "row {r}"
+            );
+        }
+        // The zero-weight row lies past the range: it gets the value at 4,
+        // not the line's 101.
+        assert_eq!(clamped.predict_row(&data, 4), clamped.predict_row(&data, 5));
+        assert!((plain.predict_row(&data, 4) - 101.0).abs() < 1e-3);
     }
 
     #[test]

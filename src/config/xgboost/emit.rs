@@ -251,6 +251,7 @@ impl TrainingParams {
         set("linear_tree", json(linear_tree.is_some()));
         if let Some(linear_tree) = linear_tree {
             set("linear_lambda", json(linear_tree.lambda()));
+            set("linear_clamp", json(linear_tree.clamp()));
         }
         set("use_quantized_grad", json(quantized.is_some()));
         if let Some(quantized) = quantized {

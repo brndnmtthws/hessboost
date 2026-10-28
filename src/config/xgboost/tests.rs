@@ -148,6 +148,10 @@ fn dependent_keys_without_their_switch_are_refused_by_name() {
         (json!({"extra_seed": 3}), "extra_seed"),
         (json!({"extra_trees": false, "extra_seed": 3}), "extra_seed"),
         (json!({"linear_lambda": 0.5}), "linear_lambda"),
+        (
+            json!({"linear_tree": false, "linear_clamp": true}),
+            "linear_clamp",
+        ),
         (json!({"num_grad_quant_bins": 8}), "num_grad_quant_bins"),
     ] {
         let refusal = refused(pairs.clone()).unwrap_or_else(|| panic!("{pairs} accepted"));
@@ -256,7 +260,7 @@ fn option_groups_round_trip_through_the_flat_form() {
         ),
         process_type: ProcessType::Update(Refresh::stats_only()),
         extra_trees: Some(ExtraTrees::with_seed(11)),
-        linear_tree: Some(LinearTree::new(0.5).unwrap()),
+        linear_tree: Some(LinearTree::new(0.5).unwrap().with_clamp(true)),
         quantized: Some(
             QuantizedGrad::builder()
                 .bins(8)

@@ -458,6 +458,13 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
             return Ok(None);
         }
     }
+    // Drawn after the boosters for the same reason; exhausted input (`false`)
+    // keeps linear leaves unclamped.
+    if let Some(linear) = params.linear_tree
+        && u.arbitrary()?
+    {
+        params.linear_tree = Some(linear.with_clamp(true));
+    }
     Ok(Some(Case {
         params,
         dtrain,

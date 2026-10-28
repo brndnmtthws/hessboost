@@ -598,25 +598,69 @@ impl Default for ExtraTrees {
 /// every leaf fits the numerical features split on along its path, with an
 /// L2 penalty `lambda >= 0` on the slopes, not the intercepts (LightGBM
 /// `linear_lambda`, default 0).
+///
+/// With [`clamp`](Self::clamp) (`linear_clamp`, default off; LightGBM has
+/// no such option) every leaf records, per term, the smallest and largest
+/// value of the term's feature among the rows its model was fit on, and
+/// prediction clamps a row's value to that range before the slope
+/// multiplies it. Past the values a leaf was fit on, its model then stays
+/// flat, as a constant leaf does, instead of extrapolating along its
+/// slopes: a leaf's output is bounded by its model's extremes over the box
+/// of those ranges. The rows a leaf was fit on are its training rows with
+/// every feature of its model present, except rows whose gradient and
+/// Hessian are both zero (such as zero-weight rows), which contribute
+/// nothing to its fit. Every row it was fit on lies inside its ranges, so
+/// clamping changes the leaf's output only for other rows: new data, and
+/// training rows its fit left out (sampled-out or zero-weight ones).
+///
+/// ```
+/// use hessboost::config::LinearTree;
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let linear = LinearTree::new(10.0)?.with_clamp(true);
+/// assert_eq!((linear.lambda(), linear.clamp()), (10.0, true));
+/// assert!(!LinearTree::default().clamp());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LinearTree {
     lambda: f64,
+    /// `linear_clamp`.
+    clamp: bool,
 }
 
 impl LinearTree {
-    /// Linear leaves with slope penalty `lambda`.
+    /// Linear leaves with slope penalty `lambda`, inputs unclamped.
     ///
     /// # Errors
     ///
     /// `linear_lambda` is negative or not finite.
     pub fn new(lambda: f64) -> Result<Self> {
         non_negative("linear_lambda", lambda)?;
-        Ok(LinearTree { lambda })
+        Ok(LinearTree {
+            lambda,
+            clamp: false,
+        })
+    }
+
+    /// These linear leaves with their inputs clamped to the ranges they
+    /// were fit on (`clamp = true`), or unclamped (`linear_clamp`).
+    #[must_use]
+    pub fn with_clamp(mut self, clamp: bool) -> Self {
+        self.clamp = clamp;
+        self
     }
 
     /// The penalty on the leaf models' slopes.
     pub fn lambda(&self) -> f64 {
         self.lambda
+    }
+
+    /// Whether every leaf model clamps its inputs to the ranges it was fit
+    /// on (`linear_clamp`).
+    pub fn clamp(&self) -> bool {
+        self.clamp
     }
 }
 

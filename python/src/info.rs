@@ -22,6 +22,9 @@ struct LinearArrays {
     offsets: Vec<i64>,
     features: Vec<i32>,
     coefficients: Vec<f64>,
+    /// Every term's `[lower, upper]` input range, row-major, when the
+    /// leaves clamp their inputs.
+    ranges: Option<Vec<f32>>,
 }
 
 /// One tree's node-indexed arrays.
@@ -99,6 +102,8 @@ impl TreeArrays {
                 offsets: Vec::with_capacity(nodes.len() + 1),
                 features: Vec::new(),
                 coefficients: Vec::new(),
+                // Either every node has ranges (clamping leaves) or none has.
+                ranges: linear.ranges(0).map(|_| Vec::new()),
             };
             out.offsets.push(0);
             for nid in 0..nodes.len() {
@@ -108,6 +113,9 @@ impl TreeArrays {
                     out.features.push(int32(feature, "a linear-leaf feature")?);
                 }
                 out.coefficients.extend_from_slice(coefficients);
+                if let (Some(kept), Some(ranges)) = (&mut out.ranges, linear.ranges(nid)) {
+                    kept.extend(ranges.iter().flatten());
+                }
                 out.offsets.push(out.features.len() as i64);
             }
             arrays.linear = Some(out);
@@ -149,6 +157,11 @@ impl TreeArrays {
                 d.set_item("offsets", to_numpy(py, linear.offsets, &[nodes + 1])?)?;
                 d.set_item("features", to_numpy(py, linear.features, &[terms])?)?;
                 d.set_item("coefficients", to_numpy(py, linear.coefficients, &[terms])?)?;
+                let ranges = match linear.ranges {
+                    Some(ranges) => Some(to_numpy(py, ranges, &[terms, 2])?),
+                    None => None,
+                };
+                d.set_item("ranges", ranges)?;
                 Some(d)
             }
             None => None,

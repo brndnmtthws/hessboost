@@ -164,6 +164,7 @@ flat_params! {
     path_smooth: f64,
     linear_tree: bool,
     linear_lambda: f64,
+    linear_clamp: bool,
     use_quantized_grad: bool,
     num_grad_quant_bins: usize,
     stochastic_rounding: bool,

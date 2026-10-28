@@ -196,7 +196,10 @@
 //!     ([`TrainingParams::extra_trees`](config::TrainingParams::extra_trees),
 //!     [`path_smooth`](config::TrainingParams::path_smooth),
 //!     [`linear_tree`](config::TrainingParams::linear_tree),
-//!     [`LinearLeaves`](tree::LinearLeaves));
+//!     [`LinearLeaves`](tree::LinearLeaves)), and linear leaves that clamp
+//!     their inputs to the ranges they were fit on, so they stay flat
+//!     beyond them ([`LinearTree::clamp`](config::LinearTree::clamp),
+//!     `linear_clamp`);
 //!   - LightGBM class-balanced bagging for binary classification
 //!     ([`BalancedBagging`](config::BalancedBagging): `pos_bagging_fraction`,
 //!     `neg_bagging_fraction`), in place of `subsample`;

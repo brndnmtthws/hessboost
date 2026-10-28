@@ -701,7 +701,7 @@ models yet) counts as unreleased: the bump starts from that release, so
 `bump minor` or `bump <manifest version>` targets the manifest version,
 updates the snippets from the release's minor, and saves its models.
 Review and merge that PR; then, on `main`, run `./release.py --dry-run` and
-`./release.py` to create and push the annotated release tag. The tag runs
+`./release.py` to create and push the signed annotated release tag. The tag runs
 `.github/workflows/publish.yml`, which verifies the Rust tests and Python
 wheels/sdists before publishing to crates.io and PyPI
 (`hessboost-runtime-cuda`, then `hessboost`) and creating a GitHub

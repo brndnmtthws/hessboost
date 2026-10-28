@@ -7,7 +7,8 @@
 
 `./release.py bump {major|minor|patch|X.Y.Z[-alpha.N|-beta.N|-rc.N]}` prepares,
 pushes, and opens the release-bump PR. After merging it, `./release.py` creates
-and pushes the annotated release tag. The no-subcommand flow remains tagging.
+and pushes the signed annotated release tag. The no-subcommand flow remains
+tagging.
 
 A bump starts from the manifest version, or from the latest crates.io release
 when the manifest is an unreleased bump made by hand (see `bump_base`).
@@ -650,7 +651,7 @@ def main() -> int:
     commit = run("git", "log", "-1", "--format=%h %s")
     prerelease = " (marked prerelease)" if "-" in version else ""
     print(
-        f"\nRelease hessboost {version}\n  tag:    {tag} (annotated)\n  commit: {commit}\n"
+        f"\nRelease hessboost {version}\n  tag:    {tag} (signed)\n  commit: {commit}\n"
         f"Pushing {tag} starts Publish: it validates, builds and verifies Python "
         f"distributions, publishes hessboost {version} to crates.io and hessboost "
         f"{pep440(version)} to PyPI, then creates a GitHub release{prerelease}."
@@ -661,7 +662,7 @@ def main() -> int:
     if not args.yes and not confirm(f"\nCreate and push tag {tag}? [y/N] "):
         print("Aborted.")
         return 1
-    run("git", "tag", "-a", tag, "-m", tag)
+    run("git", "tag", "-s", tag, "-m", tag)
     try:
         run("git", "push", "origin", f"refs/tags/{tag}")
     except CheckError:

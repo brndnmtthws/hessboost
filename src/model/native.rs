@@ -12,7 +12,13 @@
 //! parameters `objective.*`, and the trees are stored column-wise: one array
 //! per node field across all trees (`node.*`), split per tree by
 //! `tree.node_count`, plus per-tree category pools, leaf vectors and leaf
-//! linear models. `model.writer` (optional, not `REQUIRED`, never read back)
+//! linear models. `tree.has_linear` is 0 for constant leaves, 1 for linear
+//! leaves, and 2 for linear leaves that clamp their inputs, whose terms'
+//! ranges are `leaf_linear.lower` and `leaf_linear.upper` (`f32`, one per
+//! term of those trees, in tree order); those two sections exist only when
+//! some tree clamps, and are `REQUIRED`, so a reader that predates them
+//! refuses such a file instead of extrapolating its leaves.
+//! `model.writer` (optional, not `REQUIRED`, never read back)
 //! names the release that wrote the file, e.g. `hessboost 0.2.0`. A model
 //! trained with model shrinkage adds `shrinkage.factors` (`f64`, one
 //! coefficient per iteration) and `shrinkage.base_score` (`f32`, the
@@ -23,7 +29,7 @@
 //! EBM the `ebm.*` sections of its [`EbmInfo`] (likewise optional).
 //!
 //! The reader is strict about everything it knows: `node.flags` bits it
-//! does not define, `tree.has_linear` bytes other than 0 and 1, and bytes
+//! does not define, `tree.has_linear` bytes other than 0, 1 and 2, and bytes
 //! between the last payload and the checksum are refused, so a later
 //! writer can give any of them a meaning without this version misreading
 //! the file.
@@ -94,6 +100,14 @@ const CATEGORICAL: u8 = 2;
 /// Every bit `node.flags` defines; the reader refuses the others.
 const NODE_FLAGS: u8 = DEFAULT_LEFT | CATEGORICAL;
 
+/// `tree.has_linear` of a tree with linear leaves.
+const LINEAR: u8 = 1;
+/// `tree.has_linear` of a tree whose linear leaves clamp their inputs to
+/// the `leaf_linear.lower`/`upper` ranges.
+const CLAMPED_LINEAR: u8 = 2;
+/// The sections of the clamped trees' term ranges.
+const RANGE_SECTIONS: [&str; 2] = ["leaf_linear.lower", "leaf_linear.upper"];
+
 /// Every section this version reads.
 const KNOWN: &[&str] = &[
     "model.objective",
@@ -130,6 +144,8 @@ const KNOWN: &[&str] = &[
     "leaf_linear.intercepts",
     "leaf_linear.features",
     "leaf_linear.coeffs",
+    RANGE_SECTIONS[0],
+    RANGE_SECTIONS[1],
     "boulevard.dropout",
     "boulevard.learning_rate",
     "boulevard.subsample",
@@ -509,29 +525,44 @@ fn write_tree_sections(w: &mut Writer, trees: &[RegTree]) {
     };
     w.array(
         "tree.has_linear",
-        trees.iter().map(|t| u8::from(t.linear_leaves().is_some())),
+        trees.iter().map(|t| match t.linear_leaves() {
+            None => 0,
+            Some(linear) if linear.parts().ranges.is_none() => LINEAR,
+            Some(_) => CLAMPED_LINEAR,
+        }),
         |b: u8| [b],
     );
     w.array(
         "leaf_linear.offsets",
-        linear().flat_map(|p| p.0.iter().copied()),
+        linear().flat_map(|p| p.offsets.iter().copied()),
         u32::to_le_bytes,
     );
     w.array(
         "leaf_linear.intercepts",
-        linear().flat_map(|p| p.1.iter().copied()),
+        linear().flat_map(|p| p.intercepts.iter().copied()),
         f64::to_le_bytes,
     );
     w.array(
         "leaf_linear.features",
-        linear().flat_map(|p| p.2.iter().copied()),
+        linear().flat_map(|p| p.features.iter().copied()),
         u32::to_le_bytes,
     );
     w.array(
         "leaf_linear.coeffs",
-        linear().flat_map(|p| p.3.iter().copied()),
+        linear().flat_map(|p| p.coeffs.iter().copied()),
         f64::to_le_bytes,
     );
+    // Only models that clamp carry the ranges, so every other model's file
+    // stays readable by releases that predate them.
+    if linear().any(|p| p.ranges.is_some()) {
+        for (side, name) in RANGE_SECTIONS.into_iter().enumerate() {
+            w.array(
+                name,
+                linear().flat_map(|p| p.ranges.into_iter().flatten().map(move |r| r[side])),
+                f32::to_le_bytes,
+            );
+        }
+    }
 }
 
 /// Decode a container (zstd-compressed or not). The caller validates the
@@ -607,15 +638,24 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
     }
     let mut categories = Cursor::new(s.array("tree.categories", u32::from_le_bytes)?);
     let mut leaf_vectors = Cursor::new(s.array("tree.leaf_vectors", f32::from_le_bytes)?);
-    if let Some(&bad) = has_linear.iter().find(|&&b| b > 1) {
+    if let Some(&bad) = has_linear.iter().find(|&&b| b > CLAMPED_LINEAR) {
         return Err(format_error(format!(
-            "`tree.has_linear` holds {bad}, not 0 or 1"
+            "`tree.has_linear` holds {bad}, not 0, 1 or 2"
         )));
     }
     let mut offsets = Cursor::new(s.array("leaf_linear.offsets", u32::from_le_bytes)?);
     let mut intercepts = Cursor::new(s.array("leaf_linear.intercepts", f64::from_le_bytes)?);
     let mut features = Cursor::new(s.array("leaf_linear.features", u32::from_le_bytes)?);
     let mut coeffs = Cursor::new(s.array("leaf_linear.coeffs", f64::from_le_bytes)?);
+    // Written together, and only when some tree clamps its inputs.
+    let [mut lower, mut upper] = if RANGE_SECTIONS.iter().any(|name| s.has(name)) {
+        [
+            Cursor::new(s.array(RANGE_SECTIONS[0], f32::from_le_bytes)?),
+            Cursor::new(s.array(RANGE_SECTIONS[1], f32::from_le_bytes)?),
+        ]
+    } else {
+        [Cursor::new(Vec::new()), Cursor::new(Vec::new())]
+    };
 
     let mut trees = Vec::with_capacity(n_trees);
     let mut first = 0usize;
@@ -641,17 +681,24 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
         let n_weights = n
             .checked_mul(width)
             .ok_or_else(|| format_error("leaf vectors overflow"))?;
-        let linear = if has_linear[t] == 1 {
+        let linear = if has_linear[t] == 0 {
+            None
+        } else {
             let offsets = offsets.take(n + 1, "leaf_linear.offsets")?;
             let n_terms = offsets.last().map_or(0, |&end| end as usize);
+            let intercepts = intercepts.take(n, "leaf_linear.intercepts")?;
+            let features = features.take(n_terms, "leaf_linear.features")?;
+            let coeffs = coeffs.take(n_terms, "leaf_linear.coeffs")?;
+            let ranges = if has_linear[t] == CLAMPED_LINEAR {
+                let lower = lower.take(n_terms, RANGE_SECTIONS[0])?;
+                let upper = upper.take(n_terms, RANGE_SECTIONS[1])?;
+                Some(lower.into_iter().zip(upper).map(|(l, u)| [l, u]).collect())
+            } else {
+                None
+            };
             Some(LinearLeaves::from_parts(
-                offsets,
-                intercepts.take(n, "leaf_linear.intercepts")?,
-                features.take(n_terms, "leaf_linear.features")?,
-                coeffs.take(n_terms, "leaf_linear.coeffs")?,
+                offsets, intercepts, features, coeffs, ranges,
             ))
-        } else {
-            None
         };
         trees.push(RegTree::from_parts(
             nodes,
@@ -668,6 +715,8 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
         (intercepts.rest(), "leaf_linear.intercepts"),
         (features.rest(), "leaf_linear.features"),
         (coeffs.rest(), "leaf_linear.coeffs"),
+        (lower.rest(), RANGE_SECTIONS[0]),
+        (upper.rest(), RANGE_SECTIONS[1]),
     ] {
         if rest != 0 {
             return Err(wrong_length(name));
@@ -995,7 +1044,7 @@ mod tests {
 
     /// Values a later writer could give a meaning are refused rather than
     /// ignored: undefined `node.flags` bits, `tree.has_linear` bytes other
-    /// than 0 and 1, and bytes after the last section.
+    /// than 0, 1 and 2, and bytes after the last section.
     #[test]
     fn undefined_encodings_are_refused() {
         let (model, _) = model();
@@ -1009,7 +1058,7 @@ mod tests {
         for (edited, needle) in [
             (set("node.flags", 4), "node.flags"),
             (set("node.flags", 0x80), "node.flags"),
-            (set("tree.has_linear", 2), "tree.has_linear"),
+            (set("tree.has_linear", 3), "tree.has_linear"),
         ] {
             let err = BoostedModel::decode(&edited, ModelFormat::Binary)
                 .unwrap_err()

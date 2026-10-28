@@ -152,8 +152,10 @@ class LinearLeavesInfo:
     """The per-leaf linear models of a ``linear_tree`` tree
     (:attr:`TreeInfo.linear`), node-indexed: leaf ``n`` predicts
     ``intercept[n] + sum(coefficients[i] * x[features[i]])`` over ``i`` in
-    ``offsets[n]:offsets[n + 1]``, or its constant :attr:`TreeInfo.value`
-    when any of those features is missing. Internal nodes have no terms."""
+    ``offsets[n]:offsets[n + 1]``, each ``x[features[i]]`` first clipped to
+    ``ranges[i]`` when the leaves clamp their inputs, or its constant
+    :attr:`TreeInfo.value` when any of those features is missing. Internal
+    nodes have no terms."""
 
     intercept: NDArray[np.float64]
     """Every node's intercept (``0`` for internal nodes), ``(nodes,)``."""
@@ -163,6 +165,11 @@ class LinearLeavesInfo:
     """Every term's feature, node by node in evaluation order."""
     coefficients: NDArray[np.float64]
     """Every term's slope, aligned with :attr:`features`."""
+    ranges: NDArray[np.float32] | None
+    """Every term's ``[lower, upper]`` input range, ``(terms, 2)`` aligned
+    with :attr:`features`, for a model trained with ``linear_clamp``: the
+    smallest and largest value of the term's feature among the rows its leaf
+    was fit on. ``None`` when the leaves do not clamp their inputs."""
 
 
 @dataclass(frozen=True)

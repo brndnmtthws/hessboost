@@ -182,9 +182,11 @@ def test_shrinkage_record() -> None:
         assert margin[0] == want
 
 
-def test_linear_leaves_record() -> None:
+@pytest.mark.parametrize("clamp", [False, True])
+def test_linear_leaves_record(clamp: bool) -> None:
     x, y = regression(rows=300)
-    booster = hessboost.train({"linear_tree": True, "max_depth": 2}, DMatrix(x, y), 3)
+    params = {"linear_tree": True, "linear_clamp": clamp, "max_depth": 2}
+    booster = hessboost.train(params, DMatrix(x, y), 3)
     info = booster.model_info()
     assert info.linear_leaves
     # The first boosting round keeps constant leaves.
@@ -201,9 +203,19 @@ def test_linear_leaves_record() -> None:
         assert linear.offsets[-1] == len(linear.features) == len(linear.coefficients)
         internal = np.flatnonzero(tree.left != -1)
         np.testing.assert_array_equal(linear.offsets[internal + 1], linear.offsets[internal])
-    # A leaf predicts its linear model on rows with every term present.
-    expected = booster.predict(x[:10], output_margin=True)
-    for row, want in zip(float32_rows(x[:10]), expected, strict=True):
+        if clamp:
+            assert linear.ranges is not None
+            assert linear.ranges.dtype == np.float32
+            assert linear.ranges.shape == (len(linear.features), 2)
+            assert (linear.ranges[:, 0] <= linear.ranges[:, 1]).all()
+        else:
+            assert linear.ranges is None
+    # A leaf predicts its linear model on rows with every term present,
+    # each value first clipped to its range when the leaves clamp: also on
+    # rows far outside the training data.
+    rows = x[:10] * 100 if clamp else x[:10]
+    expected = booster.predict(rows, output_margin=True)
+    for row, want in zip(float32_rows(rows), expected, strict=True):
         margin = float(info.base_margins[0])
         for tree in info.trees:
             n = leaf(tree, row)
@@ -212,7 +224,11 @@ def test_linear_leaves_record() -> None:
                 continue
             linear = tree.linear
             terms = slice(linear.offsets[n], linear.offsets[n + 1])
-            values = row[linear.features[terms]].astype(np.float64)
-            margin += float(linear.intercept[n] + linear.coefficients[terms] @ values)
+            values = row[linear.features[terms]]
+            if linear.ranges is not None:
+                values = np.clip(values, linear.ranges[terms, 0], linear.ranges[terms, 1])
+            margin += float(
+                linear.intercept[n] + linear.coefficients[terms] @ values.astype(np.float64)
+            )
         # Summed in float64 here, in float32 per tree by the model.
         assert margin == pytest.approx(float(want), rel=1e-5, abs=1e-5)

@@ -602,12 +602,15 @@ fn grow_sampled_tree(
     if let Some(linear_tree) = params.linear_tree
         && grow.iteration > 0
     {
-        let lambda = linear_tree.lambda();
         if leaf_rows.is_empty() {
-            crate::tree::linear_fit::fit_linear_leaves(&mut tree, dtrain, gk, rows, lambda);
+            crate::tree::linear_fit::fit_linear_leaves(&mut tree, dtrain, gk, rows, linear_tree);
         } else {
             crate::tree::linear_fit::fit_captured_linear_leaves(
-                &mut tree, dtrain, gk, &leaf_rows, lambda,
+                &mut tree,
+                dtrain,
+                gk,
+                &leaf_rows,
+                linear_tree,
             );
         }
     }

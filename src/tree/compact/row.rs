@@ -763,6 +763,7 @@ mod tests {
             vec![0.0, 0.5, 0.0],
             vec![3],
             vec![2.0],
+            None,
         ));
         trees[6 * CHUNK + 1] = linear;
         let mut rows = rows(&mut rng, 100, n_features);

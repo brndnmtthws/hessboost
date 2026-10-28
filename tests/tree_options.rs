@@ -1,5 +1,6 @@
 //! End-to-end behavior of the opt-in LightGBM tree options: `extra_trees`,
-//! `path_smooth`, and `linear_tree` / `linear_lambda`.
+//! `path_smooth`, and `linear_tree` / `linear_lambda`, with hessboost's
+//! `linear_clamp`.
 
 use hessboost::config::{
     BoosterKind, ExtraTrees, LinearTree, Monotone, MultiStrategy, TrainingParamsBuilder,
@@ -170,6 +171,70 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
         incompatible_model(model.predict_interactions(&data, Iterations::Best)),
         "linear_tree"
     );
+}
+
+/// Clamped linear leaves bound their extrapolation: a row moved past either
+/// end of the training range predicts as the training row at that end does,
+/// bit for bit, where unclamped leaves run off along their slopes. Every
+/// training row lies inside its leaves' ranges, so on the training rows the
+/// two fits are the same model; the ranges survive both native formats.
+#[test]
+fn clamped_linear_leaves_stay_flat_beyond_the_training_range() {
+    let n = 1000;
+    let x = uniform(2 * n, 7);
+    let rows = x.as_chunks::<2>().0;
+    let y: Vec<f32> = rows.iter().map(|r| 10.0 * r[0] - 4.0 * r[1]).collect();
+    let data = labeled_dense(&x, 2, &y);
+    let fit = |clamp: bool| {
+        let params = base()
+            .linear_tree(LinearTree::default().with_clamp(clamp))
+            .build()
+            .unwrap();
+        train(&params, &data, 10).unwrap()
+    };
+    let (plain, clamped) = (fit(false), fit(true));
+    let margins = |model: &BoostedModel, data: &DMatrix| {
+        let margins = model.predict_margin(data, Iterations::Best).unwrap();
+        common::bits::bits(margins.as_slice())
+    };
+    assert_eq!(margins(&plain, &data), margins(&clamped, &data));
+    assert!(
+        clamped.trees()[1..]
+            .iter()
+            .all(|t| t.linear_leaves().unwrap().ranges(0).is_some())
+    );
+
+    // The training rows with the smallest and largest `x0`, and copies of
+    // them moved 50 further out.
+    let by_x0 = |a: &&[f32; 2], b: &&[f32; 2]| a[0].total_cmp(&b[0]);
+    let (low, high) = (
+        rows.iter().min_by(by_x0).unwrap(),
+        rows.iter().max_by(by_x0).unwrap(),
+    );
+    let edges = DMatrix::from_dense(&[low[0], low[1], high[0], high[1]], 2, 2).unwrap();
+    let far = DMatrix::from_dense(&[low[0] - 50.0, low[1], high[0] + 50.0, high[1]], 2, 2).unwrap();
+    assert_eq!(margins(&clamped, &far), margins(&clamped, &edges));
+    let jump = |model: &BoostedModel| {
+        let at = |data: &DMatrix| model.predict_margin(data, Iterations::Best).unwrap();
+        let (far, edges) = (at(&far), at(&edges));
+        (far.as_slice()[1] - edges.as_slice()[1]) - (far.as_slice()[0] - edges.as_slice()[0])
+    };
+    // Unclamped, 50 past each end moves the margins along the slope of 10.
+    assert!(jump(&plain) > 400.0, "{}", jump(&plain));
+
+    for format in [ModelFormat::Binary, ModelFormat::Json] {
+        let restored = BoostedModel::decode(clamped.encode(format).unwrap(), format).unwrap();
+        assert_eq!(
+            margins(&restored, &far),
+            margins(&clamped, &far),
+            "{format:?}"
+        );
+        assert_eq!(
+            restored.encode(ModelFormat::Binary).unwrap(),
+            clamped.encode(ModelFormat::Binary).unwrap(),
+            "{format:?}"
+        );
+    }
 }
 
 /// [`piecewise_linear`] with every tenth label shifted by +20: outliers a

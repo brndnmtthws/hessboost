@@ -167,7 +167,9 @@ fn incomplete_json_documents_are_refused() {
     assert_refused(&doc, "multi-target size_leaf_vector");
 
     // Linear leaves: a tree that has them must carry them, with all of
-    // their parts (nothing else marks a linear-leaf tree).
+    // their parts (nothing else marks a linear-leaf tree), except their
+    // input ranges: files written before clamping existed lack them, which
+    // leaves the model unclamped (the writer states `null`).
     let linear = trained_doc(
         &base().linear_tree(LinearTree::default()).build().unwrap(),
         &matrix(1),
@@ -184,16 +186,22 @@ fn incomplete_json_documents_are_refused() {
         .keys()
         .cloned()
         .collect();
+    assert!(linear["trees"][tree]["linear"]["ranges"].is_null());
     let mut doc = linear.clone();
     doc["trees"][tree].as_object_mut().unwrap().remove("linear");
     assert_refused(&doc, "linear leaves");
+    let binary = |doc: &Value| load_doc(doc).unwrap().encode(ModelFormat::Binary).unwrap();
     for part in &parts {
         let mut doc = linear.clone();
         doc["trees"][tree]["linear"]
             .as_object_mut()
             .unwrap()
             .remove(part);
-        assert_refused(&doc, part);
+        if part == "ranges" {
+            assert_eq!(binary(&doc), binary(&linear));
+        } else {
+            assert_refused(&doc, part);
+        }
     }
 }
 
@@ -901,7 +909,8 @@ fn saved_models_keep_loading_with_their_margins() {
 ///
 /// - each `BoostedModel`, loaded from its `.bin` and from its `.json`,
 ///   re-saves the `.json` document member for member (members a later writer
-///   adds are `null`, and none may be dropped) and, where a `.hbtd` was
+///   adds, at any depth, are `null`, and none may be dropped; see
+///   [`adds_only_nulls`]) and, where a `.hbtd` was
 ///   saved, the compact bytes exactly, from every version;
 /// - the native binary containers (`.bin`, `.hbdm`, `.hbff`) re-save byte
 ///   for byte from this version's directory: they record their writer's
@@ -940,7 +949,10 @@ fn saved_models_re_save_byte_identically() {
                         }
                         for (key, value) in resaved {
                             let saved = saved_json.get(key).unwrap_or(&Value::Null);
-                            assert!(value == saved, "{what}: {source} re-saves `{key}`");
+                            assert!(
+                                adds_only_nulls(value, saved),
+                                "{what}: {source} re-saves `{key}`"
+                            );
                         }
                         if let Some(hbtd) = &hbtd {
                             let compact = model.to_compact_bytes().unwrap();
@@ -970,6 +982,29 @@ fn saved_models_re_save_byte_identically() {
         versions += 1;
     }
     assert!(versions > 0, "no saved model versions");
+}
+
+/// Whether `resaved` is `saved` with nothing but `null` members added, at
+/// any depth (a tree's `linear.ranges`, a model's `shrinkage`): what a later
+/// writer may add to an earlier writer's document.
+fn adds_only_nulls(resaved: &Value, saved: &Value) -> bool {
+    match (resaved, saved) {
+        (Value::Object(resaved), Value::Object(saved)) => {
+            saved.keys().all(|key| resaved.contains_key(key))
+                && resaved.iter().all(|(key, value)| match saved.get(key) {
+                    Some(saved) => adds_only_nulls(value, saved),
+                    None => value.is_null(),
+                })
+        }
+        (Value::Array(resaved), Value::Array(saved)) => {
+            resaved.len() == saved.len()
+                && resaved
+                    .iter()
+                    .zip(saved)
+                    .all(|(resaved, saved)| adds_only_nulls(resaved, saved))
+        }
+        _ => resaved == saved,
+    }
 }
 
 /// Write this version's saved models (see the module docs), then drop the

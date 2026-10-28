@@ -92,6 +92,7 @@ impl Flat {
             path_smooth,
             linear_tree: _,
             linear_lambda: _,
+            linear_clamp: _,
             use_quantized_grad: _,
             num_grad_quant_bins: _,
             stochastic_rounding: _,
@@ -315,6 +316,12 @@ impl Flat {
                 "`linear_tree=true`",
             ),
             (
+                "linear_clamp",
+                self.linear_clamp.is_some(),
+                self.linear_tree == Some(true),
+                "`linear_tree=true`",
+            ),
+            (
                 "num_grad_quant_bins",
                 self.num_grad_quant_bins.is_some(),
                 quantized,
@@ -425,7 +432,8 @@ impl Flat {
                 .map_or_else(ExtraTrees::default, ExtraTrees::with_seed)
         });
         let linear_tree = if self.linear_tree == Some(true) {
-            Some(LinearTree::new(self.linear_lambda.unwrap_or_default())?)
+            let linear = LinearTree::new(self.linear_lambda.unwrap_or_default())?;
+            Some(linear.with_clamp(self.linear_clamp.unwrap_or_default()))
         } else {
             None
         };

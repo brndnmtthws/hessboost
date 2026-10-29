@@ -5,10 +5,10 @@ use super::distributional::{
     DistFamily, DistGradient, DistLoss, DistSplitDirection, Distributional,
 };
 use super::{
-    AbsoluteError, Aft, AftDistribution, AftLoss, Cox, Expectile, Expectiles, Gamma, Hinge,
-    LambdaMart, LambdaRank, LogisticLoss, Loss, Multiclass, Poisson, PseudoHuber, PseudoHuberLoss,
-    Quantile, Quantiles, RegLoss, Softmax, SquaredError, SquaredLogError, Tweedie, TweedieLoss,
-    Xendcg, multi_target::MultiTarget,
+    AbsoluteError, Aft, AftDistribution, AftLoss, Cox, Exceedance, Expectile, Expectiles, Gamma,
+    Hinge, LambdaMart, LambdaRank, LogisticLoss, Loss, Multiclass, Poisson, PseudoHuber,
+    PseudoHuberLoss, Quantile, Quantiles, RegLoss, Softmax, SquaredError, SquaredLogError,
+    Thresholds, Tweedie, TweedieLoss, Xendcg, multi_target::MultiTarget,
 };
 use crate::error::{HessboostError, Result};
 use serde::Serialize;
@@ -59,6 +59,23 @@ pub enum Objective {
     Quantile(Quantiles),
     /// `reg:expectileerror`: one output per expectile.
     Expectile(Expectiles),
+    /// `reg:exceedance` (a hessboost extension): distribution regression
+    /// over the threshold ladder [`Thresholds`] `k_1 < … < k_K`, one output
+    /// per threshold against one finite label column, output `j`
+    /// predicting `P(y ≥ k_j)`.
+    ///
+    /// Output `j` trains exactly as `binary:logistic` on the indicator
+    /// `y ≥ k_j` (compared in `f64`), gradients and intercept included; a
+    /// threshold that every label (or no label) reaches gets that
+    /// objective's clamped, finite intercept. Predictions take its sigmoid
+    /// per output, then sort each row descending (monotone rearrangement),
+    /// so they never increase with `j`; `predict` is that transform of
+    /// `predict_margin`. The default metric is `exceedance-logloss`. It
+    /// replaces `K` separate `binary:logistic` models on indicator labels
+    /// with one model, one file, and coherent probabilities; train them
+    /// separately only when thresholds need their own parameters. Models
+    /// save in the native formats only (XGBoost export refuses them).
+    Exceedance(Thresholds),
     /// `reg:logistic`: logistic regression on probabilities, evaluated with
     /// `rmse`.
     RegLogistic(RegLoss),
@@ -141,6 +158,7 @@ impl PartialEq for Objective {
             (O::PseudoHuber(a), O::PseudoHuber(b)) => a == b,
             (O::Quantile(a), O::Quantile(b)) => a == b,
             (O::Expectile(a), O::Expectile(b)) => a == b,
+            (O::Exceedance(a), O::Exceedance(b)) => a == b,
             (O::SquaredError(a), O::SquaredError(b))
             | (O::RegLogistic(a), O::RegLogistic(b))
             | (O::BinaryLogistic(a), O::BinaryLogistic(b))
@@ -215,6 +233,7 @@ pub(crate) struct ObjectiveParts {
     pub(crate) lambdarank_num_pair_per_sample: usize,
     pub(crate) quantile_alpha: Vec<f64>,
     pub(crate) expectile_alpha: Vec<f64>,
+    pub(crate) exceedance_threshold: Vec<f64>,
     pub(crate) aft_loss_distribution: AftDistribution,
     pub(crate) aft_loss_distribution_scale: f64,
     pub(crate) dist_gradient: DistGradient,
@@ -232,6 +251,7 @@ impl Default for ObjectiveParts {
             lambdarank_num_pair_per_sample: LambdaRank::default().num_pair_per_sample(),
             quantile_alpha: Vec::new(),
             expectile_alpha: Vec::new(),
+            exceedance_threshold: Vec::new(),
             aft_loss_distribution: AftDistribution::Normal,
             aft_loss_distribution_scale: Aft::default().scale(),
             dist_gradient: DistGradient::Fisher,
@@ -322,6 +342,12 @@ pub(crate) const OBJECTIVE_PARAMS: &[ObjectiveParam] = &[
         value: |p| json(&p.expectile_alpha),
     },
     ObjectiveParam {
+        key: "exceedance_threshold",
+        users: "`reg:exceedance` and the `exceedance-logloss` metric",
+        read_by: |o| matches!(o, Objective::Exceedance(_)),
+        value: |p| json(&p.exceedance_threshold),
+    },
+    ObjectiveParam {
         key: "aft_loss_distribution",
         users: "`survival:aft` and the `aft-nloglik` metric",
         read_by: |o| matches!(o, Objective::Aft(_)),
@@ -363,6 +389,7 @@ impl Objective {
             Objective::AbsoluteError => "reg:absoluteerror",
             Objective::Quantile(_) => "reg:quantileerror",
             Objective::Expectile(_) => "reg:expectileerror",
+            Objective::Exceedance(_) => "reg:exceedance",
             Objective::RegLogistic(_) => "reg:logistic",
             Objective::BinaryLogistic(_) => "binary:logistic",
             Objective::BinaryLogitRaw(_) => "binary:logitraw",
@@ -454,6 +481,7 @@ impl Objective {
             Objective::SquaredLogError
             | Objective::Quantile(_)
             | Objective::Expectile(_)
+            | Objective::Exceedance(_)
             | Objective::BinaryLogitRaw(_)
             | Objective::BinaryHinge
             | Objective::Softmax(_)
@@ -481,6 +509,7 @@ impl Objective {
             | Objective::SquaredLogError
             | Objective::PseudoHuber(_)
             | Objective::Expectile(_)
+            | Objective::Exceedance(_)
             | Objective::RegLogistic(_)
             | Objective::BinaryLogistic(_)
             | Objective::BinaryLogitRaw(_)
@@ -528,6 +557,8 @@ impl Objective {
             "reg:expectileerror" => {
                 Expectiles::new(parts.expectile_alpha.iter().copied()).map(Objective::Expectile)
             }
+            "reg:exceedance" => Thresholds::new(parts.exceedance_threshold.iter().copied())
+                .map(Objective::Exceedance),
             "reg:logistic" => reg_loss().map(Objective::RegLogistic),
             "binary:logistic" => reg_loss().map(Objective::BinaryLogistic),
             "binary:logitraw" => reg_loss().map(Objective::BinaryLogitRaw),
@@ -574,6 +605,10 @@ impl Objective {
             },
             Objective::Expectile(e) => ObjectiveParts {
                 expectile_alpha: e.alpha().to_vec(),
+                ..d
+            },
+            Objective::Exceedance(t) => ObjectiveParts {
+                exceedance_threshold: t.values().to_vec(),
                 ..d
             },
             Objective::SquaredError(r)
@@ -635,6 +670,7 @@ impl Objective {
             Objective::PseudoHuber(huber) => Box::new(PseudoHuberLoss::new(*huber)),
             Objective::Quantile(q) => Box::new(Quantile::from_levels(q.clone())),
             Objective::Expectile(e) => Box::new(Expectile::from_levels(e.clone())),
+            Objective::Exceedance(t) => Box::new(Exceedance::new(t.clone())),
             Objective::RegLogistic(r) => {
                 Box::new(LogisticLoss::regression(r.scale_pos_weight() as f32))
             }

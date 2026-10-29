@@ -234,6 +234,7 @@ impl Decomposition {
             | Objective::AbsoluteError
             | Objective::Quantile(_)
             | Objective::Expectile(_)
+            | Objective::Exceedance(_)
             | Objective::Poisson
             | Objective::Gamma(_)
             | Objective::Tweedie(_)

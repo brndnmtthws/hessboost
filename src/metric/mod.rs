@@ -628,6 +628,7 @@ mod tests {
         let source = XgboostMetricSource {
             quantile_alpha: &[0.2, 0.8],
             expectile_alpha: &[0.5],
+            exceedance_threshold: &[1.0, 2.0],
             distribution: Some(DistFamily::Normal),
             ..DEFAULT_SOURCE
         };
@@ -655,6 +656,7 @@ mod tests {
             "pre@2",
             "quantile",
             "expectile",
+            "exceedance-logloss",
             "cox-nloglik",
             "aft-nloglik",
             "interval-regression-accuracy",

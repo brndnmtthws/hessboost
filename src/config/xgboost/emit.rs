@@ -30,6 +30,7 @@ fn metric_keys(metric: &EvalMetric, objective: &Objective) -> Result<Vec<(&'stat
         EvalMetric::Mphe(huber) => vec![("huber_slope", json(huber.slope()))],
         EvalMetric::Quantile(q) => vec![("quantile_alpha", json(q.alpha()))],
         EvalMetric::Expectile(e) => vec![("expectile_alpha", json(e.alpha()))],
+        EvalMetric::ExceedanceLogLoss(t) => vec![("exceedance_threshold", json(t.values()))],
         EvalMetric::AftNLogLik(aft) => vec![
             ("aft_loss_distribution", json(aft.distribution())),
             ("aft_loss_distribution_scale", json(aft.scale())),
@@ -71,7 +72,8 @@ impl TrainingParams {
     /// XGBoost's form cannot state: a custom loss, or a
     /// metric whose parameters differ from the objective's (XGBoost's
     /// `mphe`, `quantile`, `expectile`, and `aft-nloglik` read the same
-    /// keys as the objective, and `nll` / `crps` its `dist:*` family).
+    /// keys as the objective, as does `exceedance-logloss`, and `nll` /
+    /// `crps` its `dist:*` family).
     pub fn to_xgboost(&self) -> Result<Map<String, Value>> {
         let TrainingParams {
             booster,

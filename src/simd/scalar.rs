@@ -156,6 +156,13 @@ fn xlogy(x: f64, y: f64) -> f64 {
     }
 }
 
+/// XGBoost's `logloss` of one `label` and `probability`:
+/// `−y·ln(max(p, ε)) − (1 − y)·ln(max(1 − p, ε))`, a zero-coefficient term
+/// dropped.
+pub(super) fn log_loss_term(label: f64, probability: f64) -> f64 {
+    xlogy(-label, probability) + xlogy(-(1.0 - label), 1.0 - probability)
+}
+
 pub(super) fn log_loss(
     preds: &[f32],
     labels: &[f32],
@@ -163,9 +170,7 @@ pub(super) fn log_loss(
     range: std::ops::Range<usize>,
 ) -> (f64, f64) {
     weighted_sum(weights, range, |index| {
-        let probability = f64::from(preds[index]);
-        let label = f64::from(labels[index]);
-        xlogy(-label, probability) + xlogy(-(1.0 - label), 1.0 - probability)
+        log_loss_term(f64::from(labels[index]), f64::from(preds[index]))
     })
 }
 

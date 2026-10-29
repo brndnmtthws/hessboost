@@ -166,6 +166,39 @@ def test_quantile_and_multi_target_models_predict_one_column_per_output() -> Non
         assert rmse(predictions[:, 1], -y) < 0.5
 
 
+def test_exceedance_predicts_non_increasing_probabilities_and_round_trips() -> None:
+    rng = np.random.default_rng(4)
+    x = rng.normal(size=(1000, 3))
+    target = np.exp(0.5 * x[:, 0]) * rng.exponential(size=1000)
+    thresholds = [0.25, 0.5, 1.0, 2.0]
+    for strategy in ["one_output_per_tree", "multi_output_tree"]:
+        booster = hessboost.train(
+            {
+                "objective": "reg:exceedance",
+                "exceedance_threshold": thresholds,
+                "multi_strategy": strategy,
+                "tree_method": "hist",
+            },
+            DMatrix(x, target),
+            20,
+        )
+        assert booster.exceedance_thresholds == tuple(thresholds)
+        probabilities = booster.predict(x)
+        assert probabilities.shape == (1000, 4)
+        assert ((probabilities >= 0) & (probabilities <= 1)).all()
+        assert (np.diff(probabilities, axis=1) <= 0).all()
+        rates = [np.mean(target >= k) for k in thresholds]
+        np.testing.assert_allclose(probabilities.mean(axis=0), rates, atol=0.05)
+        for raw in (booster.save_raw(), booster.save_raw("json")):
+            loaded = hessboost.Booster(raw)
+            assert loaded.exceedance_thresholds == tuple(thresholds)
+            np.testing.assert_array_equal(loaded.predict(x), probabilities)
+    plain = hessboost.train({}, DMatrix(x, target), 2)
+    assert plain.exceedance_thresholds is None
+    with pytest.raises(HessboostError, match="exceedance_threshold"):
+        hessboost.train({"exceedance_threshold": [1.0]}, DMatrix(x, target), 1)
+
+
 def test_gblinear_and_dart() -> None:
     x, y = regression()
     linear = hessboost.train(

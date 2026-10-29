@@ -128,6 +128,7 @@ flat_params! {
     lambdarank_num_pair_per_sample: usize,
     quantile_alpha: Vec<f64>,
     expectile_alpha: Vec<f64>,
+    exceedance_threshold: Vec<f64>,
     aft_loss_distribution: AftDistribution,
     aft_loss_distribution_scale: f64,
     dist_gradient: DistGradient,

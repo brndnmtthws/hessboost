@@ -741,6 +741,7 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         | Objective::Dist(_) => true,
         Objective::AbsoluteError
         | Objective::Quantile(_)
+        | Objective::Exceedance(_)
         | Objective::RankPairwise(_)
         | Objective::RankNdcg(_)
         | Objective::RankMap(_)
@@ -752,7 +753,8 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         return refuse(
             "objective",
             "a built-in objective with per-row gradients and Newton-step leaves (not \
-             ranking, survival:cox, reg:absoluteerror, reg:quantileerror, or a custom loss)",
+             ranking, survival:cox, reg:absoluteerror, reg:quantileerror, reg:exceedance, or \
+             a custom loss)",
         );
     }
     let objective = params.loss(1)?;

@@ -365,6 +365,14 @@ class Booster(_SchemaState):
         return self._model.objective
 
     @property
+    def exceedance_thresholds(self) -> tuple[float, ...] | None:
+        """The thresholds ``k_1 < ... < k_K`` of a ``reg:exceedance`` model,
+        whose output ``j`` predicts ``P(y >= k_j)``, or ``None`` for any
+        other objective."""
+        thresholds = self._model.exceedance_thresholds
+        return None if thresholds is None else tuple(thresholds)
+
+    @property
     def boulevard(self) -> BoulevardInfo | None:
         """How a ``booster = boulevard`` model was trained, or ``None`` (see
         :mod:`hessboost.inference`)."""

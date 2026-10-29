@@ -14,6 +14,12 @@ use document::{model_from_value, model_to_value, xgboost_typed_array};
 /// (including DART tree weights as `weight_drop`), and is accepted by
 /// [`import_xgboost_json`] as well as upstream XGBoost 3.4.2. See the module
 /// docs (above) for the `base_score` space convention.
+///
+/// # Errors
+///
+/// [`HessboostError::ModelFormat`] for a model XGBoost cannot carry (see
+/// the module docs), including a hessboost-only objective such as
+/// `dist:*`, `rank:xendcg`, or `reg:exceedance`.
 pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
     Ok(serde_json::to_string_pretty(&model_to_value(model)?)?)
 }
@@ -24,6 +30,10 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
 /// way `xgboost.Booster.save_model("m.ubj")` encodes it (typed tree arrays;
 /// see [UBJSON encoding](self#ubjson-encoding)). They are accepted by
 /// [`import_xgboost_ubjson`] and upstream XGBoost 3.4.2.
+///
+/// # Errors
+///
+/// Those of [`export_xgboost_json`].
 pub fn export_xgboost_ubjson(model: &BoostedModel) -> Result<Vec<u8>> {
     ubjson::encode(&model_to_value(model)?, &xgboost_typed_array)
 }

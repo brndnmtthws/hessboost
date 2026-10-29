@@ -183,11 +183,12 @@ pub(super) fn model_to_value(model: &BoostedModel) -> Result<Value> {
 }
 
 /// Refuse hessboost's own objectives, which XGBoost does not define: the
-/// distributional `dist:*` objectives and `rank:xendcg`. Their models are
-/// saved in the native binary or JSON formats only.
+/// distributional `dist:*` objectives, `rank:xendcg`, and `reg:exceedance`.
+/// Their models are saved in the native binary or JSON formats only.
 pub(super) fn reject_extension_objective(objective: &str) -> Result<()> {
     if crate::objective::distributional::DistFamily::from_objective(objective).is_some()
         || objective == Objective::RankXendcg.name()
+        || objective == "reg:exceedance"
     {
         return Err(HessboostError::model_format(format!(
             "objective `{objective}` is a hessboost extension that XGBoost models cannot \

@@ -11,8 +11,8 @@
 //! [`PseudoHuber`], [`Quantiles`], [`Expectiles`], [`Tweedie`],
 //! [`LambdaRank`], [`Aft`], [`distributional::Distributional`]; each
 //! validated when constructed, several shared with the metrics that read
-//! them), or [`Objective::Custom`] with any [`Loss`] such as
-//! [`CustomLoss`].
+//! them), a hessboost extension such as `reg:exceedance` ([`Thresholds`]),
+//! or [`Objective::Custom`] with any [`Loss`] such as [`CustomLoss`].
 //! [`TrainingParams::loss`](crate::config::TrainingParams::loss) builds the
 //! loss a configuration trains with.
 
@@ -44,6 +44,7 @@ mod classification;
 mod count;
 mod custom;
 pub mod distributional;
+mod exceedance;
 mod multi_target;
 mod multiclass;
 mod params;
@@ -59,10 +60,11 @@ pub(crate) use absolute::AbsoluteError;
 pub(crate) use classification::{Hinge, LogisticLoss};
 pub(crate) use count::{Gamma, Poisson, TweedieLoss};
 pub use custom::CustomLoss;
+pub(crate) use exceedance::Exceedance;
 pub(crate) use multiclass::Softmax;
 pub use params::{
     Aft, AftDistribution, Expectiles, LambdaRank, Multiclass, PseudoHuber, Quantiles, RegLoss,
-    Tweedie,
+    Thresholds, Tweedie,
 };
 pub(crate) use quantile::{Expectile, Quantile, interpolated_quantile, weighted_step_quantile};
 pub(crate) use ranking::LambdaMart;

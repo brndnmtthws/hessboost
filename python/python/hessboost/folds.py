@@ -5,9 +5,11 @@ rows for early stopping or conformal calibration. :func:`forward_chaining`
 purges a fixed number of rows before each test block;
 :func:`purged_forward` purges by each row's own label window,
 :func:`purged_forward_at` does the same at caller-given block starts
-(walk-forward validation by calendar period), and :class:`PurgedTail` is
-the purged early-stopping split of a fold's own training rows
-(:func:`hessboost.cross_validate`'s ``per_fold_stopping``)::
+(walk-forward validation by calendar period), both optionally over a
+subset of the rows (``rows=``, such as those with a finite label), and
+:class:`PurgedTail` is the purged early-stopping split of a fold's own
+training rows (:func:`hessboost.cross_validate`'s ``per_fold_stopping``),
+cut by time span or row count::
 
     from hessboost import folds
 
@@ -18,10 +20,13 @@ the purged early-stopping split of a fold's own training rows
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _hessboost
+from hessboost._exceptions import HessboostError
 
 __all__ = [
     "PurgedTail",
@@ -75,6 +80,21 @@ def _times(values: ArrayLike, name: str) -> NDArray[np.int64]:
     return np.ascontiguousarray(array, dtype=np.int64)
 
 
+def _selected(rows: ArrayLike | None, n_rows: int) -> NDArray[np.int64] | None:
+    if rows is None:
+        return None
+    array = np.asarray(rows).reshape(-1)
+    if array.dtype == np.bool_:
+        if array.size != n_rows:
+            raise HessboostError(
+                f"a rows mask needs one entry per row ({n_rows}), got {array.size}"
+            )
+        array = np.flatnonzero(array)
+    elif array.size and not np.issubdtype(array.dtype, np.integer):
+        raise TypeError(f"rows must be integer indices or a boolean mask, got {array.dtype}")
+    return np.ascontiguousarray(array, dtype=np.int64)
+
+
 def purged_forward(
     decision_at: ArrayLike,
     label_end: ArrayLike,
@@ -82,6 +102,7 @@ def purged_forward(
     validation_fraction: float,
     blocks: int = 1,
     min_train: int = 1,
+    rows: ArrayLike | None = None,
 ) -> list[Split]:
     """Forward folds over timestamped rows, purged by each row's label
     window: for labels that span time (forecast horizons, overlapping
@@ -102,19 +123,30 @@ def purged_forward(
     training rows, its start moves later one decision time at a time until
     it leaves them.
 
+    With ``rows`` (strictly increasing row indices, or a boolean mask with
+    one entry per row), only those rows take part, for example the rows
+    with a finite label: the folds are those of the selected rows' times
+    alone, as indices into all the rows. The other rows are neither trained
+    nor tested on, and their times are not checked (placeholders are fine).
+
     Raises:
         HessboostError: The inputs differ in length or are empty, a label
             ends before its decision, ``validation_fraction`` is not in
-            ``(0, 1)``, or no split leaves ``min_train`` training rows and a
-            decision time per block.
-        TypeError: The times are neither integers nor ``datetime64``.
+            ``(0, 1)``, no split leaves ``min_train`` training rows and a
+            decision time per block, or ``rows`` selects no row, is not
+            strictly increasing, is out of bounds, or is a mask of the
+            wrong length.
+        TypeError: The times are neither integers nor ``datetime64``, or
+            ``rows`` is neither integers nor booleans.
     """
+    times = _times(decision_at, "decision_at")
     return _hessboost.purged_forward(
-        _times(decision_at, "decision_at"),
+        times,
         _times(label_end, "label_end"),
         float(validation_fraction),
         blocks,
         min_train,
+        _selected(rows, len(times)),
     )
 
 
@@ -124,6 +156,7 @@ def purged_forward_at(
     block_starts: ArrayLike,
     *,
     min_train: int = 1,
+    rows: ArrayLike | None = None,
 ) -> list[Split]:
     """Forward folds over timestamped rows with test blocks starting at
     caller-given times, purged by each row's label window: walk-forward
@@ -149,6 +182,10 @@ def purged_forward_at(
         block_starts: The test blocks' start times, strictly increasing.
         min_train: The fewest purged training rows any fold may have
             (at least 1). Defaults to 1.
+        rows: The rows that take part (strictly increasing row indices, or
+            a boolean mask with one entry per row), for example those with
+            a finite label; the others are neither trained nor tested on,
+            and their times are not checked. Defaults to every row.
 
     Returns:
         One ``(train_rows, test_rows)`` split per block start, in order.
@@ -156,9 +193,12 @@ def purged_forward_at(
     Raises:
         HessboostError: The inputs differ in length or are empty, a label
             ends before its decision, ``block_starts`` is empty or not
-            strictly increasing, a block has no test rows, or a block's
-            purged training set has fewer than ``max(min_train, 1)`` rows.
-        TypeError: The times are neither integers nor ``datetime64``.
+            strictly increasing, a block has no test rows, a block's
+            purged training set has fewer than ``max(min_train, 1)`` rows,
+            or ``rows`` selects no row, is not strictly increasing, is out
+            of bounds, or is a mask of the wrong length.
+        TypeError: The times are neither integers nor ``datetime64``, or
+            ``rows`` is neither integers nor booleans.
 
     Example:
         Daily blocks over the last three days of hourly rows whose labels
@@ -169,11 +209,13 @@ def purged_forward_at(
             splits = folds.purged_forward_at(at, at + 3_600, [7 * day, 8 * day, 9 * day])
             result = hessboost.cv(params, dtrain, 50, folds=splits)
     """
+    times = _times(decision_at, "decision_at")
     return _hessboost.purged_forward_at(
-        _times(decision_at, "decision_at"),
+        times,
         _times(label_end, "label_end"),
         _times(block_starts, "block_starts"),
         min_train,
+        _selected(rows, len(times)),
     )
 
 
@@ -184,34 +226,57 @@ class PurgedTail:
 
     ``decision_at`` and ``label_end`` hold every row's decision time and the
     end of its label window plus any embargo, as for
-    :func:`purged_forward`. The cut is by time span (unlike
-    :func:`purged_forward`, which cuts by the count of distinct decision
-    times): for rows decided from ``first`` to ``last``, :meth:`split` starts
-    the tail at the first of their decision times at or after ``first + (1 -
-    fraction) * (last - first)``. That offset from ``first`` is computed in
-    ``float64`` and rounded up to a whole time unit, then compared exactly
-    with each time's offset (so a ``fraction`` of ``0.3`` cuts a span of 10
-    units at 7, as the decimal says; past 2**53 units the span itself
-    rounds).
-    The tail is every row decided at or after it, and the early-stopping
-    fit trains on the rows decided before it whose labels end at or before
-    it (a label ending exactly at the split is kept, one ending a tick later
-    is purged). The start never moves: a split leaving a side empty is
-    refused.
+    :func:`purged_forward`. :meth:`split` starts the tail at one of the
+    split rows' decision times, which ``cut`` places:
+
+    - ``"span"`` (the default) cuts by time span (unlike
+      :func:`purged_forward`, which cuts by the count of distinct decision
+      times): for rows decided from ``first`` to ``last``, the tail starts
+      at the first of their decision times at or after ``first + (1 -
+      fraction) * (last - first)``. That offset from ``first`` is computed
+      in ``float64`` and rounded up to a whole time unit, then compared
+      exactly with each time's offset (so a ``fraction`` of ``0.3`` cuts a
+      span of 10 units at 7, as the decimal says; past 2**53 units the span
+      itself rounds).
+    - ``"rows"`` cuts by row count: with the ``n`` split rows sorted by
+      decision time, the tail starts at the decision time of the row at
+      position ``min(n - 1, floor((1 - fraction) * n))`` (in ``float64``),
+      so it holds the last ``fraction`` of the rows, plus any rows decided
+      with that one (a decision time is never split).
+
+    The two differ when the rows' density varies over time, as across the
+    periods of an expanding fold: where later periods hold more rows per
+    time unit, the span cut's tail holds more than ``fraction`` of the rows
+    (fewer where they hold fewer), the row cut's about ``fraction``.
+
+    The tail is every row decided at or after its start, and the
+    early-stopping fit trains on the rows decided before it whose labels end
+    at or before it (a label ending exactly at the split is kept, one ending
+    a tick later is purged). The start never moves: a split leaving a side
+    empty is refused.
 
     Raises:
         HessboostError: The inputs differ in length or are empty, a label
-            ends before its decision, or ``fraction`` is not in ``(0, 1)``.
+            ends before its decision, ``fraction`` is not in ``(0, 1)``, or
+            ``cut`` is neither ``"span"`` nor ``"rows"``.
         TypeError: The times are neither integers nor ``datetime64``.
     """
 
-    __slots__ = ("_decision_at", "_fraction", "_label_end")
+    __slots__ = ("_cut", "_decision_at", "_fraction", "_label_end")
 
-    def __init__(self, decision_at: ArrayLike, label_end: ArrayLike, fraction: float) -> None:
+    def __init__(
+        self,
+        decision_at: ArrayLike,
+        label_end: ArrayLike,
+        fraction: float,
+        *,
+        cut: Literal["span", "rows"] = "span",
+    ) -> None:
         self._decision_at = _times(decision_at, "decision_at")
         self._label_end = _times(label_end, "label_end")
         self._fraction = float(fraction)
-        _hessboost.check_purged_tail(self._decision_at, self._label_end, self._fraction)
+        self._cut: Literal["span", "rows"] = cut
+        _hessboost.check_purged_tail(self._decision_at, self._label_end, self._fraction, cut)
 
     @property
     def decision_at(self) -> NDArray[np.int64]:
@@ -225,8 +290,15 @@ class PurgedTail:
 
     @property
     def fraction(self) -> float:
-        """The tail's share of the rows' time span."""
+        """The tail's share of the rows' time span (``cut="span"``) or of
+        the rows (``cut="rows"``)."""
         return self._fraction
+
+    @property
+    def cut(self) -> Literal["span", "rows"]:
+        """How the tail is cut: ``"span"`` (by time span) or ``"rows"`` (by
+        row count)."""
+        return self._cut
 
     def split(self, rows: ArrayLike) -> tuple[int, Split]:
         """The split time of ``rows`` (a decision time, in the integer units
@@ -246,6 +318,7 @@ class PurgedTail:
             self._decision_at,
             self._label_end,
             self._fraction,
+            self._cut,
             np.ascontiguousarray(array, dtype=np.int64),
         )
         return split_at, split

@@ -126,7 +126,9 @@
 //!   read the values.
 //! - **Objectives** ([`Objective`](objective::Objective), each with its
 //!   parameters): regression (squared, squared-log, pseudo-Huber, smoothed
-//!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
+//!   absolute, quantile/expectile lists), exceedance probabilities over a
+//!   threshold ladder (`reg:exceedance`: `P(y ≥ k_j)` per threshold, never
+//!   increasing in `j`), binary (logistic, logitraw, hinge)
 //!   and multiclass, counts, LambdaMART and XE-NDCG ranking, survival (`survival:cox`,
 //!   `survival:aft` on censored bounds), plus custom losses
 //!   ([`Objective::Custom`](objective::Objective::Custom), e.g. a
@@ -141,7 +143,8 @@
 //! - **Metrics** ([`EvalMetric`](metric::EvalMetric), each with its own
 //!   parameters): rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
-//!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, plus
+//!   quantile, expectile, exceedance-logloss, cox/aft-nloglik,
+//!   interval-regression-accuracy, plus
 //!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric),
 //!   reported after built-in metrics). XGBoost-compatible parameter dictionaries parse through
 //!   [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost):
@@ -166,13 +169,17 @@
 //!   forward-chaining (time-ordered, purged by a row gap), or purged forward
 //!   (timestamped rows, purged by each label window, in test blocks of the
 //!   last decision times or starting at given times such as calendar
-//!   periods: [`Fold::purged_forward`](training::Fold::purged_forward),
-//!   [`Fold::purged_forward_at`](training::Fold::purged_forward_at))
+//!   periods, over every row or a row subset such as the labeled rows:
+//!   [`Fold::purged_forward`](training::Fold::purged_forward),
+//!   [`Fold::purged_forward_at`](training::Fold::purged_forward_at), and
+//!   their `_rows` variants)
 //!   [`Fold`](training::Fold)s with fold-mean or leakage-safe per-fold
-//!   early stopping on a purged tail of each fold's training rows
+//!   early stopping on a purged tail of each fold's training rows, the last
+//!   share of their time span or row count
 //!   ([`CrossValidation`](training::CrossValidation),
 //!   [`CvStopping`](training::CvStopping),
-//!   [`PurgedTail`](training::PurgedTail)); each fold's round count and
+//!   [`PurgedTail`](training::PurgedTail),
+//!   [`TailCut`](training::TailCut)); each fold's round count and
 //!   every row's out-of-fold margins
 //!   ([`CvReport`](training::CvReport)); whole-query folds of
 //!   ranking data; ordered target statistics fitted inside each fold

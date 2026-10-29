@@ -11,6 +11,7 @@ use hessboost::error::HessboostError;
 use hessboost::model::{
     BoostedModel, Contributions, ImportanceType, Interactions, Iterations, Predictions, RowVariants,
 };
+use hessboost::objective::Objective;
 use numpy::{
     PyArray1, PyArray2, PyArrayDyn, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
     PyReadonlyArrayDyn, PyUntypedArrayMethods,
@@ -497,6 +498,15 @@ impl Booster {
     #[getter]
     fn objective(&self) -> &str {
         self.model.objective().name()
+    }
+
+    /// The thresholds of a `reg:exceedance` model, else `None`.
+    #[getter]
+    fn exceedance_thresholds(&self) -> Option<Vec<f64>> {
+        match self.model.objective().built_in() {
+            Some(Objective::Exceedance(thresholds)) => Some(thresholds.values().to_vec()),
+            _ => None,
+        }
     }
 
     #[getter]

@@ -143,6 +143,61 @@ alpha_list!(
     "expectile_alpha"
 );
 
+/// The thresholds `k_1 < … < k_K` of `reg:exceedance` and the
+/// `exceedance-logloss` metric: one output per threshold, predicting
+/// `P(y ≥ k_j)`. Flat key `exceedance_threshold`.
+///
+/// ```
+/// use hessboost::objective::{Objective, Thresholds};
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let ladder = Objective::Exceedance(Thresholds::new([0.0, 1.0, 2.5])?);
+/// assert_eq!(ladder.name(), "reg:exceedance");
+/// assert!(Thresholds::new([1.0, 1.0]).is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct Thresholds {
+    values: Vec<f64>,
+}
+
+impl Thresholds {
+    /// The thresholds `values`, compared in `f64` against each label.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::InvalidParameter`] (`exceedance_threshold`) when
+    /// `values` is empty, has a non-finite entry, or is not strictly
+    /// increasing.
+    pub fn new(values: impl IntoIterator<Item = f64>) -> Result<Self> {
+        let values: Vec<f64> = values.into_iter().collect();
+        ensure(
+            "exceedance_threshold",
+            !values.is_empty(),
+            "is required and must list at least one value",
+        )?;
+        if let Some(&bad) = values.iter().find(|v| !v.is_finite()) {
+            return Err(HessboostError::invalid_param(
+                "exceedance_threshold",
+                format!("every value must be finite, got {bad}"),
+            ));
+        }
+        if let Some(&[earlier, later]) = values.windows(2).find(|pair| pair[0] >= pair[1]) {
+            return Err(HessboostError::invalid_param(
+                "exceedance_threshold",
+                format!("values must be strictly increasing, got {earlier} then {later}"),
+            ));
+        }
+        Ok(Thresholds { values })
+    }
+
+    /// The thresholds, strictly increasing.
+    pub fn values(&self) -> &[f64] {
+        &self.values
+    }
+}
+
 /// The variance power `ρ` of the Tweedie distribution (`reg:tweedie` and
 /// the `tweedie-nloglik` metric): `1` is Poisson, `2` (excluded) Gamma.
 /// XGBoost `tweedie_variance_power`, default `1.5`.
@@ -413,6 +468,24 @@ mod tests {
         assert_eq!(
             Quantiles::new([0.1, 0.1, 0.9]).unwrap().alpha(),
             [0.1, 0.1, 0.9]
+        );
+        for values in [
+            vec![],
+            vec![1.0, 0.0],
+            vec![0.0, 0.0],
+            vec![0.0, f64::NAN],
+            vec![f64::NEG_INFINITY, 0.0],
+            vec![0.0, f64::INFINITY],
+        ] {
+            assert_eq!(
+                refused(&Thresholds::new(values.clone())),
+                Some("exceedance_threshold"),
+                "{values:?}"
+            );
+        }
+        assert_eq!(
+            Thresholds::new([-1.0, 0.0, 2.5]).unwrap().values(),
+            [-1.0, 0.0, 2.5]
         );
     }
 

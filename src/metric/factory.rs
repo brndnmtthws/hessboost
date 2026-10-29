@@ -4,7 +4,7 @@
 use super::curve::{Auc, AucPr};
 use super::distributional::{DistCrps, DistNll};
 use super::elementwise::{Mape, PseudoHuberError, Rmsle};
-use super::quantile::{ExpectileError, QuantileError};
+use super::quantile::{ExceedanceLogLoss, ExpectileError, QuantileError};
 use super::ranking::{MeanAveragePrecision, Ndcg, Precision};
 use super::survival::{AftNLogLik, CoxNLogLik, IntervalRegressionAccuracy};
 use super::{
@@ -13,7 +13,9 @@ use super::{
 };
 use crate::error::{HessboostError, Result};
 use crate::objective::distributional::DistFamily;
-use crate::objective::{Aft, AftDistribution, Expectiles, PseudoHuber, Quantiles, Tweedie};
+use crate::objective::{
+    Aft, AftDistribution, Expectiles, PseudoHuber, Quantiles, Thresholds, Tweedie,
+};
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
 
@@ -114,6 +116,10 @@ pub enum EvalMetric {
     Quantile(Quantiles),
     /// Expectile loss at these levels (`expectile`).
     Expectile(Expectiles),
+    /// Binary log loss of the indicators `y ≥ k_j` against the predicted
+    /// `P(y ≥ k_j)` (`exceedance-logloss`, a hessboost extension), averaged
+    /// over rows and these thresholds, one prediction per threshold.
+    ExceedanceLogLoss(Thresholds),
     /// Cox proportional-hazards negative partial log-likelihood
     /// (`cox-nloglik`).
     CoxNLogLik,
@@ -177,6 +183,7 @@ impl EvalMetric {
             EvalMetric::Precision(cutoff) => return Cow::Owned(cutoff_name("pre", cutoff.k())),
             EvalMetric::Quantile(_) => "quantile",
             EvalMetric::Expectile(_) => "expectile",
+            EvalMetric::ExceedanceLogLoss(_) => "exceedance-logloss",
             EvalMetric::CoxNLogLik => "cox-nloglik",
             EvalMetric::AftNLogLik(_) => "aft-nloglik",
             EvalMetric::IntervalRegressionAccuracy => "interval-regression-accuracy",
@@ -245,6 +252,9 @@ impl EvalMetric {
             EvalMetric::Expectile(expectiles) => {
                 Box::new(ExpectileError::new(expectiles.alpha_f32()))
             }
+            EvalMetric::ExceedanceLogLoss(thresholds) => {
+                Box::new(ExceedanceLogLoss::new(thresholds.clone()))
+            }
             EvalMetric::CoxNLogLik => Box::new(CoxNLogLik),
             EvalMetric::AftNLogLik(aft) => {
                 Box::new(AftNLogLik::new(aft.distribution(), aft.scale() as f32))
@@ -263,6 +273,7 @@ impl EvalMetric {
             "mphe" => &["huber_slope"],
             "quantile" => &["quantile_alpha"],
             "expectile" => &["expectile_alpha"],
+            "exceedance-logloss" => &["exceedance_threshold"],
             "aft-nloglik" => &["aft_loss_distribution", "aft_loss_distribution_scale"],
             _ => &[],
         }
@@ -271,8 +282,9 @@ impl EvalMetric {
     /// The metric XGBoost names `name`, with the parameters XGBoost would
     /// give it: the `@k` cutoff of `ndcg`/`map`/`pre` and the `@rho` power of
     /// `tweedie-nloglik` (1.5 without one) from the suffix, the rest from
-    /// `source` (the flat parameters `mphe`, `quantile`, `expectile`, and
-    /// `aft-nloglik` read, and the `dist:*` family `nll` and `crps` score).
+    /// `source` (the flat parameters `mphe`, `quantile`, `expectile`,
+    /// `exceedance-logloss`, and `aft-nloglik` read, and the `dist:*` family
+    /// `nll` and `crps` score).
     ///
     /// Only those four names take an `@` suffix; any other suffix, including
     /// XGBoost's `error@t` threshold and the `-` variants (`ndcg@3-`), is
@@ -309,6 +321,7 @@ impl EvalMetric {
             "pre" => EvalMetric::Precision(cutoff()?),
             "quantile" => EvalMetric::Quantile(source.quantiles()?),
             "expectile" => EvalMetric::Expectile(source.expectiles()?),
+            "exceedance-logloss" => EvalMetric::ExceedanceLogLoss(source.thresholds()?),
             "cox-nloglik" => EvalMetric::CoxNLogLik,
             "aft-nloglik" => EvalMetric::AftNLogLik(source.aft()?),
             "interval-regression-accuracy" => EvalMetric::IntervalRegressionAccuracy,
@@ -342,6 +355,8 @@ pub(crate) struct XgboostMetricSource<'a> {
     pub(crate) quantile_alpha: &'a [f64],
     /// `expectile_alpha` (`expectile`).
     pub(crate) expectile_alpha: &'a [f64],
+    /// `exceedance_threshold` (`exceedance-logloss`).
+    pub(crate) exceedance_threshold: &'a [f64],
     /// `aft_loss_distribution` (`aft-nloglik`).
     pub(crate) aft_loss_distribution: AftDistribution,
     /// `aft_loss_distribution_scale` (`aft-nloglik`).
@@ -361,6 +376,10 @@ impl XgboostMetricSource<'_> {
 
     fn expectiles(&self) -> Result<Expectiles> {
         Expectiles::new(self.expectile_alpha.iter().copied())
+    }
+
+    fn thresholds(&self) -> Result<Thresholds> {
+        Thresholds::new(self.exceedance_threshold.iter().copied())
     }
 
     fn aft(&self) -> Result<Aft> {
@@ -425,6 +444,7 @@ pub(crate) const DEFAULT_SOURCE: XgboostMetricSource<'static> = XgboostMetricSou
     huber_slope: 1.0,
     quantile_alpha: &[],
     expectile_alpha: &[],
+    exceedance_threshold: &[],
     aft_loss_distribution: AftDistribution::Normal,
     aft_loss_distribution_scale: 1.0,
     distribution: None,

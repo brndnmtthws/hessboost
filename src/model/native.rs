@@ -24,7 +24,10 @@
 //! coefficient per iteration) and `shrinkage.base_score` (`f32`, the
 //! intercepts before shrinkage), both `REQUIRED`: a reader unaware of them
 //! would read iteration ranges as tree prefixes. Their absence means no
-//! shrinkage. A Boulevard fit adds the `boulevard.*` sections of its
+//! shrinkage. A `reg:exceedance` model adds `objective.exceedance_threshold`
+//! (`f64`, `REQUIRED`: a reader that predates the objective refuses the
+//! file rather than predicting its margins); no other model writes it.
+//! A Boulevard fit adds the `boulevard.*` sections of its
 //! [`BoulevardInfo`] (not `REQUIRED`: predictions do not read them), an
 //! EBM the `ebm.*` sections of its [`EbmInfo`] (likewise optional).
 //!
@@ -323,6 +326,7 @@ pub(super) const OBJECTIVE_SECTIONS: &[&str] = &[
     "objective.lambdarank_num_pair_per_sample",
     "objective.quantile_alpha",
     "objective.expectile_alpha",
+    "objective.exceedance_threshold",
     "objective.aft_loss_distribution",
     "objective.aft_loss_distribution_scale",
     "objective.dist_gradient",
@@ -745,6 +749,14 @@ pub(super) fn write_objective_params(w: &mut Writer, p: &StoredObjectiveParams) 
         p.expectile_alpha.iter().copied(),
         f64::to_le_bytes,
     );
+    // Only `reg:exceedance` has thresholds; other models keep their bytes.
+    if !p.exceedance_threshold.is_empty() {
+        w.array(
+            "objective.exceedance_threshold",
+            p.exceedance_threshold.iter().copied(),
+            f64::to_le_bytes,
+        );
+    }
     w.str(
         "objective.aft_loss_distribution",
         p.aft_loss_distribution.name(),
@@ -798,6 +810,12 @@ pub(super) fn read_objective_params(
         )?,
         quantile_alpha: or(s, "objective.quantile_alpha", base.quantile_alpha, f64s)?,
         expectile_alpha: or(s, "objective.expectile_alpha", base.expectile_alpha, f64s)?,
+        exceedance_threshold: or(
+            s,
+            "objective.exceedance_threshold",
+            base.exceedance_threshold,
+            f64s,
+        )?,
         aft_loss_distribution: named(
             s,
             "objective.aft_loss_distribution",

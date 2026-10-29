@@ -270,7 +270,8 @@
 //! [`HessboostError::ModelFormat`]. Numeric and categorical splits both
 //! round-trip in either direction. Export refuses what XGBoost cannot load:
 //! `gblinear` models, linear-leaf trees (`linear_tree`), custom objectives,
-//! and the distributional `dist:*` objectives (which import refuses as well).
+//! the distributional `dist:*` objectives (which import refuses as well),
+//! and `reg:exceedance` (likewise).
 //!
 //! ## Tree layout (`tree_info`)
 //!
@@ -941,7 +942,8 @@ impl BoostedModel {
 
     /// Number of raw outputs (margins) per row: `num_class` for multiclass,
     /// one per alpha for a `reg:quantileerror` or `reg:expectileerror` alpha
-    /// list, one per natural parameter for `dist:*`,
+    /// list, one per threshold for `reg:exceedance`, one per natural
+    /// parameter for `dist:*`,
     /// [`BoostedModel::n_targets`] for a label matrix, `1` for every other
     /// built-in objective, and what a custom objective declares.
     #[inline]

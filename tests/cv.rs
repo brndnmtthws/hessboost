@@ -8,7 +8,7 @@ use hessboost::data::target_stats::OrderedTargetEncoder;
 use hessboost::model::{Iterations, ModelFormat};
 use hessboost::objective::{Objective, Quantiles};
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams};
-use hessboost::training::{CrossValidation, CvResult, CvStopping, Fold, PurgedTail};
+use hessboost::training::{CrossValidation, CvResult, CvStopping, Fold, PurgedTail, TailCut};
 use std::num::NonZeroUsize;
 
 mod common;
@@ -340,6 +340,47 @@ fn per_fold_stopping_sizes_each_fold_on_its_own_tail() {
     assert!(refit.stopping.is_some());
     let expected = Trainer::new(&params, &data, rounds).train().unwrap().model;
     assert_same_model(&refit.model, &expected, &data);
+}
+
+/// Per-fold stopping cuts each fold's tail as its `PurgedTail` says: on
+/// rows whose density changes, a row-count tail sizes each fold on its
+/// row-count split, which is not the span cut's.
+#[test]
+fn per_fold_stopping_honors_the_row_count_cut() {
+    let data = regression();
+    let params = params();
+    // Half the rows ten minutes apart, then the rest one minute apart.
+    let decision_at: Vec<i64> = (0..ROWS as i64)
+        .map(|i| {
+            if i < 75 {
+                i * 600
+            } else {
+                75 * 600 + (i - 75) * 60
+            }
+        })
+        .collect();
+    let label_end: Vec<i64> = decision_at.iter().map(|at| at + 180).collect();
+    let folds = || Fold::purged_forward(&decision_at, &label_end, 0.4, 3, 20).unwrap();
+    let tail = PurgedTail::with_cut(&decision_at, &label_end, 0.3, TailCut::Rows).unwrap();
+    let span = PurgedTail::new(&decision_at, &label_end, 0.3).unwrap();
+    let report = CrossValidation::new(&params, &data, 40, folds())
+        .early_stopping(CvStopping::per_fold(NonZeroUsize::new(3).unwrap(), tail))
+        .run()
+        .unwrap();
+    let mut differs = false;
+    for (fold, got) in folds().iter().zip(&report.folds) {
+        let (rounds, best, split_at, fit_rows, tail_rows) =
+            tail_stopping(&params, &data, &tail, &fold.train);
+        assert_eq!(got.num_boost_round, rounds);
+        let tail_stop = got.stopping.unwrap();
+        assert_eq!(
+            (tail_stop.split_at, tail_stop.fit_rows, tail_stop.tail_rows),
+            (split_at, fit_rows, tail_rows)
+        );
+        assert_eq!(tail_stop.best_score, best);
+        differs |= span.split(&fold.train).unwrap().0 != split_at;
+    }
+    assert!(differs);
 }
 
 /// Under fold-mean stopping every fold's margins are its model through the

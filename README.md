@@ -163,12 +163,14 @@ See [`python/README.md`](python/README.md).
 - **Core boosting:** `gbtree`, `dart`, and `gblinear` boosters, boosted random forests,
   and `exact`, `hist`, and `approx` tree methods with native missing-value and categorical support.
 - **Objectives & metrics:** Regression (squared, log, Huber, quantile, expectile),
+  exceedance probabilities over a threshold ladder (`reg:exceedance`, non-crossing `P(y ≥ k)`),
   binary/multiclass classification, ranking (LambdaMART, XE-NDCG), count, and survival (Cox, AFT),
   plus typed objective and metric APIs and custom loss hooks. Quantile and absolute-error models can
   set each leaf to the exact residual quantile of its rows (`leaf_estimation_method = exact`).
 - **Validation & workflow:** Cross-validation (including purged and forward time-series folds,
-  optionally at caller-given block starts such as calendar-aligned walk-forward blocks,
-  leakage-safe per-fold early stopping on a purged tail of each fold's training rows, out-of-fold
+  optionally at caller-given block starts such as calendar-aligned walk-forward blocks, or over
+  a subset of the rows such as the labeled ones, leakage-safe per-fold early stopping on a
+  purged tail of each fold's training rows cut by time span or row count, out-of-fold
   margins and per-fold round counts, whole-query ranking folds, per-fold target statistics,
   continuing a model, and refitting on all rows at the chosen round count), early stopping,
   feature importance, SHAP values and interactions, model slicing and averaging (bagged

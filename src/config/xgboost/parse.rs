@@ -56,6 +56,7 @@ impl Flat {
             lambdarank_num_pair_per_sample: _,
             quantile_alpha: _,
             expectile_alpha: _,
+            exceedance_threshold: _,
             aft_loss_distribution: _,
             aft_loss_distribution_scale: _,
             dist_gradient: _,
@@ -182,6 +183,10 @@ impl Flat {
                 .unwrap_or(p.lambdarank_num_pair_per_sample),
             quantile_alpha: self.quantile_alpha.clone().unwrap_or(p.quantile_alpha),
             expectile_alpha: self.expectile_alpha.clone().unwrap_or(p.expectile_alpha),
+            exceedance_threshold: self
+                .exceedance_threshold
+                .clone()
+                .unwrap_or(p.exceedance_threshold),
             aft_loss_distribution: self
                 .aft_loss_distribution
                 .unwrap_or(p.aft_loss_distribution),
@@ -215,6 +220,7 @@ impl Flat {
             huber_slope: parts.huber_slope,
             quantile_alpha: &parts.quantile_alpha,
             expectile_alpha: &parts.expectile_alpha,
+            exceedance_threshold: &parts.exceedance_threshold,
             aft_loss_distribution: parts.aft_loss_distribution,
             aft_loss_distribution_scale: parts.aft_loss_distribution_scale,
             distribution: objective.dist_family(),
@@ -539,7 +545,7 @@ impl Flat {
 fn normalize(key: &'static str, value: Value) -> Result<Value> {
     Ok(match (key, value) {
         ("eval_metric", Value::String(name)) => Value::Array(vec![Value::String(name)]),
-        ("quantile_alpha" | "expectile_alpha", Value::Number(alpha)) => {
+        ("quantile_alpha" | "expectile_alpha" | "exceedance_threshold", Value::Number(alpha)) => {
             Value::Array(vec![Value::Number(alpha)])
         }
         ("monotone_constraints", Value::String(text)) => {
@@ -600,8 +606,9 @@ impl TrainingParams {
     /// `min_split_loss`, `reg_lambda`, `reg_alpha`, `random_state`,
     /// `n_jobs`) are accepted, as are XGBoost's other value spellings: a
     /// single string for `eval_metric`, a number for `quantile_alpha` /
-    /// `expectile_alpha`, `monotone_constraints` as `"(1,-1,0)"` or
-    /// `-1`/`0`/`1` entries, and `interaction_constraints` as a JSON string.
+    /// `expectile_alpha` / `exceedance_threshold`, `monotone_constraints`
+    /// as `"(1,-1,0)"` or `-1`/`0`/`1` entries, and `interaction_constraints`
+    /// as a JSON string.
     /// XGBoost options hessboost implements at one setting only
     /// (`updater = "coord_descent"` with `booster = gblinear`,
     /// `feature_selector = "cyclic"`, `lambdarank_pair_method = "topk"`,

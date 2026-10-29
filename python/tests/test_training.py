@@ -166,6 +166,39 @@ def test_quantile_and_multi_target_models_predict_one_column_per_output() -> Non
         assert rmse(predictions[:, 1], -y) < 0.5
 
 
+def test_exceedance_predicts_non_increasing_probabilities_and_round_trips() -> None:
+    rng = np.random.default_rng(4)
+    x = rng.normal(size=(1000, 3))
+    target = np.exp(0.5 * x[:, 0]) * rng.exponential(size=1000)
+    thresholds = [0.25, 0.5, 1.0, 2.0]
+    for strategy in ["one_output_per_tree", "multi_output_tree"]:
+        booster = hessboost.train(
+            {
+                "objective": "reg:exceedance",
+                "exceedance_threshold": thresholds,
+                "multi_strategy": strategy,
+                "tree_method": "hist",
+            },
+            DMatrix(x, target),
+            20,
+        )
+        assert booster.exceedance_thresholds == tuple(thresholds)
+        probabilities = booster.predict(x)
+        assert probabilities.shape == (1000, 4)
+        assert ((probabilities >= 0) & (probabilities <= 1)).all()
+        assert (np.diff(probabilities, axis=1) <= 0).all()
+        rates = [np.mean(target >= k) for k in thresholds]
+        np.testing.assert_allclose(probabilities.mean(axis=0), rates, atol=0.05)
+        for raw in (booster.save_raw(), booster.save_raw("json")):
+            loaded = hessboost.Booster(raw)
+            assert loaded.exceedance_thresholds == tuple(thresholds)
+            np.testing.assert_array_equal(loaded.predict(x), probabilities)
+    plain = hessboost.train({}, DMatrix(x, target), 2)
+    assert plain.exceedance_thresholds is None
+    with pytest.raises(HessboostError, match="exceedance_threshold"):
+        hessboost.train({"exceedance_threshold": [1.0]}, DMatrix(x, target), 1)
+
+
 def test_gblinear_and_dart() -> None:
     x, y = regression()
     linear = hessboost.train(
@@ -789,6 +822,43 @@ def test_cross_validate_refuses_unusable_stopping() -> None:
         overlapping.out_of_fold()
 
 
+def test_cross_validate_per_fold_stopping_honors_the_row_cut() -> None:
+    """A ``cut="rows"`` tail sizes each fold on its row-count split, which
+    on rows of changing density is not the span cut's."""
+    x, y = regression()
+    dtrain = DMatrix(x, y)
+    params = {"max_depth": 4, "eta": 0.6, "subsample": 0.8, "seed": 2}
+    # Half the rows ten minutes apart, the rest one minute apart.
+    index = np.arange(400)
+    at = np.where(index < 200, index * 600, 200 * 600 + (index - 200) * 60)
+    end = at + 180
+    splits = hessboost.folds.purged_forward(at, end, validation_fraction=0.4, blocks=2)
+    tail = hessboost.folds.PurgedTail(at, end, 0.25, cut="rows")
+    span = hessboost.folds.PurgedTail(at, end, 0.25)
+    report = hessboost.cross_validate(
+        params, dtrain, 60, folds=splits, early_stopping_rounds=3, per_fold_stopping=tail
+    )
+    differs = False
+    for (train_rows, _), fold in zip(splits, report.folds, strict=True):
+        split_at, (fit_rows, tail_rows) = tail.split(train_rows)
+        trial = hessboost.train(
+            params,
+            dtrain.slice(fit_rows),
+            60,
+            evals=[(dtrain.slice(tail_rows), "tail")],
+            early_stopping_rounds=3,
+            verbose_eval=False,
+        )
+        assert trial.best_iteration is not None
+        assert trial.best_score is not None
+        assert fold.num_boost_round == trial.best_iteration + 1
+        assert fold.stopping == hessboost.TailStopping(
+            split_at, len(fit_rows), len(tail_rows), trial.best_score
+        )
+        differs |= span.split(train_rows)[0] != split_at
+    assert differs
+
+
 def test_cross_validation_of_no_rounds_has_no_scores() -> None:
     """Zero rounds leave each fold its intercept: empty histories, and no
     fold scores, in both the history-only and the reporting run."""
@@ -959,6 +1029,79 @@ def test_purged_forward_at_folds_drive_cv() -> None:
     result = hessboost.cv({}, DMatrix(x, y), 5, folds=folds)
     assert result["test-rmse-mean"].shape == (5,)
     assert np.all(np.isfinite(result["test-rmse-mean"]))
+
+
+def test_purged_folds_over_a_row_subset() -> None:
+    """``rows=``, as indices or a boolean mask, builds the folds of the
+    selected rows alone, as indices into every row; the excluded rows may
+    hold placeholder times."""
+    day = 86_400
+    decision_at = np.repeat(np.arange(10) * day, 3)
+    label_end = decision_at + 2 * day
+    keep = np.ones(len(decision_at), dtype=bool)
+    keep[::4] = False
+    selected = np.flatnonzero(keep)
+    # Placeholder label ends, before their decisions, on the excluded rows.
+    placeholder = np.where(keep, label_end, -1)
+    starts = [6 * day, 8 * day]
+    sub = hessboost.folds.purged_forward(
+        decision_at[selected], label_end[selected], validation_fraction=0.3, blocks=2
+    )
+    sub_at = hessboost.folds.purged_forward_at(decision_at[selected], label_end[selected], starts)
+    for rows in (selected, keep, selected.tolist()):
+        folds = hessboost.folds.purged_forward(
+            decision_at, placeholder, validation_fraction=0.3, blocks=2, rows=rows
+        )
+        at_folds = hessboost.folds.purged_forward_at(decision_at, placeholder, starts, rows=rows)
+        for got, expected in ((folds, sub), (at_folds, sub_at)):
+            assert len(got) == len(expected) == 2
+            for (train, test), (sub_train, sub_test) in zip(got, expected, strict=True):
+                np.testing.assert_array_equal(train, selected[sub_train])
+                np.testing.assert_array_equal(test, selected[sub_test])
+    with pytest.raises(HessboostError, match="before its decision"):
+        hessboost.folds.purged_forward(decision_at, placeholder, validation_fraction=0.3)
+    for rows in ([], [3, 2], [2, 2], [0, 30], [-1, 2], keep[1:]):
+        with pytest.raises(HessboostError):
+            hessboost.folds.purged_forward(
+                decision_at, label_end, validation_fraction=0.3, rows=rows
+            )
+        with pytest.raises(HessboostError):
+            hessboost.folds.purged_forward_at(decision_at, label_end, [8 * day], rows=rows)
+    with pytest.raises(TypeError, match="boolean mask"):
+        hessboost.folds.purged_forward(decision_at, label_end, validation_fraction=0.3, rows=[0.5])
+
+
+def test_purged_tail_cuts_by_row_count() -> None:
+    """``cut="rows"`` starts the tail at the row ``1 - fraction`` of the way
+    through by decision time, keeping its decision time whole; on rows of
+    changing density it differs from the default span cut."""
+    # Ten rows ten units apart, then ten rows one unit apart.
+    at = np.concatenate([np.arange(10) * 10, np.arange(91, 101)])
+    rows = np.arange(20)
+    span = hessboost.folds.PurgedTail(at, at, 0.5)
+    assert span.cut == "span"
+    split_at, (_, tail_rows) = span.split(rows)
+    assert split_at == 50
+    np.testing.assert_array_equal(tail_rows, np.arange(5, 20))
+    by_rows = hessboost.folds.PurgedTail(at, at, 0.5, cut="rows")
+    assert by_rows.cut == "rows"
+    split_at, (fit_rows, tail_rows) = by_rows.split(rows)
+    assert split_at == 91
+    np.testing.assert_array_equal(fit_rows, np.arange(10))
+    np.testing.assert_array_equal(tail_rows, np.arange(10, 20))
+    # 0.15 of 100 rows starts at position 85.
+    hundred = hessboost.folds.PurgedTail(np.arange(100), np.arange(100), 0.15, cut="rows")
+    assert hundred.split(np.arange(100))[0] == 85
+    # Rows tied with position 5 join the tail.
+    tied = np.array([0, 1, 2, 3, 3, 3, 3, 4, 5, 6])
+    split_at, (fit_rows, tail_rows) = hessboost.folds.PurgedTail(tied, tied, 0.5, cut="rows").split(
+        np.arange(10)
+    )
+    assert split_at == 3
+    np.testing.assert_array_equal(fit_rows, [0, 1, 2])
+    np.testing.assert_array_equal(tail_rows, np.arange(3, 10))
+    with pytest.raises(HessboostError, match="cut"):
+        hessboost.folds.PurgedTail(at, at, 0.5, cut="count")  # ty: ignore[invalid-argument-type]
 
 
 class Recorder(hessboost.TrainingCallback):

@@ -611,6 +611,7 @@ def _cross_validate(
             per_fold_stopping._decision_at,
             per_fold_stopping._label_end,
             per_fold_stopping._fraction,
+            per_fold_stopping._cut,
         ),
         "target_stats": encoding,
         "target_stats_label": labels,

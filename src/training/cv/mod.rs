@@ -2,14 +2,16 @@
 //! caller-supplied folds ([`CrossValidation`], [`Fold`]), including
 //! forward-chaining folds for time-ordered rows, forward folds purged by
 //! each row's label window ([`Fold::purged_forward`], or at given test-block
-//! starts with [`Fold::purged_forward_at`]), whole-query folds of
+//! starts with [`Fold::purged_forward_at`]; over a row subset with their
+//! `_rows` variants), whole-query folds of
 //! ranking data, per-fold ordered target statistics
 //! ([`CrossValidation::target_stats`], optionally fitted on a separate
 //! per-row target), continuing a model in every fold
 //! ([`CrossValidation::init_model`]), every held-out row's out-of-fold
 //! margin and each fold's round count ([`CvReport`]), leakage-safe
 //! per-fold early stopping on a purged tail of each fold's own training
-//! rows ([`CvStopping::per_fold`], [`PurgedTail`]), and retraining on
+//! rows ([`CvStopping::per_fold`], [`PurgedTail`], cut by time span or row
+//! count: [`TailCut`]), and retraining on
 //! every row for the round count cross-validation chose
 //! ([`CrossValidation::refit`], [`CvRefit`]).
 //!
@@ -18,7 +20,7 @@
 
 mod fold;
 
-pub use fold::{Fold, PurgedTail};
+pub use fold::{Fold, PurgedTail, TailCut};
 
 use crate::config::{BoosterKind, TrainingParams};
 use crate::data::DMatrix;

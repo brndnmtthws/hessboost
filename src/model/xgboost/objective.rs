@@ -183,6 +183,7 @@ pub(super) fn objective_to_json(objective: &Objective, max_delta_step: f64) -> V
         | Objective::AbsoluteError
         | Objective::Dist(_)
         | Objective::RankXendcg
+        | Objective::Exceedance(_)
         | Objective::Custom(_) => {
             return Value::Object(out);
         }

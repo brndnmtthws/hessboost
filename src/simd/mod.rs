@@ -656,6 +656,12 @@ pub(crate) fn log_loss_sum(
     scalar::log_loss(preds, labels, weights, 0..preds.len())
 }
 
+/// The `logloss` term of one `label` and `probability`, with the clamping
+/// [`log_loss_sum`] applies to each of its cells.
+pub(crate) fn log_loss_term(label: f64, probability: f64) -> f64 {
+    scalar::log_loss_term(label, probability)
+}
+
 pub(crate) fn positive_nloglik_sum<const GAMMA: bool>(
     preds: &[f32],
     labels: &[f32],

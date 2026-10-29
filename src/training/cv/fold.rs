@@ -1,6 +1,7 @@
 //! [`Fold`] builders: caller-supplied, shuffled k-fold, forward-chaining,
-//! and purged forward folds (at chosen or given block starts);
-//! [`PurgedTail`], the per-fold early-stopping split.
+//! and purged forward folds (at chosen or given block starts, over every
+//! row or a row subset); [`PurgedTail`], the per-fold early-stopping split,
+//! cut by time span or row count ([`TailCut`]).
 
 use crate::error::{HessboostError, Result};
 use crate::rng::Rng;
@@ -13,7 +14,9 @@ use crate::rng::Rng;
 /// [`Fold::k_fold`] (what [`cv`](super::cv()) uses), [`Fold::forward_chaining`]
 /// (time-ordered rows), [`Fold::purged_forward`] (timestamped rows with
 /// label windows), or [`Fold::purged_forward_at`] (the same, with test
-/// blocks starting at given times, such as calendar periods).
+/// blocks starting at given times, such as calendar periods); their `_rows`
+/// variants ([`Fold::purged_forward_rows`], [`Fold::purged_forward_at_rows`])
+/// build them over a subset of the rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Fold {
@@ -164,73 +167,56 @@ impl Fold {
         min_train: usize,
     ) -> Result<Vec<Fold>> {
         check_purged_rows(decision_at, label_end)?;
-        if !(validation_fraction > 0.0 && validation_fraction < 1.0) || blocks == 0 {
-            return Err(purged_refusal(format!(
-                "need a validation fraction in (0, 1) and at least one block, got \
-                 {validation_fraction} and {blocks}"
-            )));
-        }
-        check_purged_labels(decision_at, label_end)?;
-        let mut times = decision_at.to_vec();
-        times.sort_unstable();
-        times.dedup();
-        let count = times.len();
-        let mut split = (count - 1).min(((1.0 - validation_fraction) * count as f64) as usize);
-        // A row trains a fold starting at `start` when `at < start` and
-        // `end <= start`; as `end >= at`, that is `start >= end`, strictly
-        // when the label ends at its decision. Sorted by `(end, strict)`,
-        // the rows a start trains are a prefix, and the candidate starts
-        // only grow, so one pass counts them all.
-        let mut keys: Vec<(i64, bool)> = decision_at
-            .iter()
-            .zip(label_end)
-            .map(|(&at, &end)| (end, end == at))
-            .collect();
-        keys.sort_unstable();
-        let mut trained = 0;
-        let mut trainable = |start: i64| {
-            while let Some(&(end, strict)) = keys.get(trained)
-                && (end < start || (end == start && !strict))
-            {
-                trained += 1;
-            }
-            trained
-        };
-        while trainable(times[split]) < min_train {
-            split += 1;
-            if split + blocks > count {
-                return Err(purged_refusal(format!(
-                    "no test start leaves {min_train} purged training rows and {blocks} test \
-                     decision times"
-                )));
-            }
-        }
-        let tail = &times[split..];
-        if tail.len() < blocks {
-            return Err(purged_refusal(format!(
-                "{blocks} test blocks need {blocks} distinct decision times; the tail has {}",
-                tail.len()
-            )));
-        }
-        let starts: Vec<i64> = (0..blocks)
-            .map(|block| tail[block * tail.len() / blocks])
-            .collect();
-        let mut folds = Vec::with_capacity(blocks);
-        for (block, &start) in starts.iter().enumerate() {
-            let fold = purged_fold(
-                decision_at,
-                label_end,
-                start,
-                starts.get(block + 1).copied(),
-            );
-            if fold.train.is_empty() || fold.test.is_empty() {
-                return Err(purged_refusal(format!(
-                    "test block {block} leaves no training or test rows"
-                )));
-            }
-            folds.push(fold);
-        }
-        Ok(folds)
+        PurgedRows::all(decision_at, label_end).forward(validation_fraction, blocks, min_train)
+    }
+
+    /// [`Fold::purged_forward`] over the selected `rows` only (for example
+    /// the rows with a finite label): the folds `purged_forward` builds from
+    /// `decision_at[rows]` and `label_end[rows]`, with their indices mapped
+    /// back to the rows they stand for, in row order. The other rows take
+    /// no part: no fold trains or tests on them, and their times are not
+    /// checked, so they may hold placeholders.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fold::purged_forward`] over the selected rows (a label ending
+    /// before its decision names its row), and
+    /// [`HessboostError::InvalidParameter`] (`purged folds`) when `rows` is
+    /// empty, not strictly increasing (the message names the position), or
+    /// holds a row out of bounds (the message names it).
+    ///
+    /// ```
+    /// use hessboost::training::Fold;
+    ///
+    /// # fn main() -> hessboost::error::Result<()> {
+    /// // One row per day for 10 days, each label ending a day later; day 7's
+    /// // label is missing, so its label end is a placeholder.
+    /// let day = 86_400;
+    /// let decision_at: Vec<i64> = (0..10).map(|i| i * day).collect();
+    /// let mut label_end: Vec<i64> = decision_at.iter().map(|at| at + day).collect();
+    /// label_end[7] = 0;
+    /// let rows: Vec<usize> = (0..10).filter(|&row| row != 7).collect();
+    /// let folds = Fold::purged_forward_rows(&decision_at, &label_end, &rows, 0.3, 1, 1)?;
+    /// // Of the nine selected decision times, the last three test.
+    /// assert_eq!(folds[0].test, [6, 8, 9]);
+    /// assert_eq!(folds[0].train, [0, 1, 2, 3, 4, 5]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn purged_forward_rows(
+        decision_at: &[i64],
+        label_end: &[i64],
+        rows: &[usize],
+        validation_fraction: f64,
+        blocks: usize,
+        min_train: usize,
+    ) -> Result<Vec<Fold>> {
+        let (decision_at, label_end) = select_purged_rows(decision_at, label_end, rows)?;
+        PurgedRows::selected(&decision_at, &label_end, rows).forward(
+            validation_fraction,
+            blocks,
+            min_train,
+        )
     }
 
     /// Forward, purged folds whose test blocks start at given times, for
@@ -290,7 +276,143 @@ impl Fold {
         min_train: usize,
     ) -> Result<Vec<Fold>> {
         check_purged_rows(decision_at, label_end)?;
-        check_purged_labels(decision_at, label_end)?;
+        PurgedRows::all(decision_at, label_end).forward_at(block_starts, min_train)
+    }
+
+    /// [`Fold::purged_forward_at`] over the selected `rows` only (for
+    /// example the rows with a finite label): the folds `purged_forward_at`
+    /// builds from `decision_at[rows]` and `label_end[rows]`, with their
+    /// indices mapped back to the rows they stand for, in row order. The
+    /// other rows take no part: no fold trains or tests on them, and their
+    /// times are not checked, so they may hold placeholders.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fold::purged_forward_at`] over the selected rows (a label
+    /// ending before its decision names its row), and
+    /// [`HessboostError::InvalidParameter`] (`purged folds`) when `rows` is
+    /// empty, not strictly increasing (the message names the position), or
+    /// holds a row out of bounds (the message names it).
+    pub fn purged_forward_at_rows(
+        decision_at: &[i64],
+        label_end: &[i64],
+        rows: &[usize],
+        block_starts: &[i64],
+        min_train: usize,
+    ) -> Result<Vec<Fold>> {
+        let (decision_at, label_end) = select_purged_rows(decision_at, label_end, rows)?;
+        PurgedRows::selected(&decision_at, &label_end, rows).forward_at(block_starts, min_train)
+    }
+}
+
+/// The rows a purged fold builder splits: their decision and label-end
+/// times by position, and the row each position stands for (`None`: its
+/// own index).
+struct PurgedRows<'a> {
+    decision_at: &'a [i64],
+    label_end: &'a [i64],
+    rows: Option<&'a [usize]>,
+}
+
+impl<'a> PurgedRows<'a> {
+    /// Every row, by its index.
+    fn all(decision_at: &'a [i64], label_end: &'a [i64]) -> Self {
+        PurgedRows {
+            decision_at,
+            label_end,
+            rows: None,
+        }
+    }
+
+    /// The selected `rows`, whose times [`select_purged_rows`] gathered.
+    fn selected(decision_at: &'a [i64], label_end: &'a [i64], rows: &'a [usize]) -> Self {
+        PurgedRows {
+            decision_at,
+            label_end,
+            rows: Some(rows),
+        }
+    }
+
+    /// The row `position` stands for.
+    fn row(&self, position: usize) -> usize {
+        self.rows.map_or(position, |rows| rows[position])
+    }
+
+    /// [`Fold::purged_forward`] after its row check.
+    fn forward(
+        &self,
+        validation_fraction: f64,
+        blocks: usize,
+        min_train: usize,
+    ) -> Result<Vec<Fold>> {
+        if !(validation_fraction > 0.0 && validation_fraction < 1.0) || blocks == 0 {
+            return Err(purged_refusal(format!(
+                "need a validation fraction in (0, 1) and at least one block, got \
+                 {validation_fraction} and {blocks}"
+            )));
+        }
+        self.check_labels()?;
+        let mut times = self.decision_at.to_vec();
+        times.sort_unstable();
+        times.dedup();
+        let count = times.len();
+        let mut split = (count - 1).min(((1.0 - validation_fraction) * count as f64) as usize);
+        // A row trains a fold starting at `start` when `at < start` and
+        // `end <= start`; as `end >= at`, that is `start >= end`, strictly
+        // when the label ends at its decision. Sorted by `(end, strict)`,
+        // the rows a start trains are a prefix, and the candidate starts
+        // only grow, so one pass counts them all.
+        let mut keys: Vec<(i64, bool)> = self
+            .decision_at
+            .iter()
+            .zip(self.label_end)
+            .map(|(&at, &end)| (end, end == at))
+            .collect();
+        keys.sort_unstable();
+        let mut trained = 0;
+        let mut trainable = |start: i64| {
+            while let Some(&(end, strict)) = keys.get(trained)
+                && (end < start || (end == start && !strict))
+            {
+                trained += 1;
+            }
+            trained
+        };
+        while trainable(times[split]) < min_train {
+            split += 1;
+            if split + blocks > count {
+                return Err(purged_refusal(format!(
+                    "no test start leaves {min_train} purged training rows and {blocks} test \
+                     decision times"
+                )));
+            }
+        }
+        let tail = &times[split..];
+        if tail.len() < blocks {
+            return Err(purged_refusal(format!(
+                "{blocks} test blocks need {blocks} distinct decision times; the tail has {}",
+                tail.len()
+            )));
+        }
+        let starts: Vec<i64> = (0..blocks)
+            .map(|block| tail[block * tail.len() / blocks])
+            .collect();
+        let mut folds = Vec::with_capacity(blocks);
+        for (block, &start) in starts.iter().enumerate() {
+            let fold = self.fold(start, starts.get(block + 1).copied());
+            if fold.train.is_empty() || fold.test.is_empty() {
+                return Err(purged_refusal(format!(
+                    "test block {block} leaves no training or test rows"
+                )));
+            }
+            folds.push(fold);
+        }
+        Ok(folds)
+    }
+
+    /// [`Fold::purged_forward_at`] after its row check.
+    fn forward_at(&self, block_starts: &[i64], min_train: usize) -> Result<Vec<Fold>> {
+        self.check_labels()?;
         if block_starts.is_empty() {
             return Err(purged_refusal("no test block starts"));
         }
@@ -306,7 +428,7 @@ impl Fold {
         let mut folds = Vec::with_capacity(block_starts.len());
         for (block, &start) in block_starts.iter().enumerate() {
             let end = block_starts.get(block + 1).copied();
-            let fold = purged_fold(decision_at, label_end, start, end);
+            let fold = self.fold(start, end);
             if fold.test.is_empty() {
                 return Err(purged_refusal(format!(
                     "test block {block} starting at {start} has no rows decided in it"
@@ -322,6 +444,34 @@ impl Fold {
             folds.push(fold);
         }
         Ok(folds)
+    }
+
+    /// Refuses the first row whose label ends before its decision.
+    fn check_labels(&self) -> Result<()> {
+        match (0..self.decision_at.len()).find(|&at| self.label_end[at] < self.decision_at[at]) {
+            Some(position) => Err(purged_refusal(format!(
+                "row {}'s label ends before its decision",
+                self.row(position)
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The purged forward fold testing on the rows decided from `start`
+    /// until `end` (to the last row without one) and training on the rows
+    /// decided before `start` whose labels end at or before it, both in row
+    /// order.
+    fn fold(&self, start: i64, end: Option<i64>) -> Fold {
+        let (decision_at, label_end) = (self.decision_at, self.label_end);
+        let test = (0..decision_at.len())
+            .filter(|&at| decision_at[at] >= start && end.is_none_or(|end| decision_at[at] < end))
+            .map(|at| self.row(at))
+            .collect();
+        let train = (0..decision_at.len())
+            .filter(|&at| decision_at[at] < start && label_end[at] <= start)
+            .map(|at| self.row(at))
+            .collect();
+        Fold::new(train, test)
     }
 }
 
@@ -346,27 +496,53 @@ fn check_purged_rows(decision_at: &[i64], label_end: &[i64]) -> Result<()> {
     Ok(())
 }
 
-/// Refuses the first row whose label ends before its decision.
-fn check_purged_labels(decision_at: &[i64], label_end: &[i64]) -> Result<()> {
-    match (0..decision_at.len()).find(|&row| label_end[row] < decision_at[row]) {
-        Some(row) => Err(purged_refusal(format!(
-            "row {row}'s label ends before its decision"
-        ))),
-        None => Ok(()),
+/// The decision and label-end times of `rows`, refusing times that differ
+/// in length and rows that are empty, not strictly increasing, or out of
+/// bounds.
+fn select_purged_rows(
+    decision_at: &[i64],
+    label_end: &[i64],
+    rows: &[usize],
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    check_purged_rows(decision_at, label_end)?;
+    if rows.is_empty() {
+        return Err(purged_refusal("no rows"));
     }
+    if let Some(previous) = rows.windows(2).position(|pair| pair[1] <= pair[0]) {
+        let position = previous + 1;
+        return Err(purged_refusal(format!(
+            "rows must strictly increase; position {position}'s row {} does not follow \
+             position {previous}'s {}",
+            rows[position], rows[previous]
+        )));
+    }
+    // Strictly increasing, so only the last row can be out of bounds.
+    let n = decision_at.len();
+    if let Some(&row) = rows.last()
+        && row >= n
+    {
+        return Err(purged_refusal(format!(
+            "row {row} at position {} is out of bounds for {n} rows",
+            rows.len() - 1
+        )));
+    }
+    Ok(rows
+        .iter()
+        .map(|&row| (decision_at[row], label_end[row]))
+        .unzip())
 }
 
-/// The purged forward fold testing on the rows decided from `start` until
-/// `end` (to the last row without one) and training on the rows decided
-/// before `start` whose labels end at or before it, both in row order.
-fn purged_fold(decision_at: &[i64], label_end: &[i64], start: i64, end: Option<i64>) -> Fold {
-    let test = (0..decision_at.len())
-        .filter(|&row| decision_at[row] >= start && end.is_none_or(|end| decision_at[row] < end))
-        .collect();
-    let train = (0..decision_at.len())
-        .filter(|&row| decision_at[row] < start && label_end[row] <= start)
-        .collect();
-    Fold::new(train, test)
+/// Where [`PurgedTail::split`] starts the tail: at a share of the split
+/// rows' time span or of their count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TailCut {
+    /// The tail is the last `fraction` of the rows' time span.
+    #[default]
+    Span,
+    /// The tail is the last `fraction` of the rows by decision time,
+    /// lengthened to keep the decision time it starts at whole.
+    Rows,
 }
 
 /// The purged chronological tail of a set of timestamped rows, the
@@ -376,17 +552,32 @@ fn purged_fold(decision_at: &[i64], label_end: &[i64], start: i64, end: Option<i
 ///
 /// `decision_at[i]` and `label_end[i]` are row `i`'s decision time and the
 /// end of its label window plus any embargo, as for
-/// [`Fold::purged_forward`]. The cut is by time span, as an expanding
-/// fold's early-stopping tail is cut (unlike `purged_forward`, which cuts
-/// by the count of distinct decision times): for rows decided from `first`
-/// to `last`, [`split`](Self::split) starts the tail at `split_at`, the
-/// first of their decision times at or after `first + (1 − fraction) ·
-/// (last − first)`, so irregular gaps do not shift it. That offset from
-/// `first` is evaluated in `f64` and rounded up to a whole tick, then
-/// compared exactly with each time's offset (so a `fraction` of `0.3` cuts
-/// a span of 10 ticks at 7, as the decimal says, though binary `0.3` is a
-/// little under 3/10; past 2^53 ticks the span itself rounds). The tail is
-/// every row decided at or after `split_at`, and the rows the
+/// [`Fold::purged_forward`]. [`split`](Self::split) starts the tail at
+/// `split_at`, one of the split rows' decision times, which the
+/// [`TailCut`] places:
+///
+/// - [`TailCut::Span`] (the default, [`new`](Self::new)) cuts by time span,
+///   as an expanding fold's early-stopping tail is cut (unlike
+///   `purged_forward`, which cuts by the count of distinct decision times):
+///   for rows decided from `first` to `last`, `split_at` is the first of
+///   their decision times at or after `first + (1 − fraction) · (last −
+///   first)`, so irregular gaps do not shift it. That offset from `first`
+///   is evaluated in `f64` and rounded up to a whole tick, then compared
+///   exactly with each time's offset (so a `fraction` of `0.3` cuts a span
+///   of 10 ticks at 7, as the decimal says, though binary `0.3` is a little
+///   under 3/10; past 2^53 ticks the span itself rounds).
+/// - [`TailCut::Rows`] cuts by row count: with the `n` split rows sorted by
+///   decision time, `split_at` is the decision time of the row at 0-based
+///   position `min(n − 1, ⌊(1 − fraction) · n⌋)` (evaluated in `f64`), so
+///   the tail holds the last `fraction` of the rows, plus any rows decided
+///   with the one there (a decision time is never split).
+///
+/// The two differ when the rows' density varies over time, as across the
+/// periods of an expanding fold: where later periods hold more rows per
+/// tick, the span cut's tail holds more than `fraction` of the rows (fewer
+/// where they hold fewer), the row cut's about `fraction`.
+///
+/// The tail is every row decided at or after `split_at`, and the rows the
 /// early-stopping fit trains on are those decided before it whose labels
 /// end at or before it (so a label ending exactly at the split is kept, one
 /// ending a tick later is purged; the rows in between go to neither side).
@@ -395,7 +586,7 @@ fn purged_fold(decision_at: &[i64], label_end: &[i64], start: i64, end: Option<i
 /// empty is refused.
 ///
 /// ```
-/// use hessboost::training::PurgedTail;
+/// use hessboost::training::{PurgedTail, TailCut};
 ///
 /// # fn main() -> hessboost::error::Result<()> {
 /// // One row per hour for nine hours; each label ends two hours later.
@@ -409,6 +600,9 @@ fn purged_fold(decision_at: &[i64], label_end: &[i64], start: i64, end: Option<i
 /// assert_eq!(split_at, 6 * hour);
 /// assert_eq!(split.test, [6, 7, 8]);
 /// assert_eq!(split.train, [0, 1, 2, 3, 4]);
+/// // By row count, the tail starts at row ⌊0.75 · 9⌋ = 6 too.
+/// let rows = PurgedTail::with_cut(&decision_at, &label_end, 0.25, TailCut::Rows)?;
+/// assert_eq!(rows.split(&(0..9).collect::<Vec<_>>())?, (split_at, split));
 /// # Ok(())
 /// # }
 /// ```
@@ -417,11 +611,13 @@ pub struct PurgedTail<'a> {
     decision_at: &'a [i64],
     label_end: &'a [i64],
     fraction: f64,
+    cut: TailCut,
 }
 
 impl<'a> PurgedTail<'a> {
     /// The tail of the last `fraction` of a row set's time span, over the
-    /// rows' `decision_at` and `label_end` times.
+    /// rows' `decision_at` and `label_end` times: [`with_cut`](Self::with_cut)
+    /// with [`TailCut::Span`].
     ///
     /// # Errors
     ///
@@ -430,6 +626,22 @@ impl<'a> PurgedTail<'a> {
     /// are empty, a label ends before its decision, or `fraction` is not in
     /// `(0, 1)`.
     pub fn new(decision_at: &'a [i64], label_end: &'a [i64], fraction: f64) -> Result<Self> {
+        Self::with_cut(decision_at, label_end, fraction, TailCut::Span)
+    }
+
+    /// The tail of the last `fraction` of a row set's time span
+    /// ([`TailCut::Span`]) or rows ([`TailCut::Rows`]), as `cut` says, over
+    /// the rows' `decision_at` and `label_end` times.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new).
+    pub fn with_cut(
+        decision_at: &'a [i64],
+        label_end: &'a [i64],
+        fraction: f64,
+        cut: TailCut,
+    ) -> Result<Self> {
         let refuse = |reason: String| HessboostError::invalid_param("purged tail", reason);
         if decision_at.len() != label_end.len() {
             return Err(HessboostError::dimension_mismatch(
@@ -455,7 +667,13 @@ impl<'a> PurgedTail<'a> {
             decision_at,
             label_end,
             fraction,
+            cut,
         })
+    }
+
+    /// How the tail is cut: by time span or row count.
+    pub fn cut(&self) -> TailCut {
+        self.cut
     }
 
     /// The number of rows the times describe.
@@ -486,19 +704,30 @@ impl<'a> PurgedTail<'a> {
         }
         let mut times: Vec<i64> = rows.iter().map(|&row| self.decision_at[row]).collect();
         times.sort_unstable();
-        times.dedup();
         if times.is_empty() {
             return Err("no rows to split".to_string());
         }
-        // The first decision time at or past `1 - fraction` of the span: the
-        // cutoff offset in `f64`, rounded up to a whole tick and capped at
-        // the span (which `last` always reaches), against which offsets
-        // compare as integers (in `f64`, one just before the cutoff could
-        // round onto it past 2^53).
-        let first = i128::from(times[0]);
-        let span = i128::from(times[times.len() - 1]) - first;
-        let cutoff = (((1.0 - self.fraction) * span as f64).ceil() as i128).min(span);
-        let split_at = times[times.partition_point(|&time| i128::from(time) - first < cutoff)];
+        let split_at = match self.cut {
+            TailCut::Span => {
+                times.dedup();
+                // The first decision time at or past `1 - fraction` of the
+                // span: the cutoff offset in `f64`, rounded up to a whole
+                // tick and capped at the span (which `last` always
+                // reaches), against which offsets compare as integers (in
+                // `f64`, one just before the cutoff could round onto it
+                // past 2^53).
+                let first = i128::from(times[0]);
+                let span = i128::from(times[times.len() - 1]) - first;
+                let cutoff = (((1.0 - self.fraction) * span as f64).ceil() as i128).min(span);
+                times[times.partition_point(|&time| i128::from(time) - first < cutoff)]
+            }
+            // The decision time of the row `1 - fraction` of the way
+            // through, by decision time; its ties join the tail below.
+            TailCut::Rows => {
+                let n = times.len();
+                times[(n - 1).min(((1.0 - self.fraction) * n as f64) as usize)]
+            }
+        };
         let (mut train, mut test) = (Vec::new(), Vec::new());
         for &row in rows {
             if self.decision_at[row] >= split_at {
@@ -756,5 +985,194 @@ mod tests {
         let (split_at, split) = tail.split(&[0, 1, 2]).unwrap();
         assert_eq!(split_at, i64::MAX - 1);
         assert_eq!(split.test, [2]);
+    }
+
+    /// The row cut starts the tail at the decision time of the row at
+    /// position `min(n - 1, floor((1 - fraction) * n))` by decision time,
+    /// whatever order the rows come in.
+    #[test]
+    fn purged_tail_cuts_by_row_count() {
+        for (fraction, n, position) in [(0.15, 100_usize, 85_usize), (0.3, 20, 14), (0.15, 7, 5)] {
+            // Row `i` is decided at `10 * (n - 1 - i)`: latest first.
+            let at: Vec<i64> = (0..n).map(|i| 10 * (n - 1 - i) as i64).collect();
+            let tail = PurgedTail::with_cut(&at, &at, fraction, TailCut::Rows).unwrap();
+            assert_eq!(tail.cut(), TailCut::Rows);
+            let (split_at, split) = tail.split(&(0..n).collect::<Vec<_>>()).unwrap();
+            assert_eq!(split_at, 10 * position as i64, "{fraction} of {n}");
+            assert_eq!(split.test, (0..n - position).collect::<Vec<_>>());
+            assert_eq!(split.train, (n - position..n).collect::<Vec<_>>());
+        }
+    }
+
+    /// A decision time is never split: rows tied with the row cut's first
+    /// row join the tail. Where late rows come denser, the span cut's tail
+    /// holds more rows; [`PurgedTail::new`] is the span cut.
+    #[test]
+    fn purged_tail_row_cut_keeps_decision_times_whole() {
+        let at = [0, 1, 2, 3, 3, 3, 3, 4, 5, 6];
+        let tail = PurgedTail::with_cut(&at, &at, 0.5, TailCut::Rows).unwrap();
+        let (split_at, split) = tail.split(&(0..10).collect::<Vec<_>>()).unwrap();
+        // Position 5 is decided at 3, with three other rows.
+        assert_eq!(split_at, 3);
+        assert_eq!(split.test, [3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(split.train, [0, 1, 2]);
+        // Ten rows ten ticks apart, then ten rows one tick apart.
+        let at: Vec<i64> = (0..10).map(|i| 10 * i).chain(91..=100).collect();
+        let rows: Vec<usize> = (0..20).collect();
+        let span = PurgedTail::new(&at, &at, 0.5).unwrap();
+        assert_eq!(span.cut(), TailCut::Span);
+        let (split_at, split) = span.split(&rows).unwrap();
+        assert_eq!(split_at, 50);
+        assert_eq!(split.test, (5..20).collect::<Vec<_>>());
+        let default = PurgedTail::with_cut(&at, &at, 0.5, TailCut::default()).unwrap();
+        assert_eq!(default.split(&rows).unwrap(), (split_at, split));
+        let by_rows = PurgedTail::with_cut(&at, &at, 0.5, TailCut::Rows).unwrap();
+        let (split_at, split) = by_rows.split(&rows).unwrap();
+        assert_eq!(split_at, 91);
+        assert_eq!(split.test, (10..20).collect::<Vec<_>>());
+        assert_eq!(split.train, (0..10).collect::<Vec<_>>());
+        // The row cut refuses what the span cut refuses.
+        assert!(PurgedTail::with_cut(&at, &at, 1.0, TailCut::Rows).is_err());
+        assert!(PurgedTail::with_cut(&[5, 6], &[4, 7], 0.5, TailCut::Rows).is_err());
+        for rows in [vec![], vec![0], vec![3, 4, 20]] {
+            assert!(by_rows.split(&rows).is_err(), "{rows:?}");
+        }
+    }
+
+    /// On random schedules, the `_rows` builders are the plain builders on
+    /// the selected rows' times, with indices mapped back; excluded rows
+    /// hold label ends the plain builders would refuse.
+    #[test]
+    fn purged_row_subsets_equal_the_plain_builders_on_the_selected_rows() {
+        let mut rng = Rng::new(11);
+        let mut built = 0;
+        for _ in 0..200 {
+            let n = rng.range(1..60);
+            let decision_at: Vec<i64> = (0..n).map(|_| rng.below(30) as i64).collect();
+            let mut label_end: Vec<i64> = decision_at
+                .iter()
+                .map(|&at| at + rng.below(6) as i64)
+                .collect();
+            let rows: Vec<usize> = (0..n).filter(|_| rng.below(3) != 0).collect();
+            let sub = |times: &[i64]| -> Vec<i64> { rows.iter().map(|&row| times[row]).collect() };
+            let (sub_at, sub_end) = (sub(&decision_at), sub(&label_end));
+            for row in (0..n).filter(|row| rows.binary_search(row).is_err()) {
+                label_end[row] = -1;
+            }
+            let mapped = |folds: Vec<Fold>| -> Vec<Fold> {
+                folds
+                    .into_iter()
+                    .map(|fold| {
+                        Fold::new(
+                            fold.train.iter().map(|&at| rows[at]).collect(),
+                            fold.test.iter().map(|&at| rows[at]).collect(),
+                        )
+                    })
+                    .collect()
+            };
+            let same = |expected: Result<Vec<Fold>>, got: Result<Vec<Fold>>| match (expected, got) {
+                (Ok(expected), Ok(got)) => {
+                    assert_eq!(mapped(expected), got);
+                    1
+                }
+                (Err(expected), Err(got)) => {
+                    match (&expected, &got) {
+                        (
+                            HessboostError::InvalidParameter { name: plain, .. },
+                            HessboostError::InvalidParameter { name: selected, .. },
+                        ) => assert_eq!(plain, selected),
+                        (
+                            HessboostError::DimensionMismatch {
+                                what: plain_what,
+                                expected: plain_expected,
+                                got: plain_got,
+                            },
+                            HessboostError::DimensionMismatch {
+                                what: selected_what,
+                                expected: selected_expected,
+                                got: selected_got,
+                            },
+                        ) => assert_eq!(
+                            (plain_what, plain_expected, plain_got),
+                            (selected_what, selected_expected, selected_got)
+                        ),
+                        _ => panic!("{expected:?} vs {got:?}"),
+                    }
+                    0
+                }
+                (expected, got) => panic!("{expected:?} vs {got:?}"),
+            };
+            let fraction = 0.05 + 0.9 * rng.f64();
+            let blocks = rng.range(1..4);
+            let min_train = rng.range(0..6);
+            built += same(
+                Fold::purged_forward(&sub_at, &sub_end, fraction, blocks, min_train),
+                Fold::purged_forward_rows(
+                    &decision_at,
+                    &label_end,
+                    &rows,
+                    fraction,
+                    blocks,
+                    min_train,
+                ),
+            );
+            let count = rng.range(1..4);
+            let mut starts: Vec<i64> = (0..count).map(|_| rng.below(36) as i64).collect();
+            starts.sort_unstable();
+            starts.dedup();
+            built += same(
+                Fold::purged_forward_at(&sub_at, &sub_end, &starts, min_train),
+                Fold::purged_forward_at_rows(&decision_at, &label_end, &rows, &starts, min_train),
+            );
+        }
+        assert!(built > 40, "{built} of 400 runs built folds");
+    }
+
+    /// `rows` must be non-empty, strictly increasing, and in bounds; the
+    /// label check covers the selected rows only.
+    #[test]
+    fn purged_row_subsets_refuse_unusable_rows() {
+        let day = 86_400;
+        let (decisions, mut ends) = schedule(24);
+        let refusal = |result: Result<Vec<Fold>>| match result {
+            Err(HessboostError::InvalidParameter { name, .. }) => {
+                assert_eq!(name, "purged folds");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        for rows in [vec![], vec![3, 2], vec![2, 2], vec![0, 120]] {
+            refusal(Fold::purged_forward_rows(
+                &decisions, &ends, &rows, 0.2, 1, 1,
+            ));
+            refusal(Fold::purged_forward_at_rows(
+                &decisions,
+                &ends,
+                &rows,
+                &[16 * day],
+                1,
+            ));
+        }
+        assert!(matches!(
+            Fold::purged_forward_rows(&decisions, &ends[1..], &[0], 0.2, 1, 1),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
+        // Row 0, excluded, holds a label ending before its decision.
+        ends[0] = decisions[0] - 1;
+        let rows: Vec<usize> = (1..120).collect();
+        assert!(Fold::purged_forward(&decisions, &ends, 0.2, 1, 1).is_err());
+        let folds = Fold::purged_forward_rows(&decisions, &ends, &rows, 0.2, 1, 1).unwrap();
+        assert!(!folds[0].train.contains(&0));
+        Fold::purged_forward_at_rows(&decisions, &ends, &rows, &[16 * day], 1).unwrap();
+        // Row 7, selected, holds one too: refused until it is excluded.
+        ends[7] = decisions[7] - 1;
+        for result in [
+            Fold::purged_forward_rows(&decisions, &ends, &rows, 0.2, 1, 1),
+            Fold::purged_forward_at_rows(&decisions, &ends, &rows, &[16 * day], 1),
+        ] {
+            refusal(result);
+        }
+        let rows: Vec<usize> = (1..120).filter(|&row| row != 7).collect();
+        Fold::purged_forward_rows(&decisions, &ends, &rows, 0.2, 1, 1).unwrap();
+        Fold::purged_forward_at_rows(&decisions, &ends, &rows, &[16 * day], 1).unwrap();
     }
 }

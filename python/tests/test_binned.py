@@ -71,6 +71,30 @@ def test_binned_matrices_keep_the_frame_schema_and_take_new_labels() -> None:
     assert a.feature_names == matrix.feature_names
 
 
+def test_binned_matrices_keep_and_replace_split_groups() -> None:
+    x, y = regression(rows=400)
+    episodes = np.arange(400) // 20
+    matrix = DMatrix(x, y, split_group=episodes)
+    binned = BinnedMatrix(matrix)
+    np.testing.assert_array_equal(binned.get_split_group(), episodes)
+    params = {"max_depth": 4, "min_child_groups": 3, "subsample": 0.8, "seed": 1}
+    assert hessboost.train(params, binned, 5).save_raw() == (
+        hessboost.train(params, matrix, 5).save_raw()
+    )
+    # Unlike the weights, the groups can change after binning.
+    coarse = np.arange(400) // 100
+    binned.set_info(split_group=coarse)
+    matrix.set_info(split_group=coarse)
+    np.testing.assert_array_equal(binned.get_split_group(), coarse)
+    assert hessboost.train(params, binned, 5).save_raw() == (
+        hessboost.train(params, matrix, 5).save_raw()
+    )
+    with pytest.raises(HessboostError, match="split_groups"):
+        binned.set_info(split_group=np.arange(10))
+    with pytest.raises(InvalidDataError, match="split_groups"):
+        hessboost.train({"min_child_groups": 2}, BinnedMatrix(DMatrix(x, y)), 1)
+
+
 def test_custom_objectives_read_the_binned_matrix() -> None:
     x, y = regression(rows=300)
     matrix = DMatrix(x, y)

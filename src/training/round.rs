@@ -53,13 +53,14 @@ pub(super) struct RoundState<'a> {
 /// computes its gradients with a vector kernel) on one label column, one
 /// tree per iteration of a plain `gbtree`, every row in every tree, and
 /// none of the options that read the host's gradients or rows (SGLB,
-/// linear leaves, reuse penalties, model shrinkage).
+/// linear leaves, reuse penalties, model shrinkage, split groups).
 fn device_round_applies(run: &TrainContext, state: &RoundState) -> Option<DeviceLoss> {
     let TrainContext {
         params,
         dtrain,
         objective,
         langevin,
+        split_groups,
         ..
     } = *run;
     let plain = objective.n_outputs() == 1
@@ -77,6 +78,7 @@ fn device_round_applies(run: &TrainContext, state: &RoundState) -> Option<Device
         && params.linear_tree.is_none()
         && params.model_shrink.is_none()
         && langevin.is_none()
+        && split_groups.is_none()
         && state.reuse.is_none();
     if !plain {
         return None;

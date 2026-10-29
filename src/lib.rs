@@ -205,6 +205,12 @@
 //!     ([`BoosterKind::Ebm`](config::BoosterKind::Ebm), [`ebm`],
 //!     [`EbmInference`](inference::EbmInference));
 //!   - CatBoost-style ordered target statistics ([`data::target_stats`]);
+//!   - split-group child constraints: a split only where both children
+//!     hold rows of at least `min_child_groups` distinct groups, each row's
+//!     group its independent unit of evidence (one symbol on one day, an
+//!     episode), counted exactly over each node's sampled rows
+//!     ([`min_child_groups`](config::TrainingParams::min_child_groups),
+//!     [`DMatrix::with_split_groups`](data::DMatrix::with_split_groups));
 //!   - LightGBM options `extra_trees`, `path_smooth`, `linear_tree` leaves
 //!     ([`TrainingParams::extra_trees`](config::TrainingParams::extra_trees),
 //!     [`path_smooth`](config::TrainingParams::path_smooth),

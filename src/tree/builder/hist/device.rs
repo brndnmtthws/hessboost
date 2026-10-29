@@ -103,11 +103,13 @@ struct ResidentNode<'n> {
 impl HistTreeBuilder<'_> {
     /// The backend's row engine, when this tree can grow on it: depthwise
     /// or loss-guided growth on `f64` histograms, without reuse penalties
-    /// (whose commits a device failure's regrowth would repeat).
+    /// (whose commits a device failure's regrowth would repeat) or split
+    /// groups (`min_child_groups`, counted over the node's rows on the host).
     pub(super) fn device_engine(&self) -> Option<&dyn RowEngine> {
         let params = self.config.params;
         let supported = params.quantized.is_none()
             && self.reuse.is_none()
+            && self.groups.is_none()
             && matches!(
                 params.grow_policy,
                 GrowPolicy::DepthWise | GrowPolicy::LossGuide
@@ -190,7 +192,14 @@ impl HistTreeBuilder<'_> {
                 .next()?;
             NodeEntry {
                 seg: Some(seg),
-                ..self.root_entry(ghist, sampler, root_stats, root_hist, row_subset.len())
+                ..self.root_entry(
+                    ghist,
+                    sampler,
+                    root_stats,
+                    root_hist,
+                    row_subset.len(),
+                    None,
+                )
             }
         };
         let mut tree = RegTree::with_root(root_stats.hess as f32);
@@ -415,6 +424,7 @@ impl HistTreeBuilder<'_> {
             |(split, (part, left_hist, right_hist)): (PendingSplit, (Partitioned, _, _))| {
                 self.finish_children(
                     ghist,
+                    gpair,
                     split,
                     device_child(part.left, left_hist),
                     device_child(part.right, right_hist),
@@ -514,6 +524,7 @@ impl HistTreeBuilder<'_> {
             };
             let (left, right) = self.finish_children(
                 on.ghist,
+                on.gpair,
                 split,
                 device_child(part.left, Vec::new()),
                 device_child(part.right, Vec::new()),
@@ -596,7 +607,7 @@ impl HistTreeBuilder<'_> {
         match scan {
             NodeScan::Replay(_) => {
                 let hist = on.engine.read_hist(node.slot)?;
-                Some(self.evaluate(on.ghist, &hist, node.features, node.allowed, node.ctx))
+                Some(self.evaluate(on.ghist, &hist, node.features, node.allowed, node.ctx, None))
             }
             scan => resident_best(scan, on.ghist.cuts(), node.ctx.stats, |feature| {
                 self.scorer(self.node_scorer(node.ctx), feature)
@@ -820,7 +831,7 @@ mod tests {
                         builder.scorer(builder.node_scorer(ctx), f)
                     })
                     .unwrap();
-                    let expected = builder.evaluate(&index, &hist, &features, None, ctx);
+                    let expected = builder.evaluate(&index, &hist, &features, None, ctx, None);
                     assert_split_bits(&actual, &expected);
                 }
             }
@@ -997,7 +1008,7 @@ mod tests {
         let actual = builder
             .resident_merge(on, &node, NodeScan::Replay(ScanFallback::CategoricalOrder))
             .unwrap();
-        let expected = builder.evaluate(&index, &hist, &[0], None, ctx);
+        let expected = builder.evaluate(&index, &hist, &[0], None, ctx, None);
         assert_split_bits(&actual, &expected);
         assert_eq!(backend.scan_diagnostics().categorical_order_replays, 1);
         // Finite category keys with a NaN parent baseline cannot be

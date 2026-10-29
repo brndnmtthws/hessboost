@@ -140,6 +140,11 @@ impl BinnedMatrix {
         self.matrix.group()
     }
 
+    /// Split groups ([`DMatrix::split_groups`]).
+    pub fn split_groups(&self) -> Option<&[u64]> {
+        self.matrix.split_groups()
+    }
+
     /// The feature types the cuts were computed for.
     pub fn feature_types(&self) -> &[FeatureType] {
         self.matrix.feature_types()
@@ -178,6 +183,11 @@ impl BinnedMatrix {
     /// [`DMatrix::with_group_sizes`].
     pub fn with_group_sizes(self, sizes: &[usize]) -> Result<Self> {
         self.map(|m| m.with_group_sizes(sizes))
+    }
+
+    /// [`DMatrix::with_split_groups`].
+    pub fn with_split_groups(self, groups: &[u64]) -> Result<Self> {
+        self.map(|m| m.with_split_groups(groups))
     }
 
     /// [`DMatrix::with_feature_weights`].

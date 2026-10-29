@@ -1,8 +1,9 @@
 //! Request validation: what training refuses before anything is built.
 
 use super::eval::EvalSet;
+use super::row_sampling::gradient_sampling;
 use crate::config::{BoosterKind, Device, ProcessType, TrainingParams, TreeMethod};
-use crate::data::{DMatrix, FeatureType};
+use crate::data::{DMatrix, FeatureType, SketchedRows};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::Loss;
@@ -102,6 +103,7 @@ pub(super) fn validate_binned_request(
         max_depth: params.max_depth,
         max_leaves: params.max_leaves,
         min_child_weight: params.min_child_weight,
+        min_child_groups: params.min_child_groups,
         max_delta_step: params.max_delta_step,
         subsample: params.subsample,
         colsample_bytree: params.colsample_bytree,
@@ -141,10 +143,11 @@ pub(super) struct TrainRequest<'a> {
     pub(super) early_stopping_rounds: Option<NonZeroUsize>,
 }
 /// Refuse a training call that cannot run: invalid parameters, early
-/// stopping without eval sets, unlabeled or mismatched data, constraints
-/// naming missing features, feature weights on a path that samples no
-/// columns, and objective settings a saved model could not rebuild. The
-/// checks run, and report their first refusal, in this order.
+/// stopping without eval sets, unlabeled or mismatched data, a constraint
+/// on split groups the training matrix lacks, constraints naming missing
+/// features, feature weights on a path that samples no columns, and
+/// objective settings a saved model could not rebuild. The checks run, and
+/// report their first refusal, in this order.
 pub(super) fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
     let &TrainRequest {
         params,
@@ -158,6 +161,7 @@ pub(super) fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> 
         return Err(HessboostError::EmptyDataset("train: dtrain has no labels"));
     }
     validate_balanced_bagging(params, dtrain)?;
+    validate_split_groups(params, dtrain, objective)?;
     validate_datasets(objective, dtrain, evals)?;
     validate_constraints(params, dtrain.n_cols())?;
     validate_booster(request, objective)?;
@@ -180,6 +184,52 @@ fn validate_setup(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
         return Err(HessboostError::invalid_param(
             "early_stopping_rounds",
             "requires at least one evaluation dataset",
+        ));
+    }
+    Ok(())
+}
+
+/// `min_child_groups` counts the training rows' split groups, so the
+/// training matrix must have them. It counts them by the rows' bins, which
+/// route every row it counts (those of nonzero Hessian) as its values do
+/// only when the cuts were sketched from all of them. Under `hist`, a
+/// [`ViewCuts::Source`](crate::data::ViewCuts::Source) view weighing rows
+/// its source weighs zero breaks that. `approx` sketches each tree's cuts
+/// from its gradients, except that a constant Hessian's first cuts serve
+/// every tree: gradient-based sampling then trains later trees on rows the
+/// first tree's sample left out, which those cuts never saw.
+fn validate_split_groups(
+    params: &TrainingParams,
+    dtrain: &DMatrix,
+    objective: &dyn Loss,
+) -> Result<()> {
+    if !params.split_groups_on() {
+        return Ok(());
+    }
+    if dtrain.split_groups().is_none() {
+        return Err(HessboostError::invalid_data(
+            "split_groups",
+            format!(
+                "`min_child_groups = {}` requires split groups on the training dataset",
+                params.min_child_groups
+            ),
+        ));
+    }
+    if params.tree_method == TreeMethod::Approx {
+        if objective.const_hess() && gradient_sampling(params) {
+            return Err(HessboostError::invalid_param(
+                "min_child_groups",
+                "under `tree_method = approx` with gradient-based sampling needs a Hessian \
+                 that varies: a constant one's cuts are sketched once, from the first tree's \
+                 sample, and later samples train on rows they never saw (use `tree_method = \
+                 hist`)",
+            ));
+        }
+    } else if dtrain.sketched_rows() == SketchedRows::Partial {
+        return Err(HessboostError::invalid_data(
+            "weights",
+            "`min_child_groups` needs every weighted row in the cuts: this view with its \
+             source's cuts weighs rows its source weighs zero",
         ));
     }
     Ok(())

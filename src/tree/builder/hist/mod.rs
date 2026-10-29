@@ -9,6 +9,7 @@
 mod device;
 mod search;
 
+use super::groups::{LegalCuts, NodeGroups, SplitGroups};
 use super::lightgbm::{SplitOptions, finalize_smoothed_leaves};
 use super::partition::{child_histograms_for_features, partition_rows};
 use super::shared::{
@@ -61,6 +62,27 @@ pub(super) struct NodeCtx {
     pub(super) output: f64,
     /// Seed of the tree being grown ([`crate::tree::sampler::ColumnSampler::seed`]).
     pub(super) tree_seed: u64,
+}
+
+/// One node's split search ([`HistTreeBuilder::evaluate`]): the index, the
+/// node's histogram and context, and under `min_child_groups` its split
+/// groups with every plain numeric feature's legal cuts (by feature id;
+/// empty without a constraint).
+#[derive(Clone, Copy)]
+pub(super) struct Search<'s> {
+    pub(super) ghist: &'s GHistIndex,
+    pub(super) hist: &'s [GradStats],
+    pub(super) node: NodeCtx,
+    pub(super) groups: Option<&'s NodeGroups>,
+    legal: &'s [Option<LegalCuts>],
+}
+
+impl Search<'_> {
+    /// Feature `f`'s legal cuts (`None`: no constraint, or not a plain
+    /// numeric feature).
+    pub(super) fn legal(&self, f: u32) -> Option<LegalCuts> {
+        self.legal.get(f as usize).copied().flatten()
+    }
 }
 
 /// A node awaiting or undergoing expansion.
@@ -139,6 +161,9 @@ pub struct HistTreeBuilder<'a> {
     reuse: Option<HistReuse>,
     /// Stream of the stochastic gradient rounding (`use_quantized_grad`).
     rounding_seed: u64,
+    /// The training rows' split groups under `min_child_groups` (`None`
+    /// without the constraint).
+    groups: Option<&'a SplitGroups>,
 }
 
 impl<'a> HistTreeBuilder<'a> {
@@ -150,6 +175,7 @@ impl<'a> HistTreeBuilder<'a> {
             options: SplitOptions::from_params(params),
             reuse: None,
             rounding_seed: 0,
+            groups: None,
         }
     }
 
@@ -170,6 +196,29 @@ impl<'a> HistTreeBuilder<'a> {
     pub(crate) fn with_rounding_seed(mut self, seed: u64) -> Self {
         self.rounding_seed = seed;
         self
+    }
+
+    /// Constrain every split by `groups` (`min_child_groups` over the
+    /// training rows' split groups; `None` constrains nothing).
+    #[must_use]
+    pub(crate) fn with_split_groups(mut self, groups: Option<&'a SplitGroups>) -> Self {
+        self.groups = groups;
+        self
+    }
+
+    /// The split groups of the node holding `rows`, under the constraint,
+    /// over the rows whose gradient pairs in `gpair` count. Only
+    /// device-resident growth lacks host gradients, and it never runs under
+    /// the constraint ([`Self::device_engine`]).
+    fn node_groups(
+        &self,
+        ghist: &GHistIndex,
+        gpair: Option<&[GradPair]>,
+        rows: &[u32],
+    ) -> Option<NodeGroups> {
+        debug_assert!(self.groups.is_none() || gpair.is_some());
+        let (groups, gpair) = (self.groups?, gpair?);
+        Some(NodeGroups::new(groups, ghist, gpair, rows))
     }
 
     /// Use a specific histogram backend (the Metal GPU's, when
@@ -222,13 +271,12 @@ impl<'a> HistTreeBuilder<'a> {
         self.backend.prepare(ghist, gpair);
 
         if self.config.params.grow_policy == GrowPolicy::Symmetric {
-            return super::oblivious::SymmetricTreeBuilder::new(&self.config, self.backend).build(
-                ghist,
-                gpair,
-                row_subset,
-                sampler,
-                capture_rows,
-            );
+            return super::oblivious::SymmetricTreeBuilder::new(
+                &self.config,
+                self.backend,
+                self.groups,
+            )
+            .build(ghist, gpair, row_subset, sampler, capture_rows);
         }
         debug_assert!(
             self.reuse
@@ -330,7 +378,15 @@ impl<'a> HistTreeBuilder<'a> {
                 };
                 (root_stats, root_hist, None)
             };
-        let root = self.root_entry(ghist, sampler, root_stats, root_hist, row_subset.len());
+        let groups = self.node_groups(ghist, Some(gpair), row_subset);
+        let root = self.root_entry(
+            ghist,
+            sampler,
+            root_stats,
+            root_hist,
+            row_subset.len(),
+            groups.as_ref(),
+        );
         let root = NodeEntry {
             rows: row_subset.to_vec(),
             quant: root_quant,
@@ -340,7 +396,8 @@ impl<'a> HistTreeBuilder<'a> {
     }
 
     /// The root entry of `rows` rows with statistics `root_stats` and
-    /// histogram `root_hist`, drawing the root's column sample and finding
+    /// histogram `root_hist` (and split groups `groups`, under
+    /// `min_child_groups`), drawing the root's column sample and finding
     /// its best split. Its rows are left empty for the caller.
     fn root_entry(
         &self,
@@ -349,9 +406,10 @@ impl<'a> HistTreeBuilder<'a> {
         root_stats: GradStats,
         root_hist: Histogram,
         rows: usize,
+        groups: Option<&NodeGroups>,
     ) -> NodeEntry {
         let (root_feats, root_ctx) = self.root_context(sampler, root_stats, rows);
-        let best = self.evaluate(ghist, &root_hist, &root_feats, None, root_ctx);
+        let best = self.evaluate(ghist, &root_hist, &root_feats, None, root_ctx, groups);
         NodeEntry {
             pool: sampler.tree_features(),
             hist: root_hist,
@@ -670,6 +728,7 @@ impl<'a> HistTreeBuilder<'a> {
         };
         self.finish_children(
             ghist,
+            Some(gpair),
             split,
             child(left_rows, left_hist, left_quant),
             child(right_rows, right_hist, right_quant),
@@ -713,10 +772,12 @@ impl<'a> HistTreeBuilder<'a> {
 
     /// Both children of `split` from their rows and histograms (empty for
     /// terminal splits): their interaction state and best splits, searched
-    /// here unless `searched` holds them.
+    /// here unless `searched` holds them (`gpair`: the host's gradients, if
+    /// it has them).
     fn finish_children(
         &self,
         ghist: &GHistIndex,
+        gpair: Option<&[GradPair]>,
         split: PendingSplit,
         left: Child,
         right: Child,
@@ -739,15 +800,29 @@ impl<'a> HistTreeBuilder<'a> {
                 (BestSplit::none(), BestSplit::none())
             } else {
                 let allowed = allowed.as_ref();
-                let eval_left =
-                    || self.evaluate(ghist, &left.hist, &split.left_features, allowed, left_ctx);
+                // Device-resident growth, whose rows stay on the device, is
+                // off under `min_child_groups` (`device_engine`).
+                debug_assert!(self.groups.is_none() || (left.seg.is_none() && right.seg.is_none()));
+                let eval_left = || {
+                    let groups = self.node_groups(ghist, gpair, &left.rows);
+                    self.evaluate(
+                        ghist,
+                        &left.hist,
+                        &split.left_features,
+                        allowed,
+                        left_ctx,
+                        groups.as_ref(),
+                    )
+                };
                 let eval_right = || {
+                    let groups = self.node_groups(ghist, gpair, &right.rows);
                     self.evaluate(
                         ghist,
                         &right.hist,
                         &split.right_features,
                         allowed,
                         right_ctx,
+                        groups.as_ref(),
                     )
                 };
                 if left.len + right.len >= PARALLEL_EVALUATE_ROWS && rayon_available() {

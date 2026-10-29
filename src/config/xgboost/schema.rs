@@ -138,6 +138,7 @@ flat_params! {
     max_depth: FlatLimit,
     max_leaves: FlatLimit,
     min_child_weight: f64,
+    min_child_groups: usize,
     max_delta_step: Option<f64>,
     subsample: f64,
     colsample_bytree: f64,

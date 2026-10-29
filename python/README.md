@@ -115,8 +115,12 @@ anything `numpy.asarray` accepts, and keeps its own copy of the values;
 `copy=False` reads a read-only, C-contiguous `float32` array in place
 instead (such as `np.load(path, mmap_mode="r")`), which must then stay
 unchanged. NaN, and a frame's null, is missing (or pass
-`missing=`); ranking data takes `group=` sizes or `qid=`, and
-`survival:aft` takes `label_lower_bound=`/`label_upper_bound=`.
+`missing=`); ranking data takes `group=` sizes or `qid=`,
+`survival:aft` takes `label_lower_bound=`/`label_upper_bound=`, and
+`split_group=` gives each row an integer id of its independent unit of
+evidence (a symbol on one day, an episode), which the `min_child_groups`
+parameter counts: a split is taken only when both children hold rows of at
+least that many groups.
 `Booster.predict` accepts the same inputs directly. `DMatrix.slice(rows)`
 is a view of the rows, sharing the values, and `BinnedMatrix(dtrain,
 max_bin)` keeps only a matrix's histogram bins (XGBoost's
@@ -124,9 +128,9 @@ max_bin)` keeps only a matrix's histogram bins (XGBoost's
 
 With a frame, the per-row metadata can name its columns instead of
 arriving as separate arrays: `label`, `weight`, `base_margin`, `qid`,
-`label_lower_bound` and `label_upper_bound` (`label` and `base_margin`
-also a list of names, for a label matrix or per-output margins). The named
-columns leave the features:
+`split_group`, `label_lower_bound` and `label_upper_bound` (`label` and
+`base_margin` also a list of names, for a label matrix or per-output
+margins). The named columns leave the features:
 
 ```python
 import polars as pl

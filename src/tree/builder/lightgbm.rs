@@ -31,13 +31,13 @@
 //! of the node's Hessian (`round(n·H_child/H_node)`, exact for constant
 //! Hessians); leaves keep the outputs their split recorded.
 
-use super::hist::NodeCtx;
+use super::groups::{CategoryGroups, LegalCuts};
+use super::hist::{NodeCtx, Search};
 use super::shared::{xgb_calc_weight, xgb_node_gain};
 use super::split::{SplitScorer, for_each_numeric_split};
 use super::{BestSplit, Children, Score, SplitPos, children_valid, xgb_update};
 use crate::K_RT_EPS;
 use crate::config::TrainingParams;
-use crate::data::ghist::GHistIndex;
 use crate::rng::{Rng, splitmix64};
 use crate::tree::constraints::{Bounds, MonotoneConstraints, gain_at_weight, satisfies};
 use crate::tree::gain::{GradStats, RegParams};
@@ -67,19 +67,25 @@ impl SplitOptions {
         self.path_smooth > 0.0
     }
 
-    /// Find the best split of `node` from its histogram, under the enabled
-    /// options. `features` is already filtered by column sampling and
-    /// interaction constraints; the candidate order and tie rule follow the
-    /// builder's XGBoost search.
+    /// Find the best split of `search`'s node from its histogram, under the
+    /// enabled options. `features` is already filtered by column sampling
+    /// and interaction constraints; the candidate order and tie rule follow
+    /// the builder's XGBoost search, and `min_child_groups` leaves out the
+    /// candidates whose children hold too few split groups.
     pub(super) fn evaluate(
         &self,
-        ghist: &GHistIndex,
-        hist: &[GradStats],
+        search: &Search,
         features: &[u32],
         cons: &MonotoneConstraints,
         reg: &RegParams,
-        node: NodeCtx,
     ) -> BestSplit {
+        let Search {
+            ghist,
+            hist,
+            node,
+            groups,
+            ..
+        } = *search;
         let cuts = ghist.cuts();
         let dense = ghist.is_dense();
         let total = node.stats;
@@ -104,20 +110,33 @@ impl SplitOptions {
             let dir = cons.dir(f as usize);
             let ctx = Candidate {
                 feature: f,
+                first: fs,
                 total,
                 bounds,
                 dir,
                 reg,
                 scorer: &scorer,
+                legal: search.legal(f),
             };
             if cuts.is_categorical(f as usize) {
                 let mut cats: Vec<(u32, GradStats)> = (fs..fe)
                     .filter(|&i| hist[i].hess > 0.0)
                     .map(|i| (cuts.cut_value(i) as u32, hist[i]))
                     .collect();
-                ctx.categorical(&mut best, &mut cats, constrained, rng.as_mut());
+                let category = groups.map(|node| CategoryGroups {
+                    node,
+                    ghist,
+                    feature: f as usize,
+                });
+                ctx.categorical(
+                    &mut best,
+                    &mut cats,
+                    constrained,
+                    rng.as_mut(),
+                    category.as_ref(),
+                );
             } else if let Some(rng) = rng.as_mut() {
-                ctx.random_numeric(&mut best, &hist[fs..fe], fs, dense, rng);
+                ctx.random_numeric(&mut best, &hist[fs..fe], dense, rng);
             } else {
                 // Every boundary, exactly as the builder's XGBoost search.
                 for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
@@ -228,11 +247,15 @@ enum Scorer {
 /// One feature's candidate evaluation context within a node.
 struct Candidate<'a> {
     feature: u32,
+    /// The feature's first global bin.
+    first: usize,
     total: GradStats,
     bounds: Bounds,
     dir: i8,
     reg: &'a RegParams,
     scorer: &'a Scorer,
+    /// The numeric candidates `min_child_groups` leaves legal (`None`: all).
+    legal: Option<LegalCuts>,
 }
 
 impl Candidate<'_> {
@@ -248,8 +271,15 @@ impl Candidate<'_> {
     }
 
     /// Score a numeric candidate and keep it if it beats `best` (XGBoost's
-    /// `f32` comparison and tie rule).
+    /// `f32` comparison and tie rule); one `min_child_groups` forbids is
+    /// skipped.
     fn offer_numeric(&self, best: &mut BestSplit, pos: SplitPos, children: Children) {
+        if self
+            .legal
+            .is_some_and(|legal| !legal.allows_numeric(self.first, pos, children.default_left))
+        {
+            return;
+        }
         let Children { left, right, .. } = children;
         let scored = match self.scorer {
             Scorer::Xgb { root_gain } => self.xgb_scorer(*root_gain).loss_chg(left, right),
@@ -268,14 +298,7 @@ impl Candidate<'_> {
 
     /// One random boundary between the node's lowest and highest occupied
     /// bin, scored with missing values right and (when present) left.
-    fn random_numeric(
-        &self,
-        best: &mut BestSplit,
-        bins: &[GradStats],
-        first: usize,
-        dense: bool,
-        rng: &mut Rng,
-    ) {
+    fn random_numeric(&self, best: &mut BestSplit, bins: &[GradStats], dense: bool, rng: &mut Rng) {
         let occupied = |i: &usize| bins[*i].hess > 0.0;
         let (Some(lo), Some(hi)) = (
             (0..bins.len()).find(occupied),
@@ -296,7 +319,7 @@ impl Candidate<'_> {
         for &bin in &bins[cut + 1..] {
             suffix.add(bin);
         }
-        let pos = SplitPos::Bin(first + cut);
+        let pos = SplitPos::Bin(self.first + cut);
         self.offer_numeric(best, pos, Children::new(false, left, self.total.sub(left)));
         let mut present = left;
         present.add(suffix);
@@ -311,12 +334,15 @@ impl Candidate<'_> {
 
     /// Prefix partitions of the categories ordered by gradient/Hessian ratio
     /// (the builder's sorted-partition sweep); with `rng`, one random prefix.
+    /// `groups` (`min_child_groups`) skips the prefixes whose sides hold too
+    /// few split groups.
     fn categorical(
         &self,
         best: &mut BestSplit,
         cats: &mut [(u32, GradStats)],
         constrained: bool,
         rng: Option<&mut Rng>,
+        groups: Option<&CategoryGroups>,
     ) {
         if cats.len() < 2 {
             return; // no interior partition
@@ -325,13 +351,22 @@ impl Candidate<'_> {
         let ratio = |s: GradStats| s.grad / (s.hess + reg.lambda);
         cats.sort_by(|a, b| ratio(a.1).total_cmp(&ratio(b.1)));
         let chosen = rng.map(|rng| rng.range(1..cats.len()));
+        // A prefix (the sorted categories below a cut) goes left; the rest,
+        // the categories left out for lacking Hessian, and missing values go
+        // right.
+        let legal = groups.map(|groups| {
+            let codes: Vec<u32> = cats.iter().map(|&(cat, _)| cat).collect();
+            groups.ordered_categories(&codes)
+        });
         sweep_prefixes(
             best,
             cats,
             self.total,
             self.feature,
             |left, right, cats_left| {
-                if chosen.is_some_and(|len| len != cats_left.len()) {
+                if chosen.is_some_and(|len| len != cats_left.len())
+                    || legal.is_some_and(|legal| !legal.allows(cats_left.len(), false))
+                {
                     return None;
                 }
                 match self.scorer {

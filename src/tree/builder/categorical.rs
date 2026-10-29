@@ -1,6 +1,7 @@
 //! XGBoost's categorical split search (`HistEvaluator`'s one-hot and
 //! partition enumeration), shared by the histogram and exact builders.
 
+use super::groups::CategoryGroups;
 use super::shared::xgb_calc_weight;
 use super::split::SplitScorer;
 use super::{BestSplit, Children, Score, need_replace};
@@ -41,7 +42,9 @@ struct CatCandidate {
 /// child; the recorded split stores that set as the tree's left child, with
 /// the children (and the missing direction) swapped to match. `penalty`
 /// (opt-in reuse penalties) is subtracted from each candidate's loss change
-/// before it competes; `None` leaves the search untouched.
+/// before it competes; `None` leaves the search untouched. `groups`
+/// (`min_child_groups`) skips the candidates whose children hold too few
+/// split groups.
 pub(super) fn sweep_categorical(
     best: &mut BestSplit,
     cats: &[(u32, GradStats)],
@@ -49,6 +52,7 @@ pub(super) fn sweep_categorical(
     scorer: &SplitScorer,
     feature: u32,
     penalty: Option<&dyn CategoricalPenalty>,
+    groups: Option<&CategoryGroups>,
 ) {
     let n = cats.len();
     let reg = scorer.reg;
@@ -91,19 +95,25 @@ pub(super) fn sweep_categorical(
             present.add(stats);
         }
         let missing = total.sub(present);
+        let one_hot = groups.map(CategoryGroups::one_hot);
+        let legal = |bin: usize, with_missing: bool| {
+            one_hot
+                .as_ref()
+                .is_none_or(|one_hot| one_hot.allows(bin, with_missing))
+        };
         let mut local = None;
         let mut chosen = 0;
-        for &(cat, stats) in cats {
+        for (bin, &(cat, stats)) in cats.iter().enumerate() {
             let single = || vec![cat];
             // Missing values with the other categories, then with this one.
             let mut right = stats;
             let missing_left = Children::new(true, total.sub(right), right);
-            if offer(&mut local, missing_left, &single) {
+            if legal(bin, false) && offer(&mut local, missing_left, &single) {
                 chosen = cat;
             }
             right.add(missing);
             let missing_right = Children::new(false, total.sub(right), right);
-            if offer(&mut local, missing_right, &single) {
+            if legal(bin, true) && offer(&mut local, missing_right, &single) {
                 chosen = cat;
             }
         }
@@ -127,6 +137,10 @@ pub(super) fn sweep_categorical(
     });
     let set_of =
         |partition: usize| -> Vec<u32> { sorted[..partition].iter().map(|&c| cats[c].0).collect() };
+    // A partition puts the first `partition` sorted categories on the low
+    // side of a cut, missing values on the other side going forward and
+    // beside them going backward.
+    let legal = groups.map(|groups| groups.ordered(&sorted));
     let depth = MAX_CAT_THRESHOLD.min(n);
     for forward in [true, false] {
         let mut acc = GradStats::default();
@@ -144,9 +158,11 @@ pub(super) fn sweep_categorical(
             } else {
                 (acc, total.sub(acc))
             };
-            if offer(&mut local, Children::new(forward, left, right), &|| {
-                set_of(partition)
-            }) {
+            if legal.is_none_or(|legal| legal.allows(partition, !forward))
+                && offer(&mut local, Children::new(forward, left, right), &|| {
+                    set_of(partition)
+                })
+            {
                 best_partition = partition;
             }
         }
@@ -180,7 +196,7 @@ mod tests {
             bounds: Bounds::default(),
             dir: 0,
         };
-        sweep_categorical(&mut best, cats, total, &scorer, 0, None);
+        sweep_categorical(&mut best, cats, total, &scorer, 0, None, None);
         best
     }
 

@@ -446,6 +446,7 @@ def info(
     label_lower_bound: ArrayLike | None = None,
     label_upper_bound: ArrayLike | None = None,
     feature_weights: ArrayLike | None = None,
+    split_group: ArrayLike | None = None,
 ) -> dict[str, object]:
     """The native ``info`` mapping for the given metadata (``None`` fields
     are left out)."""
@@ -468,7 +469,50 @@ def info(
         )
     if feature_weights is not None:
         out["feature_weights"] = as_vector(feature_weights, "feature_weights")
+    if split_group is not None:
+        out["split_group"] = split_group_ids(split_group)
     return out
+
+
+def _split_group_dtype_error(dtype: object) -> TypeError:
+    """The refusal of split-group ids of ``dtype``, which are not integers."""
+    return TypeError(
+        f"split_group has dtype {dtype}; it takes integer ids without missing values "
+        f"(code other values first, e.g. with pandas.factorize or "
+        f"numpy.unique(..., return_inverse=True))"
+    )
+
+
+def _check_polars_split_groups(series: pl.Series) -> None:
+    """Refuse a polars series of anything but integer split-group ids before
+    numpy reads it: polars 1.0's ``to_numpy`` crashes on a ``Duration``
+    series."""
+    if not series.dtype.is_integer():
+        raise _split_group_dtype_error(series.dtype)
+
+
+def split_group_ids(values: ArrayLike) -> NDArray[np.uint64]:
+    """One split-group id per row as a 1-D ``uint64`` array, from an array
+    of any integer dtype (signed ones without negative ids).
+
+    Raises:
+        HessboostError: An id is negative, or ``values`` is not 1-D.
+        TypeError: ``values`` does not have an integer dtype.
+    """
+    pl = _polars()
+    if pl is not None and isinstance(values, pl.Series):
+        _check_polars_split_groups(values)
+    array = np.asarray(values)
+    if array.ndim == 2 and array.shape[1] == 1:
+        array = array.reshape(-1)
+    if array.ndim != 1:
+        raise HessboostError(f"split_group must be 1-D, got shape {array.shape}")
+    # By kind: numpy counts timedelta64 as a signed integer type.
+    if array.dtype.kind not in "iu":
+        raise _split_group_dtype_error(array.dtype)
+    if array.dtype.kind == "i" and array.size and (low := array.min()) < 0:
+        raise HessboostError(f"split_group ids must be non-negative, got {low}")
+    return np.ascontiguousarray(array, dtype=np.uint64)
 
 
 _PER_ROW_FIELDS = (
@@ -478,6 +522,7 @@ _PER_ROW_FIELDS = (
     "qid",
     "label_lower_bound",
     "label_upper_bound",
+    "split_group",
 )
 """The metadata with one value per row, which a frame can supply by column
 name (``label`` and ``base_margin`` several, for a label matrix or
@@ -513,12 +558,17 @@ def _lazy_alignment_error(field: str) -> HessboostError:
     )
 
 
+_KEPT_VALUE_FIELDS = frozenset({"qid", "split_group"})
+"""The per-row fields whose frame column keeps its values (ids, compared or
+checked as integers) instead of becoming ``float32``."""
+
+
 def _pandas_columns(frame: pd.DataFrame, field: str, names: list[str]) -> NDArray[Any]:
     """The ``names`` columns of a pandas frame as ``field``'s values:
-    ``float32`` with ``NA`` missing (``qid`` keeps its values), ``(rows,)``
-    for one name and ``(rows, k)`` for ``k``."""
+    ``float32`` with ``NA`` missing (``qid`` and ``split_group`` keep their
+    values), ``(rows,)`` for one name and ``(rows, k)`` for ``k``."""
     pd = _pandas()
-    if field == "qid":
+    if field in _KEPT_VALUE_FIELDS:
         return frame[names[0]].to_numpy()
     for name in names:
         dtype = frame[name].dtype
@@ -533,12 +583,16 @@ def _pandas_columns(frame: pd.DataFrame, field: str, names: list[str]) -> NDArra
 
 def _polars_columns(frame: pl.DataFrame, field: str, names: list[str]) -> NDArray[Any]:
     """The ``names`` columns of a polars frame as ``field``'s values:
-    ``float32`` with null missing (``qid`` keeps its values), ``(rows,)``
-    for one name and ``(rows, k)`` for ``k``. Columns are looked up by
-    exact name (``get_column``), not through ``pl.col``'s regex parsing."""
+    ``float32`` with null missing (``qid`` and ``split_group`` keep their
+    values), ``(rows,)`` for one name and ``(rows, k)`` for ``k``. Columns
+    are looked up by exact name (``get_column``), not through ``pl.col``'s
+    regex parsing."""
     pl = _polars()
-    if field == "qid":
-        return frame.get_column(names[0]).to_numpy()
+    if field in _KEPT_VALUE_FIELDS:
+        column = frame.get_column(names[0])
+        if field == "split_group":
+            _check_polars_split_groups(column)
+        return column.to_numpy()
     for name in names:
         dtype = frame.schema[name]
         if not _polars_numeric(pl, dtype):

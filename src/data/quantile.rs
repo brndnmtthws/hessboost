@@ -261,6 +261,18 @@ impl HistCuts {
         (self.feature_offset[f + 1] - self.feature_offset[f]) as usize
     }
 
+    /// The feature owning global bin `global_bin` (below
+    /// [`Self::total_bins`]).
+    #[inline]
+    pub(crate) fn feature_of_bin(&self, global_bin: usize) -> usize {
+        // Every feature owns at least one bin, so the offsets ascend
+        // strictly and the owner is the last feature starting at or before
+        // the bin.
+        self.feature_offset
+            .partition_point(|&start| start as usize <= global_bin)
+            - 1
+    }
+
     /// The cut value at a global bin index (its exclusive upper threshold: an
     /// instance goes left of a split here when `value < cut_value(bin)`).
     #[inline]

@@ -184,10 +184,10 @@ the same row). With `per_fold_stopping=folds.PurgedTail(decision_at,
 label_end, fraction)`, early stopping is per fold and leakage-safe: each
 fold sizes its rounds, with `early_stopping_rounds` as the patience, on the
 purged chronological tail of its own training rows (the last `fraction` of
-their time span, starting at a decision time and purged as
-`purged_forward` purges), then trains on all of them. No forward fold uses
-rounds chosen with later labels, and the refit is sized the same way on
-every row:
+their time span, or with `cut="rows"` of the rows themselves, starting at a
+decision time and purged as `purged_forward` purges), then trains on all of
+them. No forward fold uses rounds chosen with later labels, and the refit
+is sized the same way on every row:
 
 ```python
 from hessboost import folds
@@ -609,9 +609,11 @@ print(booster.size_report().compression_ratio)
 loops: shuffled `k_fold` (what `cv` uses by default), `forward_chaining`
 expanding windows with a purged `gap`, and `purged_forward` (timestamped
 rows, purged by each row's own label window, for overlapping or irregular
-horizons); `PurgedTail` is the purged early-stopping split of a fold's own
-training rows that `cross_validate(per_fold_stopping=...)` sizes each fold
-on:
+horizons; `rows=` restricts it, like `purged_forward_at`, to selected rows
+such as those with a finite label, as indices or a boolean mask);
+`PurgedTail` is the purged early-stopping split of a fold's own training
+rows that `cross_validate(per_fold_stopping=...)` sizes each fold on, cut by
+time span or, with `cut="rows"`, by row count:
 
 ```python
 from hessboost import folds

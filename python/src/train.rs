@@ -11,7 +11,8 @@ use hessboost::metric::CustomMetric;
 use hessboost::objective::{CustomLoss, GradPair, Objective};
 use hessboost::training::budget::{self, BudgetConfig};
 use hessboost::training::{
-    CrossValidation, CvStopping, Fold, PurgedTail, RoundEval, TailStopping, Trainer, TrainingData,
+    CrossValidation, CvStopping, Fold, PurgedTail, RoundEval, TailCut, TailStopping, Trainer,
+    TrainingData,
 };
 use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArrayDyn, PyReadonlyArray1, ToPyArray};
@@ -538,9 +539,9 @@ type RefitTuple = (
 /// `(train rows, test rows)` folds, with `target_stats = (encoder, columns)`
 /// fitted inside each fold (over `target_stats_label` when given), an
 /// `init_model` every fold continues, per-fold early stopping on the
-/// purged tail `per_fold_stopping = (decision_at, label_end, fraction)`
-/// (with `early_stopping_rounds` its patience), and `history_only` (what
-/// `hessboost.cv` runs: the fold-mean history without fold reports).
+/// purged tail `per_fold_stopping = (decision_at, label_end, fraction,
+/// cut)` (with `early_stopping_rounds` its patience), and `history_only`
+/// (what `hessboost.cv` runs: the fold-mean history without fold reports).
 #[derive(FromPyObject)]
 #[pyo3(from_item_all)]
 pub(crate) struct CvRequest<'py> {
@@ -551,7 +552,12 @@ pub(crate) struct CvRequest<'py> {
     #[pyo3(default)]
     early_stopping_rounds: Option<usize>,
     #[pyo3(default)]
-    per_fold_stopping: Option<(PyReadonlyArray1<'py, i64>, PyReadonlyArray1<'py, i64>, f64)>,
+    per_fold_stopping: Option<(
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+        f64,
+        String,
+    )>,
     #[pyo3(default)]
     target_stats: Option<(Py<OrderedTargetEncoder>, Vec<usize>)>,
     #[pyo3(default)]
@@ -583,11 +589,12 @@ impl CvRequest<'_> {
             folds,
         );
         let stopping = match (&request.per_fold_stopping, early_stopping_rounds) {
-            (Some((decision_at, label_end, fraction)), Some(rounds)) => {
-                let tail = PurgedTail::new(
+            (Some((decision_at, label_end, fraction, cut)), Some(rounds)) => {
+                let tail = PurgedTail::with_cut(
                     row_major(decision_at, "decision_at")?,
                     row_major(label_end, "label_end")?,
                     *fraction,
+                    tail_cut(cut)?,
                 )
                 .or_raise()?;
                 Some(CvStopping::per_fold(rounds, tail))
@@ -729,17 +736,32 @@ pub(crate) fn cross_validate(
     ))
 }
 
-/// `(decision_at, label_end, fraction)` checked as a purged tail.
+/// The tail cut `cut` names: `"span"` or `"rows"`.
+fn tail_cut(cut: &str) -> PyResult<TailCut> {
+    match cut {
+        "span" => Ok(TailCut::Span),
+        "rows" => Ok(TailCut::Rows),
+        _ => Err(HessboostError::invalid_param(
+            "cut",
+            format!("must be \"span\" or \"rows\", got {cut:?}"),
+        ))
+        .or_raise(),
+    }
+}
+
+/// `(decision_at, label_end, fraction, cut)` checked as a purged tail.
 #[pyfunction]
 pub(crate) fn check_purged_tail(
     decision_at: PyReadonlyArray1<'_, i64>,
     label_end: PyReadonlyArray1<'_, i64>,
     fraction: f64,
+    cut: &str,
 ) -> PyResult<()> {
-    PurgedTail::new(
+    PurgedTail::with_cut(
         row_major(&decision_at, "decision_at")?,
         row_major(&label_end, "label_end")?,
         fraction,
+        tail_cut(cut)?,
     )
     .or_raise()
     .map(|_| ())
@@ -752,12 +774,14 @@ pub(crate) fn purged_tail_split<'py>(
     decision_at: PyReadonlyArray1<'_, i64>,
     label_end: PyReadonlyArray1<'_, i64>,
     fraction: f64,
+    cut: &str,
     rows: PyReadonlyArray1<'_, i64>,
 ) -> PyResult<(i64, FoldArrays<'py>)> {
-    let tail = PurgedTail::new(
+    let tail = PurgedTail::with_cut(
         row_major(&decision_at, "decision_at")?,
         row_major(&label_end, "label_end")?,
         fraction,
+        tail_cut(cut)?,
     )
     .or_raise()?;
     let n = tail.n_rows();
@@ -817,9 +841,30 @@ pub(crate) fn forward_chaining(
     )
 }
 
-/// Forward folds over timestamped rows, purging every training row whose
-/// label window reaches into its fold's test block.
+/// The purged fold builders' row selection as indices, refusing a
+/// negative one.
+fn selected_rows(rows: &PyReadonlyArray1<'_, i64>) -> PyResult<Vec<usize>> {
+    row_major(rows, "rows")?
+        .iter()
+        .enumerate()
+        .map(|(position, &row)| {
+            usize::try_from(row)
+                .map_err(|_| {
+                    HessboostError::invalid_param(
+                        "purged folds",
+                        format!("row {row} at position {position} is negative"),
+                    )
+                })
+                .or_raise()
+        })
+        .collect()
+}
+
+/// Forward folds over timestamped rows (the selected `rows` only, when
+/// given), purging every training row whose label window reaches into its
+/// fold's test block.
 #[pyfunction]
+#[pyo3(signature = (decision_at, label_end, validation_fraction, blocks, min_train, rows=None))]
 pub(crate) fn purged_forward<'py>(
     py: Python<'py>,
     decision_at: PyReadonlyArray1<'_, i64>,
@@ -827,39 +872,57 @@ pub(crate) fn purged_forward<'py>(
     validation_fraction: f64,
     blocks: usize,
     min_train: usize,
+    rows: Option<PyReadonlyArray1<'_, i64>>,
 ) -> PyResult<FoldArrays<'py>> {
     let (decision_at, label_end) = (
         row_major(&decision_at, "decision_at")?,
         row_major(&label_end, "label_end")?,
     );
-    let folds = py.detached(|| {
-        Fold::purged_forward(
+    let rows = rows.as_ref().map(selected_rows).transpose()?;
+    let folds = py.detached(|| match &rows {
+        None => Fold::purged_forward(
             decision_at,
             label_end,
             validation_fraction,
             blocks,
             min_train,
-        )
+        ),
+        Some(rows) => Fold::purged_forward_rows(
+            decision_at,
+            label_end,
+            rows,
+            validation_fraction,
+            blocks,
+            min_train,
+        ),
     })?;
     fold_arrays(py, folds)
 }
 
-/// Forward folds at caller-given block starts, purging every training row
-/// whose label window reaches past its fold's block start.
+/// Forward folds at caller-given block starts (over the selected `rows`
+/// only, when given), purging every training row whose label window
+/// reaches past its fold's block start.
 #[pyfunction]
+#[pyo3(signature = (decision_at, label_end, block_starts, min_train, rows=None))]
 pub(crate) fn purged_forward_at<'py>(
     py: Python<'py>,
     decision_at: PyReadonlyArray1<'_, i64>,
     label_end: PyReadonlyArray1<'_, i64>,
     block_starts: PyReadonlyArray1<'_, i64>,
     min_train: usize,
+    rows: Option<PyReadonlyArray1<'_, i64>>,
 ) -> PyResult<FoldArrays<'py>> {
     let (decision_at, label_end, block_starts) = (
         row_major(&decision_at, "decision_at")?,
         row_major(&label_end, "label_end")?,
         row_major(&block_starts, "block_starts")?,
     );
-    let folds =
-        py.detached(|| Fold::purged_forward_at(decision_at, label_end, block_starts, min_train))?;
+    let rows = rows.as_ref().map(selected_rows).transpose()?;
+    let folds = py.detached(|| match &rows {
+        None => Fold::purged_forward_at(decision_at, label_end, block_starts, min_train),
+        Some(rows) => {
+            Fold::purged_forward_at_rows(decision_at, label_end, rows, block_starts, min_train)
+        }
+    })?;
     fold_arrays(py, folds)
 }

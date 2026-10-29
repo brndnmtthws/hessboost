@@ -217,3 +217,133 @@ def test_transform_margins_refusals() -> None:
     float64 = np.empty((4, 3))
     with pytest.raises(TypeError, match="float32"):
         softprob.transform_margins(margins, out=float64)  # ty: ignore[invalid-argument-type]
+
+
+def materialized(
+    base: NDArray[np.float64], features: list[int], values: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """The rows ``base`` with ``features`` set to each row of ``values``."""
+    rows = np.repeat(base[None, :], len(values), axis=0)
+    rows[:, features] = values
+    return rows
+
+
+@pytest.mark.parametrize("output_margin", [False, True])
+def test_predict_variants_equals_predict_of_the_rows(output_margin: bool) -> None:
+    rng = np.random.default_rng(5)
+    for booster, x in models():
+        features = [x.shape[1] - 1, 0]
+        # 70 variants: past one 64-variant walk; missing values included.
+        values = x[rng.integers(0, len(x), 70)][:, features]
+        rows = materialized(x[1], features, values)
+        for iteration_range in [None, (0, 2), (1, 3)]:
+            variants = booster.predict_variants(
+                x[1], features, values, output_margin=output_margin, iteration_range=iteration_range
+            )
+            expected = booster.predict(
+                rows, output_margin=output_margin, iteration_range=iteration_range
+            ).reshape(70, -1)
+            assert variants.dtype == np.float32
+            assert variants.shape == expected.shape
+            np.testing.assert_array_equal(variants, expected)
+
+
+def test_predict_variants_by_feature_name() -> None:
+    x, y = regression(rows=200)
+    names = [f"f{i}" for i in range(x.shape[1])]
+    booster = hessboost.train({}, DMatrix(x, y, feature_names=names), 4)
+    values = x[:10, [3, 1]]
+    by_index = booster.predict_variants(x[0], [3, 1], values)
+    np.testing.assert_array_equal(booster.predict_variants(x[0], ["f3", "f1"], values), by_index)
+    np.testing.assert_array_equal(booster.predict_variants(x[0], ["f3", 1], values), by_index)
+    np.testing.assert_array_equal(
+        by_index, booster.predict(materialized(x[0], [3, 1], values)).reshape(10, 1)
+    )
+    with pytest.raises(HessboostError, match="unknown feature"):
+        booster.predict_variants(x[0], ["nope"], values[:, :1])
+    unnamed = hessboost.train({}, DMatrix(x, y), 2)
+    with pytest.raises(HessboostError, match="no feature names"):
+        unnamed.predict_variants(x[0], ["f3"], values[:, :1])
+
+
+def test_predict_variants_refusals() -> None:
+    booster, x = models()[0]
+    values = x[:4, :2]
+    with pytest.raises(HessboostError, match="1-D"):
+        booster.predict_variants(x[:2], [0, 1], values)
+    with pytest.raises(HessboostError, match="feature count"):
+        booster.predict_variants(x[0, :3], [0, 1], values)
+    with pytest.raises(HessboostError, match="shape"):
+        booster.predict_variants(x[0], [0], values)
+    with pytest.raises(HessboostError, match="shape"):
+        booster.predict_variants(x[0], [0, 1], values.reshape(-1))
+    with pytest.raises(HessboostError, match="twice"):
+        booster.predict_variants(x[0], [1, 1], values)
+    with pytest.raises(HessboostError, match="at least one"):
+        booster.predict_variants(x[0], [], np.empty((3, 0)))
+    with pytest.raises(HessboostError, match="negative"):
+        booster.predict_variants(x[0], [-1, 1], values)
+    with pytest.raises(HessboostError, match="out of range"):
+        booster.predict_variants(x[0], [0, x.shape[1]], values)
+    with pytest.raises(InvalidDataError):
+        booster.predict_variants(x[0], [0, 1], np.full((2, 2), np.inf))
+    with pytest.raises(InvalidDataError):
+        booster.predict_variants(np.full(x.shape[1], np.inf), [0, 1], values)
+    with pytest.raises(TypeError, match="sequence"):
+        booster.predict_variants(x[0], "f0", values[:, :1])  # a str is not a list of names
+    assert booster.predict_variants(x[0], [0, 1], np.empty((0, 2))).shape == (0, 1)
+
+
+def test_margin_bounds_contain_sampled_predictions() -> None:
+    rng = np.random.default_rng(9)
+    for booster, x in models():
+        categorical = [i for i, t in enumerate(booster.feature_types or []) if t == "c"]
+        lower = np.nanquantile(x, 0.2, axis=0)
+        upper = np.nanquantile(x, 0.8, axis=0)
+        lower[categorical] = upper[categorical] = 2.0
+        low, high = booster.margin_bounds(lower, upper)
+        assert low.dtype == high.dtype == np.float32
+        assert low.shape == high.shape == (booster.num_outputs,)
+        rows = lower + (upper - lower) * rng.random((200, x.shape[1]))
+        rows[:, categorical] = 2.0
+        margins = booster.predict(rows, output_margin=True).reshape(200, -1)
+        assert (low <= margins).all()
+        assert (margins <= high).all()
+        # Unbounded numeric features hold every row of the training data.
+        lower = np.full(x.shape[1], -np.inf)
+        upper = np.full(x.shape[1], np.inf)
+        lower[categorical] = upper[categorical] = 2.0
+        low, high = booster.margin_bounds(lower, upper, iteration_range=(0, 2))
+        inside = x[(x[:, categorical] == 2.0).all(axis=1)]
+        margins = booster.predict(inside, output_margin=True, iteration_range=(0, 2))
+        margins = margins.reshape(len(inside), -1)
+        assert (low <= margins).all()
+        assert (margins <= high).all()
+        # A box of one row (missing values as NaN in both bounds) is its margin.
+        for row in x[:5]:
+            low, high = booster.margin_bounds(row, row)
+            exact = booster.predict_row(row, output_margin=True)
+            np.testing.assert_array_equal(low, exact)
+            np.testing.assert_array_equal(high, exact)
+
+
+def test_margin_bounds_refusals() -> None:
+    booster, x = models()[0]
+    lower, upper = np.zeros(x.shape[1]), np.ones(x.shape[1])
+    with pytest.raises(HessboostError, match="feature count"):
+        booster.margin_bounds(lower[:3], upper[:3])
+    with pytest.raises(HessboostError, match="1-D"):
+        booster.margin_bounds(lower[None, :], upper)
+    with pytest.raises(HessboostError, match="above"):
+        booster.margin_bounds(upper, lower)
+    one_sided = upper.copy()
+    one_sided[1] = np.nan
+    with pytest.raises(HessboostError, match="NaN"):
+        booster.margin_bounds(lower, one_sided)
+    cats, data = models()[5]
+    with pytest.raises(HessboostError, match="categorical"):
+        cats.margin_bounds(np.zeros(data.shape[1]), np.full(data.shape[1], 5.0))
+    xs, y = regression(rows=200)
+    linear = hessboost.train({"linear_tree": True}, DMatrix(xs, y), 3)
+    with pytest.raises(hessboost.IncompatibleModelError, match="linear leaves"):
+        linear.margin_bounds(np.zeros(xs.shape[1]), np.ones(xs.shape[1]))

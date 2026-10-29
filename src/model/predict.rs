@@ -795,7 +795,7 @@ impl BoostedModel {
     /// refusing a shrunk model's ranges that start after iteration 0: every
     /// later iteration rescaled the earlier ones, so `a..b` alone is no
     /// model.
-    fn margin_iterations(&self, iterations: Iterations) -> Result<Range<usize>> {
+    pub(super) fn margin_iterations(&self, iterations: Iterations) -> Result<Range<usize>> {
         let iterations = self.resolve_iterations(iterations, "iterations")?;
         if self.shrinkage.is_some() && iterations.start != 0 {
             return Err(HessboostError::incompatible_model(

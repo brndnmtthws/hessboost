@@ -25,8 +25,15 @@
 //! [`n_outputs`](BoostedModel::n_outputs)) values into a caller's buffer,
 //! allocating nothing; [`predict_rows`](BoostedModel::predict_rows) /
 //! [`predict_margin_rows`](BoostedModel::predict_margin_rows) read many rows
-//! in place. Every path gives the same bits as [`BoostedModel::predict`] of
-//! any matrix holding the rows: the trees add up in the same order, and the
+//! in place. [`RowVariants`] are rows differing from one base row in a few
+//! features (candidate values of some inputs against a fixed context):
+//! [`predict_variants_into`](BoostedModel::predict_variants_into) /
+//! [`predict_margin_variants_into`](BoostedModel::predict_margin_variants_into)
+//! predict them all in one walk of each tree, and
+//! [`margin_bounds_into`](BoostedModel::margin_bounds_into) bounds the
+//! margins of every row in a box of feature values. Every path but the
+//! bounds gives the same bits as [`BoostedModel::predict`] of any matrix
+//! holding the rows: the trees add up in the same order, and the
 //! objective's transform applies to each value (each row, for softmax and
 //! the sorted quantiles) on its own, with XGBoost's scalar `expf`, sigmoid,
 //! and softmax. [`transform_margin`](BoostedModel::transform_margin) and
@@ -394,6 +401,7 @@ mod transform;
 mod ubjson;
 pub mod uncertainty;
 mod validate;
+mod variants;
 mod xgboost;
 
 pub use shrinkage::Shrinkage;
@@ -408,6 +416,7 @@ pub(crate) use predict::initial_margins;
 pub use predictions::{Contributions, Interactions, Predictions};
 pub(crate) use transform::Transform;
 pub(crate) use validate::{check_objective_width, validate_prediction_data};
+pub use variants::RowVariants;
 
 use self::serde::UncheckedBoostedModel;
 use crate::data::{DMatrix, Rows};

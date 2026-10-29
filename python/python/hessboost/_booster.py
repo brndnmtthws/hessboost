@@ -572,6 +572,113 @@ class Booster(_SchemaState):
         model.predict_row_into(values, output_margin, out, self._range(iteration_range))
         return out
 
+    def predict_variants(
+        self,
+        base: ArrayLike,
+        features: Sequence[int | str],
+        values: ArrayLike,
+        *,
+        output_margin: bool = False,
+        iteration_range: tuple[int, int] | None = None,
+    ) -> NDArray[np.float32]:
+        """Predicts the rows that differ from ``base`` only in ``features``,
+        one row of ``values`` per variant, without building them: variant
+        ``v`` is ``base`` with ``base[features[j]] = values[v, j]``, and its
+        predictions are bit for bit :meth:`predict_row` of that row. Each
+        tree is walked once per 64 variants rather than once per variant,
+        which pays off when scoring many candidate values of a few inputs
+        against one fixed context.
+
+        Args:
+            base: One value per feature (``(num_features(),)``, converted to
+                ``float32``; NaN missing); categorical features as the
+                model's integer codes.
+            features: The varying features, distinct, by index or by name
+                (on a booster with feature names).
+            values: ``(n_variants, len(features))`` values (NaN missing).
+            output_margin: Return raw margins instead of the objective's
+                predictions.
+            iteration_range: As for :meth:`predict` (``None``: through
+                :attr:`best_iteration`).
+
+        Returns:
+            ``(n_variants, num_outputs)`` predictions (margins with
+            ``output_margin``), or ``(n_variants, 1)`` class indices for
+            ``multi:softmax``, as ``float32``.
+
+        Raises:
+            HessboostError: ``base`` is not 1-D or holds the wrong number of
+                values, ``values`` is not ``(n_variants, len(features))``,
+                or ``features`` is empty, repeats a feature, names an
+                unknown one, or holds an index out of range.
+            InvalidDataError: ``base`` or ``values`` holds an infinity.
+            TypeError: ``features`` is not a sequence of indices or names.
+        """
+        model = self._model
+        row = _data.as_float32(base, "base")
+        if row.ndim != 1:
+            raise HessboostError(f"base must be 1-D (one value per feature), got shape {row.shape}")
+        indices = _data.feature_indices(features, self._feature_names)
+        table = _data.as_float32(values, "values")
+        if table.ndim != 2 or table.shape[1] != len(indices):
+            raise HessboostError(
+                f"values must have shape (n_variants, {len(indices)}), got {table.shape}"
+            )
+        width = model.num_outputs if output_margin else model.prediction_width
+        out = np.empty((table.shape[0], width), dtype=np.float32)
+        model.predict_variants_into(
+            row, indices, table, output_margin, out, self._range(iteration_range)
+        )
+        return out
+
+    def margin_bounds(
+        self,
+        lower: ArrayLike,
+        upper: ArrayLike,
+        *,
+        iteration_range: tuple[int, int] | None = None,
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        """Bounds on the margins of every row ``x`` with ``lower <= x <=
+        upper``: each of the ``num_outputs`` margins of every such row lies
+        between the returned bounds. Each tree contributes its least and
+        greatest leaf among those a row in the box reaches, so the bounds
+        are sound but not the tightest; a box of one row (``lower ==
+        upper``) gives that row's margins exactly.
+
+        Args:
+            lower: One lower bound per feature (``(num_features(),)``,
+                converted to ``float32``); ``-inf`` leaves it unbounded.
+            upper: One upper bound per feature; ``inf`` leaves it unbounded.
+                NaN in both bounds of a feature makes it missing in every
+                row of the box.
+            iteration_range: As for :meth:`predict` (``None``: through
+                :attr:`best_iteration`).
+
+        Returns:
+            ``(lower_margins, upper_margins)``, each ``(num_outputs,)``
+            ``float32``.
+
+        Raises:
+            HessboostError: ``lower`` or ``upper`` is not 1-D or holds the
+                wrong number of values, a feature has NaN in one bound only
+                or ``lower > upper`` (or no finite value in between), or a
+                categorical feature is not fixed (``lower != upper``).
+            IncompatibleModelError: The model has linear leaves.
+        """
+        model = self._model
+        low = _data.as_float32(lower, "lower")
+        high = _data.as_float32(upper, "upper")
+        if low.ndim != 1 or high.ndim != 1:
+            raise HessboostError(
+                f"lower and upper must be 1-D (one value per feature), got shapes "
+                f"{low.shape} and {high.shape}"
+            )
+        outputs = model.num_outputs
+        out_lower = np.empty(outputs, dtype=np.float32)
+        out_upper = np.empty(outputs, dtype=np.float32)
+        model.margin_bounds_into(low, high, out_lower, out_upper, self._range(iteration_range))
+        return out_lower, out_upper
+
     def transform_margin(self, margin: float) -> float:
         """The prediction of one margin of a single-output model by its
         objective's transform (the sigmoid of ``binary:logistic``, the

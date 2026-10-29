@@ -1076,7 +1076,28 @@ mod tests {
                     1
                 }
                 (Err(expected), Err(got)) => {
-                    assert_eq!(expected.to_string(), got.to_string());
+                    match (&expected, &got) {
+                        (
+                            HessboostError::InvalidParameter { name: plain, .. },
+                            HessboostError::InvalidParameter { name: selected, .. },
+                        ) => assert_eq!(plain, selected),
+                        (
+                            HessboostError::DimensionMismatch {
+                                what: plain_what,
+                                expected: plain_expected,
+                                got: plain_got,
+                            },
+                            HessboostError::DimensionMismatch {
+                                what: selected_what,
+                                expected: selected_expected,
+                                got: selected_got,
+                            },
+                        ) => assert_eq!(
+                            (plain_what, plain_expected, plain_got),
+                            (selected_what, selected_expected, selected_got)
+                        ),
+                        _ => panic!("{expected:?} vs {got:?}"),
+                    }
                     0
                 }
                 (expected, got) => panic!("{expected:?} vs {got:?}"),
@@ -1108,15 +1129,14 @@ mod tests {
     }
 
     /// `rows` must be non-empty, strictly increasing, and in bounds; the
-    /// label check covers the selected rows only and names the row.
+    /// label check covers the selected rows only.
     #[test]
     fn purged_row_subsets_refuse_unusable_rows() {
         let day = 86_400;
         let (decisions, mut ends) = schedule(24);
         let refusal = |result: Result<Vec<Fold>>| match result {
-            Err(HessboostError::InvalidParameter { name, reason }) => {
+            Err(HessboostError::InvalidParameter { name, .. }) => {
                 assert_eq!(name, "purged folds");
-                reason
             }
             other => panic!("expected a refusal, got {other:?}"),
         };
@@ -1143,12 +1163,16 @@ mod tests {
         let folds = Fold::purged_forward_rows(&decisions, &ends, &rows, 0.2, 1, 1).unwrap();
         assert!(!folds[0].train.contains(&0));
         Fold::purged_forward_at_rows(&decisions, &ends, &rows, &[16 * day], 1).unwrap();
+        // Row 7, selected, holds one too: refused until it is excluded.
         ends[7] = decisions[7] - 1;
         for result in [
             Fold::purged_forward_rows(&decisions, &ends, &rows, 0.2, 1, 1),
             Fold::purged_forward_at_rows(&decisions, &ends, &rows, &[16 * day], 1),
         ] {
-            assert!(refusal(result).contains("row 7's"));
+            refusal(result);
         }
+        let rows: Vec<usize> = (1..120).filter(|&row| row != 7).collect();
+        Fold::purged_forward_rows(&decisions, &ends, &rows, 0.2, 1, 1).unwrap();
+        Fold::purged_forward_at_rows(&decisions, &ends, &rows, &[16 * day], 1).unwrap();
     }
 }

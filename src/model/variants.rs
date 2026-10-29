@@ -47,6 +47,12 @@ const DENSE_SPLIT: u32 = 16;
 /// Active variants from which a single-output leaf adds to every lane.
 const DENSE_ADD: u32 = 8;
 
+/// Nested branches a box's traversal of one tree follows by recursion
+/// ([`reach`]); a tree whose reachable branches nest deeper (only an
+/// imported or hand-built pathologically deep one) is bounded by all of its
+/// leaves instead, so the stack stays bounded.
+const MAX_REACH_DEPTH: usize = 256;
+
 /// Rows that differ from one base row in a few features: variant `v` is
 /// `base` with `base[features[j]]` replaced by `values[v * features.len() +
 /// j]`, for every `j`. [`BoostedModel::predict_margin_variants_into`] and
@@ -374,31 +380,54 @@ fn route(
 /// a child is reachable when the tree sends the box's lower end there
 /// (left) or its upper end (right), which for a threshold `x < c` is every
 /// child some value in between reaches, and for a fixed value or a missing
-/// feature exactly one. Recursion only where both children are reachable.
+/// feature exactly one. Recursion only where both children are reachable,
+/// at most [`MAX_REACH_DEPTH`] levels below `depth`: past that, return
+/// `false` (some reachable leaves possibly unvisited).
 fn reach(
     tree: &RegTree,
     lower: &[f32],
     upper: &[f32],
     mut nid: usize,
+    depth: usize,
     leaf: &mut impl FnMut(usize),
-) {
+) -> bool {
     let nodes = tree.nodes();
     loop {
         let node = &nodes[nid];
         if node.is_leaf() {
             leaf(nid);
-            return;
+            return true;
         }
         let f = node.split_feature as usize;
         let left = tree.goes_left(node, present(lower[f]));
         let right = !tree.goes_left(node, present(upper[f]));
         if left && right {
-            reach(tree, lower, upper, node.left as usize, leaf);
+            if depth == MAX_REACH_DEPTH
+                || !reach(tree, lower, upper, node.left as usize, depth + 1, leaf)
+            {
+                return false;
+            }
             nid = node.right as usize;
         } else if left {
             nid = node.left as usize;
         } else {
             nid = node.right as usize;
+        }
+    }
+}
+
+/// Call `leaf(leaf_id)` for every leaf of `tree` a row in the box reaches
+/// ([`reach`] from the root), or, for a tree whose reachable branches nest
+/// past [`MAX_REACH_DEPTH`], for every leaf of the tree (a linear scan of
+/// its nodes): a superset, so bounds over it stay sound, only looser. Some
+/// leaves may be visited twice, which a least and greatest value ignore.
+/// A box of one row never branches, so it always takes the exact path.
+fn reachable_leaves(tree: &RegTree, lower: &[f32], upper: &[f32], leaf: &mut impl FnMut(usize)) {
+    if !reach(tree, lower, upper, 0, 0, leaf) {
+        for (nid, node) in tree.nodes().iter().enumerate() {
+            if node.is_leaf() {
+                leaf(nid);
+            }
         }
     }
 }
@@ -579,7 +608,10 @@ impl BoostedModel {
     /// monotone. A `gblinear` model bounds each feature's term by its
     /// endpoints (a zero weight adds 0 even on an unbounded feature). The
     /// bounds are as tight as each tree's reachable leaves allow, not the
-    /// tightest over the box: trees are bounded independently. Where a sum
+    /// tightest over the box: trees are bounded independently. A tree whose
+    /// reachable branches nest more than 256 deep (only a pathologically
+    /// deep imported one) is bounded by all of its leaves, which keeps the
+    /// stack bounded. Where a sum
     /// meets opposite infinities (a term overflowing `f32` against an
     /// unbounded feature), the bound widens to `-inf` or `+inf` rather than
     /// `NaN`. Allocates nothing and never enters rayon.
@@ -656,7 +688,7 @@ impl BoostedModel {
                         let outputs = first..(first + OUTPUT_CHUNK).min(k);
                         let mut least = [f32::INFINITY; OUTPUT_CHUNK];
                         let mut most = [f32::NEG_INFINITY; OUTPUT_CHUNK];
-                        reach(tree, lower, upper, 0, &mut |nid| {
+                        reachable_leaves(tree, lower, upper, &mut |nid| {
                             let leaf = &tree.leaf_vector(nid)[outputs.clone()];
                             for ((&x, lo), hi) in leaf.iter().zip(&mut least).zip(&mut most) {
                                 let c = weight * x;
@@ -672,7 +704,7 @@ impl BoostedModel {
                 } else {
                     let nodes = tree.nodes();
                     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-                    reach(tree, lower, upper, 0, &mut |nid| {
+                    reachable_leaves(tree, lower, upper, &mut |nid| {
                         let c = weight * nodes[nid].leaf_value;
                         lo = lo.min(c);
                         hi = hi.max(c);

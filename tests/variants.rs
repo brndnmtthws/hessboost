@@ -697,6 +697,115 @@ fn opposite_infinities_widen_the_bounds() {
     assert_eq!((low[0], high[0]), (f32::INFINITY, f32::INFINITY));
 }
 
+/// A tree far deeper than the bounds traversal recurses (a chain of tens of
+/// thousands of splits, as an imported model may hold) is bounded by all of
+/// its leaves instead of overflowing the stack, whichever child continues
+/// the chain (the traversal recurses into left children and loops through
+/// right ones, so the left-continued chain is the one that reaches the
+/// cap): the bounds of boxes spanning the thresholds hold every row, and a
+/// point box is still exactly its row's margin. The bounds run on a thread
+/// with a small stack, which recursion through the whole chain would
+/// overflow. Margins are recomputed from the public tree metadata, which
+/// walks the chain without recursion.
+#[test]
+fn bounds_of_a_pathologically_deep_tree() {
+    const DEPTH: usize = 40_000;
+    let x: Vec<f32> = (0..40).map(|i| i as f32).collect();
+    let dtrain = DMatrix::from_dense(&x, 40, 1)
+        .unwrap()
+        .with_labels(&x)
+        .unwrap();
+    let trained =
+        serde_json::to_value(train(&TrainingParams::default(), &dtrain, 1).unwrap()).unwrap();
+    let node = |left: i64, right: i64, cond: f32, value: f32| {
+        json!({
+            "split_feature": 0,
+            "split_cond": cond,
+            "default_left": true,
+            "left": left,
+            "right": right,
+            "leaf_value": value,
+            "sum_hess": 1.0,
+            "split_gain": 0.0,
+            "is_categorical": false,
+            "cat_begin": 0,
+            "cat_end": 0,
+        })
+    };
+    let leaf_value = |i: usize| (i % 7) as f32 * 0.25 - 0.5;
+    for continue_left in [false, true] {
+        // Split `i` is node `2i`, its leaf node `2i + 1`, the next split
+        // node `2i + 2`; the last node is a leaf. Continued right: `x < i`
+        // reaches the leaf. Continued left: `x < DEPTH - i` continues.
+        let mut nodes = Vec::with_capacity(2 * DEPTH + 1);
+        for i in 0..DEPTH {
+            let id = 2 * i as i64;
+            nodes.push(if continue_left {
+                node(id + 2, id + 1, (DEPTH - i) as f32, 0.0)
+            } else {
+                node(id + 1, id + 2, i as f32, 0.0)
+            });
+            nodes.push(node(-1, -1, 0.0, leaf_value(i)));
+        }
+        nodes.push(node(-1, -1, 0.0, 1.5));
+        let mut doc = trained.clone();
+        doc["trees"][0]["nodes"] = Value::Array(nodes);
+        let model: BoostedModel = serde_json::from_value(doc).unwrap();
+        let tree = &model.trees()[0];
+        assert_eq!(tree.num_nodes(), 2 * DEPTH + 1);
+        let weight = model.tree_weights().next().unwrap();
+        let base = model.base_scores()[0];
+        let margin = |x0: f32| {
+            let leaf = tree.leaf_id_dense(&[x0], f32::NAN);
+            base + weight * tree.leaf_vector(leaf)[0]
+        };
+        let bounds = |lower: f32, upper: f32| {
+            std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .stack_size(256 * 1024)
+                    .spawn_scoped(scope, || {
+                        let (mut low, mut high) = ([0.0], [0.0]);
+                        model
+                            .margin_bounds_into(&[lower], &[upper], .., &mut low, &mut high)
+                            .map(|()| (low[0], high[0]))
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        let name = if continue_left { "left" } else { "right" };
+        for (lower, upper) in [
+            (f32::NEG_INFINITY, f32::INFINITY),
+            (-1.0, 50_000.0),
+            (100.0, f32::INFINITY),
+            (-3.0, 30_000.5),
+        ] {
+            let (low, high) = bounds(lower, upper);
+            for x0 in [
+                -1e30, -2.0, -1.0, 0.0, 0.5, 1.0, 99.0, 100.0, 123.25, 29_999.0, 30_000.5,
+                39_999.5, 40_000.0, 50_000.0, 1e9,
+            ] {
+                if x0 < lower || x0 > upper {
+                    continue;
+                }
+                let m = margin(x0);
+                assert!(low <= m && m <= high, "{name}: {x0} in [{lower}, {upper}]");
+            }
+        }
+        for x0 in [-2.0, 0.0, 123.25, 39_999.5, 1e9, f32::NAN] {
+            let (low, high) = bounds(x0, x0);
+            let m = margin(x0);
+            assert_eq!(
+                (low.to_bits(), high.to_bits()),
+                (m.to_bits(), m.to_bits()),
+                "{name}: {x0}"
+            );
+        }
+    }
+}
+
 #[test]
 fn malformed_boxes_are_refused() {
     let all = cases();

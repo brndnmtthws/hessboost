@@ -128,6 +128,32 @@ def _check_names(names: Sequence[str], n_cols: int) -> list[str]:
     return names
 
 
+def feature_indices(features: Sequence[int | str], names: list[str] | None) -> list[int]:
+    """``features`` (indices, or names among ``names``) as feature indices;
+    indices past the feature count are left for the native side to refuse."""
+    if isinstance(features, (str, int)) or not isinstance(features, Sequence):
+        raise TypeError(
+            "features must be a sequence of feature indices or names, "
+            f"got {type(features).__name__}"
+        )
+    return [feature_index(feature, names) for feature in features]
+
+
+def feature_index(feature: int | str, names: list[str] | None) -> int:
+    """One feature, by index or by name among ``names``, as its index."""
+    if isinstance(feature, (int, np.integer)) and not isinstance(feature, bool):
+        if feature < 0:
+            raise HessboostError(f"feature index {feature} is negative")
+        return int(feature)
+    if isinstance(feature, str):
+        if names is None:
+            raise HessboostError(f"feature {feature!r} named, but there are no feature names")
+        if feature not in names:
+            raise HessboostError(f"unknown feature {feature!r}")
+        return names.index(feature)
+    raise TypeError(f"a feature must be an index or a name, got {type(feature).__name__}")
+
+
 def _categorical_columns(feature_types: Sequence[str], n_cols: int) -> list[int]:
     if len(feature_types) != n_cols:
         raise HessboostError(f"{len(feature_types)} feature types for {n_cols} features")

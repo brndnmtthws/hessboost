@@ -29,7 +29,7 @@ from typing import Literal, Self
 import numpy as np
 from numpy.typing import ArrayLike
 
-from hessboost import _hessboost
+from hessboost import _data, _hessboost
 from hessboost._exceptions import HessboostError
 from hessboost._matrix import DMatrix, _matrix_for
 from hessboost._model_io import PathLike, _SchemaState, read_bytes, write_bytes
@@ -42,30 +42,6 @@ type TargetKind = Literal["regression", "binary"]
 
 type Column = int | str
 """A feature by index, or by name on a matrix with feature names."""
-
-
-def _column_indices(columns: Sequence[Column], names: list[str] | None) -> list[int]:
-    """``columns`` as feature indices (out-of-range indices are left for
-    the native encoder to refuse)."""
-    if isinstance(columns, (str, int)) or not isinstance(columns, Sequence):
-        raise TypeError(
-            f"columns must be a sequence of feature indices or names, got {type(columns).__name__}"
-        )
-    return [_column_index(column, names) for column in columns]
-
-
-def _column_index(column: Column, names: list[str] | None) -> int:
-    if isinstance(column, (int, np.integer)) and not isinstance(column, bool):
-        if column < 0:
-            raise HessboostError(f"feature index {column} is negative")
-        return int(column)
-    if isinstance(column, str):
-        if names is None:
-            raise HessboostError(f"feature {column!r} named, but the data has no feature names")
-        if column not in names:
-            raise HessboostError(f"unknown feature {column!r}")
-        return names.index(column)
-    raise TypeError(f"a column must be a feature index or name, got {type(column).__name__}")
 
 
 def _encoded(source: DMatrix, core: _hessboost.DMatrix, columns: list[int]) -> DMatrix:
@@ -154,7 +130,7 @@ class OrderedTargetEncoder:
         """
         if not isinstance(dtrain, DMatrix):
             raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
-        indices = _column_indices(columns, dtrain._feature_names)
+        indices = _data.feature_indices(columns, dtrain._feature_names)
         labels = None
         if label is not None:
             labels = np.asarray(label, dtype=np.float32)
@@ -282,7 +258,7 @@ class FittedTargetEncoder(_SchemaState):
         Raises:
             HessboostError: ``column`` is not encoded.
         """
-        index = _column_index(column, self._feature_names)
+        index = _data.feature_index(column, self._feature_names)
         value = self._core.encoding(index, int(code))
         if value is None:
             raise HessboostError(f"feature {column!r} is not target-encoded")

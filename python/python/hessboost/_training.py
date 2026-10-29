@@ -10,18 +10,12 @@ from typing import Any, Literal, Protocol, cast, overload
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from hessboost import _hessboost
+from hessboost import _data, _hessboost
 from hessboost._booster import Booster
 from hessboost._exceptions import HessboostError
 from hessboost._matrix import BinnedMatrix, DMatrix, _check_schema
 from hessboost.folds import PurgedTail
-from hessboost.target_stats import (
-    Column,
-    FittedTargetEncoder,
-    OrderedTargetEncoder,
-    _column_indices,
-    _encoded,
-)
+from hessboost.target_stats import Column, FittedTargetEncoder, OrderedTargetEncoder, _encoded
 
 __all__ = [
     "CustomMetric",
@@ -577,7 +571,7 @@ def _cross_validate(
             raise TypeError(
                 f"target_encoder must be an OrderedTargetEncoder, got {type(encoder).__name__}"
             )
-        encoding = (encoder._core, _column_indices(target_stats, dtrain._feature_names))
+        encoding = (encoder._core, _data.feature_indices(target_stats, dtrain._feature_names))
     elif target_encoder is not None:
         raise HessboostError("target_encoder needs target_stats, the columns to encode")
     labels = None

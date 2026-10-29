@@ -9,12 +9,12 @@ use crate::errors::{DetachExt, OrRaise, map_err, refuse};
 use crate::gpu::GpuModel;
 use hessboost::error::HessboostError;
 use hessboost::model::{
-    BoostedModel, Contributions, ImportanceType, Interactions, Iterations, Predictions,
+    BoostedModel, Contributions, ImportanceType, Interactions, Iterations, Predictions, RowVariants,
 };
 use hessboost::objective::Objective;
 use numpy::{
-    PyArray1, PyArrayDyn, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
-    PyUntypedArrayMethods,
+    PyArray1, PyArray2, PyArrayDyn, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArrayDyn, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -216,6 +216,78 @@ impl Booster {
             }
         })
         .or_raise()
+    }
+
+    /// Writes the predictions (`margin`: raw margins) of the rows that are
+    /// `base` with the features `features` set to each row of `values`
+    /// (`(variants, len(features))`, C-contiguous) into `out`, one row of
+    /// `prediction_width` values (`margin`: `num_outputs`) per variant: bit
+    /// for bit `predict_row_into` of each such row. Never uses rayon, so it
+    /// detaches without the pool.
+    #[pyo3(signature = (base, features, values, margin, out, iteration_range=None))]
+    fn predict_variants_into(
+        &self,
+        base: PyReadonlyArray1<'_, f32>,
+        features: Vec<usize>,
+        values: PyReadonlyArray2<'_, f32>,
+        margin: bool,
+        out: &Bound<'_, PyArray2<f32>>,
+        iteration_range: Option<(usize, usize)>,
+    ) -> PyResult<()> {
+        let py = out.py();
+        let columns = values.shape()[1];
+        if columns != features.len() {
+            return Err(map_err(HessboostError::DimensionMismatch {
+                what: "variant values per varying feature",
+                expected: features.len(),
+                got: columns,
+            }));
+        }
+        let base = row_major(&base, "base")?;
+        let values = row_major(&values, "values")?;
+        // Fails for a read-only `out` or one sharing memory with the inputs.
+        let mut out = out.try_readwrite().map_err(|_| {
+            refuse("out must be writeable and must not share memory with base or values")
+        })?;
+        let out = out.as_slice_mut()?;
+        let model = &*self.model;
+        let iterations = iterations(model, iteration_range, Iterations::Best);
+        py.detach(|| {
+            let variants = RowVariants::new(base, &features, values)?;
+            if margin {
+                model.predict_margin_variants_into(&variants, iterations, out)
+            } else {
+                model.predict_variants_into(&variants, iterations, out)
+            }
+        })
+        .or_raise()
+    }
+
+    /// Writes bounds on the margins of every row `x` with `lower <= x <=
+    /// upper` (both `NaN`: missing) into `out_lower` and `out_upper`
+    /// (`num_outputs` each). Never uses rayon, so it detaches without the
+    /// pool.
+    #[pyo3(signature = (lower, upper, out_lower, out_upper, iteration_range=None))]
+    fn margin_bounds_into(
+        &self,
+        py: Python<'_>,
+        lower: PyReadonlyArray1<'_, f32>,
+        upper: PyReadonlyArray1<'_, f32>,
+        out_lower: &Bound<'_, PyArray1<f32>>,
+        out_upper: &Bound<'_, PyArray1<f32>>,
+        iteration_range: Option<(usize, usize)>,
+    ) -> PyResult<()> {
+        let lower = row_major(&lower, "lower")?;
+        let upper = row_major(&upper, "upper")?;
+        let shared =
+            || refuse("the outputs must be writeable and share memory with no other input");
+        let mut out_lower = out_lower.try_readwrite().map_err(|_| shared())?;
+        let mut out_upper = out_upper.try_readwrite().map_err(|_| shared())?;
+        let (out_lower, out_upper) = (out_lower.as_slice_mut()?, out_upper.as_slice_mut()?);
+        let model = &*self.model;
+        let iterations = iterations(model, iteration_range, Iterations::Best);
+        py.detach(|| model.margin_bounds_into(lower, upper, iterations, out_lower, out_upper))
+            .or_raise()
     }
 
     /// The prediction of one margin of a single-output model, by the

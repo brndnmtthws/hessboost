@@ -3,6 +3,7 @@
 //! every model kind, and transforming its margins, allocates nothing. The
 //! test has its own binary because it installs a counting global allocator.
 
+use hessboost::model::RowVariants;
 use hessboost::prelude::*;
 use hessboost::tree::{Node, RegTree};
 use serde_json::{Value, json};
@@ -170,6 +171,31 @@ fn row_predictions_allocate_nothing() {
             .predict_row_into(row, Iterations::Best, &mut values)
             .unwrap();
         let single = model.n_outputs() == 1;
+        // 70 variants of features 0 and 2 (two chunks), every 5th missing.
+        let varied: Vec<f32> = (0..140)
+            .map(|i| {
+                if i % 5 == 1 {
+                    f32::NAN
+                } else {
+                    (i % 13) as f32 / 3.0
+                }
+            })
+            .collect();
+        let variants = RowVariants::new(row, &[0, 2], &varied).unwrap();
+        let mut variant_margins = vec![0.0; 70 * model.n_outputs()];
+        let mut variant_values = vec![0.0; 70 * model.prediction_width()];
+        let linear_leaves = model.trees().iter().any(|t| t.linear_leaves().is_some());
+        let (lower, upper): (Vec<f32>, Vec<f32>) = row
+            .iter()
+            .map(|&v| {
+                if v.is_nan() {
+                    (v, v)
+                } else {
+                    (v - 1.0, v + 1.0)
+                }
+            })
+            .unzip();
+        let (mut low, mut high) = (margins.clone(), margins.clone());
         let count = allocations(|| {
             for _ in 0..3 {
                 model
@@ -183,6 +209,17 @@ fn row_predictions_allocate_nothing() {
                     let margin = model.predict_margin_row(row, ..).unwrap();
                     model.predict_row(row, ..).unwrap();
                     model.transform_margin(margin).unwrap();
+                }
+                model
+                    .predict_margin_variants_into(&variants, .., &mut variant_margins)
+                    .unwrap();
+                model
+                    .predict_variants_into(&variants, Iterations::Best, &mut variant_values)
+                    .unwrap();
+                if !linear_leaves {
+                    model
+                        .margin_bounds_into(&lower, &upper, .., &mut low, &mut high)
+                        .unwrap();
                 }
             }
         });

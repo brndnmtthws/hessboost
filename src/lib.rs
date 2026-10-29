@@ -92,6 +92,12 @@
 //!   quantiles) is transformed on its own, with XGBoost's scalar `expf`,
 //!   sigmoid, and softmax
 //!   ([`transform_margins_into`](model::BoostedModel::transform_margins_into)).
+//!   What-if prediction of rows that differ from one base row in a few
+//!   features, in one walk of each tree and bit for bit their rows'
+//!   predictions ([`RowVariants`](model::RowVariants),
+//!   [`predict_variants_into`](model::BoostedModel::predict_variants_into)),
+//!   and sound margin bounds over a box of feature values
+//!   ([`margin_bounds_into`](model::BoostedModel::margin_bounds_into)).
 //!   Read-only model metadata: tree weights, the outputs each tree feeds,
 //!   nodes, depths, and category sets, `gblinear` weights, and the
 //!   model-shrinkage record

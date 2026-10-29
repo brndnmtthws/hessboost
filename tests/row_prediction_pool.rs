@@ -4,6 +4,7 @@
 //! has its own binary because it checks that the process never built rayon's
 //! global pool.
 
+use hessboost::model::RowVariants;
 use hessboost::objective::{Multiclass, Objective};
 use hessboost::prelude::*;
 
@@ -51,6 +52,31 @@ fn row_predictions_never_build_the_global_thread_pool() {
         .unwrap();
     softprob
         .predict_row_into(&[0.5, 1.5], Iterations::Best, &mut out)
+        .unwrap();
+    // Variants and bounds of the same models, on the calling thread too.
+    let candidates = [0.25, 0.75, f32::NAN];
+    let variants = RowVariants::new(&row, &[0], &candidates).unwrap();
+    let mut margins = [0.0; 3];
+    wide.predict_margin_variants_into(&variants, Iterations::Best, &mut margins)
+        .unwrap();
+    wide.predict_variants_into(&variants, Iterations::Best, &mut margins)
+        .unwrap();
+    let (lower, upper) = (vec![0.0; WIDE], vec![1.0; WIDE]);
+    wide.margin_bounds_into(&lower, &upper, .., &mut [0.0], &mut [0.0])
+        .unwrap();
+    let variants = RowVariants::new(&[0.5, 1.5], &[1], &[0.0, 2.0]).unwrap();
+    let mut wide_out = vec![0.0; 2 * OUTPUTS];
+    softprob
+        .predict_variants_into(&variants, Iterations::Best, &mut wide_out)
+        .unwrap();
+    softprob
+        .margin_bounds_into(
+            &[0.0, 1.0],
+            &[1.0, 2.0],
+            ..,
+            &mut out,
+            &mut wide_out[..OUTPUTS],
+        )
         .unwrap();
     assert!(
         rayon::ThreadPoolBuilder::new().build_global().is_ok(),

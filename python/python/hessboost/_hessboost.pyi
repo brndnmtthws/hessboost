@@ -184,6 +184,23 @@ class Booster:
         out: NDArray[np.float32],
         iteration_range: tuple[int, int] | None = None,
     ) -> None: ...
+    def predict_variants_into(
+        self,
+        base: NDArray[np.float32],
+        features: list[int],
+        values: NDArray[np.float32],
+        margin: bool,
+        out: NDArray[np.float32],
+        iteration_range: tuple[int, int] | None = None,
+    ) -> None: ...
+    def margin_bounds_into(
+        self,
+        lower: NDArray[np.float32],
+        upper: NDArray[np.float32],
+        out_lower: NDArray[np.float32],
+        out_upper: NDArray[np.float32],
+        iteration_range: tuple[int, int] | None = None,
+    ) -> None: ...
     def transform_margin(self, margin: float) -> float: ...
     def transform_margins_into(
         self, margins: NDArray[np.float32], out: NDArray[np.float32]

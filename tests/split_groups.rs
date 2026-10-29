@@ -6,7 +6,8 @@
 use std::collections::BTreeSet;
 
 use hessboost::config::{
-    BoosterKind, ExtraTrees, GrowPolicy, MultiStrategy, ProcessType, Refresh, TrainingParamsBuilder,
+    BoosterKind, ExtraTrees, GrowPolicy, MultiStrategy, ProcessType, Refresh, SamplingMethod,
+    TrainingParamsBuilder,
 };
 use hessboost::data::{BinnedMatrix, FeatureType, ViewCuts};
 use hessboost::diffusion::{DiffusionModel, DiffusionParams};
@@ -523,6 +524,18 @@ fn unsupported_requests_are_refused() {
         .with_split_groups(&block_groups(300, 5))
         .unwrap();
     let params = constrained().build().unwrap();
+    // `approx` sketches a constant Hessian's cuts once, from the first
+    // tree's gradient sample, which later samples' rows may lie outside.
+    let sampled = constrained()
+        .tree_method(TreeMethod::Approx)
+        .sampling_method(SamplingMethod::GradientBased)
+        .subsample(0.5)
+        .build()
+        .unwrap();
+    assert_eq!(
+        invalid_param(train(&sampled, &grouped, 2)),
+        "min_child_groups"
+    );
     // Budget mode, refresh, and in-place updates run no split search that
     // could apply it.
     assert_eq!(

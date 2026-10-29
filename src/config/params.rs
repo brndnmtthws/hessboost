@@ -476,9 +476,11 @@ pub struct TrainingParams {
     /// (`tree_method` `hist`, `approx` or `auto`) with one output per tree;
     /// refused with `booster = gblinear` and
     /// `multi_strategy = multi_output_tree`, by budget mode, refresh,
-    /// in-place updates, and diffusion models, and under `hist` for a
+    /// in-place updates, and diffusion models, under `hist` for a
     /// [`ViewCuts::Source`] view weighing rows its source weighs zero (its
-    /// cuts never saw them). Counting reads every searched
+    /// cuts never saw them), and under `approx` with gradient-based
+    /// sampling and a constant Hessian (`reg:squarederror`), whose cuts are
+    /// sketched once, from the first tree's sample. Counting reads every searched
     /// node's rows once for their groups and once per feature it checks
     /// (those whose best split could still win; every feature under
     /// symmetric growth, `extra_trees`, `path_smooth`, and reuse

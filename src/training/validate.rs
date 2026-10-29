@@ -1,6 +1,7 @@
 //! Request validation: what training refuses before anything is built.
 
 use super::eval::EvalSet;
+use super::row_sampling::gradient_sampling;
 use crate::config::{BoosterKind, Device, ProcessType, TrainingParams, TreeMethod};
 use crate::data::{DMatrix, FeatureType, SketchedRows};
 use crate::error::{HessboostError, Result};
@@ -160,7 +161,7 @@ pub(super) fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> 
         return Err(HessboostError::EmptyDataset("train: dtrain has no labels"));
     }
     validate_balanced_bagging(params, dtrain)?;
-    validate_split_groups(params, dtrain)?;
+    validate_split_groups(params, dtrain, objective)?;
     validate_datasets(objective, dtrain, evals)?;
     validate_constraints(params, dtrain.n_cols())?;
     validate_booster(request, objective)?;
@@ -190,12 +191,18 @@ fn validate_setup(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
 
 /// `min_child_groups` counts the training rows' split groups, so the
 /// training matrix must have them. It counts them by the rows' bins, which
-/// route every row it counts (those of nonzero weight) as its values do
-/// only when the cuts were sketched from all of them: under `hist`, not
-/// for a [`ViewCuts::Source`](crate::data::ViewCuts::Source) view weighing
-/// rows its source weighs zero (`approx` sketches every round's cuts from
-/// the matrix itself).
-fn validate_split_groups(params: &TrainingParams, dtrain: &DMatrix) -> Result<()> {
+/// route every row it counts (those of nonzero Hessian) as its values do
+/// only when the cuts were sketched from all of them. Under `hist`, a
+/// [`ViewCuts::Source`](crate::data::ViewCuts::Source) view weighing rows
+/// its source weighs zero breaks that. `approx` sketches each tree's cuts
+/// from its gradients, except that a constant Hessian's first cuts serve
+/// every tree: gradient-based sampling then trains later trees on rows the
+/// first tree's sample left out, which those cuts never saw.
+fn validate_split_groups(
+    params: &TrainingParams,
+    dtrain: &DMatrix,
+    objective: &dyn Loss,
+) -> Result<()> {
     if !params.split_groups_on() {
         return Ok(());
     }
@@ -208,7 +215,17 @@ fn validate_split_groups(params: &TrainingParams, dtrain: &DMatrix) -> Result<()
             ),
         ));
     }
-    if params.tree_method != TreeMethod::Approx && dtrain.sketched_rows() == SketchedRows::Partial {
+    if params.tree_method == TreeMethod::Approx {
+        if objective.const_hess() && gradient_sampling(params) {
+            return Err(HessboostError::invalid_param(
+                "min_child_groups",
+                "under `tree_method = approx` with gradient-based sampling needs a Hessian \
+                 that varies: a constant one's cuts are sketched once, from the first tree's \
+                 sample, and later samples train on rows they never saw (use `tree_method = \
+                 hist`)",
+            ));
+        }
+    } else if dtrain.sketched_rows() == SketchedRows::Partial {
         return Err(HessboostError::invalid_data(
             "weights",
             "`min_child_groups` needs every weighted row in the cuts: this view with its \

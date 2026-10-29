@@ -474,6 +474,23 @@ def info(
     return out
 
 
+def _split_group_dtype_error(dtype: object) -> TypeError:
+    """The refusal of split-group ids of ``dtype``, which are not integers."""
+    return TypeError(
+        f"split_group has dtype {dtype}; it takes integer ids without missing values "
+        f"(code other values first, e.g. with pandas.factorize or "
+        f"numpy.unique(..., return_inverse=True))"
+    )
+
+
+def _check_polars_split_groups(series: pl.Series) -> None:
+    """Refuse a polars series of anything but integer split-group ids before
+    numpy reads it: polars 1.0's ``to_numpy`` crashes on a ``Duration``
+    series."""
+    if not series.dtype.is_integer():
+        raise _split_group_dtype_error(series.dtype)
+
+
 def split_group_ids(values: ArrayLike) -> NDArray[np.uint64]:
     """One split-group id per row as a 1-D ``uint64`` array, from an array
     of any integer dtype (signed ones without negative ids).
@@ -482,6 +499,9 @@ def split_group_ids(values: ArrayLike) -> NDArray[np.uint64]:
         HessboostError: An id is negative, or ``values`` is not 1-D.
         TypeError: ``values`` does not have an integer dtype.
     """
+    pl = _polars()
+    if pl is not None and isinstance(values, pl.Series):
+        _check_polars_split_groups(values)
     array = np.asarray(values)
     if array.ndim == 2 and array.shape[1] == 1:
         array = array.reshape(-1)
@@ -489,11 +509,7 @@ def split_group_ids(values: ArrayLike) -> NDArray[np.uint64]:
         raise HessboostError(f"split_group must be 1-D, got shape {array.shape}")
     # By kind: numpy counts timedelta64 as a signed integer type.
     if array.dtype.kind not in "iu":
-        raise TypeError(
-            f"split_group has dtype {array.dtype}; it takes integer ids without missing values "
-            f"(code other values first, e.g. with pandas.factorize or "
-            f"numpy.unique(..., return_inverse=True))"
-        )
+        raise _split_group_dtype_error(array.dtype)
     if array.dtype.kind == "i" and array.size and (low := array.min()) < 0:
         raise HessboostError(f"split_group ids must be non-negative, got {low}")
     return np.ascontiguousarray(array, dtype=np.uint64)
@@ -573,7 +589,10 @@ def _polars_columns(frame: pl.DataFrame, field: str, names: list[str]) -> NDArra
     regex parsing."""
     pl = _polars()
     if field in _KEPT_VALUE_FIELDS:
-        return frame.get_column(names[0]).to_numpy()
+        column = frame.get_column(names[0])
+        if field == "split_group":
+            _check_polars_split_groups(column)
+        return column.to_numpy()
     for name in names:
         dtype = frame.schema[name]
         if not _polars_numeric(pl, dtype):

@@ -170,9 +170,13 @@ def test_split_groups_come_from_a_polars_column_or_series() -> None:
         DMatrix(holes, label="y", split_group="episode")
     with pytest.raises(TypeError, match="split_group has dtype"):
         DMatrix(data, label="y", split_group="color")
+    # Refused by dtype before numpy reads it (polars 1.0's `to_numpy`
+    # crashes on a `Duration` series), by name or as a series.
     durations = data.with_columns(lag=pl.col("episode").cast(pl.Int64).cast(pl.Duration("us")))
-    with pytest.raises(TypeError, match="split_group has dtype timedelta64"):
+    with pytest.raises(TypeError, match="split_group has dtype Duration"):
         DMatrix(durations, label="y", split_group="lag")
+    with pytest.raises(TypeError, match="split_group has dtype Duration"):
+        DMatrix(data.drop("episode"), label="y", split_group=durations["lag"])
 
 
 @pytest.mark.parametrize("library", ["pandas", "polars"])

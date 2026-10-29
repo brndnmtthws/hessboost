@@ -160,13 +160,17 @@
 //!   forward-chaining (time-ordered, purged by a row gap), or purged forward
 //!   (timestamped rows, purged by each label window, in test blocks of the
 //!   last decision times or starting at given times such as calendar
-//!   periods: [`Fold::purged_forward`](training::Fold::purged_forward),
-//!   [`Fold::purged_forward_at`](training::Fold::purged_forward_at))
+//!   periods, over every row or a row subset such as the labeled rows:
+//!   [`Fold::purged_forward`](training::Fold::purged_forward),
+//!   [`Fold::purged_forward_at`](training::Fold::purged_forward_at), and
+//!   their `_rows` variants)
 //!   [`Fold`](training::Fold)s with fold-mean or leakage-safe per-fold
-//!   early stopping on a purged tail of each fold's training rows
+//!   early stopping on a purged tail of each fold's training rows, the last
+//!   share of their time span or row count
 //!   ([`CrossValidation`](training::CrossValidation),
 //!   [`CvStopping`](training::CvStopping),
-//!   [`PurgedTail`](training::PurgedTail)); each fold's round count and
+//!   [`PurgedTail`](training::PurgedTail),
+//!   [`TailCut`](training::TailCut)); each fold's round count and
 //!   every row's out-of-fold margins
 //!   ([`CvReport`](training::CvReport)); whole-query folds of
 //!   ranking data; ordered target statistics fitted inside each fold

@@ -514,12 +514,13 @@ def cross_validate(
     CvReport, tuple[Booster, int, FittedTargetEncoder | None, _TailStopping | None] | None
 ]: ...
 def check_purged_tail(
-    decision_at: NDArray[np.int64], label_end: NDArray[np.int64], fraction: float
+    decision_at: NDArray[np.int64], label_end: NDArray[np.int64], fraction: float, cut: str
 ) -> None: ...
 def purged_tail_split(
     decision_at: NDArray[np.int64],
     label_end: NDArray[np.int64],
     fraction: float,
+    cut: str,
     rows: NDArray[np.int64],
 ) -> tuple[int, list[tuple[NDArray[np.int64], NDArray[np.int64]]]]: ...
 def k_fold(
@@ -534,12 +535,14 @@ def purged_forward(
     validation_fraction: float,
     blocks: int,
     min_train: int,
+    rows: NDArray[np.int64] | None = None,
 ) -> list[tuple[NDArray[np.int64], NDArray[np.int64]]]: ...
 def purged_forward_at(
     decision_at: NDArray[np.int64],
     label_end: NDArray[np.int64],
     block_starts: NDArray[np.int64],
     min_train: int,
+    rows: NDArray[np.int64] | None = None,
 ) -> list[tuple[NDArray[np.int64], NDArray[np.int64]]]: ...
 def samples_mean(samples: NDArray[np.float32]) -> NDArray[np.float64]: ...
 def samples_quantiles(samples: NDArray[np.float32], levels: list[float]) -> NDArray[np.float64]: ...

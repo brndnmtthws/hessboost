@@ -113,6 +113,71 @@ def test_metadata_getters_and_set_info() -> None:
     assert repr(matrix) == "DMatrix(rows=10, features=5)"
 
 
+def test_split_groups_take_integer_ids_of_any_dtype() -> None:
+    x, y = regression(rows=6)
+    ids = np.array([3, 3, 1, 0, 1, 2])
+    assert DMatrix(x, y).get_split_group().dtype == np.uint64
+    assert DMatrix(x, y).get_split_group().size == 0
+    for given in [
+        ids,
+        ids.astype(np.int8),
+        ids.astype(np.uint16),
+        ids.tolist(),
+        pd.Series(ids, dtype="Int64"),
+        pd.Series(ids, dtype="UInt32"),
+    ]:
+        groups = DMatrix(x, y, split_group=given).get_split_group()
+        assert groups.dtype == np.uint64
+        np.testing.assert_array_equal(groups, ids)
+    largest = np.full(6, np.iinfo(np.uint64).max, dtype=np.uint64)
+    np.testing.assert_array_equal(DMatrix(x, split_group=largest).get_split_group(), largest)
+    matrix = DMatrix(x, y)
+    matrix.set_info(split_group=ids)
+    np.testing.assert_array_equal(matrix.get_split_group(), ids)
+    # Row views gather the ids with the rest of the metadata.
+    np.testing.assert_array_equal(matrix.slice([5, 0, 0]).get_split_group(), [2, 3, 3])
+    np.testing.assert_array_equal(matrix.slice([4, 2], cuts="source").get_split_group(), [1, 1])
+    # A frame's column, by name, leaves the features.
+    frame = pd.DataFrame(x, columns=list("abcde")).assign(episode=ids)
+    named = DMatrix(frame, y, split_group="episode")
+    assert named.feature_names == list("abcde")
+    np.testing.assert_array_equal(named.get_split_group(), ids)
+
+
+def test_split_groups_refuse_what_is_not_an_integer_id() -> None:
+    x, y = regression(rows=6)
+    with pytest.raises(HessboostError, match="non-negative"):
+        DMatrix(x, y, split_group=[0, 1, -1, 2, 3, 4])
+    for given in [
+        np.arange(6, dtype=np.float64),
+        np.ones(6, dtype=bool),
+        np.array(list("abcdef")),
+        np.array([0, 1, 2, 3, 4, None], dtype=object),
+        pd.Series([0, 1, 2, 3, 4, None], dtype="Int64"),
+        # numpy counts timedelta64 as a signed integer type.
+        np.arange(6).astype("m8[s]"),
+        np.array([0, 1, 2, 3, 4, "NaT"], dtype="m8[s]"),
+        pd.to_timedelta(np.arange(6), unit="s"),
+    ]:
+        with pytest.raises(TypeError, match=r"split_group has dtype .*factorize"):
+            DMatrix(x, y, split_group=given)
+    with pytest.raises(HessboostError, match="split_groups"):
+        DMatrix(x, y, split_group=np.arange(5))
+    with pytest.raises(HessboostError, match="1-D"):
+        DMatrix(x, y, split_group=np.zeros((3, 2), dtype=np.int64))
+    matrix = DMatrix(x, y)
+    with pytest.raises(HessboostError, match="split_groups"):
+        matrix.set_info(split_group=np.arange(7))
+    assert matrix.get_split_group().size == 0
+    frame = pd.DataFrame(x, columns=list("abcde")).assign(
+        episode=np.linspace(0, 1, 6), lag=pd.to_timedelta([0, 1, 2, 3, 4, None], unit="s")
+    )
+    with pytest.raises(TypeError, match="split_group has dtype float64"):
+        DMatrix(frame, y, split_group="episode")
+    with pytest.raises(TypeError, match="split_group has dtype timedelta64"):
+        DMatrix(frame, y, split_group="lag")
+
+
 def test_slices_train_as_copies_or_on_their_sources_bins() -> None:
     x, y = regression(rows=600)
     x[::7, 1] = np.nan

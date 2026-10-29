@@ -185,6 +185,7 @@ See [`python/README.md`](python/README.md).
   - [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/): Asymptotic confidence and prediction intervals for `f(x)`.
   - [Explainable boosting machines](https://docs.rs/hessboost/latest/hessboost/ebm/): Interpretable cyclic GAM/GA²M models with shape-function confidence bands.
   - [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/): Full predictive distributions per row (`dist:normal`, `dist:gamma`, `dist:student_t` for heavy-tailed targets with learned degrees of freedom, etc.).
+  - [Split-group constraints](https://docs.rs/hessboost/latest/hessboost/config/struct.TrainingParams.html#structfield.min_child_groups): `min_child_groups` takes a split only when both children hold rows of enough distinct groups (independent units such as one symbol on one day), so no split rests on a few units' rows.
   - [Uncertainty & virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/): SGLB posterior sampling and model shrinkage.
   - [Generative tabular modeling](https://docs.rs/hessboost/latest/hessboost/diffusion/): Tree-based conditional diffusion, flow matching, and ForestFlow synthetic data and imputation.
   - [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/): Fast incremental learning and exact or approximate unlearning.

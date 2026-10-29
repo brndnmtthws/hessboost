@@ -11,6 +11,7 @@
 pub(crate) mod budget;
 mod categorical;
 mod exact;
+mod groups;
 mod hist;
 mod lightgbm;
 mod multi;
@@ -21,6 +22,7 @@ mod shared;
 mod split;
 
 pub(crate) use exact::{ExactTreeBuilder, SortedColumns, all_rows};
+pub(crate) use groups::SplitGroups;
 pub use hist::HistTreeBuilder;
 pub(crate) use multi::{MultiTreeBuilder, VectorGradients};
 pub(crate) use oblivious::check_symmetric_input;

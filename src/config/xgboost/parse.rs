@@ -66,6 +66,7 @@ impl Flat {
             max_depth,
             max_leaves,
             min_child_weight,
+            min_child_groups,
             max_delta_step,
             subsample: _,
             colsample_bytree,
@@ -131,6 +132,7 @@ impl Flat {
             max_depth: max_depth.map_or(d.max_depth, |limit| limit.0),
             max_leaves: max_leaves.map_or(d.max_leaves, |limit| limit.0),
             min_child_weight: min_child_weight.unwrap_or(d.min_child_weight),
+            min_child_groups: min_child_groups.unwrap_or(d.min_child_groups),
             max_delta_step: match max_delta_step.flatten() {
                 None => MaxDeltaStep::ObjectiveDefault,
                 Some(0.0) => MaxDeltaStep::Unbounded,

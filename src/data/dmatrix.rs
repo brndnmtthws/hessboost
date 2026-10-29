@@ -308,6 +308,8 @@ pub struct DMatrix {
     weights: Option<Vec<f32>>,
     base_margin: Option<Vec<f32>>,
     group: Option<GroupInfo>,
+    /// One split group id per row ([`DMatrix::with_split_groups`]).
+    split_groups: Option<Vec<u64>>,
     feature_types: Vec<FeatureType>,
     feature_weights: Option<Vec<f32>>,
 }
@@ -373,6 +375,7 @@ impl DMatrix {
             weights: None,
             base_margin: None,
             group: None,
+            split_groups: None,
             feature_types: vec![FeatureType::Numerical; n_cols],
             feature_weights: None,
         }
@@ -650,6 +653,20 @@ impl DMatrix {
         Ok(self)
     }
 
+    /// Attach each row's split group (`len == n_rows`): the independent unit
+    /// of evidence the row belongs to, such as one id per symbol and day, or
+    /// per episode. Only equality matters. Under
+    /// [`min_child_groups`](crate::config::TrainingParams::min_child_groups)
+    /// above 1, a split is legal only when both children hold rows of at
+    /// least that many distinct groups; otherwise training does not read
+    /// them. They are not stored in the model, and they are not ranking's
+    /// query groups ([`with_group_sizes`](Self::with_group_sizes)).
+    pub fn with_split_groups(mut self, groups: &[u64]) -> Result<Self> {
+        check_len("split_groups", groups.len(), self.n_rows)?;
+        self.split_groups = Some(groups.to_vec());
+        Ok(self)
+    }
+
     /// Set the feature types (`len == n_cols`). A [`ViewCuts::Source`] view
     /// keeps its source's, which its source's cuts were computed for.
     pub fn with_feature_types(mut self, types: &[FeatureType]) -> Result<Self> {
@@ -772,6 +789,12 @@ impl DMatrix {
     #[inline]
     pub fn group(&self) -> Option<&GroupInfo> {
         self.group.as_ref()
+    }
+
+    /// Split groups, if attached ([`with_split_groups`](Self::with_split_groups)).
+    #[inline]
+    pub fn split_groups(&self) -> Option<&[u64]> {
+        self.split_groups.as_deref()
     }
 
     /// Feature types. This is always populated and defaults to all numerical.
@@ -1134,9 +1157,9 @@ impl DMatrix {
     /// The matrix of only `rows` (in the given order, repeats allowed), a
     /// view sharing this matrix's feature values (nothing is copied but the
     /// metadata: labels, every target of each row, label bounds, weights,
-    /// base margin, ranking groups, and feature metadata). Training on it
-    /// is training on a copy of those rows, bit for bit: the view cuts its
-    /// own rows ([`ViewCuts::Own`]; see
+    /// base margin, ranking and split groups, and feature metadata). Training
+    /// on it is training on a copy of those rows, bit for bit: the view cuts
+    /// its own rows ([`ViewCuts::Own`]; see
     /// [`select_rows_with_cuts`](Self::select_rows_with_cuts)).
     ///
     /// On a matrix with query groups, `rows` must list whole groups back to
@@ -1208,14 +1231,19 @@ impl DMatrix {
             group: group_sizes
                 .filter(|sizes| !sizes.is_empty())
                 .map(|sizes| GroupInfo::from_sizes(&sizes)),
+            split_groups: self
+                .split_groups
+                .as_deref()
+                .map(|groups| rows.iter().map(|&r| groups[r]).collect()),
             feature_types: self.feature_types.clone(),
             feature_weights: self.feature_weights.clone(),
         })
     }
 
     /// This matrix without the metadata binning does not read (labels,
-    /// bounds, base margins, groups, feature weights), sharing its values
-    /// and bin cache: what a [`ViewCuts::Source`] view keeps of its source.
+    /// bounds, base margins, query and split groups, feature weights),
+    /// sharing its values and bin cache: what a [`ViewCuts::Source`] view
+    /// keeps of its source.
     fn binning_source(&self) -> DMatrix {
         DMatrix {
             n_rows: self.n_rows,
@@ -1231,6 +1259,7 @@ impl DMatrix {
             weights: self.weights.clone(),
             base_margin: None,
             group: None,
+            split_groups: None,
             feature_types: self.feature_types.clone(),
             feature_weights: None,
         }

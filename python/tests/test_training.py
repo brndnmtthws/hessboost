@@ -509,6 +509,65 @@ def test_weights_change_the_fit() -> None:
     assert rmse(weighted[heavy], y[heavy]) < rmse(plain[heavy], y[heavy])
 
 
+def grouped_step() -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]:
+    """Six split groups of ten rows: feature 0 marks group 0 alone, whose
+    labels stand far above the rest; feature 1 halves every group."""
+    groups = np.repeat(np.arange(6), 10)
+    x = np.column_stack([groups == 0, np.arange(60) % 2]).astype(np.float64)
+    y = np.where(groups == 0, 10.0, 0.0) + x[:, 1]
+    return x, y, groups
+
+
+@pytest.mark.parametrize(
+    "growth",
+    [{}, {"tree_method": "approx"}, {"grow_policy": "lossguide"}],
+)
+def test_min_child_groups_refuses_splits_that_isolate_a_group(growth: dict[str, Any]) -> None:
+    x, y, groups = grouped_step()
+    dtrain = DMatrix(x, y, split_group=groups)
+    stump = {"max_depth": 1, **growth}
+
+    def root(params: dict[str, Any]) -> int:
+        return int(hessboost.train(params, dtrain, 1).model_info().trees[0].feature[0])
+
+    assert root(stump) == 0
+    # 1 (the default) is off: the groups change nothing.
+    plain = hessboost.train(stump, DMatrix(x, y), 3).save_raw()
+    assert hessboost.train({**stump, "min_child_groups": 1}, dtrain, 3).save_raw() == plain
+    # Feature 0's split leaves one group on a side, feature 1's six on each.
+    assert root({**stump, "min_child_groups": 2}) == 1
+    assert root({**stump, "min_child_groups": 6}) == 1
+    # No split leaves seven groups on both sides: the root stays a leaf.
+    assert root({**stump, "min_child_groups": 7}) == -1
+
+
+def test_min_child_groups_refusals() -> None:
+    x, y, groups = grouped_step()
+    with pytest.raises(InvalidDataError, match="split_groups"):
+        hessboost.train({"min_child_groups": 2}, DMatrix(x, y), 1)
+    dtrain = DMatrix(x, y, split_group=groups)
+    for params in [
+        {"booster": "gblinear"},
+        {"tree_method": "exact"},
+    ]:
+        with pytest.raises(HessboostError) as refused:
+            hessboost.train({**params, "min_child_groups": 2}, dtrain, 1)
+        assert type(refused.value) is HessboostError
+    targets = DMatrix(x, np.column_stack([y, -y]), split_group=groups)
+    with pytest.raises(HessboostError) as refused:
+        hessboost.train({"multi_strategy": "multi_output_tree", "min_child_groups": 2}, targets, 1)
+    assert type(refused.value) is HessboostError
+
+
+def test_cv_folds_carry_split_groups() -> None:
+    x, y = regression()
+    params = {"max_depth": 3, "min_child_groups": 4}
+    result = hessboost.cv(params, DMatrix(x, y, split_group=np.arange(400) // 20), 5)
+    assert np.all(np.isfinite(result["test-rmse-mean"]))
+    with pytest.raises(InvalidDataError, match="split_groups"):
+        hessboost.cv(params, DMatrix(x, y), 5)
+
+
 def test_custom_objective_reproduces_squared_error() -> None:
     x, y = regression()
     dtrain = DMatrix(x, y)

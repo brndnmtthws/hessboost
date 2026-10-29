@@ -10,8 +10,8 @@ use hessboost::data::{
 };
 use numpy::ndarray::{ArrayD, IxDyn};
 use numpy::{
-    IntoPyArray, PyArray2, PyArrayDyn, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
-    PyUntypedArrayMethods,
+    IntoPyArray, PyArray1, PyArray2, PyArrayDyn, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArrayDyn, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
@@ -98,6 +98,9 @@ pub struct Info<'py> {
     /// `(features,)` column-sampling weights.
     #[pyo3(default)]
     feature_weights: Option<PyReadonlyArray1<'py, f32>>,
+    /// `(rows,)` split-group ids (only equality matters).
+    #[pyo3(default)]
+    split_group: Option<PyReadonlyArray1<'py, u64>>,
     /// Indices of the categorical columns (every other column is
     /// numerical); `None` keeps the current types.
     categorical: Option<Vec<usize>>,
@@ -112,6 +115,7 @@ struct InfoSlices<'a> {
     group: Option<&'a [usize]>,
     label_bounds: Option<(&'a [f32], &'a [f32])>,
     feature_weights: Option<&'a [f32]>,
+    split_group: Option<&'a [u64]>,
     categorical: Option<&'a [usize]>,
 }
 
@@ -146,6 +150,11 @@ impl Info<'_> {
                 .feature_weights
                 .as_ref()
                 .map(|weights| row_major(weights, "feature_weights"))
+                .transpose()?,
+            split_group: self
+                .split_group
+                .as_ref()
+                .map(|groups| row_major(groups, "split_group"))
                 .transpose()?,
             categorical: self.categorical.as_deref(),
         })
@@ -197,6 +206,9 @@ impl InfoSlices<'_> {
         if let Some(weights) = self.feature_weights {
             matrix = matrix.with_feature_weights(weights)?;
         }
+        if let Some(groups) = self.split_group {
+            matrix = matrix.with_split_groups(groups)?;
+        }
         Ok(matrix)
     }
 
@@ -234,6 +246,9 @@ impl InfoSlices<'_> {
         }
         if let Some(weights) = self.feature_weights {
             binned = binned.with_feature_weights(weights)?;
+        }
+        if let Some(groups) = self.split_group {
+            binned = binned.with_split_groups(groups)?;
         }
         Ok(binned)
     }
@@ -291,6 +306,14 @@ fn categorical_columns(types: &[FeatureType]) -> Vec<usize> {
         .filter(|(_, kind)| **kind == FeatureType::Categorical)
         .map(|(column, _)| column)
         .collect()
+}
+
+/// Split-group ids, if any.
+fn split_groups_array<'py>(
+    py: Python<'py>,
+    groups: Option<&[u64]>,
+) -> Option<Bound<'py, PyArray1<u64>>> {
+    groups.map(|groups| PyArray1::from_slice(py, groups))
 }
 
 /// An immutable hessboost dataset: features plus labels, weights, margins,
@@ -490,6 +513,12 @@ impl DMatrix {
         group_sizes(self.inner.group())
     }
 
+    /// Split-group ids, one per row, if any.
+    #[getter]
+    fn split_group<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<u64>>> {
+        split_groups_array(py, self.inner.split_groups())
+    }
+
     /// Indices of the categorical columns.
     #[getter]
     fn categorical(&self) -> Vec<usize> {
@@ -581,6 +610,12 @@ impl BinnedMatrix {
     #[getter]
     fn group(&self) -> Option<Vec<usize>> {
         group_sizes(self.inner.group())
+    }
+
+    /// Split-group ids, one per row, if any.
+    #[getter]
+    fn split_group<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<u64>>> {
+        split_groups_array(py, self.inner.split_groups())
     }
 
     /// Indices of the categorical columns.

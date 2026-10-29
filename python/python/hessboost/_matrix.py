@@ -64,10 +64,16 @@ class _Metadata[Core: (_hessboost.DMatrix, _hessboost.BinnedMatrix)]:
         """The column-sampling feature weights; empty when unset."""
         return _or_empty(self._core.feature_weights)
 
+    def get_split_group(self) -> NDArray[np.uint64]:
+        """The split-group ids, one per row; empty when unset."""
+        groups = self._core.split_group
+        return np.empty(0, dtype=np.uint64) if groups is None else groups
+
 
 class DMatrix(_Metadata[_hessboost.DMatrix]):
     """A dataset: features plus labels, weights, base margins, ranking
-    groups and feature metadata, as XGBoost's ``xgboost.DMatrix``.
+    groups, split groups and feature metadata, as XGBoost's
+    ``xgboost.DMatrix``.
 
     ``data`` may be a 2-D numpy array of any numeric dtype and memory
     layout (converted to C-contiguous ``float32``), a pandas or polars
@@ -83,12 +89,12 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
     NaN by default) are missing; infinities are refused.
 
     With a frame, the per-row metadata (``label``, ``weight``,
-    ``base_margin``, ``qid`` and the label bounds) may name columns of it
-    (``label="price"``; ``label`` and ``base_margin`` also a list of names,
-    for a label matrix or per-output margins), which then leave the
-    features. A ``LazyFrame`` takes them this way only, so that its labels
-    and rows come out of the same ``collect`` (polars' streaming engine, the
-    default since polars 2.0, keeps no row order after a join or
+    ``base_margin``, ``qid``, ``split_group`` and the label bounds) may name
+    columns of it (``label="price"``; ``label`` and ``base_margin`` also a
+    list of names, for a label matrix or per-output margins), which then
+    leave the features. A ``LazyFrame`` takes them this way only, so that
+    its labels and rows come out of the same ``collect`` (polars' streaming
+    engine, the default since polars 2.0, keeps no row order after a join or
     ``group_by``); ``group`` sizes are refused with it (pass ``qid``).
 
     A matrix is coded when it is built, so a model or matrix it is used with
@@ -123,6 +129,11 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
         label_upper_bound: ``survival:aft`` interval upper bounds
             (``inf`` for right-censored rows; or a frame's column name).
         feature_weights: Per-feature column-sampling weights.
+        split_group: One split-group id per row, of any integer dtype (or a
+            frame's column name): rows sharing an id are one unit of
+            evidence, which ``train``'s ``min_child_groups`` counts in each
+            child of a split. Only equality matters; code other values first
+            (``pandas.factorize``, ``numpy.unique(..., return_inverse=True)``).
         enable_categorical: Accept categorical frame columns (as XGBoost
             requires spelling out).
         copy: With ``False``, ``data`` must be a read-only, C-contiguous
@@ -142,12 +153,13 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
 
     Raises:
         HessboostError: The inputs do not fit together (lengths, shapes,
-            non-finite values, invalid category codes), or ``copy=False``
-            got a writeable or non-contiguous array, a read-only view of a
-            writeable array or buffer (or of an owner exposing no buffer to
-            ask, such as an ``as_strided`` result, or of memory no Python
-            object owns, such as ``ctypes.memoryview_at``'s), or one another
-            Rust extension holds a mutable borrow of.
+            non-finite values, invalid category codes, negative split-group
+            ids), or ``copy=False`` got a writeable or non-contiguous array, a
+            read-only view of a writeable array or buffer (or of an owner
+            exposing no buffer to ask, such as an ``as_strided`` result, or
+            of memory no Python object owns, such as
+            ``ctypes.memoryview_at``'s), or one another Rust extension holds
+            a mutable borrow of.
         TypeError: An input has an unsupported type or dtype.
     """
 
@@ -173,6 +185,7 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
         label_lower_bound: ArrayLike | None = None,
         label_upper_bound: ArrayLike | None = None,
         feature_weights: ArrayLike | None = None,
+        split_group: ArrayLike | None = None,
         enable_categorical: bool = True,
         copy: bool = True,
     ) -> None:
@@ -185,6 +198,7 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
             qid=qid,
             label_lower_bound=label_lower_bound,
             label_upper_bound=label_upper_bound,
+            split_group=split_group,
         )
         info = _data.info(**fields, feature_weights=feature_weights)
         self._set(
@@ -255,6 +269,7 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
         label_lower_bound: ArrayLike | None = None,
         label_upper_bound: ArrayLike | None = None,
         feature_weights: ArrayLike | None = None,
+        split_group: ArrayLike | None = None,
     ) -> None:
         """Replaces the given metadata (``None`` keeps the current value),
         validated as the constructor validates it. Only the metadata is
@@ -269,14 +284,15 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
             label_lower_bound=label_lower_bound,
             label_upper_bound=label_upper_bound,
             feature_weights=feature_weights,
+            split_group=split_group,
         )
         if info:
             self._core = self._core.with_info({**info, "categorical": None})
 
     def slice(self, rindex: ArrayLike, *, cuts: Literal["own", "source"] = "own") -> DMatrix:
         """A view of the rows ``rindex`` (in that order, repeats allowed),
-        with their labels, weights, margins and bounds, sharing this
-        matrix's feature values: nothing is copied but the metadata. On
+        with their labels, weights, margins, bounds and split groups, sharing
+        this matrix's feature values: nothing is copied but the metadata. On
         ranking data ``rindex`` must list whole query groups, each group's
         rows together and in row order; they stay the result's groups.
 
@@ -314,7 +330,8 @@ class BinnedMatrix(_Metadata[_hessboost.BinnedMatrix]):
     values, weights, feature types and missing value, and shared with it),
     and ``train``'s ``max_bin`` must equal it. The weights and feature types
     are therefore fixed; the labels, base margins, query groups, label
-    bounds and feature weights can be replaced (:meth:`set_info`). It keeps
+    bounds, feature weights and split groups can be replaced
+    (:meth:`set_info`). It keeps
     ``data``'s feature names, types and categories.
 
     Only :func:`train` takes one, and it refuses what would read the
@@ -369,6 +386,7 @@ class BinnedMatrix(_Metadata[_hessboost.BinnedMatrix]):
         label_lower_bound: ArrayLike | None = None,
         label_upper_bound: ArrayLike | None = None,
         feature_weights: ArrayLike | None = None,
+        split_group: ArrayLike | None = None,
     ) -> None:
         """Replaces the given metadata (``None`` keeps the current value),
         validated as :class:`DMatrix` validates it; the bins stay shared.
@@ -381,6 +399,7 @@ class BinnedMatrix(_Metadata[_hessboost.BinnedMatrix]):
             label_lower_bound=label_lower_bound,
             label_upper_bound=label_upper_bound,
             feature_weights=feature_weights,
+            split_group=split_group,
         )
         if info:
             self._core = self._core.with_info({**info, "categorical": None})

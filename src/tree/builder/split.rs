@@ -7,7 +7,9 @@
 //! the sequential choice.
 
 use std::cell::RefCell;
+use std::ops::Range;
 
+use super::groups::LegalCuts;
 use super::shared::{apply_bounds, xgb_gain_given_weight, xgb_weight};
 use super::{Children, Score, SplitPos, children_valid};
 use crate::tree::constraints::{Bounds, calc_weight_bounded, gain_at_weight, satisfies};
@@ -446,22 +448,36 @@ pub(super) enum NumericScan {
 /// candidate with the largest finite loss change, if that one replaces the
 /// incumbent, and never takes infinite ones: offering only the returned
 /// [`NumericScan::Best`] to [`xgb_update`](super::xgb_update) picks the same split. NaN loss
-/// changes are the exception ([`NumericScan::Nan`]).
+/// changes are the exception ([`NumericScan::Nan`]). With `legal`
+/// (`min_child_groups`), only the candidates it allows are scored, which is
+/// the sequential search over them.
 pub(super) fn scan_numeric_splits(
     bins: &[GradStats],
     first: usize,
     total: GradStats,
     dense: bool,
     scorer: &SplitScorer,
+    legal: Option<&LegalCuts>,
     scratch: &mut ScanScratch,
 ) -> NumericScan {
     if bins.len() <= FILTER_BINS
         && scorer.approx_exact()
-        && let Some(scan) = scan_filtered(bins, first, total, dense, scorer, scratch)
+        && let Some(scan) = scan_filtered(bins, first, total, dense, scorer, legal, scratch)
     {
         return scan;
     }
-    scan_batched(bins, first, total, dense, scorer)
+    scan_batched(bins, first, total, dense, scorer, legal)
+}
+
+/// Mark the candidates of a scored run whose offset (`offset(k)` for the
+/// run's `k`-th) lies outside `allowed` as never taken (`-inf`).
+#[inline]
+fn forbid(scores: &mut [f32], allowed: &Range<usize>, offset: impl Fn(usize) -> usize) {
+    for (k, score) in scores.iter_mut().enumerate() {
+        if !allowed.contains(&offset(k)) {
+            *score = f32::NEG_INFINITY;
+        }
+    }
 }
 
 /// [`scan_numeric_splits`] without the approximate prefilter: every
@@ -472,6 +488,7 @@ fn scan_batched(
     total: GradStats,
     dense: bool,
     scorer: &SplitScorer,
+    legal: Option<&LegalCuts>,
 ) -> NumericScan {
     let mut run = RunMax {
         best: f32::NEG_INFINITY,
@@ -492,6 +509,10 @@ fn scan_batched(
             hess[k] = acc.hess;
         }
         scorer.score_run::<true>(total, &grad[..n], &hess[..n], &mut loss[..n]);
+        if let Some(legal) = legal {
+            let base = index * SCAN_RUN;
+            forbid(&mut loss[..n], &legal.forward(bins.len()), |k| base + k);
+        }
         if !run.scan(&loss[..n], &grad, &hess, index * SCAN_RUN) {
             return NumericScan::Nan;
         }
@@ -515,6 +536,12 @@ fn scan_batched(
                 hess[k] = suffix.hess;
             }
             scorer.score_run::<false>(total, &grad[..n], &hess[..n], &mut loss[..n]);
+            if let Some(legal) = legal {
+                let last = bins.len() - 1;
+                forbid(&mut loss[..n], &legal.backward(bins.len()), |k| {
+                    last - (base + k)
+                });
+            }
             if !run.scan(&loss[..n], &grad, &hess, base) {
                 return NumericScan::Nan;
             }
@@ -597,6 +624,7 @@ fn scan_filtered(
     total: GradStats,
     dense: bool,
     scorer: &SplitScorer,
+    legal: Option<&LegalCuts>,
     scratch: &mut ScanScratch,
 ) -> Option<NumericScan> {
     let n = bins.len();
@@ -605,7 +633,15 @@ fn scan_filtered(
         prefix.add(bin);
         *s = prefix.acc;
     }
-    scan_filtered_rest(bins, first, total, dense, scorer, scratch, prefix)
+    let input = NumericInput {
+        bins,
+        first,
+        total,
+        dense,
+        scorer: *scorer,
+        legal: legal.copied(),
+    };
+    scan_filtered_rest(&input, scratch, prefix)
 }
 
 /// A forward prefix sum in progress: the running statistics and whether
@@ -667,8 +703,16 @@ pub(super) fn scan_numeric_pair(
         }
     }
     let finish = |x: &NumericInput, s: &mut ScanScratch, acc| {
-        scan_filtered_rest(x.bins, x.first, x.total, x.dense, &x.scorer, s, acc)
-            .unwrap_or_else(|| scan_batched(x.bins, x.first, x.total, x.dense, &x.scorer))
+        scan_filtered_rest(x, s, acc).unwrap_or_else(|| {
+            scan_batched(
+                x.bins,
+                x.first,
+                x.total,
+                x.dense,
+                &x.scorer,
+                x.legal.as_ref(),
+            )
+        })
     };
     [finish(a, sa, acc_a), finish(b, sb, acc_b)]
 }
@@ -684,6 +728,8 @@ pub(super) struct NumericInput<'a> {
     /// The index has no missing values.
     pub(super) dense: bool,
     pub(super) scorer: SplitScorer<'a>,
+    /// The candidates `min_child_groups` leaves legal (`None`: all).
+    pub(super) legal: Option<LegalCuts>,
 }
 
 impl NumericInput<'_> {
@@ -695,6 +741,7 @@ impl NumericInput<'_> {
             self.total,
             self.dense,
             &self.scorer,
+            self.legal.as_ref(),
             scratch,
         )
     }
@@ -708,14 +755,18 @@ impl NumericInput<'_> {
     reason = "branch-free overflow and threshold tests vectorize"
 )]
 fn scan_filtered_rest(
-    bins: &[GradStats],
-    first: usize,
-    total: GradStats,
-    dense: bool,
-    scorer: &SplitScorer,
+    input: &NumericInput,
     scratch: &mut ScanScratch,
     prefix: Prefix,
 ) -> Option<NumericScan> {
+    let &NumericInput {
+        bins,
+        first,
+        total,
+        dense,
+        scorer,
+        legal,
+    } = input;
     let Prefix { acc, nonneg } = prefix;
     let n = bins.len();
     let ScanScratch { acc: stats, approx } = scratch;
@@ -731,6 +782,9 @@ fn scan_filtered_rest(
     };
     let (mut hess_lo, mut hess_hi) = extremes(&stats[..n]);
     scorer.approx_run::<true>(total, &stats[..n], &mut approx[..n]);
+    if let Some(legal) = &legal {
+        forbid(&mut approx[..n], &legal.forward(n), |i| i);
+    }
     // Candidates `n..2n` are the backward pass, whose accumulated statistics
     // are the right child's.
     let mut m = n;
@@ -744,6 +798,9 @@ fn scan_filtered_rest(
         hess_lo = hess_lo.min(lo);
         hess_hi = hess_hi.max(hi);
         scorer.approx_run::<false>(total, &stats[n..], &mut approx[n..]);
+        if let Some(legal) = &legal {
+            forbid(&mut approx[n..], &legal.backward(n), |j| n - 1 - j);
+        }
         m = 2 * n;
     }
     let mut max = f32::NEG_INFINITY;
@@ -918,15 +975,17 @@ mod tests {
     use crate::tree::builder::{BestSplit, SplitLocation, xgb_update};
 
     /// The split [`xgb_update`](super::xgb_update) picks from the sequential
-    /// [`for_each_numeric_split`] search and from [`scan_numeric_splits`]'s
-    /// result, as `(expected, actual)`. A [`NumericScan::Nan`] (which needs
-    /// a candidate that scores NaN) is replayed sequentially, as the
-    /// builders do.
+    /// [`for_each_numeric_split`] search over the candidates `legal` allows
+    /// (all for `None`) and from [`scan_numeric_splits`]'s result, as
+    /// `(expected, actual)`. A [`NumericScan::Nan`] (which needs a legal
+    /// candidate that scores NaN) is replayed sequentially, as the builders
+    /// do.
     fn sequential_and_scanned(
         bins: &[GradStats],
         total: GradStats,
         dense: bool,
         scorer: &SplitScorer,
+        legal: Option<&LegalCuts>,
     ) -> (BestSplit, BestSplit) {
         let offer = |best: &mut BestSplit, pos, children: Children| {
             if let Some(score) = scorer.loss_chg(children.left, children.right) {
@@ -936,13 +995,24 @@ mod tests {
         let mut expected = BestSplit::none();
         let mut nan = false;
         for_each_numeric_split(bins, 0, total, dense, |pos, children| {
+            if legal.is_some_and(|legal| !legal.allows_numeric(0, pos, children.default_left)) {
+                return;
+            }
             nan |= scorer
                 .loss_chg(children.left, children.right)
                 .is_some_and(|score| score.loss_chg.is_nan());
             offer(&mut expected, pos, children);
         });
         let mut actual = BestSplit::none();
-        match scan_numeric_splits(bins, 0, total, dense, scorer, &mut ScanScratch::new()) {
+        match scan_numeric_splits(
+            bins,
+            0,
+            total,
+            dense,
+            scorer,
+            legal,
+            &mut ScanScratch::new(),
+        ) {
             NumericScan::Empty => {}
             NumericScan::Best { pos, children, .. } => offer(&mut actual, pos, children),
             NumericScan::Nan => {
@@ -1002,11 +1072,31 @@ mod tests {
         bins
     }
 
+    /// Random legal cuts of a feature of `n` bins (`None` for two thirds of
+    /// the trials): each direction's range anywhere in `0..=n + 1`, empty
+    /// one time in six. Drawn from their own stream, so the trials'
+    /// histograms are those of the unconstrained scans.
+    fn random_legal(trial: u64, n: usize) -> Option<LegalCuts> {
+        let mut rng = crate::rng::Rng::new(0x5EED ^ trial);
+        if rng.below(3) != 0 {
+            return None;
+        }
+        let mut range = || {
+            if rng.below(6) == 0 {
+                return (1, 0);
+            }
+            let (a, b) = (rng.range(0..n + 2), rng.range(0..n + 2));
+            (a.min(b), a.max(b))
+        };
+        Some(LegalCuts::from_ranges(range(), range()))
+    }
+
     /// The batched and prefiltered numeric scans pick the split the
     /// sequential [`for_each_numeric_split`] search picks, bit for bit, over
     /// random histograms (empty bins and repeated bins give tied
-    /// candidates), missing mass, regularization, monotone directions, and
-    /// features wider than the prefilter's buffers.
+    /// candidates), missing mass, regularization, monotone directions,
+    /// features wider than the prefilter's buffers, and candidates
+    /// `min_child_groups` forbids (the sequential search skips them).
     #[test]
     fn numeric_scan_matches_sequential_search() {
         let mut rng = crate::rng::Rng::new(7);
@@ -1034,8 +1124,14 @@ mod tests {
                 bounds: Bounds::default(),
                 dir,
             };
-            let (expected, actual) = sequential_and_scanned(&bins, total, dense, &scorer);
-            assert_eq!(split_key(&actual), split_key(&expected), "trial {trial}");
+            let legal = random_legal(trial, n);
+            let (expected, actual) =
+                sequential_and_scanned(&bins, total, dense, &scorer, legal.as_ref());
+            assert_eq!(
+                split_key(&actual),
+                split_key(&expected),
+                "trial {trial} {legal:?}"
+            );
         }
     }
 
@@ -1073,7 +1169,9 @@ mod tests {
                 bounds: Bounds::default(),
                 dir: 0,
             };
-            let (expected, actual) = sequential_and_scanned(&bins, total, dense, &scorer);
+            let legal = random_legal(trial, n);
+            let (expected, actual) =
+                sequential_and_scanned(&bins, total, dense, &scorer, legal.as_ref());
             assert_eq!(split_key(&actual), split_key(&expected), "trial {trial}");
         }
     }
@@ -1115,7 +1213,7 @@ mod tests {
             dir: 0,
         };
         assert!(scorer.approx_exact());
-        let (expected, actual) = sequential_and_scanned(&bins, total, true, &scorer);
+        let (expected, actual) = sequential_and_scanned(&bins, total, true, &scorer, None);
         assert_eq!(numeric_bin(&expected), Some(0));
         assert_eq!(split_key(&actual), split_key(&expected));
     }

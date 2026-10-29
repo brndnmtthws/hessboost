@@ -16,7 +16,7 @@ use crate::training::sampling::gradient_based_sample;
 use crate::training::sglb::Langevin;
 use crate::tree::RegTree;
 use crate::tree::builder::{
-    ExactTreeBuilder, HistTreeBuilder, LeafRows, SortedColumns, check_symmetric_input,
+    ExactTreeBuilder, HistTreeBuilder, LeafRows, SortedColumns, SplitGroups, check_symmetric_input,
 };
 use crate::tree::hist::{CpuBackend, HistogramBackend};
 use crate::tree::reuse::ReuseSet;
@@ -25,8 +25,9 @@ use std::sync::{Arc, OnceLock};
 
 /// What every boosting round of one training run reads: the parameters, the
 /// training matrix with its metadata, the objective, the Langevin noise
-/// (`None` unless SGLB is on), and the exact leaves (`None` for Newton
-/// leaves).
+/// (`None` unless SGLB is on), the exact leaves (`None` for Newton
+/// leaves), and the split groups `min_child_groups` counts (`None` without
+/// the constraint).
 #[derive(Clone, Copy)]
 pub(super) struct TrainContext<'a> {
     pub(super) params: &'a TrainingParams,
@@ -37,6 +38,7 @@ pub(super) struct TrainContext<'a> {
     pub(super) exact_leaves: Option<&'a ExactLeaves<'a>>,
     /// What row sampling reads of `dtrain`, gathered once per run.
     pub(super) rows: RowMeta<'a>,
+    pub(super) split_groups: Option<&'a SplitGroups>,
 }
 
 /// The gradients one tree grows on and the rows that take part: an output's
@@ -125,7 +127,12 @@ impl Prepared {
         rounding_seed: u64,
         capture_rows: bool,
     ) -> (RegTree, Vec<LeafRows>) {
-        let TrainContext { params, dtrain, .. } = *run;
+        let TrainContext {
+            params,
+            dtrain,
+            split_groups,
+            ..
+        } = *run;
         let TreeSample {
             gpair,
             rows,
@@ -138,7 +145,8 @@ impl Prepared {
             let builder = HistTreeBuilder::new(params)
                 .with_rounding_seed(rounding_seed)
                 .with_reuse(reuse, ghist.cuts())
-                .with_backend(backend);
+                .with_backend(backend)
+                .with_split_groups(split_groups);
             if capture_rows {
                 builder.build_with_leaf_rows(ghist, gpair, rows, sampler)
             } else {

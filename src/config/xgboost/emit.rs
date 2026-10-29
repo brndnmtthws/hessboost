@@ -88,6 +88,7 @@ impl TrainingParams {
             max_depth,
             max_leaves,
             min_child_weight,
+            min_child_groups,
             max_delta_step,
             subsample,
             colsample_bytree,
@@ -208,6 +209,7 @@ impl TrainingParams {
         set("max_depth", json(max_depth.map_or(0, NonZeroUsize::get)));
         set("max_leaves", json(max_leaves.map_or(0, NonZeroUsize::get)));
         set("min_child_weight", json(min_child_weight));
+        set("min_child_groups", json(min_child_groups));
         match max_delta_step {
             MaxDeltaStep::ObjectiveDefault => {}
             MaxDeltaStep::Unbounded => set("max_delta_step", json(0.0)),
@@ -301,6 +303,7 @@ impl TrainingParams {
             max_depth,
             max_leaves,
             min_child_weight,
+            min_child_groups,
             max_delta_step,
             subsample,
             colsample_bytree,
@@ -350,6 +353,11 @@ impl TrainingParams {
         differs(
             "min_child_weight",
             *min_child_weight == other.min_child_weight,
+        );
+        // `0` and `1` both leave splits unconstrained.
+        differs(
+            "min_child_groups",
+            (*min_child_groups).max(1) == other.min_child_groups.max(1),
         );
         differs("max_delta_step", *max_delta_step == other.max_delta_step);
         differs("subsample", *subsample == other.subsample);

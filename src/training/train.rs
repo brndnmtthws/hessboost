@@ -17,7 +17,7 @@ use crate::objective::{GradPair, Loss};
 use crate::training::continuation::{require_model_for_update, resume_model};
 use crate::training::multi_output;
 use crate::training::sglb::{Sglb, Shrink};
-use crate::tree::builder::all_rows;
+use crate::tree::builder::{SplitGroups, all_rows};
 use crate::tree::reuse::ReuseSet;
 use std::num::NonZeroUsize;
 
@@ -82,6 +82,7 @@ pub(super) fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<T
         return train_linear(&request, num_boost_round, objective, model, report);
     }
     let exact_leaves = ExactLeaves::new(params, &info, n_out);
+    let split_groups = SplitGroups::of(params, dtrain);
     let run = Run {
         ctx: TrainContext {
             params,
@@ -91,6 +92,7 @@ pub(super) fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<T
             langevin: sglb.langevin.as_ref(),
             exact_leaves: exact_leaves.as_ref(),
             rows: RowMeta::of(dtrain, params),
+            split_groups: split_groups.as_ref(),
         },
         evals: &evals,
         early_stopping_rounds,

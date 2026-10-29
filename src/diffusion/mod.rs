@@ -547,8 +547,8 @@ impl DiffusionParams {
     /// [`HessboostError::InvalidParameter`] for an out-of-range fraction,
     /// fold count or process parameter, or GBDT parameters that fail
     /// [`TrainingParams::validate`], name an objective other than
-    /// `reg:squarederror` with `scale_pos_weight = 1`, or set
-    /// `process_type` to `update`.
+    /// `reg:squarederror` with `scale_pos_weight = 1`, set `process_type`
+    /// to `update`, or set `min_child_groups` above 1.
     pub fn validate(&self) -> Result<()> {
         self.method.validate()?;
         validate_regressor_params("training", &self.training)?;
@@ -593,7 +593,8 @@ fn lightgbm_like() -> TrainingParams {
 /// diffusion target is fit with; `scale_pos_weight` would reweight the rows
 /// whose noisy target happens to be positive), and grow new trees: every
 /// GBDT is trained from scratch, so there is no model for
-/// `process_type = update` to refresh.
+/// `process_type = update` to refresh. Its training sets are noisy copies
+/// of the rows, without split groups for `min_child_groups` to count.
 fn validate_regressor_params(name: &'static str, params: &TrainingParams) -> Result<()> {
     params.validate()?;
     if !params.objective.is_unweighted_squared_error() {
@@ -617,6 +618,13 @@ fn validate_regressor_params(name: &'static str, params: &TrainingParams) -> Res
             name,
             "the diffusion GBDTs are trained from scratch: process_type must be `default`, \
              not `update` (refresh)",
+        ));
+    }
+    if params.split_groups_on() {
+        return Err(HessboostError::invalid_param(
+            name,
+            "the diffusion GBDTs train on noisy copies of the rows, which hold no split \
+             groups: min_child_groups must be 0 or 1",
         ));
     }
     Ok(())

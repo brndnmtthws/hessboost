@@ -553,6 +553,8 @@ impl Level<'_> {
                     &scorer(slot, nid),
                     f,
                     self.reuse.map(|r| r as &dyn CategoricalPenalty),
+                    // `min_child_groups` is refused with `tree_method = exact`.
+                    None,
                 );
             }
             return;

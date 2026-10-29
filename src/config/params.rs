@@ -460,6 +460,30 @@ pub struct TrainingParams {
     pub max_leaves: Option<NonZeroUsize>,
     /// Minimum sum of instance hessian needed in a child. XGBoost `min_child_weight`.
     pub min_child_weight: f64,
+    /// The fewest distinct split groups ([`DMatrix::with_split_groups`]:
+    /// independent units of evidence such as one symbol on one day) each
+    /// child of a split must hold rows of: a split is taken only when both
+    /// children reach it, as well as `min_child_weight`. Groups are counted
+    /// exactly over the node's sampled rows (after `subsample` and the other
+    /// row samplers), whatever their weights, for numeric and categorical
+    /// splits with missing values sent each way they are tried, under every
+    /// growth policy; the counts are integers, so any thread count trains
+    /// the same model. `0` and `1` (the default) constrain nothing.
+    ///
+    /// Needs split groups on the training matrix and the histogram builder
+    /// (`tree_method` `hist`, `approx` or `auto`) with one output per tree;
+    /// refused with `booster = gblinear` and
+    /// `multi_strategy = multi_output_tree`, and by budget mode, refresh,
+    /// in-place updates, and diffusion models. Counting reads every searched
+    /// node's rows once for their groups and once per feature it checks
+    /// (those whose best split could still win; every feature under
+    /// symmetric growth, `extra_trees`, `path_smooth`, and reuse
+    /// penalties), so training is slower with it on. It shapes training
+    /// only: the model saves, loads, and predicts like any other. Not in
+    /// XGBoost.
+    ///
+    /// [`DMatrix::with_split_groups`]: crate::data::DMatrix::with_split_groups
+    pub min_child_groups: usize,
     /// The bound on each leaf weight ([`MaxDeltaStep`]). XGBoost
     /// `max_delta_step`.
     pub max_delta_step: MaxDeltaStep,
@@ -630,6 +654,7 @@ impl Default for TrainingParams {
             max_depth: NonZeroUsize::new(6),
             max_leaves: None,
             min_child_weight: 1.0,
+            min_child_groups: 1,
             max_delta_step: MaxDeltaStep::ObjectiveDefault,
             subsample: 1.0,
             colsample_bytree: 1.0,
@@ -709,9 +734,9 @@ impl TrainingParams {
     ///
     /// The checks run in a fixed order (numeric ranges, reuse penalties,
     /// device, objective parameters, booster, tree shape, training modes,
-    /// tree options, leaf estimation, SGLB and model shrinkage, Boulevard),
-    /// so a configuration that breaks several rules always reports the same
-    /// one.
+    /// tree options, split groups, leaf estimation, SGLB and model
+    /// shrinkage, Boulevard), so a configuration that breaks several rules
+    /// always reports the same one.
     pub fn validate(&self) -> Result<()> {
         self.validate_ranges()?;
         self.validate_reuse_penalties()?;
@@ -733,6 +758,7 @@ impl TrainingParams {
         self.validate_bagging_by_query()?;
         self.validate_balanced_bagging()?;
         self.validate_tree_options()?;
+        self.validate_min_child_groups()?;
         self.validate_leaf_estimation()?;
         self.validate_sglb()?;
         self.validate_boulevard()?;
@@ -1176,6 +1202,37 @@ impl TrainingParams {
             )?;
         }
         Ok(())
+    }
+
+    /// Whether `min_child_groups` constrains splits (above 1: every child
+    /// holds a group of its rows).
+    pub(crate) fn split_groups_on(&self) -> bool {
+        self.min_child_groups > 1
+    }
+
+    /// `min_child_groups` acts in the histogram builder's split searches
+    /// (every growth policy, symmetric included), so the booster and the
+    /// builders without one are refused instead of ignoring it.
+    fn validate_min_child_groups(&self) -> Result<()> {
+        if !self.split_groups_on() {
+            return Ok(());
+        }
+        let key = "min_child_groups";
+        ensure(
+            key,
+            self.booster != BoosterKind::GbLinear,
+            "constrains tree splits, and `gblinear` grows no trees",
+        )?;
+        ensure(
+            key,
+            self.tree_method != TreeMethod::Exact,
+            "requires the histogram tree builder (`tree_method` `hist`, `approx` or `auto`)",
+        )?;
+        ensure(
+            key,
+            self.multi_strategy == MultiStrategy::OneOutputPerTree,
+            "is not supported with `multi_strategy=multi_output_tree`",
+        )
     }
 
     /// Whether Stochastic Gradient Langevin Boosting is on: set directly or
@@ -1667,6 +1724,8 @@ impl TrainingParamsBuilder {
     }
     setter!(/// Set the minimum child hessian weight.
         min_child_weight: f64 => params.min_child_weight);
+    setter!(/// Set the fewest split groups a child must hold (`min_child_groups`).
+        min_child_groups: usize => params.min_child_groups);
     setter!(/// Set the bound on each leaf weight (XGBoost `max_delta_step`).
         max_delta_step: MaxDeltaStep => params.max_delta_step);
     setter!(/// Set the row subsample ratio.

@@ -151,6 +151,30 @@ def test_lazyframe_refuses_metadata_it_cannot_align() -> None:
     assert DMatrix(lazy.drop(["y", "w", "qid"])).num_row() == 400
 
 
+def test_split_groups_come_from_a_polars_column_or_series() -> None:
+    full, _ = labelled_frame()
+    features = ["color", "size", "count", "flag"]
+    episodes = np.arange(400) // 40
+    data = full.drop(["w", "qid"]).with_columns(episode=pl.Series(episodes, dtype=pl.UInt16))
+    for matrix in [
+        DMatrix(data, label="y", split_group="episode"),
+        DMatrix(data.lazy(), label="y", split_group="episode"),
+        DMatrix(data.drop("episode"), label="y", split_group=data["episode"]),
+    ]:
+        assert matrix.feature_names == features
+        np.testing.assert_array_equal(matrix.get_split_group(), episodes)
+    with pytest.raises(HessboostError, match="split_group is an array"):
+        DMatrix(data.lazy().drop("episode"), label="y", split_group=episodes)
+    holes = data.with_columns(episode=pl.when(pl.col("y") > 0).then(pl.col("episode")))
+    with pytest.raises(TypeError, match="split_group has dtype float"):
+        DMatrix(holes, label="y", split_group="episode")
+    with pytest.raises(TypeError, match="split_group has dtype"):
+        DMatrix(data, label="y", split_group="color")
+    durations = data.with_columns(lag=pl.col("episode").cast(pl.Int64).cast(pl.Duration("us")))
+    with pytest.raises(TypeError, match="split_group has dtype timedelta64"):
+        DMatrix(durations, label="y", split_group="lag")
+
+
 @pytest.mark.parametrize("library", ["pandas", "polars"])
 def test_frame_columns_name_the_metadata(library: str) -> None:
     full, df = labelled_frame()

@@ -45,6 +45,7 @@
 //! and XGBoost export treat them like any other tree; prediction recognizes
 //! the shape and routes rows by bit pattern (`crate::tree::oblivious`).
 
+use super::groups::{LegalCuts, NodeGroups, SplitGroups};
 use super::hist::PARALLEL_FRONTIER_ROWS;
 use super::partition::{SplitRoute, child_histograms, partition_rows};
 use super::shared::{
@@ -150,11 +151,21 @@ struct ExpandedNode {
 pub(super) struct SymmetricTreeBuilder<'a> {
     config: &'a BuilderConfig<'a>,
     backend: &'a dyn HistogramBackend,
+    /// The training rows' split groups under `min_child_groups`.
+    groups: Option<&'a SplitGroups>,
 }
 
 impl<'a> SymmetricTreeBuilder<'a> {
-    pub(super) fn new(config: &'a BuilderConfig<'a>, backend: &'a dyn HistogramBackend) -> Self {
-        SymmetricTreeBuilder { config, backend }
+    pub(super) fn new(
+        config: &'a BuilderConfig<'a>,
+        backend: &'a dyn HistogramBackend,
+        groups: Option<&'a SplitGroups>,
+    ) -> Self {
+        SymmetricTreeBuilder {
+            config,
+            backend,
+            groups,
+        }
     }
 
     /// Grow one symmetric tree. With `capture_rows`, also return every leaf's
@@ -202,7 +213,24 @@ impl<'a> SymmetricTreeBuilder<'a> {
                 .copied()
                 .filter(|&f| permits(allowed.as_ref(), f))
                 .collect();
-            let Some(split) = self.best_level_split(ghist, &level, &features) else {
+            // The level nodes' split groups (`min_child_groups`; none
+            // without it).
+            let groups: Vec<NodeGroups> = self.groups.map_or_else(Vec::new, |groups| {
+                if level.iter().map(|node| node.rows.len()).sum::<usize>() >= PARALLEL_FRONTIER_ROWS
+                    && rayon_available()
+                {
+                    level
+                        .par_iter()
+                        .map(|node| NodeGroups::new(groups, ghist, &node.rows))
+                        .collect()
+                } else {
+                    level
+                        .iter()
+                        .map(|node| NodeGroups::new(groups, ghist, &node.rows))
+                        .collect()
+                }
+            });
+            let Some(split) = self.best_level_split(ghist, &level, &groups, &features) else {
                 break;
             };
             let cuts = ghist.cuts();
@@ -215,11 +243,16 @@ impl<'a> SymmetricTreeBuilder<'a> {
                 default_left: split.missing_left,
             };
             let dir = self.config.cons.dir(feature);
+            let splits: Vec<Option<NodeSplit>> = level
+                .iter()
+                .enumerate()
+                .map(|(k, node)| self.node_split(ghist, node, groups.get(k), &split))
+                .collect();
 
             // Expand in node order, so child ids stay breadth-first.
             let mut pending = Vec::with_capacity(level.len());
-            for node in level {
-                let Some(s) = self.node_split(ghist, &node, &split) else {
+            for (node, s) in level.into_iter().zip(splits) {
+                let Some(s) = s else {
                     record_leaf(node);
                     continue;
                 };
@@ -348,14 +381,16 @@ impl<'a> SymmetricTreeBuilder<'a> {
     /// The best level-wide candidate over `features`, or `None` when no
     /// candidate splits any node. Features are scored independently (in
     /// parallel for large levels) and reduced in ascending feature order,
-    /// keeping the earlier candidate on ties.
+    /// keeping the earlier candidate on ties. `groups` holds the level
+    /// nodes' split groups under `min_child_groups` (else nothing).
     fn best_level_split(
         &self,
         ghist: &GHistIndex,
         level: &[LevelNode],
+        groups: &[NodeGroups],
         features: &[u32],
     ) -> Option<LevelSplit> {
-        let score = |&f: &u32| self.score_feature(ghist, level, f);
+        let score = |&f: &u32| self.score_feature(ghist, level, groups, f);
         let per_feature: Vec<Option<LevelSplit>> =
             if level.len() * ghist.total_bins() >= PARALLEL_SCORE_BINS && rayon_available() {
                 features.par_iter().map(score).collect()
@@ -374,8 +409,15 @@ impl<'a> SymmetricTreeBuilder<'a> {
     /// Score every boundary of feature `f` across the level's nodes and return
     /// the best one. Candidate order within a feature is XGBoost's: forward
     /// boundaries ascending, then (when some node has missing values)
-    /// backward boundaries descending.
-    fn score_feature(&self, ghist: &GHistIndex, level: &[LevelNode], f: u32) -> Option<LevelSplit> {
+    /// backward boundaries descending. A node adds nothing to a candidate
+    /// its split groups forbid.
+    fn score_feature(
+        &self,
+        ghist: &GHistIndex,
+        level: &[LevelNode],
+        groups: &[NodeGroups],
+        f: u32,
+    ) -> Option<LevelSplit> {
         let (fs, fe) = ghist.cuts().feature_bins(f as usize);
         if fe <= fs + 1 {
             return None; // degenerate feature, no interior boundary
@@ -402,7 +444,12 @@ impl<'a> SymmetricTreeBuilder<'a> {
             slot.1 += 1;
         };
 
-        for node in level {
+        for (k, node) in level.iter().enumerate() {
+            let legal = groups
+                .get(k)
+                .map(|groups| node_cuts(groups, ghist, f as usize));
+            let allows =
+                |cut, missing_low| legal.is_none_or(|legal| legal.allows(cut, missing_low));
             let hist = &node.hist[fs..fe];
             let total = node.total;
             let mut acc = GradStats::default();
@@ -411,7 +458,9 @@ impl<'a> SymmetricTreeBuilder<'a> {
                 let term = self
                     .node_gain(node, acc, total.sub(acc), dir)
                     .map(|score| f64::from(score.loss_chg) - gamma);
-                if let Some(term) = term {
+                if let Some(term) = term
+                    && allows(b + 1, false)
+                {
                     add(&mut forward[b], term);
                 }
                 if !dense {
@@ -423,9 +472,12 @@ impl<'a> SymmetricTreeBuilder<'a> {
             }
             if acc == total {
                 // No missing values here: the backward boundary at `b` is
-                // the forward partition at `b - 1` (and nothing at `0`).
+                // the forward partition at `b - 1` (and nothing at `0`),
+                // though rows missing the feature (of no weight) go left.
                 for b in 1..n_bins {
-                    if let Some(term) = node_forward[b - 1] {
+                    if let Some(term) = node_forward[b - 1]
+                        && allows(b, true)
+                    {
                         add(&mut backward[b], term);
                     }
                 }
@@ -434,8 +486,9 @@ impl<'a> SymmetricTreeBuilder<'a> {
                 let mut suffix = GradStats::default();
                 for b in (0..n_bins).rev() {
                     suffix.add(hist[b]);
-                    if let Some(Score { loss_chg, .. }) =
-                        self.node_gain(node, total.sub(suffix), suffix, dir)
+                    if allows(b, true)
+                        && let Some(Score { loss_chg, .. }) =
+                            self.node_gain(node, total.sub(suffix), suffix, dir)
                     {
                         add(&mut backward[b], f64::from(loss_chg) - gamma);
                     }
@@ -465,13 +518,15 @@ impl<'a> SymmetricTreeBuilder<'a> {
         best
     }
 
-    /// The level split as applied to `node`, recomputed with the same
-    /// accumulation order as [`Self::score_feature`] so the decision matches
+    /// The level split as applied to `node` (with split groups `groups`
+    /// under `min_child_groups`), recomputed with the same accumulation
+    /// order and checks as [`Self::score_feature`] so the decision matches
     /// the score exactly; `None` when the node stays a leaf.
     fn node_split(
         &self,
         ghist: &GHistIndex,
         node: &LevelNode,
+        groups: Option<&NodeGroups>,
         split: &LevelSplit,
     ) -> Option<NodeSplit> {
         let feature = split.feature as usize;
@@ -503,6 +558,13 @@ impl<'a> SymmetricTreeBuilder<'a> {
             let left = prefix(split.offset);
             (left, total.sub(left))
         };
+        // Bins below the backward offset, or up to the forward one, go left.
+        let cut = split.offset + usize::from(!split.missing_left);
+        if groups.is_some_and(|groups| {
+            !node_cuts(groups, ghist, feature).allows(cut, split.missing_left)
+        }) {
+            return None;
+        }
         let Score {
             loss_chg,
             w_left,
@@ -515,6 +577,16 @@ impl<'a> SymmetricTreeBuilder<'a> {
             w_left,
             w_right,
         })
+    }
+}
+
+/// Feature `f`'s legal cuts in a level node with split groups `groups`:
+/// none when the node holds too few groups for any split.
+fn node_cuts(groups: &NodeGroups, ghist: &GHistIndex, f: usize) -> LegalCuts {
+    if groups.splittable() {
+        groups.numeric(ghist, f)
+    } else {
+        LegalCuts::NONE
     }
 }
 

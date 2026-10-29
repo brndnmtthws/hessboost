@@ -397,7 +397,7 @@ impl ForestParams {
     /// [`HessboostError::InvalidParameter`] for invalid `β`, or
     /// GBDT parameters that fail [`TrainingParams::validate`], name an
     /// objective other than `reg:squarederror` with `scale_pos_weight = 1`,
-    /// or set `process_type` to `update`.
+    /// set `process_type` to `update`, or set `min_child_groups` above 1.
     pub fn validate(&self) -> Result<()> {
         self.method.validate()?;
         validate_regressor_params("training", &self.training)

@@ -658,7 +658,8 @@ impl DMatrix {
     /// per episode. Only equality matters. Under
     /// [`min_child_groups`](crate::config::TrainingParams::min_child_groups)
     /// above 1, a split is legal only when both children hold rows of at
-    /// least that many distinct groups; otherwise training does not read
+    /// least that many distinct groups (rows of zero weight never count);
+    /// otherwise training does not read
     /// them. They are not stored in the model, and they are not ranking's
     /// query groups ([`with_group_sizes`](Self::with_group_sizes)).
     pub fn with_split_groups(mut self, groups: &[u64]) -> Result<Self> {

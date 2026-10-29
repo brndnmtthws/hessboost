@@ -2,7 +2,7 @@
 
 use super::eval::EvalSet;
 use crate::config::{BoosterKind, Device, ProcessType, TrainingParams, TreeMethod};
-use crate::data::{DMatrix, FeatureType};
+use crate::data::{DMatrix, FeatureType, SketchedRows};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::Loss;
@@ -189,15 +189,30 @@ fn validate_setup(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
 }
 
 /// `min_child_groups` counts the training rows' split groups, so the
-/// training matrix must have them.
+/// training matrix must have them. It counts them by the rows' bins, which
+/// route every row it counts (those of nonzero weight) as its values do
+/// only when the cuts were sketched from all of them: under `hist`, not
+/// for a [`ViewCuts::Source`](crate::data::ViewCuts::Source) view weighing
+/// rows its source weighs zero (`approx` sketches every round's cuts from
+/// the matrix itself).
 fn validate_split_groups(params: &TrainingParams, dtrain: &DMatrix) -> Result<()> {
-    if params.split_groups_on() && dtrain.split_groups().is_none() {
+    if !params.split_groups_on() {
+        return Ok(());
+    }
+    if dtrain.split_groups().is_none() {
         return Err(HessboostError::invalid_data(
             "split_groups",
             format!(
                 "`min_child_groups = {}` requires split groups on the training dataset",
                 params.min_child_groups
             ),
+        ));
+    }
+    if params.tree_method != TreeMethod::Approx && dtrain.sketched_rows() == SketchedRows::Partial {
+        return Err(HessboostError::invalid_data(
+            "weights",
+            "`min_child_groups` needs every weighted row in the cuts: this view with its \
+             source's cuts weighs rows its source weighs zero",
         ));
     }
     Ok(())

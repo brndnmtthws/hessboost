@@ -206,10 +206,19 @@ impl<'a> HistTreeBuilder<'a> {
         self
     }
 
-    /// The split groups of the node holding `rows`, under the constraint.
-    fn node_groups(&self, ghist: &GHistIndex, rows: &[u32]) -> Option<NodeGroups> {
-        self.groups
-            .map(|groups| NodeGroups::new(groups, ghist, rows))
+    /// The split groups of the node holding `rows`, under the constraint,
+    /// over the rows whose gradient pairs in `gpair` count. Only
+    /// device-resident growth lacks host gradients, and it never runs under
+    /// the constraint ([`Self::device_engine`]).
+    fn node_groups(
+        &self,
+        ghist: &GHistIndex,
+        gpair: Option<&[GradPair]>,
+        rows: &[u32],
+    ) -> Option<NodeGroups> {
+        debug_assert!(self.groups.is_none() || gpair.is_some());
+        let (groups, gpair) = (self.groups?, gpair?);
+        Some(NodeGroups::new(groups, ghist, gpair, rows))
     }
 
     /// Use a specific histogram backend (the Metal GPU's, when
@@ -369,7 +378,7 @@ impl<'a> HistTreeBuilder<'a> {
                 };
                 (root_stats, root_hist, None)
             };
-        let groups = self.node_groups(ghist, row_subset);
+        let groups = self.node_groups(ghist, Some(gpair), row_subset);
         let root = self.root_entry(
             ghist,
             sampler,
@@ -719,6 +728,7 @@ impl<'a> HistTreeBuilder<'a> {
         };
         self.finish_children(
             ghist,
+            Some(gpair),
             split,
             child(left_rows, left_hist, left_quant),
             child(right_rows, right_hist, right_quant),
@@ -762,10 +772,12 @@ impl<'a> HistTreeBuilder<'a> {
 
     /// Both children of `split` from their rows and histograms (empty for
     /// terminal splits): their interaction state and best splits, searched
-    /// here unless `searched` holds them.
+    /// here unless `searched` holds them (`gpair`: the host's gradients, if
+    /// it has them).
     fn finish_children(
         &self,
         ghist: &GHistIndex,
+        gpair: Option<&[GradPair]>,
         split: PendingSplit,
         left: Child,
         right: Child,
@@ -792,7 +804,7 @@ impl<'a> HistTreeBuilder<'a> {
                 // off under `min_child_groups` (`device_engine`).
                 debug_assert!(self.groups.is_none() || (left.seg.is_none() && right.seg.is_none()));
                 let eval_left = || {
-                    let groups = self.node_groups(ghist, &left.rows);
+                    let groups = self.node_groups(ghist, gpair, &left.rows);
                     self.evaluate(
                         ghist,
                         &left.hist,
@@ -803,7 +815,7 @@ impl<'a> HistTreeBuilder<'a> {
                     )
                 };
                 let eval_right = || {
-                    let groups = self.node_groups(ghist, &right.rows);
+                    let groups = self.node_groups(ghist, gpair, &right.rows);
                     self.evaluate(
                         ghist,
                         &right.hist,

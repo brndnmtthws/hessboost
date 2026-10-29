@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use hessboost::config::{
     BoosterKind, ExtraTrees, GrowPolicy, MultiStrategy, ProcessType, Refresh, TrainingParamsBuilder,
 };
-use hessboost::data::{BinnedMatrix, FeatureType};
+use hessboost::data::{BinnedMatrix, FeatureType, ViewCuts};
 use hessboost::diffusion::{DiffusionModel, DiffusionParams};
 use hessboost::model::Iterations;
 use hessboost::prelude::*;
@@ -443,9 +443,44 @@ fn folds_count_their_own_rows_groups() {
     }
 }
 
+/// Rows of zero weight never count toward a child's groups: they add
+/// nothing to its fit, and the cuts are sketched without them, so binning
+/// clamps a value of theirs beyond the last cut into the last bin while the
+/// model routes it past the cut. Here group 1 holds the only weighted rows
+/// with a value, so no split leaves weighted rows of two groups on both
+/// sides, though the last bin holds a zero-weight row of group 2 at a value
+/// the cuts never saw (under `approx`, its Hessian of zero keeps it out of
+/// every round's cuts).
+#[test]
+fn zero_weight_rows_never_count() {
+    let data = DMatrix::from_dense(&[0.0, 1.0, 10.0, f32::NAN, f32::NAN], 5, 1)
+        .unwrap()
+        .with_labels(&[0.0, 0.0, 0.0, 1.0, 1.0])
+        .unwrap()
+        .with_weights(&[1.0, 1.0, 0.0, 1.0, 1.0])
+        .unwrap()
+        .with_split_groups(&[1, 1, 2, 3, 4])
+        .unwrap();
+    for method in [TreeMethod::Hist, TreeMethod::Approx] {
+        let nodes = |k| {
+            let params = TrainingParams::builder()
+                .max_depth(1)
+                .tree_method(method)
+                .min_child_groups(k)
+                .build()
+                .unwrap();
+            train(&params, &data, 1).unwrap().trees()[0].num_nodes()
+        };
+        // Unconstrained, the present values split from the missing ones.
+        assert_eq!(nodes(1), 3, "{method:?}");
+        assert_eq!(nodes(2), 1, "{method:?}");
+    }
+}
+
 /// The constraint needs groups on the training matrix (of the right
-/// length), a tree booster's histogram split search with one output per
-/// tree, and a training path that searches splits.
+/// length) whose weighted rows the `hist` cuts all saw, a tree booster's
+/// histogram split search with one output per tree, and a training path
+/// that searches splits.
 #[test]
 fn unsupported_requests_are_refused() {
     let data = dense(300, 4, false, 13);
@@ -458,6 +493,24 @@ fn unsupported_requests_are_refused() {
         data.clone().with_split_groups(&[1, 2, 3]),
         Err(HessboostError::DimensionMismatch { .. })
     ));
+    // A view taking its source's cuts that weighs rows its source weighs
+    // zero holds weighted rows its cuts never saw, which its bins need not
+    // route as their values do.
+    let weights: Vec<f32> = (0..300).map(|i| f32::from(u8::from(i % 10 != 0))).collect();
+    let view = data
+        .clone()
+        .with_weights(&weights)
+        .unwrap()
+        .select_rows_with_cuts(&(0..300).collect::<Vec<_>>(), ViewCuts::Source)
+        .unwrap()
+        .with_weights(&[1.0; 300])
+        .unwrap()
+        .with_split_groups(&block_groups(300, 5))
+        .unwrap();
+    assert_eq!(
+        invalid_data(train(&constrained().build().unwrap(), &view, 2)),
+        ("weights", None)
+    );
     for refused in [
         constrained().booster(BoosterKind::GbLinear),
         constrained().tree_method(TreeMethod::Exact),

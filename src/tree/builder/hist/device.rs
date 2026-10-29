@@ -424,6 +424,7 @@ impl HistTreeBuilder<'_> {
             |(split, (part, left_hist, right_hist)): (PendingSplit, (Partitioned, _, _))| {
                 self.finish_children(
                     ghist,
+                    gpair,
                     split,
                     device_child(part.left, left_hist),
                     device_child(part.right, right_hist),
@@ -523,6 +524,7 @@ impl HistTreeBuilder<'_> {
             };
             let (left, right) = self.finish_children(
                 on.ghist,
+                on.gpair,
                 split,
                 device_child(part.left, Vec::new()),
                 device_child(part.right, Vec::new()),

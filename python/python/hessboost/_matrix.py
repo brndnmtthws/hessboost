@@ -132,8 +132,9 @@ class DMatrix(_Metadata[_hessboost.DMatrix]):
         split_group: One split-group id per row, of any integer dtype (or a
             frame's column name): rows sharing an id are one unit of
             evidence, which ``train``'s ``min_child_groups`` counts in each
-            child of a split. Only equality matters; code other values first
-            (``pandas.factorize``, ``numpy.unique(..., return_inverse=True)``).
+            child of a split (rows of zero weight never count). Only
+            equality matters; code other values first (``pandas.factorize``,
+            ``numpy.unique(..., return_inverse=True)``).
         enable_categorical: Accept categorical frame columns (as XGBoost
             requires spelling out).
         copy: With ``False``, ``data`` must be a read-only, C-contiguous

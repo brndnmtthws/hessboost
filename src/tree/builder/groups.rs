@@ -27,6 +27,7 @@
 //! rows: the layout and its code tables are the node's, and a feature's
 //! pass keeps only its counts.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use rayon::prelude::*;
@@ -37,6 +38,7 @@ use super::shared::rayon_available;
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::data::ghist::{BinIndex, Bins, Column, Columns, GHistIndex, missing_bit};
+use crate::objective::GradPair;
 
 /// Training rows at which [`SplitGroups::of`] codes the groups in parallel.
 const PARALLEL_CODE_ROWS: usize = 1 << 16;
@@ -208,12 +210,12 @@ impl OneHot {
     }
 }
 
-/// One node's rows as split groups: the rows laid out group by group (the
-/// groups numbered by first appearance in the node's rows, each group's
-/// rows in row order) and, for an index that keeps no columns, their
-/// entries by feature in that layout.
+/// One node's counted rows as split groups: those rows laid out group by
+/// group (the groups numbered by first appearance, each group's rows in row
+/// order) and, for an index that keeps no columns, their entries by feature
+/// in that layout.
 pub(super) struct NodeGroups {
-    /// The node's rows, group by group.
+    /// The node's counted rows, group by group.
     grouped: Vec<u32>,
     /// Group `g`'s rows are `grouped[starts[g]..starts[g + 1]]`.
     starts: Vec<usize>,
@@ -228,12 +230,30 @@ pub(super) struct NodeGroups {
 }
 
 impl NodeGroups {
-    /// The groups of the node holding `rows` of `ghist`.
-    pub(super) fn new(groups: &SplitGroups, ghist: &GHistIndex, rows: &[u32]) -> Self {
-        let (grouped, starts) = if rows.len() >= 2 * CHUNK_ROWS && rayon_available() {
-            group_in_chunks(groups, rows)
+    /// The groups of the node holding `rows` of `ghist`, over the rows
+    /// whose gradient pair in `gpair` [`counts`].
+    pub(super) fn new(
+        groups: &SplitGroups,
+        ghist: &GHistIndex,
+        gpair: &[GradPair],
+        rows: &[u32],
+    ) -> Self {
+        let parallel = rows.len() >= 2 * CHUNK_ROWS && rayon_available();
+        let counted = |&r: &u32| counts(gpair[r as usize]);
+        let all = if parallel {
+            rows.par_iter().all(counted)
         } else {
-            let grouping = group(groups, rows);
+            rows.iter().all(counted)
+        };
+        let rows: Cow<'_, [u32]> = match (all, parallel) {
+            (true, _) => Cow::Borrowed(rows),
+            (false, true) => Cow::Owned(rows.par_iter().copied().filter(|r| counted(r)).collect()),
+            (false, false) => Cow::Owned(rows.iter().copied().filter(|r| counted(r)).collect()),
+        };
+        let (grouped, starts) = if rows.len() >= 2 * CHUNK_ROWS && rayon_available() {
+            group_in_chunks(groups, &rows)
+        } else {
+            let grouping = group(groups, &rows);
             (grouping.grouped, grouping.starts)
         };
         let chunks = group_chunks(&starts);
@@ -375,6 +395,18 @@ impl NodeGroups {
             None => unreachable!("an index without columns has its entries by feature"),
         }
     }
+}
+
+/// Whether a row with gradient pair `g` counts toward its group: its
+/// Hessian is finite and nonzero. A row of zero weight adds nothing to a
+/// child's fit (nor to `min_child_weight`), and the rows that count are
+/// those the cuts were sketched from (`hist`'s rows of nonzero weight,
+/// `approx`'s of nonzero Hessian), whose bins route them as their values
+/// do; binning clamps an unsketched value beyond the last cut into the
+/// last bin, and an unsketched category into the first.
+#[inline]
+fn counts(g: GradPair) -> bool {
+    g.hess != 0.0 && g.hess.is_finite()
 }
 
 /// Feed `fold` the entries of one feature's `column` among the rows of
@@ -1056,10 +1088,25 @@ mod tests {
         (low.len(), high.len())
     }
 
+    /// A random node of [`node`].
+    struct Node {
+        /// An ascending subset of the rows.
+        rows: Vec<u32>,
+        /// Every row's group id.
+        ids: Vec<u64>,
+        min: usize,
+        /// Every row's gradient pair.
+        gpair: Vec<GradPair>,
+        /// The node's rows whose Hessian is finite and nonzero: the rows
+        /// that count.
+        counted: Vec<u32>,
+    }
+
     /// Random nodes: an ascending subset of `n` rows, group ids drawn from
     /// `groups` values spread over the `u64` range (in runs of consecutive
-    /// rows when `runs`), and `min` in `2..=5`.
-    fn node(rng: &mut Rng, n: usize, groups: u64, runs: bool) -> (Vec<u32>, Vec<u64>, usize) {
+    /// rows when `runs`), `min` in `2..=5`, and Hessians that are sometimes
+    /// zero (of either sign), NaN, or negative.
+    fn node(rng: &mut Rng, n: usize, groups: u64, runs: bool) -> Node {
         let ids: Vec<u64> = (0..n)
             .map(|r| {
                 let g = if runs {
@@ -1072,7 +1119,33 @@ mod tests {
             .collect();
         let keep = 1 + rng.below(4);
         let rows: Vec<u32> = (0..n as u32).filter(|_| rng.below(4) < keep).collect();
-        (rows, ids, 2 + rng.range(0..4))
+        let gpair: Vec<GradPair> = (0..n)
+            .map(|_| {
+                let hess = match rng.below(12) {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f32::NAN,
+                    3 => -0.5,
+                    _ => 1.0,
+                };
+                GradPair::new(1.0, hess)
+            })
+            .collect();
+        let counted = rows
+            .iter()
+            .copied()
+            .filter(|&r| {
+                let hess = gpair[r as usize].hess;
+                hess != 0.0 && hess.is_finite()
+            })
+            .collect();
+        Node {
+            rows,
+            ids,
+            min: 2 + rng.range(0..4),
+            gpair,
+            counted,
+        }
     }
 
     const LAYOUTS: [Layout; 3] = [
@@ -1101,8 +1174,8 @@ mod tests {
 
     /// Every numeric cut, with missing values on either side, is legal
     /// exactly when both sides hold `min` distinct groups of the node's
-    /// rows, in an index with a missing bitmap, one without, and one
-    /// without columns; the scans' offset ranges agree.
+    /// counted rows, in an index with a missing bitmap, one without, and
+    /// one without columns; the scans' offset ranges agree.
     #[test]
     fn numeric_cuts_count_the_groups_of_both_sides() {
         let mut rng = Rng::new(3);
@@ -1110,10 +1183,17 @@ mod tests {
             for trial in 0..60 {
                 let n = 20 + rng.range(0..300);
                 let ghist = layout.index(n, &mut rng);
-                let (rows, ids, min) = node(&mut rng, n, [2, 3, 6, 40][trial % 4], trial % 8 >= 4);
-                let groups = SplitGroups::new(&ids, min);
-                let node = NodeGroups::new(&groups, &ghist, &rows);
-                let distinct: BTreeSet<u64> = rows.iter().map(|&r| ids[r as usize]).collect();
+                let trial_node = node(&mut rng, n, [2, 3, 6, 40][trial % 4], trial % 8 >= 4);
+                let Node {
+                    rows,
+                    ids,
+                    min,
+                    gpair,
+                    counted,
+                } = &trial_node;
+                let (min, groups) = (*min, SplitGroups::new(ids, *min));
+                let node = NodeGroups::new(&groups, &ghist, gpair, rows);
+                let distinct: BTreeSet<u64> = counted.iter().map(|&r| ids[r as usize]).collect();
                 assert_eq!(node.splittable(), distinct.len() >= min);
                 for f in 0..layout.n_cols {
                     let n_bins = ghist.cuts().num_bins(f);
@@ -1121,7 +1201,7 @@ mod tests {
                     for cut in 0..=n_bins {
                         for missing_low in [false, true] {
                             let (low, high) =
-                                sides(&ghist, f, &rows, &ids, cut, missing_low, &|b| b);
+                                sides(&ghist, f, counted, ids, cut, missing_low, &|b| b);
                             assert_eq!(
                                 legal.allows(cut, missing_low),
                                 low >= min && high >= min,
@@ -1146,7 +1226,8 @@ mod tests {
 
     /// Categories in a search's order (some left out, which stay high) and
     /// one-hot categories (alone, missing values with or against them) are
-    /// legal exactly when both sides hold `min` distinct groups.
+    /// legal exactly when both sides hold `min` distinct groups of the
+    /// node's counted rows.
     #[test]
     fn categorical_candidates_count_the_groups_of_both_sides() {
         let mut rng = Rng::new(5);
@@ -1161,9 +1242,16 @@ mod tests {
             for trial in 0..60 {
                 let n = 20 + rng.range(0..300);
                 let ghist = layout.index(n, &mut rng);
-                let (rows, ids, min) = node(&mut rng, n, [2, 3, 6, 40][trial % 4], trial % 8 >= 4);
-                let groups = SplitGroups::new(&ids, min);
-                let node = NodeGroups::new(&groups, &ghist, &rows);
+                let trial_node = node(&mut rng, n, [2, 3, 6, 40][trial % 4], trial % 8 >= 4);
+                let Node {
+                    rows,
+                    ids,
+                    min,
+                    gpair,
+                    counted,
+                } = &trial_node;
+                let (min, groups) = (*min, SplitGroups::new(ids, *min));
+                let node = NodeGroups::new(&groups, &ghist, gpair, rows);
                 for feature in 0..2 {
                     let category = CategoryGroups {
                         node: &node,
@@ -1181,7 +1269,7 @@ mod tests {
                     for cut in 0..=order.len() {
                         for missing_low in [false, true] {
                             let (low, high) =
-                                sides(&ghist, feature, &rows, &ids, cut, missing_low, &position);
+                                sides(&ghist, feature, counted, ids, cut, missing_low, &position);
                             assert_eq!(
                                 legal.allows(cut, missing_low),
                                 low >= min && high >= min,
@@ -1199,7 +1287,7 @@ mod tests {
                         let first = |b: usize| usize::from(b != bin);
                         for with_missing in [false, true] {
                             let (low, high) =
-                                sides(&ghist, feature, &rows, &ids, 1, with_missing, &first);
+                                sides(&ghist, feature, counted, ids, 1, with_missing, &first);
                             assert_eq!(
                                 one_hot.allows(bin, with_missing),
                                 low >= min && high >= min,
@@ -1222,7 +1310,7 @@ mod tests {
         for trial in 0..40 {
             let n = 200 + rng.range(0..800);
             let ids = [1, 2, 9, 70, 1000][trial % 5];
-            let (rows, ids, min) = node(&mut rng, n, ids, trial % 2 == 0);
+            let Node { rows, ids, min, .. } = node(&mut rng, n, ids, trial % 2 == 0);
             let groups = SplitGroups::new(&ids, min);
             let sequential = group(&groups, &rows);
             assert_eq!(

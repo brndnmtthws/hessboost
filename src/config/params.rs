@@ -465,16 +465,20 @@ pub struct TrainingParams {
     /// child of a split must hold rows of: a split is taken only when both
     /// children reach it, as well as `min_child_weight`. Groups are counted
     /// exactly over the node's sampled rows (after `subsample` and the other
-    /// row samplers), whatever their weights, for numeric and categorical
-    /// splits with missing values sent each way they are tried, under every
-    /// growth policy; the counts are integers, so any thread count trains
-    /// the same model. `0` and `1` (the default) constrain nothing.
+    /// row samplers) with a nonzero Hessian: a row of zero weight adds
+    /// nothing to a child's fit, nor to `min_child_weight`, and never
+    /// counts. They are counted for numeric and categorical splits with
+    /// missing values sent each way they are tried, under every growth
+    /// policy; the counts are integers, so any thread count trains the same
+    /// model. `0` and `1` (the default) constrain nothing.
     ///
     /// Needs split groups on the training matrix and the histogram builder
     /// (`tree_method` `hist`, `approx` or `auto`) with one output per tree;
     /// refused with `booster = gblinear` and
-    /// `multi_strategy = multi_output_tree`, and by budget mode, refresh,
-    /// in-place updates, and diffusion models. Counting reads every searched
+    /// `multi_strategy = multi_output_tree`, by budget mode, refresh,
+    /// in-place updates, and diffusion models, and under `hist` for a
+    /// [`ViewCuts::Source`] view weighing rows its source weighs zero (its
+    /// cuts never saw them). Counting reads every searched
     /// node's rows once for their groups and once per feature it checks
     /// (those whose best split could still win; every feature under
     /// symmetric growth, `extra_trees`, `path_smooth`, and reuse
@@ -483,6 +487,7 @@ pub struct TrainingParams {
     /// XGBoost.
     ///
     /// [`DMatrix::with_split_groups`]: crate::data::DMatrix::with_split_groups
+    /// [`ViewCuts::Source`]: crate::data::ViewCuts::Source
     pub min_child_groups: usize,
     /// The bound on each leaf weight ([`MaxDeltaStep`]). XGBoost
     /// `max_delta_step`.

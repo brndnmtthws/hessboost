@@ -221,12 +221,12 @@ impl<'a> SymmetricTreeBuilder<'a> {
                 {
                     level
                         .par_iter()
-                        .map(|node| NodeGroups::new(groups, ghist, &node.rows))
+                        .map(|node| NodeGroups::new(groups, ghist, gpair, &node.rows))
                         .collect()
                 } else {
                     level
                         .iter()
-                        .map(|node| NodeGroups::new(groups, ghist, &node.rows))
+                        .map(|node| NodeGroups::new(groups, ghist, gpair, &node.rows))
                         .collect()
                 }
             });

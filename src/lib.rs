@@ -120,7 +120,9 @@
 //!   read the values.
 //! - **Objectives** ([`Objective`](objective::Objective), each with its
 //!   parameters): regression (squared, squared-log, pseudo-Huber, smoothed
-//!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
+//!   absolute, quantile/expectile lists), exceedance probabilities over a
+//!   threshold ladder (`reg:exceedance`: `P(y ≥ k_j)` per threshold, never
+//!   increasing in `j`), binary (logistic, logitraw, hinge)
 //!   and multiclass, counts, LambdaMART and XE-NDCG ranking, survival (`survival:cox`,
 //!   `survival:aft` on censored bounds), plus custom losses
 //!   ([`Objective::Custom`](objective::Objective::Custom), e.g. a
@@ -135,7 +137,8 @@
 //! - **Metrics** ([`EvalMetric`](metric::EvalMetric), each with its own
 //!   parameters): rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
-//!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, plus
+//!   quantile, expectile, exceedance-logloss, cox/aft-nloglik,
+//!   interval-regression-accuracy, plus
 //!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric),
 //!   reported after built-in metrics). XGBoost-compatible parameter dictionaries parse through
 //!   [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost):

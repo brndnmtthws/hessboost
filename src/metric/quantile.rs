@@ -1,8 +1,10 @@
 //! Alpha-list regression metrics: `quantile` (pinball loss) and `expectile`
-//! (asymmetric squared loss), averaged over every alpha.
+//! (asymmetric squared loss), averaged over every alpha; and their
+//! threshold-ladder sibling `exceedance-logloss`.
 
 use super::{Metric, weighted_mean};
 use crate::data::MetaInfo;
+use crate::objective::Thresholds;
 
 /// Sum `loss(alpha, pred, label) · w` and the matching weights over every
 /// (row, alpha, target) cell of `preds` laid out `[row][alpha][target]`
@@ -138,6 +140,60 @@ impl Metric for ExpectileError {
     }
 }
 
+/// Binary log loss over a threshold ladder (`exceedance-logloss`, the
+/// default metric of `reg:exceedance`): for each row and threshold `k_j`,
+/// `logloss`'s term (with its `ε = 1e-16` floor) of the indicator `y ≥ k_j`
+/// (compared in `f64`) against the predicted `P(y ≥ k_j)`, weighted by the
+/// row weight and averaged over rows and thresholds (the weighted
+/// denominator is `K · Σw`). Predictions are `[row][threshold]`, one label
+/// per row; any other prediction count, or a `NaN` label, evaluates to
+/// `NaN`.
+#[derive(Debug, Clone)]
+pub(crate) struct ExceedanceLogLoss {
+    thresholds: Thresholds,
+}
+
+impl ExceedanceLogLoss {
+    /// The loss at the thresholds `thresholds`.
+    pub(crate) fn new(thresholds: Thresholds) -> Self {
+        ExceedanceLogLoss { thresholds }
+    }
+}
+
+impl Metric for ExceedanceLogLoss {
+    fn name(&self) -> &'static str {
+        "exceedance-logloss"
+    }
+
+    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        let levels = self.thresholds.values();
+        nan_unless_consistent!(preds, labels, weights, levels.len());
+        let (mut total, mut weight) = (0.0f64, 0.0f64);
+        for (i, (row, &y)) in preds.chunks_exact(levels.len()).zip(labels).enumerate() {
+            if y.is_nan() {
+                return f64::NAN;
+            }
+            let w = weights.map_or(1.0, |ws| f64::from(ws[i]));
+            for (&p, &level) in row.iter().zip(levels) {
+                let t = if f64::from(y) >= level { 1.0 } else { 0.0 };
+                total += crate::simd::log_loss_term(t, f64::from(p)) * w;
+                weight += w;
+            }
+        }
+        weighted_mean((total, weight))
+    }
+
+    /// One label column only: every threshold reads the same label.
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
+
+    /// One prediction per threshold.
+    fn prediction_width(&self, _info: &MetaInfo) -> Option<usize> {
+        Some(self.thresholds.values().len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +234,27 @@ mod tests {
         let e = ExpectileError::new(vec![0.2, 0.8]);
         assert!(q.eval_info(&[], &info).is_nan());
         assert!(e.eval_info(&[], &info).is_nan());
+    }
+
+    /// Two thresholds, two rows: each cell is `logloss`'s term of its
+    /// indicator, and the weighted denominator counts every cell.
+    #[test]
+    fn exceedance_logloss_averages_indicator_logloss() {
+        let m = ExceedanceLogLoss::new(Thresholds::new([1.0, 3.0]).unwrap());
+        // Row 0 (y = 2): indicators 1, 0. Row 1 (y = 3): indicators 1, 1.
+        let preds = [0.8, 0.3, 0.9, 0.6];
+        let labels = [2.0, 3.0];
+        let cells = [-0.8f64.ln(), -0.7f64.ln(), -0.9f64.ln(), -0.6f64.ln()];
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let v = m.eval(&preds, &labels, None);
+        assert!(close(v, cells.iter().sum::<f64>() / 4.0), "{v}");
+        let v = m.eval(&preds, &labels, Some(&[3.0, 1.0]));
+        let want = (3.0 * (cells[0] + cells[1]) + cells[2] + cells[3]) / 8.0;
+        assert!(close(v, want), "{v}");
+        // A probability of exactly 0 for a reached threshold is floored.
+        assert!(m.eval(&[0.0, 0.0], &[5.0], None).is_finite());
+        assert!(m.eval(&preds[..3], &labels, None).is_nan());
+        assert_eq!(m.name(), "exceedance-logloss");
+        assert!(!m.supports_label_matrix());
     }
 }

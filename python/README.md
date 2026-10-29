@@ -16,7 +16,10 @@ UBJSON.
   forked with `os.fork()` rebuilds instead of hanging.
 - **Modern modeling (opt-in).** Conformal prediction intervals,
   confidence intervals for the regression function (Boulevard boosting),
-  distributional boosting (a predictive distribution per row), LightGBM/CatBoost
+  distributional boosting (a predictive distribution per row), exceedance
+  probabilities over a threshold ladder (`objective="reg:exceedance"` with
+  `exceedance_threshold`, non-crossing `P(y >= k)` per threshold;
+  `Booster.exceedance_thresholds`), LightGBM/CatBoost
   tree options, class-balanced binary bagging, and XE-NDCG ranking
   (`objective="rank:xendcg"`).
 

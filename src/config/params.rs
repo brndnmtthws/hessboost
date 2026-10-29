@@ -1536,8 +1536,9 @@ impl TrainingParams {
     /// `reg:squarederror`, `reg:pseudohubererror`, `reg:logistic`,
     /// `binary:logistic`, and `reg:absoluteerror` accept a label matrix and
     /// give one output per label column, as in XGBoost; quantile and
-    /// expectile regression give one output per level, `dist:*` one per
-    /// distribution parameter, multiclass one per class.
+    /// expectile regression give one output per level, `reg:exceedance` one
+    /// per threshold, `dist:*` one per distribution parameter, multiclass
+    /// one per class.
     ///
     /// # Errors
     ///

@@ -1,6 +1,6 @@
 //! The objective a model records ([`ModelObjective`]) and its stored form:
 //! the objective's name plus the flat parameter record the native, native
-//! JSON, and compact formats keep (unchanged since 0.2.0).
+//! JSON, and compact formats keep (since 0.2.0; later members are additive).
 
 use crate::error::{HessboostError, Result};
 use crate::objective::distributional::{DistFamily, DistGradient, DistSplitDirection};
@@ -131,6 +131,7 @@ impl ModelObjective {
             lambdarank_num_pair_per_sample: stored.lambdarank_num_pair_per_sample,
             quantile_alpha: stored.quantile_alpha.clone(),
             expectile_alpha: stored.expectile_alpha.clone(),
+            exceedance_threshold: stored.exceedance_threshold.clone(),
             aft_loss_distribution: stored.aft_loss_distribution,
             aft_loss_distribution_scale: stored.aft_loss_distribution_scale,
             dist_gradient: stored.dist_gradient,
@@ -150,16 +151,20 @@ impl ModelObjective {
 }
 
 /// Declares [`StoredObjectiveParams`] (serialized with its fields in
-/// declaration order) and its all-optional mirror
-/// [`PartialStoredObjectiveParams`] with `fill`, from one member list. A new
-/// stored objective parameter is one line here plus its value in
-/// [`StoredObjectiveParams::of`].
+/// declaration order, each with the serde attributes listed before it) and
+/// its all-optional mirror [`PartialStoredObjectiveParams`] with `fill`,
+/// from one member list. A new stored objective parameter is one line here
+/// plus its value in [`StoredObjectiveParams::of`].
 macro_rules! stored_objective_params {
-    ($(#[doc = $sdoc:literal])* ; $(#[doc = $pdoc:literal])* ; $($name:ident: $ty:ty),* $(,)?) => {
+    (
+        $(#[doc = $sdoc:literal])* ;
+        $(#[doc = $pdoc:literal])* ;
+        $($(#[$attr:meta])* $name:ident: $ty:ty),* $(,)?
+    ) => {
         $(#[doc = $sdoc])*
         #[derive(Debug, Clone, PartialEq, Serialize)]
         pub(crate) struct StoredObjectiveParams {
-            $(pub(crate) $name: $ty,)*
+            $($(#[$attr])* pub(crate) $name: $ty,)*
         }
 
         $(#[doc = $pdoc])*
@@ -187,7 +192,11 @@ stored_objective_params! {
     /// objective gives them (the defaults for the ones it does not read), plus
     /// the `max_delta_step` training used and the `dist:*` family. Native JSON
     /// names the members as the fields; the native binary and compact formats
-    /// store `objective.<field>` sections.
+    /// store `objective.<field>` sections. `exceedance_threshold` (only
+    /// `reg:exceedance` reads it) is written only when non-empty, so every
+    /// other model's files are what they were before it existed; its
+    /// `objective.exceedance_threshold` section is `REQUIRED`, so a reader
+    /// that predates it refuses a `reg:exceedance` model.
     ;
     /// [`StoredObjectiveParams`] as native JSON stores them, with every member
     /// optional: [`PartialStoredObjectiveParams::fill`] takes each missing one
@@ -203,6 +212,8 @@ stored_objective_params! {
     lambdarank_num_pair_per_sample: usize,
     quantile_alpha: Vec<f64>,
     expectile_alpha: Vec<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exceedance_threshold: Vec<f64>,
     aft_loss_distribution: AftDistribution,
     aft_loss_distribution_scale: f64,
     dist_gradient: DistGradient,
@@ -224,6 +235,7 @@ impl StoredObjectiveParams {
             lambdarank_num_pair_per_sample: parts.lambdarank_num_pair_per_sample,
             quantile_alpha: parts.quantile_alpha,
             expectile_alpha: parts.expectile_alpha,
+            exceedance_threshold: parts.exceedance_threshold,
             aft_loss_distribution: parts.aft_loss_distribution,
             aft_loss_distribution_scale: parts.aft_loss_distribution_scale,
             dist_gradient: parts.dist_gradient,

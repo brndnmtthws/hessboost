@@ -4,7 +4,7 @@ use crate::metric::EvalMetric;
 use crate::objective::distributional::{DistFamily, Distributional};
 use crate::objective::distributional::{DistGradient, DistSplitDirection};
 use crate::objective::{
-    Aft, Expectiles, LambdaRank, Multiclass, PseudoHuber, Quantiles, RegLoss, Tweedie,
+    Aft, Expectiles, LambdaRank, Multiclass, PseudoHuber, Quantiles, RegLoss, Thresholds, Tweedie,
 };
 use crate::objective::{AftDistribution, Objective};
 use serde_json::json;
@@ -341,6 +341,7 @@ fn typed_objectives_round_trip_through_the_flat_form() {
         Objective::AbsoluteError,
         Objective::Quantile(Quantiles::new([0.1, 0.5, 0.9]).unwrap()),
         Objective::Expectile(Expectiles::new([0.2, 0.8]).unwrap()),
+        Objective::Exceedance(Thresholds::new([-1.0, 0.5, 4.0]).unwrap()),
         Objective::RegLogistic(RegLoss::new(3.0).unwrap()),
         Objective::BinaryLogistic(RegLoss::new(2.5).unwrap()),
         Objective::BinaryLogitRaw(RegLoss::new(0.5).unwrap()),

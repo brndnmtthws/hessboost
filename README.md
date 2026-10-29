@@ -163,6 +163,7 @@ See [`python/README.md`](python/README.md).
 - **Core boosting:** `gbtree`, `dart`, and `gblinear` boosters, boosted random forests,
   and `exact`, `hist`, and `approx` tree methods with native missing-value and categorical support.
 - **Objectives & metrics:** Regression (squared, log, Huber, quantile, expectile),
+  exceedance probabilities over a threshold ladder (`reg:exceedance`, non-crossing `P(y ≥ k)`),
   binary/multiclass classification, ranking (LambdaMART, XE-NDCG), count, and survival (Cox, AFT),
   plus typed objective and metric APIs and custom loss hooks. Quantile and absolute-error models can
   set each leaf to the exact residual quantile of its rows (`leaf_estimation_method = exact`).

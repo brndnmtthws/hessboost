@@ -142,9 +142,11 @@ codegen-units = 1
 # CI's test builds (`cargo nextest run --cargo-profile ci`, `cargo test --doc
 # --profile ci`). opt-level 1 keeps debug assertions and overflow checks but
 # runs the suite about ten times faster than `dev`'s opt-level 0 for a
-# fraction more compile time; line tables keep file:line backtraces.
-# Dependents ignore this profile.
+# fraction more compile time. No debug info: CI sets no `RUST_BACKTRACE`, so
+# line tables would show up nowhere (a panic still names its file and line)
+# while making every test binary about five times larger and the build, its
+# links, and its cache slower. Dependents ignore this profile.
 [profile.ci]
 inherits = "dev"
 opt-level = 1
-debug = "line-tables-only"
+debug = false

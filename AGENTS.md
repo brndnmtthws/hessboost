@@ -97,8 +97,9 @@ loads `mise.ci.toml`, which moves rustup's toolchains into that cache.
 mr-boxington-action caches what mbx compiled (`github-cache-mode: objects`,
 saved on pushes to main; a test job's push restores nothing, so its entry
 holds one build; the fuzz job caches `fuzz/target` itself). Rust
-tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal and CUDA
-tests needing a device skip without one; guard tests still fail if the
+tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (only x86_64
+Linux builds the examples, which clippy checks on both lint platforms; Metal
+and CUDA tests needing a device skip without one; guard tests still fail if the
 Metal or wgpu kernels do not compile, and the `cuda-kernels` job checks the
 CUDA PTX;
 the Linux runners also install Mesa's lavapipe and set

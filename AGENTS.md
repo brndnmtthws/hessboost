@@ -95,7 +95,8 @@ CI (`.github/workflows/ci.yml`) runs the Rust checks through `mbx` with
 `RUSTFLAGS=-D warnings`. mise-action caches mise's tools; `MISE_ENV=ci`
 loads `mise.ci.toml`, which moves rustup's toolchains into that cache.
 mr-boxington-action caches what mbx compiled (`github-cache-mode: objects`,
-saved on pushes to main; the fuzz job caches `fuzz/target` itself). Rust
+saved on pushes to main; a test job's push restores nothing, so its entry
+holds one build; the fuzz job caches `fuzz/target` itself). Rust
 tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal and CUDA
 tests needing a device skip without one; guard tests still fail if the
 Metal or wgpu kernels do not compile, and the `cuda-kernels` job checks the
@@ -105,9 +106,10 @@ the Linux runners also install Mesa's lavapipe and set
 packages per runner image and installer version), so `tests/wgpu.rs` and the
 `backend::wgpu` unit tests run the GPU paths there)
 under the `ci` Cargo profile (`Cargo.toml`: `dev` at opt-level 1, debug
-assertions and overflow checks on; about ten times faster than opt-level
-0). The parity job caches uv's XGBoost source build per uv release. Every
-Linux job that builds the root crate's `cuda` feature (clippy, test, docs, MSRV,
+assertions and overflow checks on, no debug info; about ten times faster
+than opt-level 0). The parity job caches uv's XGBoost source build per uv
+release. Every Linux job that builds the root crate's `cuda` feature
+(clippy, test, docs, MSRV,
 `semver compatibility` (cargo-semver-checks enables `cuda`), and
 `publish.yml`'s Rust test and `cargo publish --all-features`) first runs
 `.github/scripts/install-cuda-headers.sh`: NVIDIA's pinned CUDA 13 header
@@ -117,7 +119,8 @@ of the runner image's clang).
 manylinux container: dnf's `clang-devel`, `CUDA_HOME` exported.
 Its Python jobs build with maturin through mise's cargo (so through mbx;
 on Windows the toolchain's cargo, as mbx made zstd-sys's build erratically
-slow there), on x86_64/aarch64 Linux, aarch64 macOS, and x86_64 Windows
+slow there, with `python/target` cached per `python/Cargo.lock`, toolchain,
+and wheel), on x86_64/aarch64 Linux, aarch64 macOS, and x86_64 Windows
 (without the release profile's LTO and single codegen unit), the
 abi3 wheel, tested on CPython 3.12 and 3.14, and the abi3t wheel, tested on
 3.15 and free-threaded 3.15t, with `.github/scripts/test-wheel.sh`, plus

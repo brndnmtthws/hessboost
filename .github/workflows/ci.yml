@@ -18,6 +18,11 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # The segment download timeout of actions/cache's library, which every
+  # cache action here bundles. A restore that fails mid-download keeps its
+  # step alive until this timer fires (10 minutes by default), as when the
+  # cache service answers "Egress is over the account limit".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
 
 # Toolchain and tool versions (rust, mbx, nextest, uv) come from mise.toml,
 # pinned by mise.lock. mise-action runs before mr-boxington-action so the
@@ -34,12 +39,14 @@ env:
 # mise's `mr_boxington` option makes its cargo, which maturin runs too, go
 # through mbx. mr-boxington-action saves the objects mbx compiled
 # (`github-cache-mode: objects`) after a push to main, and each job restores
-# the latest entry of its `cache-generation`. Those cover every target
-# directory a job builds in and every feature; the default `target` payload
-# keeps only the dependencies of the default features, which these
-# `--all-features` builds would compile again. `cache-links` also caches
-# linked build scripts and proc macros. The fuzz job caches fuzz/target
-# itself: mbx does not cache its sanitizer builds.
+# the latest entry of its `cache-generation` (the test jobs' pushes build
+# from scratch instead; see there). Those cover every target directory a
+# job builds in and every feature; the default `target` payload keeps only
+# the dependencies of the default features, which these `--all-features`
+# builds would compile again. `cache-links` also caches linked build scripts
+# and proc macros. The fuzz job and the Windows wheels cache their target
+# directories themselves: mbx does not cache the fuzz job's sanitizer
+# builds, and Windows builds without mbx.
 
 jobs:
   fmt:
@@ -120,12 +127,19 @@ jobs:
       # job).
       - if: runner.os == 'Linux'
         run: bash .github/scripts/install-cuda-headers.sh
+      # A push to main restores nothing: it builds from scratch and saves
+      # that build alone. Cargo.lock is not committed, so a dependency's new
+      # release gives hessboost's test and example binaries new file names;
+      # a save after a restore would keep the old ones as well and grow by a
+      # build per push. Pull requests restore main's latest entry.
       - uses: jdx/mr-boxington-action@v1
         with:
           github-cache-mode: objects
           isolate-objects-cache: true
           cache-links: true
-          cache-generation: test-ci
+          cache-generation: test-ci-v2
+          # No cache key starts with "none".
+          restore-keys: ${{ github.event_name == 'push' && 'none' || '' }}
       # The `ci` Cargo profile (Cargo.toml): opt-level 1 with debug
       # assertions, about ten times faster than `dev` for this suite.
       # nextest's own `--profile` would pick a nextest profile.
@@ -392,10 +406,19 @@ jobs:
       # through mbx (see the header). Not on Windows: there mbx does not
       # cache zstd-sys's build script, and under mbx its libzstd build at
       # times took minutes instead of under one, so Windows builds with the
-      # toolchain's own cargo, uncached.
+      # toolchain's own cargo and caches python/target itself, as the fuzz
+      # job does fuzz/target. python/Cargo.lock pins every dependency, so an
+      # entry per lockfile, toolchain (mise.lock), and wheel holds their
+      # outputs; a push to main without one saves it (see below).
       - uses: jdx/mise-action@v4
       - if: runner.os == 'Windows'
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - if: runner.os == 'Windows'
+        id: windows-target
+        uses: actions/cache/restore@v6
+        with:
+          path: python/target
+          key: python-target-${{ runner.os }}-${{ runner.arch }}-${{ matrix.wheel }}-${{ hashFiles('python/Cargo.lock', 'mise.lock') }}
       - if: runner.os != 'Windows'
         uses: jdx/mr-boxington-action@v1
         with:
@@ -420,6 +443,15 @@ jobs:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: uvx --from 'maturin>=1.15,<2' maturin build --release --locked --out dist -i "${{ steps.build-python.outputs.path }}"
         working-directory: python
+      - if: runner.os == 'Windows' && steps.windows-target.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        name: Leave hessboost's and the extension's outputs out of the cache
+        working-directory: python/target
+        run: rm -rf {,*/}release/_native.* {,*/}release/deps/*hessboost* {,*/}release/deps/_native.* {,*/}release/.fingerprint/hessboost*
+      - if: runner.os == 'Windows' && steps.windows-target.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: python/target
+          key: ${{ steps.windows-target.outputs.cache-primary-key }}
       - name: Test abi3 wheel on Python 3.14
         if: matrix.wheel == 'abi3'
         run: sh ../.github/scripts/test-wheel.sh 3.14 'dist/*cp312-abi3*.whl'

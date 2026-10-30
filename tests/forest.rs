@@ -50,6 +50,15 @@ fn quick(mut params: ForestParams) -> ForestParams {
     ]);
     params
 }
+/// The smallest fit: for the encoding, decoding, and refusal tests, which
+/// need a fitted model but not a good one.
+fn tiny(params: ForestParams) -> ForestParams {
+    let mut params = quick(params);
+    params.n_t = NoiseLevels::new(2).unwrap();
+    params.duplicate_k = NonZeroUsize::MIN;
+    params.num_boost_round = NonZeroUsize::new(2).unwrap();
+    params
+}
 fn labelled(x: &[f32], y: &[f32]) -> DMatrix {
     labeled_dense(x, COLS, y)
 }
@@ -185,15 +194,15 @@ fn both_formats_round_trip() {
     let mut masked = x.clone();
     masked[4] = f32::NAN;
     for (params, data) in [
-        (quick(ForestParams::default()), labelled(&x, &y)),
+        (tiny(ForestParams::default()), labelled(&x, &y)),
         // Missing values: one GBDT per column.
         (
-            quick(ForestParams::forest_diffusion()),
+            tiny(ForestParams::forest_diffusion()),
             labelled(&masked, &y),
         ),
         // Unconditional.
         (
-            quick(ForestParams::default()),
+            tiny(ForestParams::default()),
             DMatrix::from_dense(&x, 120, COLS).unwrap(),
         ),
     ] {
@@ -251,7 +260,7 @@ fn unsupported_inputs_are_refused() {
         ("weights", None)
     );
 
-    let model = ForestModel::fit(&quick(ForestParams::forest_diffusion()), &data).unwrap();
+    let model = ForestModel::fit(&tiny(ForestParams::forest_diffusion()), &data).unwrap();
     assert_eq!(invalid_param(model.sample(0, 1)), "n_rows");
     assert_eq!(invalid_param(model.sample(usize::MAX, 1)), "n_rows");
     assert_eq!(
@@ -359,7 +368,7 @@ fn imputation_refuses_label_matrices() {
     // classes, so the matrix is refused as it is by `fit`.
     let (x, y) = table(60, 6);
     let model =
-        ForestModel::fit(&quick(ForestParams::forest_diffusion()), &labelled(&x, &y)).unwrap();
+        ForestModel::fit(&tiny(ForestParams::forest_diffusion()), &labelled(&x, &y)).unwrap();
     let matrix: Vec<f32> = y.iter().flat_map(|&c| [c, 1.0 - c]).collect();
     let data = DMatrix::from_dense(&x, 60, COLS)
         .unwrap()
@@ -377,7 +386,7 @@ fn stored_values_outside_f32_are_refused() {
     // value no `f32` fit could have produced is not a model.
     let (x, y) = table(60, 7);
     let model =
-        ForestModel::fit(&quick(ForestParams::forest_diffusion()), &labelled(&x, &y)).unwrap();
+        ForestModel::fit(&tiny(ForestParams::forest_diffusion()), &labelled(&x, &y)).unwrap();
     let json: serde_json::Value =
         serde_json::from_slice(&model.encode(DiffusionFormat::Json).unwrap()).unwrap();
     for (path, value) in [

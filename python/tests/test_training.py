@@ -199,6 +199,72 @@ def test_exceedance_predicts_non_increasing_probabilities_and_round_trips() -> N
         hessboost.train({"exceedance_threshold": [1.0]}, DMatrix(x, target), 1)
 
 
+@pytest.mark.parametrize("strategy", ["one_output_per_tree", "multi_output_tree"])
+def test_exceedance_brier_drives_stopping_with_weighted_grid_score(strategy: str) -> None:
+    x = np.tile(np.arange(3, dtype=np.float32), 30).reshape(-1, 1)
+    y_train = np.tile(np.array([0.0, 1.0, 4.0], dtype=np.float32), 30)
+    # Validation reverses the training relationship: fitting the training
+    # signal should worsen held-out probabilities, exercising real stopping.
+    y_valid = np.tile(np.array([4.0, 1.0, 0.0], dtype=np.float32), 30)
+    weights = np.tile(np.array([3.0, 1.0, 2.0], dtype=np.float32), 30)
+    thresholds = np.array([0.5, 1.5, 3.0])
+    history: hessboost.EvalsResult = {}
+    booster = hessboost.train(
+        {
+            "objective": "reg:exceedance",
+            "exceedance_threshold": thresholds.tolist(),
+            "eval_metric": ["exceedance-logloss", "exceedance-brier"],
+            "multi_strategy": strategy,
+            "tree_method": "hist",
+            "max_depth": 2,
+            "eta": 0.3,
+        },
+        DMatrix(x, y_train),
+        30,
+        evals=[(DMatrix(x, y_valid, weight=weights), "valid")],
+        early_stopping_rounds=3,
+        evals_result=history,
+        verbose_eval=False,
+    )
+    scores = history["valid"]["exceedance-brier"]
+    assert len(scores) < 30
+    best = booster.best_iteration
+    assert best is not None
+    assert booster.best_score == scores[best] == min(scores)
+    assert booster.num_boosted_rounds() == best + 4
+    targets = y_valid.astype(np.float64)[:, None] >= thresholds
+    for iteration, score in enumerate(scores):
+        probabilities = booster.predict(x, iteration_range=(0, iteration + 1)).astype(np.float64)
+        errors = (probabilities - targets) ** 2
+        # Independent interval trapezoids, with both endpoints included;
+        # normalize only by row weights, not threshold count or width.
+        row_scores = np.sum(np.diff(thresholds) * (errors[:, :-1] + errors[:, 1:]) / 2.0, axis=1)
+        expected = np.average(row_scores, weights=weights.astype(np.float64))
+        assert score == pytest.approx(expected, rel=1e-12, abs=1e-12)
+
+
+@pytest.mark.parametrize("thresholds", [[1.0], [-1.7e308, 1.7e308]])
+def test_exceedance_brier_rejects_unusable_grid_only_for_metric(
+    thresholds: list[float],
+) -> None:
+    x = np.arange(6, dtype=np.float32).reshape(-1, 1)
+    dtrain = DMatrix(x, x[:, 0])
+    params: dict[str, Any] = {
+        "objective": "reg:exceedance",
+        "exceedance_threshold": thresholds,
+    }
+    # Existing objective/default logloss retains its threshold contract.
+    hessboost.train(params, dtrain, 1, verbose_eval=False)
+    with pytest.raises(HessboostError, match="eval_metric"):
+        hessboost.train(
+            {**params, "eval_metric": "exceedance-brier"},
+            dtrain,
+            1,
+            evals=[(dtrain, "train")],
+            verbose_eval=False,
+        )
+
+
 def test_gblinear_and_dart() -> None:
     x, y = regression()
     linear = hessboost.train(

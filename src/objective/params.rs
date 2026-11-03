@@ -144,8 +144,10 @@ alpha_list!(
 );
 
 /// The thresholds `k_1 < … < k_K` of `reg:exceedance` and the
-/// `exceedance-logloss` metric: one output per threshold, predicting
-/// `P(y ≥ k_j)`. Flat key `exceedance_threshold`.
+/// `exceedance-logloss` / `exceedance-brier` metrics: one output per
+/// threshold, predicting `P(y ≥ k_j)`. Flat key `exceedance_threshold`.
+/// One threshold is sufficient except for `exceedance-brier`, whose
+/// metric construction requires at least two and representable weights.
 ///
 /// ```
 /// use hessboost::objective::{Objective, Thresholds};

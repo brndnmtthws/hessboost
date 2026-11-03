@@ -164,6 +164,7 @@ See [`python/README.md`](python/README.md).
   and `exact`, `hist`, and `approx` tree methods with native missing-value and categorical support.
 - **Objectives & metrics:** Regression (squared, log, Huber, quantile, expectile),
   exceedance probabilities over a threshold ladder (`reg:exceedance`, non-crossing `P(y ≥ k)`),
+  with log-loss and finite-grid threshold-weighted Brier scoring (`exceedance-brier`),
   binary/multiclass classification, ranking (LambdaMART, XE-NDCG), count, and survival (Cox, AFT),
   plus typed objective and metric APIs and custom loss hooks. Quantile and absolute-error models can
   set each leaf to the exact residual quantile of its rows (`leaf_estimation_method = exact`).
@@ -181,7 +182,7 @@ See [`python/README.md`](python/README.md).
   (tree weights, outputs, depths, and nodes, `gblinear` weights, model-shrinkage records).
 - **Interchange:** Native binary and JSON formats, XGBoost JSON/UBJSON import/export, LightGBM model import, and models embedded in the binary at compile time.
 - **Modern modeling (opt-in):**
-  - [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/): Finite-sample coverage guarantees.
+  - [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/): Held-out finite-sample marginal coverage under exchangeability, plus model-independent scalar/linear online score calibration.
   - [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/): Asymptotic confidence and prediction intervals for `f(x)`.
   - [Explainable boosting machines](https://docs.rs/hessboost/latest/hessboost/ebm/): Interpretable cyclic GAM/GA²M models with shape-function confidence bands.
   - [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/): Full predictive distributions per row (`dist:normal`, `dist:gamma`, `dist:student_t` for heavy-tailed targets with learned degrees of freedom, etc.).
@@ -200,6 +201,7 @@ See [`python/README.md`](python/README.md).
 - Full technical details, invariants, and statistical assumptions are documented in the [API reference](https://docs.rs/hessboost).
 - Approximate in-place updates are designed for incremental shifts (under ~1% of rows); larger changes benefit from a retrain.
 - Asymptotic Boulevard inference and prediction intervals require specific noise and structure assumptions; see the [`inference` docs](https://docs.rs/hessboost/latest/hessboost/inference/#validation) for conditions and empirical coverage validation.
+- Online calibration accepts delayed feedback in issue order but does not claim general delayed or conditional coverage. Its state and forecast receipts are not serialized. `exceedance-brier` scores a finite threshold grid, not full CRPS.
 ## Not implemented
 
 - Distributed and external-memory training.

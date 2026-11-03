@@ -1,9 +1,10 @@
 //! Alpha-list regression metrics: `quantile` (pinball loss) and `expectile`
 //! (asymmetric squared loss), averaged over every alpha; and their
-//! threshold-ladder sibling `exceedance-logloss`.
+//! threshold-ladder siblings `exceedance-logloss` and `exceedance-brier`.
 
 use super::{Metric, weighted_mean};
 use crate::data::MetaInfo;
+use crate::error::{HessboostError, Result};
 use crate::objective::Thresholds;
 
 /// Sum `loss(alpha, pred, label) · w` and the matching weights over every
@@ -194,9 +195,233 @@ impl Metric for ExceedanceLogLoss {
     }
 }
 
+/// Trapezoid-weighted Brier score over a finite threshold grid. Unlike
+/// log loss, only row weights enter the denominator: the score retains
+/// the label's units. Both endpoints contribute, without extrapolated
+/// tails; this is neither exact finite-interval integration nor full CRPS.
+#[derive(Debug, Clone)]
+pub(crate) struct ExceedanceBrier {
+    thresholds: Thresholds,
+    quadrature: Vec<f64>,
+}
+
+impl ExceedanceBrier {
+    pub(crate) fn new(thresholds: Thresholds) -> Result<Self> {
+        let levels = thresholds.values();
+        if levels.len() < 2 {
+            return Err(HessboostError::invalid_param(
+                "eval_metric",
+                "`exceedance-brier` requires at least two thresholds",
+            ));
+        }
+        if !(levels[levels.len() - 1] - levels[0]).is_finite() {
+            return Err(HessboostError::invalid_param(
+                "eval_metric",
+                "`exceedance-brier` requires a finite representable grid width",
+            ));
+        }
+        let mut quadrature = Vec::with_capacity(levels.len());
+        for j in 0..levels.len() {
+            let lo = levels[j.saturating_sub(1)];
+            let hi = levels[(j + 1).min(levels.len() - 1)];
+            // Subtract before halving: avoids overflowing a sum of large
+            // same-sign endpoints and preserves small endpoint gaps.
+            let weight = (hi - lo) * 0.5;
+            if !weight.is_finite() || weight <= 0.0 {
+                return Err(HessboostError::invalid_param(
+                    "eval_metric",
+                    "`exceedance-brier` requires positive finite representable quadrature weights",
+                ));
+            }
+            quadrature.push(weight);
+        }
+        Ok(Self {
+            thresholds,
+            quadrature,
+        })
+    }
+}
+
+impl Metric for ExceedanceBrier {
+    fn name(&self) -> &'static str {
+        "exceedance-brier"
+    }
+
+    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        let levels = self.thresholds.values();
+        nan_unless_consistent!(preds, labels, weights, levels.len());
+        // Even a finite row score can overflow when multiplied by a weight
+        // or summed over rows. Normalize first; f32 row weights sum safely
+        // in f64 for every addressable input length.
+        let weight = weights.map_or(labels.len() as f64, |ws| {
+            ws.iter().map(|&w| f64::from(w)).sum::<f64>()
+        });
+        let mut total = 0.0;
+        for (i, (row, &y)) in preds.chunks_exact(levels.len()).zip(labels).enumerate() {
+            if !y.is_finite() {
+                return f64::NAN;
+            }
+            let mut score = 0.0;
+            for ((&p, &level), &q) in row.iter().zip(levels).zip(&self.quadrature) {
+                if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+                    return f64::NAN;
+                }
+                let target = if f64::from(y) >= level { 1.0 } else { 0.0 };
+                let error = f64::from(p) - target;
+                score += q * error * error;
+            }
+            if weight > 0.0 {
+                let fraction = weights.map_or(1.0, |ws| f64::from(ws[i])) / weight;
+                total += score * fraction;
+            }
+        }
+        total
+    }
+
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
+
+    fn prediction_width(&self, _info: &MetaInfo) -> Option<usize> {
+        Some(self.thresholds.values().len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exceedance_brier_matches_interval_quadrature_and_row_weights() {
+        let grid = [-2.0, -0.5, 3.0, 8.0];
+        let m = ExceedanceBrier::new(Thresholds::new(grid).unwrap()).unwrap();
+        let predictions = [0.875, 0.75, 0.5, 0.125, 1.0, 0.875, 0.75, 0.5];
+        let labels = [-0.5, 8.0];
+        let weights = [3.0, 1.0];
+        // Independent interval-by-interval trapezoids, rather than the
+        // implementation's precomputed per-threshold weights.
+        let rows: Vec<f64> = predictions
+            .chunks_exact(grid.len())
+            .zip(labels)
+            .map(|(row, y)| {
+                grid.windows(2)
+                    .zip(row.windows(2))
+                    .map(|(ks, ps)| {
+                        let square = |p: f32, k: f64| {
+                            let target = if f64::from(y) >= k { 1.0 } else { 0.0 };
+                            (f64::from(p) - target).powi(2)
+                        };
+                        (ks[1] - ks[0]) * (square(ps[0], ks[0]) + square(ps[1], ks[1])) / 2.0
+                    })
+                    .sum()
+            })
+            .collect();
+        assert_eq!(
+            m.eval(&predictions, &labels, None),
+            f64::midpoint(rows[0], rows[1])
+        );
+        assert_eq!(
+            m.eval(&predictions, &labels, Some(&weights)),
+            (3.0 * rows[0] + rows[1]) / 4.0
+        );
+        assert_eq!(
+            m.eval(&predictions, &labels, Some(&[6.0, 2.0])),
+            m.eval(&predictions, &labels, Some(&weights))
+        );
+        // Changing label units scales the score rather than canceling
+        // out through normalization by total threshold weight.
+        let scaled = ExceedanceBrier::new(Thresholds::new(grid.map(|k| 2.0 * k)).unwrap()).unwrap();
+        assert_eq!(
+            scaled.eval(&predictions, &labels.map(|y| 2.0 * y), Some(&weights)),
+            2.0 * m.eval(&predictions, &labels, Some(&weights))
+        );
+    }
+
+    #[test]
+    fn exceedance_brier_includes_both_endpoints_and_threshold_equality() {
+        let m = ExceedanceBrier::new(Thresholds::new([0.0, 1.0, 4.0]).unwrap()).unwrap();
+        assert_eq!(m.eval(&[0.0, 0.0, 0.0], &[0.0], None), 0.5);
+        assert_eq!(m.eval(&[1.0, 0.0, 1.0], &[0.0], None), 1.5);
+        assert_eq!(m.eval(&[1.0, 1.0, 0.0], &[4.0], None), 1.5);
+        assert_eq!(m.eval(&[1.0, 1.0, 1.0], &[4.0], None), 0.0);
+    }
+
+    #[test]
+    fn finite_grid_brier_is_not_full_or_exact_interval_crps() {
+        let m = ExceedanceBrier::new(Thresholds::new([0.0, 2.0]).unwrap()).unwrap();
+        // Point forecast at 3 and observation at 4 agree everywhere on
+        // [0, 2], but their full CRPS is |3 - 4| = 1 from the omitted tail.
+        assert_eq!(m.eval(&[1.0, 1.0], &[4.0], None), 0.0);
+        // Point forecast at 0.25 and observation at 1.75 also agree at
+        // both grid points, yet exact integration inside [0, 2] is 1.5.
+        assert_eq!(m.eval(&[1.0, 0.0], &[1.75], None), 0.0);
+    }
+
+    #[test]
+    fn exceedance_brier_is_proper_at_each_threshold() {
+        let m = ExceedanceBrier::new(Thresholds::new([0.0, 1.0, 4.0]).unwrap()).unwrap();
+        let labels = [-1.0, 0.0, 2.0, 4.0];
+        let true_probabilities = [0.75, 0.5, 0.25];
+        let optimum = m.eval(&true_probabilities.repeat(4), &labels, None);
+        for j in 0..3 {
+            for delta in [-0.125, 0.125] {
+                let mut perturbed = true_probabilities;
+                perturbed[j] += delta;
+                assert!(m.eval(&perturbed.repeat(4), &labels, None) > optimum);
+            }
+        }
+    }
+
+    #[test]
+    fn exceedance_brier_averages_large_scores_without_overflow() {
+        let m = ExceedanceBrier::new(Thresholds::new([0.0, 1e308]).unwrap()).unwrap();
+        let expected = 2.5e307;
+        assert_eq!(m.eval(&[0.5, 0.5], &[0.0], Some(&[8.0])), expected);
+        assert_eq!(m.eval(&[0.5; 16], &[0.0; 8], None), expected);
+        assert_eq!(m.eval(&[0.5; 4], &[0.0; 2], Some(&[0.0, 8.0])), expected);
+    }
+
+    #[test]
+    fn exceedance_brier_preserves_f64_threshold_comparisons() {
+        let m = ExceedanceBrier::new(Thresholds::new([1.0, 1.0 + f64::EPSILON]).unwrap()).unwrap();
+        assert_eq!(m.eval(&[1.0, 0.0], &[1.0], None), 0.0);
+        assert_eq!(m.eval(&[1.0, 1.0], &[1.0], None), f64::EPSILON / 2.0);
+    }
+
+    #[test]
+    fn exceedance_brier_rejects_invalid_values_and_shapes() {
+        let m = ExceedanceBrier::new(Thresholds::new([0.0, 1.0]).unwrap()).unwrap();
+        for p in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+            assert!(m.eval(&[0.5, p], &[0.0], None).is_nan());
+        }
+        for y in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(m.eval(&[0.5, 0.5], &[y], None).is_nan());
+        }
+        assert!(m.eval(&[0.5], &[0.0], None).is_nan());
+        assert!(m.eval(&[0.5, 0.5], &[0.0], Some(&[])).is_nan());
+        assert!(!m.supports_label_matrix());
+        assert_eq!(m.prediction_width(&MetaInfo::unlabeled(1)), Some(2));
+    }
+
+    #[test]
+    fn exceedance_brier_validates_only_its_own_grid_requirements() {
+        let single = Thresholds::new([0.0]).unwrap();
+        assert!(ExceedanceBrier::new(single.clone()).is_err());
+        assert_eq!(
+            ExceedanceLogLoss::new(single).eval(&[1.0], &[0.0], None),
+            0.0
+        );
+        // Finite endpoints do not imply representable integration width.
+        let wide = Thresholds::new([-f64::MAX, f64::MAX]).unwrap();
+        assert!(ExceedanceBrier::new(wide).is_err());
+        let tiny = Thresholds::new([0.0, f64::from_bits(1)]).unwrap();
+        assert!(ExceedanceBrier::new(tiny).is_err());
+        // Large same-sign endpoints must not overflow through addition.
+        let scale = 2.0f64.powi(1022);
+        let grid = [2.0 * scale, 3.0 * scale, 3.5 * scale];
+        let m = ExceedanceBrier::new(Thresholds::new(grid).unwrap()).unwrap();
+        assert_eq!(m.eval(&[1.0, 1.0, 1.0], &[0.0], None), grid[2] - grid[0]);
+    }
 
     /// Two alphas, two rows: the denominator counts every (row, alpha) cell
     /// with its row weight.

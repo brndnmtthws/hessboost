@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 
 import hessboost
 from conftest import FRAME_TYPES, frame, numpy_codes, reorder_colors
 from hessboost import DMatrix, HessboostError
-from hessboost.conformal import ConformalizedQuantile, SplitConformal
+from hessboost.conformal import (
+    CalibrationForecast,
+    ConformalizedQuantile,
+    OnlineCalibrator,
+    SplitConformal,
+)
 
 
 def heteroscedastic(rows: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -140,3 +150,157 @@ def test_calibration_recodes_categories_and_refuses_mismatched_bands() -> None:
     )
     with pytest.raises(HessboostError, match="the data: the categories of feature 'color'"):
         band.predict_interval(DMatrix(df[test]))
+
+
+def test_online_feedback_uses_issued_threshold_and_covariates() -> None:
+    cal = OnlineCalibrator(0.5, 1.0, lags=1, covariates=1, coefficient_bound=10.0)
+    features = np.array([2.0])
+    first = cal.predict(features)
+    features[0] = 99.0
+    second = cal.predict([3.0])
+    assert (first.index, second.index, cal.pending) == (0, 1, 2)
+    assert (first.threshold, second.threshold) == (0.0, 0.0)
+    cal.update(first, 1.0)
+    np.testing.assert_array_equal(cal.coefficients, [0.0, 1.0])
+    # The issued threshold is zero; recomputing with the new state would
+    # incorrectly count this as covered and use a newly observed lag.
+    cal.update(second, 1.0)
+    np.testing.assert_array_equal(cal.coefficients, [0.0, 2.5])
+    assert (cal.intercept, cal.n_updates, cal.pending) == (1.0, 2, 0)
+    third = cal.predict([0.0])
+    cal.update(third, 2.0)
+    assert cal.predict([0.0]).threshold == 2.5
+    copied = cal.coefficients
+    copied[:] = 0.0
+    np.testing.assert_array_equal(cal.coefficients, [0.5, 2.5])
+
+
+def test_online_receipts_refuse_replay_reordering_and_foreign_calibrators() -> None:
+    cal = OnlineCalibrator(0.25, 0.5)
+    other = OnlineCalibrator(0.25, 0.5)
+    first, second = cal.predict(), cal.predict()
+    with pytest.raises(HessboostError):
+        cal.update(second, 1.0)
+    with pytest.raises(HessboostError):
+        other.update(first, 1.0)
+    with pytest.raises(hessboost.InvalidDataError):
+        cal.update(first, np.nan)
+    assert (cal.intercept, cal.n_updates, cal.pending) == (0.0, 0, 2)
+    cal.update(first, 0.0)  # A tie is covered; the next threshold can be negative.
+    assert cal.intercept == -0.125
+    with pytest.raises(HessboostError):
+        cal.update(first, 1.0)
+    cal.update(second, 1.0)
+    assert (cal.intercept, cal.n_updates, cal.pending) == (0.25, 2, 0)
+
+
+def test_online_projection_and_numerical_refusals() -> None:
+    cal = OnlineCalibrator(0.5, 2.0, covariates=2, coefficient_bound=5.0)
+    first = cal.predict([3.0, 4.0])
+    cal.update(first, 1.0)
+    second = cal.predict([3.0, 4.0])
+    cal.update(second, 100.0)
+    np.testing.assert_array_equal(cal.coefficients, [3.0, 4.0])
+    assert cal.intercept == 2.0
+    for values in ([1.0], [[1.0, 2.0]], [np.inf, 0.0]):
+        with pytest.raises(HessboostError):
+            cal.predict(values)
+    assert cal.pending == 0
+    enormous = OnlineCalibrator(0.25, np.finfo(np.float64).max, covariates=1)
+    issued = enormous.predict([np.finfo(np.float64).max])
+    with pytest.raises(HessboostError):
+        enormous.update(issued, 1.0)
+    assert enormous.intercept == 0.0
+    assert (enormous.n_updates, enormous.pending) == (0, 1)
+
+
+def test_online_numeric_and_receipt_types() -> None:
+    with pytest.raises(TypeError):
+        OnlineCalibrator("0.1", 0.1)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TypeError):
+        OnlineCalibrator(0.1, True)
+    with pytest.raises(TypeError):
+        OnlineCalibrator(0.1, 0.1, lags=1.5)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(HessboostError):
+        OnlineCalibrator(0.1, 0.1, lags=-1)
+    for alpha in (0.0, 1.0, np.nan):
+        with pytest.raises(HessboostError):
+            OnlineCalibrator(alpha, 0.1)
+    with pytest.raises(HessboostError):
+        OnlineCalibrator(0.1, 0.0)
+    with pytest.raises(TypeError):
+        CalibrationForecast()
+    cal = OnlineCalibrator(0.1, 0.1, covariates=1)
+    with pytest.raises(TypeError):
+        cal.predict(["1"])
+    with pytest.raises(TypeError):
+        cal.predict([1j])
+    with pytest.raises(TypeError):
+        cal.update(1.0, 1.0)  # ty: ignore[invalid-argument-type]
+
+
+def test_online_state_and_receipts_are_not_copied_or_pickled() -> None:
+    import copy
+    import pickle
+
+    cal = OnlineCalibrator(0.1, 0.1)
+    issued = cal.predict()
+    for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+        with pytest.raises(TypeError):
+            operation(cal)
+    with pytest.raises(TypeError):
+        pickle.dumps(issued)
+
+
+def test_online_concurrent_predictions_preserve_all_receipts() -> None:
+    cal = OnlineCalibrator(0.1, 0.01, covariates=256)
+    features = np.linspace(-1.0, 1.0, 256)
+    features.flags.writeable = False
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        forecasts = list(pool.map(lambda _: cal.predict(features), range(512)))
+    forecasts.sort(key=lambda issued: issued.index)
+    assert [issued.index for issued in forecasts] == list(range(512))
+    assert cal.pending == 512
+    for issued in forecasts:
+        cal.update(issued, 1.0)
+    assert cal.n_updates == 512
+    assert cal.pending == 0
+    assert cal.intercept == pytest.approx(512 * 0.009)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_online_fork_refuses_inherited_state_but_new_state_works() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os
+from hessboost import HessboostError
+from hessboost.conformal import OnlineCalibrator
+parent = OnlineCalibrator(0.1, 0.01)
+issued = parent.predict()
+pid = os.fork()
+if pid == 0:
+    try:
+        try:
+            parent.predict()
+        except HessboostError:
+            pass
+        else:
+            os._exit(1)
+        child = OnlineCalibrator(0.1, 0.01)
+        child.update(child.predict(), 1.0)
+        assert child.n_updates == 1
+    except BaseException:
+        os._exit(1)
+    os._exit(0)
+_, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 0
+parent.update(issued, 1.0)
+assert parent.n_updates == 1
+""",
+        ],
+        check=True,
+        timeout=30,
+    )

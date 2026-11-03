@@ -1,6 +1,6 @@
-//! Distribution-free prediction intervals by split conformal prediction.
+//! Held-out conformal intervals and online score calibration.
 //!
-//! Two calibrators wrap already-fitted models:
+//! Two held-out calibrators wrap already-fitted models:
 //!
 //! - [`SplitConformal`] turns a point regressor `f` into symmetric intervals
 //!   `[f(x) - Q, f(x) + Q]` from absolute-residual scores `|y - f(x)|`.
@@ -47,6 +47,16 @@
 //! each test point, which this API does not model; uniform weights are
 //! accepted because they do not change the quantile.
 //!
+//! # Online calibration
+//!
+//! [`online::OnlineCalibrator`] instead tracks a score quantile from
+//! sequential feedback without owning a model. Scalar and linear trackers
+//! accept forecast-time receipts when labels arrive, once and in issue
+//! order. Delayed updates use the original threshold and features. The
+//! finite-sample split-conformal guarantee above does not apply; see
+//! [`online`] for the bounded-score immediate-feedback conditions and the
+//! limits on delayed and conditional coverage.
+//!
 //! # Example
 //!
 //! ```
@@ -76,6 +86,8 @@
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Iterations, Predictions};
+
+pub mod online;
 
 /// An interval `[lower, upper]` for one row: `f32` for the conformal
 /// predictors here, `f64` for [`crate::inference`]'s intervals.

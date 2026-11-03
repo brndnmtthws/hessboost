@@ -59,7 +59,8 @@
 //!   (`dist:*` objectives).
 //! - [`metric`]: [`EvalMetric`](metric::EvalMetric) (the built-in metrics),
 //!   the `Metric` trait, `CustomMetric`.
-//! - [`conformal`]: split-conformal and conformalized-quantile intervals.
+//! - [`conformal`]: split-conformal and conformalized-quantile intervals,
+//!   and model-independent online score calibration ([`conformal::online`]).
 //! - [`inference`]: Boulevard boosting's confidence and prediction intervals
 //!   for `f(x)`, and a Boulevard EBM's shape-function bands.
 //! - [`ebm`]: explainable boosting machines' terms and shape functions.
@@ -143,7 +144,7 @@
 //! - **Metrics** ([`EvalMetric`](metric::EvalMetric), each with its own
 //!   parameters): rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
-//!   quantile, expectile, exceedance-logloss, cox/aft-nloglik,
+//!   quantile, expectile, exceedance-logloss, exceedance-brier, cox/aft-nloglik,
 //!   interval-regression-accuracy, plus
 //!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric),
 //!   reported after built-in metrics). XGBoost-compatible parameter dictionaries parse through
@@ -190,6 +191,9 @@
 //! - **Advanced & experimental methods (opt-in):**
 //!   - split-conformal and conformalized-quantile intervals with
 //!     finite-sample marginal coverage ([`conformal`]);
+//!   - scalar/linear online score calibration with forecast-time receipts
+//!     for ordered delayed feedback ([`conformal::online`]); its coverage
+//!     assumptions differ from held-out split conformal;
 //!   - Boulevard boosting (Zhou & Hooker, JMLR 2022) and its dropout
 //!     (BRAT-D) and parallel (BRAT-P) variants (Fang, Tan & Hooker, NeurIPS
 //!     2025) with CLT-based confidence intervals for `f(x)`, prediction and
@@ -301,6 +305,8 @@
 //! ### Not implemented
 //!
 //! - Distributed and external-memory training.
+//! - Serialization of online calibration state/receipts, out-of-order
+//!   calibration feedback, or general delayed/conditional coverage guarantees.
 //! - XGBoost options available at one setting only (so they are not
 //!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
 //!   setting): gblinear uses `updater = coord_descent`

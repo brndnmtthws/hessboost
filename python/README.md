@@ -363,6 +363,37 @@ cqr = ConformalizedQuantile.calibrate_outputs(band, X_cal, y_cal, alpha=0.1)
 lower, upper = cqr.predict_interval(X_test).T  # >= 90% coverage, finite-sample
 ```
 
+`OnlineCalibrator` updates a score threshold without retraining or owning a
+model. Keep each forecast receipt and the original point prediction or band
+until its label arrives; update receipts once, in issue order:
+
+```python
+from hessboost.conformal import OnlineCalibrator
+
+tracker = OnlineCalibrator(0.1, 0.05, initial_threshold=1.0, lags=1)
+point_prediction = 2.0
+issued = tracker.predict()
+lower, upper = point_prediction - issued.threshold, point_prediction + issued.threshold
+# Only when this forecast's label becomes observable:
+label = 3.5
+tracker.update(issued, abs(label - point_prediction))
+```
+
+Use `covariates=N` and `predict(features)` for forecast-time covariates in
+addition to the most recently observed score lags. Coefficients are bounded
+by `coefficient_bound` in L2 norm; the intercept is not clipped. Negative
+thresholds can shrink bands or mean an empty set. Online calibration does
+not inherit split conformal's finite-sample guarantee, and no general
+delayed-feedback or conditional coverage guarantee is claimed. State and
+receipts cannot be pickled. Concurrent calls serialize while detached from
+Python. Create a new calibrator after `fork`; inherited calibration state is
+refused before its mutex is touched.
+
+For threshold ladders, `eval_metric="exceedance-brier"` uses positive
+trapezoidal grid weights and averages by row weight. It requires at least
+two thresholds. It can drive early stopping, but is a finite-grid score,
+not full CRPS: compare every model on the same thresholds and weights.
+
 ### Distributional boosting
 
 A `dist:*` objective fits a predictive distribution per row instead of a

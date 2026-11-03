@@ -10,6 +10,7 @@ __all__ = [
     "BinnedMatrix",
     "Booster",
     "BoulevardInference",
+    "CalibrationForecast",
     "CompactModel",
     "ConformalizedQuantile",
     "CvReport",
@@ -22,6 +23,7 @@ __all__ = [
     "ForestModel",
     "ForestParams",
     "GpuModel",
+    "OnlineCalibrator",
     "OnlineModel",
     "OnlineParams",
     "OrderedTargetEncoder",
@@ -331,6 +333,38 @@ class ConformalizedQuantile:
     def alpha(self) -> float: ...
     @property
     def n_calibration(self) -> int: ...
+
+@final
+class CalibrationForecast:
+    @property
+    def threshold(self) -> float: ...
+    @property
+    def index(self) -> int: ...
+
+@final
+class OnlineCalibrator:
+    def __new__(
+        cls,
+        alpha: float,
+        learning_rate: float,
+        initial_threshold: float,
+        dimensions: tuple[int, int],
+        coefficient_bound: float,
+    ) -> OnlineCalibrator: ...
+    def predict(self, covariates: NDArray[np.float64]) -> CalibrationForecast: ...
+    def update(self, forecast: CalibrationForecast, score: float) -> None: ...
+    @property
+    def alpha(self) -> float: ...
+    @property
+    def learning_rate(self) -> float: ...
+    @property
+    def n_updates(self) -> int: ...
+    @property
+    def pending(self) -> int: ...
+    @property
+    def intercept(self) -> float: ...
+    @property
+    def coefficients(self) -> NDArray[np.float64]: ...
 
 @final
 class OnlineParams:

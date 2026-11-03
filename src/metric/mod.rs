@@ -657,6 +657,7 @@ mod tests {
             "quantile",
             "expectile",
             "exceedance-logloss",
+            "exceedance-brier",
             "cox-nloglik",
             "aft-nloglik",
             "interval-regression-accuracy",

@@ -272,6 +272,103 @@ fn flat_key_parses_only_where_it_is_read() {
 }
 
 #[test]
+fn brier_metric_round_trips_shared_thresholds_and_rejects_conflicts() {
+    let thresholds = Thresholds::new(LADDER_3).unwrap();
+    let metric = EvalMetric::ExceedanceBrier(thresholds.clone());
+    let p = TrainingParams::builder()
+        .objective(Objective::Exceedance(thresholds.clone()))
+        .eval_metric(EvalMetric::ExceedanceLogLoss(thresholds))
+        .eval_metric(metric.clone())
+        .build()
+        .unwrap();
+    assert_eq!(
+        TrainingParams::from_xgboost(p.to_xgboost().unwrap()).unwrap(),
+        p
+    );
+    // The metric, not only the exceedance objective, consumes this key.
+    let borrowed = TrainingParams::from_xgboost([
+        ("eval_metric", json!("exceedance-brier")),
+        ("exceedance_threshold", json!(LADDER_3)),
+    ])
+    .unwrap();
+    assert_eq!(borrowed.eval_metric, [metric]);
+    assert_eq!(
+        TrainingParams::from_xgboost(borrowed.to_xgboost().unwrap()).unwrap(),
+        borrowed
+    );
+    let mut conflict = p;
+    conflict.eval_metric = vec![EvalMetric::ExceedanceBrier(
+        Thresholds::new([0.0, 1.0]).unwrap(),
+    )];
+    assert_eq!(invalid_param(conflict.to_xgboost()), "eval_metric");
+    for levels in [vec![0.0], vec![-f64::MAX, f64::MAX]] {
+        let invalid = EvalMetric::ExceedanceBrier(Thresholds::new(levels).unwrap());
+        assert!(matches!(
+            invalid.build(2),
+            Err(HessboostError::InvalidParameter {
+                name: "eval_metric",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn brier_history_matches_transformed_predictions_without_changing_training() {
+    let d = data();
+    let mut p = params(&LADDER_3, MultiStrategy::OneOutputPerTree);
+    let baseline = train(&p, &d, 5).unwrap();
+    p.eval_metric = vec![EvalMetric::ExceedanceBrier(
+        Thresholds::new(LADDER_3).unwrap(),
+    )];
+    let result = Trainer::new(&p, &d, 5).eval(&d, "train").train().unwrap();
+    let scores: Vec<f64> = result
+        .history
+        .series("train", "exceedance-brier")
+        .unwrap()
+        .collect();
+    let predictions = result.model.predict(&d, Iterations::Best).unwrap();
+    assert_eq!(
+        bits(predictions.as_slice()),
+        bits(baseline.predict(&d, Iterations::Best).unwrap().as_slice())
+    );
+    let expected: f64 = predictions
+        .as_slice()
+        .as_chunks::<{ LADDER_3.len() }>()
+        .0
+        .iter()
+        .zip(d.labels().unwrap())
+        .map(|(row, &y)| {
+            LADDER_3
+                .windows(2)
+                .zip(row.windows(2))
+                .map(|(ks, ps)| {
+                    let error = |p: f32, k: f64| {
+                        let target = if f64::from(y) >= k { 1.0 } else { 0.0 };
+                        (f64::from(p) - target).powi(2)
+                    };
+                    (ks[1] - ks[0]) * (error(ps[0], ks[0]) + error(ps[1], ks[1])) / 2.0
+                })
+                .sum::<f64>()
+        })
+        .sum::<f64>()
+        / ROWS as f64;
+    assert!((scores[4] - expected).abs() < 1e-12);
+}
+
+#[test]
+fn brier_rejects_model_output_width_mismatch() {
+    let d = data();
+    let p = TrainingParams::builder()
+        .eval_metric(EvalMetric::ExceedanceBrier(
+            Thresholds::new(LADDER_3).unwrap(),
+        ))
+        .build()
+        .unwrap();
+    assert!(Trainer::new(&p, &d, 1).eval(&d, "train").train().is_err());
+}
+
+#[test]
 fn default_metric_is_exceedance_logloss() {
     let d = data();
     let result = Trainer::new(&params(&LADDER_8, MultiStrategy::OneOutputPerTree), &d, 5)

@@ -2,15 +2,131 @@
 //! the calibrator keeps alive.
 
 use crate::booster::Booster;
-use crate::data::{DMatrix, intervals_to_numpy};
-use crate::errors::DetachExt;
+use crate::data::{DMatrix, intervals_to_numpy, row_major};
+use crate::errors::{DetachExt, OrRaise, refuse};
 use hessboost::conformal;
 use hessboost::model::BoostedModel;
-use numpy::PyArrayDyn;
+use numpy::{IntoPyArray, PyArray1, PyArrayDyn, PyReadonlyArray1};
 use pyo3::prelude::*;
 use self_cell::self_cell;
 use std::sync::Arc;
+use std::sync::{Mutex, MutexGuard};
 
+/// An immutable forecast-time receipt, accepted only by its creating calibrator.
+#[pyclass(frozen, module = "hessboost._hessboost")]
+pub struct CalibrationForecast {
+    inner: conformal::online::Forecast,
+}
+
+#[pymethods]
+impl CalibrationForecast {
+    #[getter]
+    fn threshold(&self) -> f64 {
+        self.inner.threshold()
+    }
+
+    #[getter]
+    fn index(&self) -> u64 {
+        self.inner.index()
+    }
+}
+
+/// Online score calibration; mutable state is accessed only while detached.
+#[pyclass(frozen, module = "hessboost._hessboost")]
+pub struct OnlineCalibrator {
+    state: Mutex<conformal::online::OnlineCalibrator>,
+    owner: u32,
+}
+
+impl OnlineCalibrator {
+    fn state(&self) -> PyResult<MutexGuard<'_, conformal::online::OnlineCalibrator>> {
+        // No callbacks or Rayon work run under this lock. Block only while
+        // detached, but never wait on a mutex inherited across a fork.
+        if self.owner != std::process::id() {
+            return Err(refuse("create a new online calibrator in the forked child"));
+        }
+        self.state
+            .lock()
+            .map_err(|_| refuse("an earlier online calibration call panicked"))
+    }
+}
+
+#[pymethods]
+impl OnlineCalibrator {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        alpha: f64,
+        learning_rate: f64,
+        initial_threshold: f64,
+        dimensions: (usize, usize),
+        coefficient_bound: f64,
+    ) -> PyResult<Self> {
+        let state = py
+            .detach(|| {
+                let params = conformal::online::OnlineParams::builder(alpha, learning_rate)
+                    .initial_threshold(initial_threshold)
+                    .lags(dimensions.0)
+                    .covariates(dimensions.1)
+                    .coefficient_bound(coefficient_bound)
+                    .build()?;
+                conformal::online::OnlineCalibrator::new(params)
+            })
+            .or_raise()?;
+        Ok(Self {
+            state: Mutex::new(state),
+            owner: std::process::id(),
+        })
+    }
+
+    fn predict(
+        &self,
+        py: Python<'_>,
+        covariates: PyReadonlyArray1<'_, f64>,
+    ) -> PyResult<CalibrationForecast> {
+        let covariates = row_major(&covariates, "covariates")?;
+        py.detach(|| {
+            let inner = self.state()?.predict(covariates).or_raise()?;
+            Ok(CalibrationForecast { inner })
+        })
+    }
+
+    fn update(&self, py: Python<'_>, forecast: &CalibrationForecast, score: f64) -> PyResult<()> {
+        py.detach(|| self.state()?.update(&forecast.inner, score).or_raise())
+    }
+
+    #[getter]
+    fn alpha(&self, py: Python<'_>) -> PyResult<f64> {
+        py.detach(|| Ok(self.state()?.params().alpha()))
+    }
+
+    #[getter]
+    fn learning_rate(&self, py: Python<'_>) -> PyResult<f64> {
+        py.detach(|| Ok(self.state()?.params().learning_rate()))
+    }
+
+    #[getter]
+    fn n_updates(&self, py: Python<'_>) -> PyResult<u64> {
+        py.detach(|| Ok(self.state()?.n_updates()))
+    }
+
+    #[getter]
+    fn pending(&self, py: Python<'_>) -> PyResult<u64> {
+        py.detach(|| Ok(self.state()?.pending()))
+    }
+
+    #[getter]
+    fn intercept(&self, py: Python<'_>) -> PyResult<f64> {
+        py.detach(|| Ok(self.state()?.intercept()))
+    }
+
+    #[getter]
+    fn coefficients<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let values: Vec<f64> =
+            py.detach(|| Ok::<_, PyErr>(self.state()?.coefficients().to_vec()))?;
+        Ok(values.into_pyarray(py))
+    }
+}
 /// The model(s) a calibrator borrows: a band's lower and upper model, or
 /// one model twice.
 struct Models {

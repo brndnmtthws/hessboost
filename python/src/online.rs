@@ -14,9 +14,9 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 /// `(nodes_kept, subtrees_regrown, rows_refreshed)`.
 type Report = (usize, usize, usize);
 
-/// A model with its training data and update state. The one class with
-/// mutable state: an update changes it in place (copying the per-node
-/// histograms would cost more than the update) under a mutex. An update is
+/// A model with its training data and mutable update state: an update changes
+/// it in place (copying the per-node histograms would cost more than the
+/// update) under a mutex. An update is
 /// admitted on its caller's thread, before any of its work is scheduled
 /// (`updating`); while one is admitted, reading the model or data and
 /// starting another update fail fast, from any thread or the update's own

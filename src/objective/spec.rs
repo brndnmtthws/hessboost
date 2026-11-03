@@ -343,7 +343,7 @@ pub(crate) const OBJECTIVE_PARAMS: &[ObjectiveParam] = &[
     },
     ObjectiveParam {
         key: "exceedance_threshold",
-        users: "`reg:exceedance` and the `exceedance-logloss` metric",
+        users: "`reg:exceedance` and the `exceedance-logloss` / `exceedance-brier` metrics",
         read_by: |o| matches!(o, Objective::Exceedance(_)),
         value: |p| json(&p.exceedance_threshold),
     },

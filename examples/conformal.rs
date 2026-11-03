@@ -8,9 +8,11 @@
 //!
 //! Run with: `cargo run --release --example conformal`
 
+use hessboost::conformal::online::{OnlineCalibrator, OnlineParams};
 use hessboost::conformal::{ConformalizedQuantile, Interval, SplitConformal};
 use hessboost::objective::{CustomLoss, GradPair};
 use hessboost::prelude::*;
+use std::collections::VecDeque;
 
 mod common;
 use common::{lcg, normal};
@@ -118,6 +120,43 @@ fn main() -> Result<()> {
         1.0 - alpha,
         1.0 - alpha + 1.0 / (n_cal + 1.0),
         (alpha * (1.0 - alpha) / n_cal).sqrt()
+    );
+    // Online feedback is separate from the point model. The application
+    // retains the original prediction and does not update until its label
+    // arrives. This synthetic delay is not a coverage guarantee.
+    let mut online = OnlineCalibrator::new(
+        OnlineParams::builder(alpha, 0.02)
+            .initial_threshold(split.half_width())
+            .build()?,
+    )?;
+    let point_predictions = point.predict(&dtest, Iterations::Best)?;
+    let mut pending = VecDeque::new();
+    let mut covered = 0usize;
+    let mut total_width = 0.0;
+    for (&prediction, &label) in point_predictions
+        .as_slice()
+        .iter()
+        .zip(dtest.labels().unwrap())
+    {
+        let issued = online.predict(&[])?;
+        let score = (f64::from(label) - f64::from(prediction)).abs();
+        covered += usize::from(score <= issued.threshold());
+        total_width += 2.0 * issued.threshold().max(0.0);
+        pending.push_back((issued, score));
+        if pending.len() > 3 {
+            let (issued, score) = pending.pop_front().unwrap();
+            online.update(&issued, score)?;
+        }
+    }
+    for (issued, score) in pending {
+        online.update(&issued, score)?;
+    }
+    println!(
+        "online, three-label delay: coverage {:.3}, mean width {:.3}, updates {}, pending {}",
+        covered as f64 / dtest.n_rows() as f64,
+        total_width / dtest.n_rows() as f64,
+        online.n_updates(),
+        online.pending(),
     );
     Ok(())
 }

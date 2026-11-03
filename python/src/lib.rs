@@ -19,9 +19,11 @@
 //! and every class is `frozen`. Its only global state is the rayon pool
 //! native work runs on (`pool`), which a forked child rebuilds.
 //! Models and matrices are immutable and shared read-only between threads;
-//! the Python layer swaps whole objects rather than mutating them. The one
-//! exception, `OnlineModel`, updates in place under a mutex it never waits
-//! for: access during an update fails fast rather than deadlock.
+//! the Python layer swaps whole objects rather than mutating them. The
+//! exceptions, `OnlineModel` and `OnlineCalibrator`, update in place under
+//! mutexes. Online-model access during an update fails fast; short online
+//! calibration calls serialize while detached and refuse inherited state
+//! in a forked child before touching its mutex.
 
 mod booster;
 mod borrowed;
@@ -64,6 +66,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<gpu::GpuModel>()?;
     m.add_class::<conformal::SplitConformal>()?;
     m.add_class::<conformal::ConformalizedQuantile>()?;
+    m.add_class::<conformal::OnlineCalibrator>()?;
+    m.add_class::<conformal::CalibrationForecast>()?;
     m.add_class::<online::OnlineModel>()?;
     m.add_class::<online::OnlineParams>()?;
     m.add_class::<inference::BoulevardInference>()?;

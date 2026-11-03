@@ -1,5 +1,106 @@
 # Development scripts
 
+## Existing-hook synthetic experiments
+
+Run the diagnostics without Python or external datasets:
+
+```sh
+RAYON_NUM_THREADS=1 cargo run --release --example research_hooks -- small 3
+RAYON_NUM_THREADS=1 cargo run --release --example research_hooks -- large 3
+cargo run --release --example research_hooks -- calibration 3
+```
+
+The training comparisons use a seeded uniform random quantile coordinate per
+round (8/32/128 outputs), fold-local 1D k-means numeric codes against 16/256
+quantile bins, and frozen warmup-gain column sampling against all features
+and uniform sampling. Both sampled variants retain 50% and continue the same
+four-round all-feature warmup. Sampling uses dense 128-column (`small`) or
+500-column (`large`) data; other cases use 32 columns and 2% missingness.
+Prepared cuts are shared across sampling continuations, with initial binning
+and warmup costs charged once to each standalone fit. This is not EMA
+sampling, and projected Newton leaves are not exact-leaf PGB.
+
+Each variant independently chooses its best round by validation early stopping
+with patience 50. The safety cap is 1,024 rounds (`small`) or 4,096 (`large`);
+a capped search with unexpired patience is flagged and cannot qualify as a
+quality match. Timing and test labels never choose rounds. Three separate
+fixed-count refits then time precisely the chosen number of rounds without
+validation, reporting all samples and their median. Variant order rotates
+across seeds. Built-in and all-output custom quantile controls must have the
+same selected count, margin hash, and transformed-prediction hash.
+
+JSONL `benchmark` and `comparison` rows report validation/test errors, stopping
+status, fit counts, hashes, tuning time, initial cut construction, growth
+samples, and end-to-end cold-fit time. Quality-matched means both searches
+finished their patience and the variant's validation error is within 1% of the
+baseline's; it is not a claim that test quality is identical. Generation and
+evaluation are excluded from fixed-count fitting; k-means encoding of all three
+splits is included, while ordinary matrix construction is excluded.
+
+For controlled timing, finish compilation, linting and tests first, then pin
+the executable to an otherwise idle allowed CPU with `taskset -c CPU`.
+Pinning does not reserve a CPU or isolate memory bandwidth from other users.
+Do not infer speedups on a busy shared host. The harness records descriptive
+times but does not certify host exclusivity or production benefit.
+
+The `calibration` mode uses identical shifted score streams and delays 0/5
+for fixed thresholds, scalar/linear tracking, and rolling empirical quantiles
+over the latest 50/200 observed scores. Rolling thresholds use the
+`ceil((W + 1) * (1 - alpha))` order statistic. It reports coverage, width and
+score pinball loss; all settings are preselected. These synthetic comparisons
+do not establish market quality or conditional coverage.
+
+## Real hourly forecasting comparison
+
+Prepare the pinned public UCI [Bike Sharing](https://doi.org/10.24432/C5W894)
+and [Beijing PM2.5](https://doi.org/10.24432/C5JS49) archives, both CC BY 4.0:
+
+```sh
+python3 scripts/prepare_forecasting.py --output fixtures/research-real
+RAYON_NUM_THREADS=1 cargo run --release --example research_forecasting -- fixtures/research-real/bike-h1.json 32 17
+```
+
+The fixed study is both datasets × horizons 1/6 hours × quantile counts
+8/32/128 × seeds 17/29/43. Splits span 50/20/10/20% of chronological time
+for training, validation, calibration and untouched testing. Every earlier
+split purges labels available at or after the next split boundary. Only
+origin weather, exact-hour target lags and known future calendar enter the
+features. Missing numeric features get a zero plus a missingness indicator;
+label RMS scaling uses training only. Bike times use `America/New_York`,
+Beijing `Asia/Shanghai`; measurements are available after their recorded
+hour. Ambiguous Bike fall-back hours are omitted, not assigned an invented
+fold. Source hashes, clocks, boundaries and prepared-file hashes are printed
+by preparation; no datasets or fitted models are committed.
+
+The executable compares default one-output-per-tree quantiles, shared vector
+trees, a delegated custom-all control, and random-coordinate projected
+Newton trees. Common settings are depth 4, 256 bins, eta 0.1, and base score
+zero. Each strategy selects its prefix on validation with patience 50 and a
+4,096-round cap. Capped searches disqualify quality matches. The three timed
+refits are interleaved across strategies; the common bin cache, timing
+exclusions and tuning time are reported explicitly.
+
+Reports include test pinball loss over the central 5–95% quantile grid (not
+full CRPS), batch and single-row prediction latency including the common
+quantile transform, bit-identity checks, native encoded size, and tree/node
+counts. Both existing strategies are baselines. A training speedup alone is
+insufficient: prediction cost and size may grow with the projected model's
+round count. Experimental custom-loss saves require the external transform.
+
+Calibration uses original forecast bands and actual delayed label arrival:
+fixed correction, rolling windows 50/200, and scalar/linear online trackers.
+Online rates are chosen from 0.005/0.02/0.1 inside calibration, never test.
+Coverage, interval width, endpoint penalties, empty intervals and score
+pinball are all reported. This does not establish trading profit or
+conditional coverage.
+
+For a hosted run, dispatch `ci.yml` on the research branch with
+`forecasting_research=true`. Each dataset/horizon/seed gets a separate
+GitHub-hosted VM. Compilation finishes before its sequential measured runs;
+host metadata and JSON reports are uploaded for 14 days. Normal CI leaves
+this job off and uploads no research artifacts. Hosted VMs isolate this job
+from the developer machine's workloads, not from all possible cloud noise.
+
 ## Parity fixtures
 
 `gen_fixtures.py` trains **real XGBoost 3.4.2** (single thread) on deterministic

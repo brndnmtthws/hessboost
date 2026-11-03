@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      forecasting_research:
+        description: Run real-data forecasting benchmarks on isolated hosted VMs
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -622,6 +627,64 @@ jobs:
       - name: Run tests from extracted source distribution
         run: uv run --no-sync pytest -p no:cacheprovider python/tests
         working-directory: extracted/sdist
+
+  forecasting-research:
+    name: Forecast research / ${{ matrix.dataset }} / h${{ matrix.horizon }} / seed${{ matrix.seed }}
+    if: github.event_name == 'workflow_dispatch' && inputs.forecasting_research
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [bike, beijing]
+        horizon: [1, 6]
+        seed: [17, 29, 43]
+    env:
+      RAYON_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          github-cache-mode: objects
+          isolate-objects-cache: true
+          cache-links: true
+          cache-generation: forecasting-research
+      - name: Prepare chronological forecasting data
+        run: |
+          mkdir -p research-results
+          python3 scripts/prepare_forecasting.py --output fixtures/research-real \
+            > research-results/preparation.jsonl
+      - name: Build before measuring
+        run: mbx build --release --example research_forecasting
+      - name: Measure fit, prediction, size, and delayed calibration
+        env:
+          DATASET: ${{ matrix.dataset }}
+          HORIZON: ${{ matrix.horizon }}
+          SEED: ${{ matrix.seed }}
+        run: |
+          uname -a > research-results/host.txt
+          lscpu >> research-results/host.txt
+          rustc --version >> research-results/host.txt
+          cpu=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
+          echo "cpu=$cpu commit=$GITHUB_SHA" >> research-results/host.txt
+          for quantiles in 8 32 128; do
+            taskset -c "$cpu" target/release/examples/research_forecasting \
+              "fixtures/research-real/$DATASET-h$HORIZON.json" "$quantiles" "$SEED" \
+              > "research-results/$DATASET-h$HORIZON-q$quantiles-s$SEED.jsonl"
+          done
+      # Only a requested research run uploads reports; normal CI neither
+      # runs benchmarks nor uploads these artifacts. No model/binary upload.
+      - name: Upload research reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: forecast-${{ matrix.dataset }}-h${{ matrix.horizon }}-s${{ matrix.seed }}
+          path: research-results/
+          if-no-files-found: warn
+          retention-days: 14
 
   all-checks-passed:
     permissions: {}

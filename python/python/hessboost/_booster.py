@@ -996,8 +996,10 @@ class Booster(_SchemaState):
         the product), and every :meth:`save_model` format keeps it.
         Refreshing the average (``process_type="update"``, with the members'
         ``eta``) divides each refreshed leaf by it the same way, so the
-        refreshed booster is the average of the member trees refreshed
-        against the average's gradients.
+        refreshed booster is, bit for bit, the average of the member trees
+        refreshed against the average's gradients when no member is itself
+        an average. A tree averaged twice is refreshed with one division by
+        the product, which can differ in the last bit from dividing twice.
 
         Args:
             models: The members, at least one.

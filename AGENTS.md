@@ -538,8 +538,10 @@ request, not the docs.
   the member count `BoostedModel::average` divided its stored leaves by
   (product over nested averages; 1 for every other tree): predictions,
   SHAP and exports never read it, and refresh (`training/refresh.rs`)
-  divides each refreshed leaf by it as `average` divides (`divide_weight`),
-  skipping the division at 1 so other models refresh bit for bit as XGBoost.
+  divides each refreshed leaf by it as `average` divides (`divide_weight`;
+  once by the product for nested averages, which `average` rounded per
+  division, so those may differ in the last bit), skipping the division at
+  1 so other models refresh bit for bit as XGBoost.
 - **Prediction iterations:** every `BoostedModel` prediction method takes
   `iterations: impl Into<model::Iterations>`: `Iterations::Best` (through
   `best_iteration`, else all) or any Rust range of iterations (`..` is

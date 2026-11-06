@@ -13,7 +13,9 @@
 //!   `eta / num_parallel_tree`), then divided by the tree's
 //!   [`leaf_divisor`](RegTree::leaf_divisor) when it is an average's tree
 //!   (the `f32` nearest the `f64` quotient, as `BoostedModel::average`
-//!   divides a member's leaves; a divisor of `1`, every other tree's,
+//!   divides a member's leaves; once, by the product, for an average of
+//!   averages, whose stored leaves were rounded after each division, so
+//!   they can differ in the last bit; a divisor of `1`, every other tree's,
 //!   keeps the shrunk weight as is); without it the leaf values stay as
 //!   they are.
 //!
@@ -236,6 +238,32 @@ mod tests {
                 .iter()
                 .zip(averaged.nodes())
                 .any(|(p, a)| p.is_leaf() && p.leaf_value != a.leaf_value)
+        );
+    }
+
+    /// A tree of an average of averages (divided by 3, then by 3 again:
+    /// divisor 9) refreshes with one division by the product, the `f32`
+    /// nearest the refreshed weight over 9, not the stored leaves' two
+    /// rounded divisions: those can differ in the last bit.
+    #[test]
+    fn a_nested_average_divides_its_refreshed_leaves_once() {
+        let data = DMatrix::from_dense(&[0.1, 0.9], 2, 1).unwrap();
+        let gpair = [GradPair::new(-10.0, 1.0), GradPair::new(4.0, 1.0)];
+        let params = TrainingParams::builder().lambda(1.0).build().unwrap();
+        let mut plain = stump();
+        refresh_tree(&mut plain, &data, &gpair, &params, Refresh::default(), 1.0);
+        // calc_weight = -G / (H + lambda): 10 / 2 = 5 on the left.
+        assert_eq!(plain.node(1).leaf_value, 5.0);
+        let mut nested = stump();
+        nested.divide_leaves(3);
+        nested.divide_leaves(3);
+        assert_eq!(nested.leaf_divisor(), 9);
+        refresh_tree(&mut nested, &data, &gpair, &params, Refresh::default(), 1.0);
+        let once = divide_weight(5.0, 9.0);
+        assert_eq!(nested.node(1).leaf_value.to_bits(), once.to_bits());
+        assert_ne!(
+            divide_weight(divide_weight(5.0, 3.0), 3.0).to_bits(),
+            once.to_bits()
         );
     }
 

@@ -308,8 +308,13 @@ impl RegTree {
     /// Refreshing the tree (`process_type=update` with `refresh_leaf`)
     /// divides each leaf it recomputes by it too, so a refreshed average's
     /// leaves keep their `1/k` share: the leaf becomes the `f32` nearest
-    /// `calc_weight * (eta / num_parallel_tree) / leaf_divisor`, the
-    /// refreshed weight divided exactly as `average` divides a member's.
+    /// the `f64` quotient of the refreshed weight
+    /// `calc_weight * (eta / num_parallel_tree)` (an `f32`) and
+    /// `leaf_divisor`. For a tree of one average that is bit for bit how
+    /// `average` divides a member's leaf. For an average of averages it is
+    /// one division by the product, where `average` rounded after each
+    /// division, so the two can differ in the last bit (`5 / 3 / 3` rounds
+    /// to another `f32` than `5 / 9`).
     /// Predictions, SHAP, and exports never read it: the stored leaves
     /// already carry the division.
     #[inline]

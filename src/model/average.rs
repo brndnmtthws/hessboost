@@ -40,9 +40,12 @@ impl BoostedModel {
     /// `k`, so an average of averages records the product), which the native
     /// formats and the XGBoost exports keep. Refreshing the average
     /// (`process_type=update` with `refresh_leaf`) divides every refreshed
-    /// leaf by it, so the refreshed model is still an average: each tree's
-    /// leaves are the member tree's leaves refreshed with the same `eta`
-    /// against the average's gradients, divided by `k` as above.
+    /// leaf by it, so the refreshed model is still an average: for members
+    /// that are not averages themselves, each tree's leaves are bit for bit
+    /// the member tree's leaves refreshed with the same `eta` against the
+    /// average's gradients, divided by `k` as above. A tree averaged twice
+    /// is refreshed with one division by the product, which can differ in
+    /// the last bit from dividing twice (see `leaf_divisor`).
     ///
     /// Members must agree on everything their margins depend on besides
     /// the trees and intercepts: the objective with its parameters (and the

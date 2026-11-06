@@ -470,7 +470,9 @@ online.update(hessboost.DMatrix(X_new, y_new, weight=w_new), deletions=[0, 1])
 `colsample_bylevel`, `colsample_bynode`, and gradient-based sampling need
 `Exact()`. After an approximate update under `subsample`, keep the
 `OnlineModel`: `from_model` replays training's draws, which no longer match
-the samples it kept, so only `Exact()` resumes such a model.
+the samples it kept, so only `Exact()` resumes such a model (the
+approximate mode's leaf checks refuse it on a best-effort basis, not by
+recorded provenance).
 
 ### Explainable boosting machines
 

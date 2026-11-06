@@ -199,7 +199,7 @@ See [`python/README.md`](python/README.md).
 ## Caveats
 
 - Full technical details, invariants, and statistical assumptions are documented in the [API reference](https://docs.rs/hessboost).
-- Approximate in-place updates are designed for incremental shifts (under ~1% of rows); larger changes benefit from a retrain. Under row or column subsampling they keep each tree's samples rather than redrawing them (the exact mode redraws, as a retrain does); after an approximate update under `subsample`, the model cannot be resumed from a saved file in the approximate mode, and `colsample_bylevel`/`colsample_bynode` and gradient-based sampling need the exact mode.
+- Approximate in-place updates are designed for incremental shifts (under ~1% of rows); larger changes benefit from a retrain. Under row or column subsampling they keep each tree's samples rather than redrawing them (the exact mode redraws, as a retrain does); resuming a model from a saved file in the approximate mode after an approximate update under `subsample` is unsupported (refused on a best-effort basis), and `colsample_bylevel`/`colsample_bynode` and gradient-based sampling need the exact mode.
 - Asymptotic Boulevard inference and prediction intervals require specific noise and structure assumptions; see the [`inference` docs](https://docs.rs/hessboost/latest/hessboost/inference/#validation) for conditions and empirical coverage validation.
 - Online calibration accepts delayed feedback in issue order but does not claim general delayed or conditional coverage. Its state and forecast receipts are not serialized. `exceedance-brier` scores a finite threshold grid, not full CRPS.
 ## Not implemented

@@ -41,7 +41,8 @@ each tree's samples (kept rows stay in or out, an added row joins each
 tree's sample with probability ``subsample``) and refuses
 ``colsample_bylevel``, ``colsample_bynode`` and gradient-based sampling.
 :meth:`OnlineModel.from_model` replays training's draws, so after an
-approximate update under ``subsample`` only ``Exact()`` resumes the model.
+approximate update under ``subsample`` only ``Exact()`` resumes the model
+(the approximate mode's leaf checks refuse it on a best-effort basis).
 """
 
 from __future__ import annotations

@@ -82,9 +82,14 @@
 //!   trained with these parameters (and seed) on `data`: column pools
 //!   depend only on the seed and the iteration, so a model the approximate
 //!   mode updated under `colsample_bytree` alone resumes on its data, but
-//!   one updated under `subsample` does not (its kept samples are no
-//!   replay's), and is refused; keep its [`OnlineModel`], or resume it in
-//!   the exact mode. Gradient-based sampling (whose sample depends on the
+//!   one updated under `subsample` does not: its kept samples are no
+//!   replay's, so resuming it in this mode is unsupported. Keep its
+//!   [`OnlineModel`], or resume it in the exact mode. The model records no
+//!   provenance; the replay checks every tree's leaves against the replayed
+//!   samples' Newton steps, which refuses such a model (or another seed's)
+//!   whenever the samples' statistics differ, but cannot tell samples apart
+//!   whose leaves agree (constant labels, leaves within the check's `1e-3`
+//!   relative tolerance). Gradient-based sampling (whose sample depends on the
 //!   gradients an update changes) and `colsample_bylevel`/`colsample_bynode`
 //!   (drawn level by level and node by node in growth order, which a
 //!   regrown subtree does not repeat) are refused in this mode.
@@ -356,8 +361,10 @@ impl OnlineModel {
     /// whose leaves are not these parameters' Newton steps on `data`: another
     /// `eta` or `lambda`, other data or row weights, an imported LightGBM
     /// model, whose first tree carries the label average, or under
-    /// `subsample` another seed or a model the approximate mode updated; a
-    /// split outside its tree's `colsample_bytree` pool, as another seed
+    /// `subsample` another seed or a model the approximate mode updated,
+    /// as far as their leaves differ: see [Weights and
+    /// sampling](self#weights-and-sampling); a split outside its tree's
+    /// `colsample_bytree` pool, as another seed
     /// gives) and for an early-stopped model (`best_iteration` set: slice it
     /// to its best iterations first), and
     /// [`HessboostError::InvalidParameter`] for `eval_metric`s training would

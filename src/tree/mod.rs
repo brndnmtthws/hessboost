@@ -16,7 +16,7 @@ pub(crate) mod reuse;
 pub(crate) mod sampler;
 
 pub use linear::LinearLeaves;
-pub(crate) use regtree::{ChildLeaf, SplitRule, UncheckedRegTree};
+pub(crate) use regtree::{ChildLeaf, MAX_LEAF_DIVISOR, SplitRule, UncheckedRegTree, divide_weight};
 pub use regtree::{Node, RegTree};
 
 /// Output of scalar tree `t` in an ensemble of `n_outputs` outputs with

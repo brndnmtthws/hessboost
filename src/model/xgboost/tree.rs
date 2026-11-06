@@ -1,16 +1,21 @@
 //! XGBoost trees: node columns, categorical segments, vector leaves.
 
 use super::parse::{
-    column_len, float_column, integer_column, optional_float_column, scalar_f64,
+    column_len, count_param, float_column, integer_column, optional_float_column, scalar_f64,
     strict_nonnegative_integer_array,
 };
 use crate::error::{HessboostError, Result};
 use crate::model::categories::{CategoryPool, PoolError};
-use crate::tree::{Node, RegTree};
+use crate::tree::{MAX_LEAF_DIVISOR, Node, RegTree};
 use serde_json::{Value, json};
 
 /// Sentinel XGBoost writes for the parent of the root node (`kInvalidNodeId`).
 pub(super) const INVALID_NODE: i32 = i32::MAX;
+
+/// The tree key holding an average's [`RegTree::leaf_divisor`], written only
+/// when it is not 1. XGBoost ignores keys it does not define (and drops them
+/// when it saves the model again); hessboost's import reads it back.
+const LEAF_DIVISOR: &str = "hessboost_leaf_divisor";
 
 /// Encode one [`RegTree`] as XGBoost's node-indexed array bundle.
 ///
@@ -20,7 +25,8 @@ pub(super) const INVALID_NODE: i32 = i32::MAX;
 /// entry holding its leaf index, `parents[0] = -1`, and XGBoost's
 /// `DftBadValue` (the smallest subnormal) as the split condition of leaves and
 /// categorical nodes. Internal weights are not retained, so `base_weights`
-/// carries the leaf values (vectors) and zeros for internal nodes.
+/// carries the leaf values (vectors) and zeros for internal nodes. An
+/// average's tree adds its leaf divisor under [`LEAF_DIVISOR`].
 pub(super) fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
     const DFT_BAD_VALUE: f32 = f32::from_bits(1);
     let vector = tree.is_vector_leaf();
@@ -130,6 +136,9 @@ pub(super) fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Val
     });
     if vector {
         bundle["leaf_weights"] = json!(leaf_weights);
+    }
+    if tree.leaf_divisor() != 1 {
+        bundle[LEAF_DIVISOR] = json!(tree.leaf_divisor());
     }
     bundle
 }
@@ -397,7 +406,8 @@ pub(super) fn decode_nodes(
 }
 
 /// Decode one XGBoost tree object into a [`RegTree`] of a model with
-/// `n_outputs` outputs.
+/// `n_outputs` outputs. A [`LEAF_DIVISOR`] key, when present, must be a
+/// whole number from 1 to `2^53`.
 pub(super) fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
     let child = -1..=i64::from(i32::MAX);
     let n = column_len(tj, "left_children")?;
@@ -423,6 +433,12 @@ pub(super) fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
         Vec::new()
     };
     let flat_categories = categories.flatten_into(&mut nodes)?;
+    let leaf_divisor = count_param(tj, LEAF_DIVISOR, 1)? as u64;
+    if !(1..=MAX_LEAF_DIVISOR).contains(&leaf_divisor) {
+        return Err(HessboostError::model_format(format!(
+            "`{LEAF_DIVISOR}` is {leaf_divisor}, not a whole number from 1 to 2^53"
+        )));
+    }
     // Unchecked here: the model's `validate_structure` checks every tree.
     Ok(RegTree::from_parts(
         nodes,
@@ -434,5 +450,6 @@ pub(super) fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
         },
         leaf_vectors,
         None,
-    ))
+    )
+    .with_leaf_divisor(leaf_divisor))
 }

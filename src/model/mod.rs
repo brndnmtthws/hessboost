@@ -57,7 +57,10 @@
 //! first `n`, `2..5`. Leaf, contribution, and interaction ranges must start
 //! at 0 (`Best` always does). [`BoostedModel::slice`] cuts a sub-model out
 //! of an iteration range with a step, and [`BoostedModel::average`] joins
-//! compatible models (a bag of seeds) into one whose margin is their mean.
+//! compatible models (a bag of seeds) into one whose margin is their mean;
+//! its trees record the member count in
+//! [`RegTree::leaf_divisor`](crate::tree::RegTree::leaf_divisor), so a
+//! refreshed average (`process_type=update`) stays an average.
 //!
 //! A model trained with per-iteration model shrinkage
 //! ([`model_shrink`](crate::config::TrainingParams::model_shrink),
@@ -271,7 +274,12 @@
 //! round-trip in either direction. Export refuses what XGBoost cannot load:
 //! `gblinear` models, linear-leaf trees (`linear_tree`), custom objectives,
 //! the distributional `dist:*` objectives (which import refuses as well),
-//! and `reg:exceedance` (likewise).
+//! and `reg:exceedance` (likewise). An average's tree with a
+//! [`leaf_divisor`](crate::tree::RegTree::leaf_divisor) other than 1 adds
+//! it as the tree key `hessboost_leaf_divisor`, which import reads back
+//! (a whole number from 1 to `2^53`; absent means 1). XGBoost loads such a
+//! file, ignoring the key, and drops it when it saves the model again: a
+//! model re-saved by XGBoost refreshes in hessboost as a plain ensemble.
 //!
 //! ## Tree layout (`tree_info`)
 //!

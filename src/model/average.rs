@@ -2,6 +2,7 @@
 
 use super::{BoostedModel, TreeLayouts, TreeWeights};
 use crate::error::{HessboostError, Result};
+use crate::tree::{MAX_LEAF_DIVISOR, RegTree};
 
 /// Members [`BoostedModel::average`] takes at most: every count below `2^24`
 /// is a 24-bit float, which makes each leaf quotient correctly rounded.
@@ -34,6 +35,15 @@ impl BoostedModel {
     /// summed), covers (`sum_hess`) and split gains are kept, and the result
     /// has no `best_iteration`.
     ///
+    /// Every tree records the division in its
+    /// [`leaf_divisor`](crate::tree::RegTree::leaf_divisor) (multiplied by
+    /// `k`, so an average of averages records the product), which the native
+    /// formats and the XGBoost exports keep. Refreshing the average
+    /// (`process_type=update` with `refresh_leaf`) divides every refreshed
+    /// leaf by it, so the refreshed model is still an average: each tree's
+    /// leaves are the member tree's leaves refreshed with the same `eta`
+    /// against the average's gradients, divided by `k` as above.
+    ///
     /// Members must agree on everything their margins depend on besides
     /// the trees and intercepts: the objective with its parameters (and the
     /// stored `max_delta_step`), the feature count, the output, target, and
@@ -46,6 +56,7 @@ impl BoostedModel {
     ///
     /// [`HessboostError::InvalidParameter`] (`models`) for no models or
     /// `2^24` or more; [`HessboostError::IncompatibleModel`] (`average`) for
+    /// a tree whose `leaf_divisor` times `k` would exceed `2^53`, or for
     /// a member that differs from the first in any of the above, or that
     /// is not a plain tree ensemble with unit tree weights: a `gblinear`
     /// model, DART (tree weights other than `1`), model shrinkage, a
@@ -130,13 +141,26 @@ impl BoostedModel {
             }
         }
         // Exact: `MAX_MEMBERS` is far below `2^53`.
-        let count = members.len() as f64;
+        let k = members.len() as u64;
+        let count = k as f64;
+        if let Some(index) = members.iter().position(|member| {
+            member
+                .trees
+                .iter()
+                .map(RegTree::leaf_divisor)
+                .any(|divisor| divisor.checked_mul(k).is_none_or(|d| d > MAX_LEAF_DIVISOR))
+        }) {
+            return Err(HessboostError::incompatible_model(
+                "average",
+                format!("model {index} has a tree whose leaf divisor times {k} exceeds 2^53"),
+            ));
+        }
         let trees = members
             .iter()
             .flat_map(|member| member.trees.iter())
             .map(|tree| {
                 let mut tree = tree.clone();
-                tree.divide_leaves(count);
+                tree.divide_leaves(k);
                 tree
             })
             .collect();

@@ -20,6 +20,19 @@ use serde::{Deserialize, Serialize};
 /// Sentinel used in child pointers to mark "no child" (i.e. a leaf).
 const NO_CHILD: i32 = -1;
 
+/// The largest [`RegTree::leaf_divisor`]: `2^53`, below which every whole
+/// number is exact in `f64`.
+pub(crate) const MAX_LEAF_DIVISOR: u64 = 1 << 53;
+
+/// The `f32` nearest `f64::from(w) / divisor`: how [`RegTree::divide_leaves`]
+/// divides a leaf weight, and refresh a refreshed one by
+/// [`RegTree::leaf_divisor`]. For a whole `divisor` below `2^24` the `f64`
+/// quotient of two 24-bit values rounded to `f32` is correctly rounded
+/// (53 ≥ 2·24 + 2).
+pub(crate) fn divide_weight(w: f32, divisor: f64) -> f32 {
+    (f64::from(w) / divisor) as f32
+}
+
 /// A single tree node.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -149,6 +162,24 @@ pub struct RegTree {
     /// Per-leaf linear models of a `linear_tree` tree ([`LinearLeaves`]);
     /// `None` for constant-leaf trees (every tree unless `linear_tree` is on).
     linear: Option<LinearLeaves>,
+    /// The member count [`BoostedModel::average`](crate::model::BoostedModel::average)
+    /// divided the leaves by (the product over nested averages); `1` for
+    /// every other tree, and then not serialized.
+    #[serde(skip_serializing_if = "is_unit_divisor")]
+    leaf_divisor: u64,
+}
+
+/// Whether `divisor` is the `1` a tree that was never averaged has.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_unit_divisor(divisor: &u64) -> bool {
+    *divisor == 1
+}
+
+fn unit_divisor() -> u64 {
+    1
 }
 
 /// The serialized fields of a [`RegTree`] (same names and layout), before
@@ -159,7 +190,9 @@ pub struct RegTree {
 /// model requires `size_leaf_vector`
 /// ([`UncheckedRegTree::states_leaf_width`]). `linear` is required (`null`
 /// for constant leaves): nothing else marks a linear-leaf tree, so an
-/// omitted one would silently predict its constant leaf values.
+/// omitted one would silently predict its constant leaf values. An absent
+/// `leaf_divisor` is `1` (files written before it existed, and every tree
+/// that is not an average's).
 #[derive(Deserialize)]
 pub(crate) struct UncheckedRegTree {
     nodes: Vec<Node>,
@@ -170,6 +203,8 @@ pub(crate) struct UncheckedRegTree {
     // Present but nullable: a plain `Option` field would default when absent.
     #[serde(deserialize_with = "Option::deserialize")]
     linear: Option<UncheckedLinearLeaves>,
+    #[serde(default = "unit_divisor")]
+    leaf_divisor: u64,
 }
 
 impl UncheckedRegTree {
@@ -188,6 +223,7 @@ impl UncheckedRegTree {
             self.leaf_vectors,
             self.linear.map(UncheckedLinearLeaves::into_unchecked),
         )
+        .with_leaf_divisor(self.leaf_divisor)
     }
 }
 
@@ -223,6 +259,7 @@ impl RegTree {
             size_leaf_vector: 0,
             leaf_vectors: Vec::new(),
             linear: None,
+            leaf_divisor: 1,
         }
     }
 
@@ -243,13 +280,41 @@ impl RegTree {
             size_leaf_vector,
             leaf_vectors,
             linear,
+            leaf_divisor: 1,
         }
+    }
+
+    /// This tree with [`leaf_divisor`](Self::leaf_divisor) `divisor`, as a
+    /// loader stores it. The caller validates the result
+    /// ([`RegTree::is_valid_for_features`] refuses `0` and anything above
+    /// [`MAX_LEAF_DIVISOR`]).
+    pub(crate) fn with_leaf_divisor(mut self, divisor: u64) -> Self {
+        self.leaf_divisor = divisor;
+        self
     }
 
     /// The stored leaf-vector width (`0` for a scalar tree) and weights, as
     /// [`RegTree::from_parts`] takes them.
     pub(crate) fn leaf_vector_parts(&self) -> (usize, &[f32]) {
         (self.size_leaf_vector, &self.leaf_vectors)
+    }
+
+    /// The member count this tree's leaves were divided by when
+    /// [`BoostedModel::average`](crate::model::BoostedModel::average) made
+    /// it part of an average (the product of the counts when averages are
+    /// averaged again); `1` for every tree hessboost trains or imports
+    /// otherwise.
+    ///
+    /// Refreshing the tree (`process_type=update` with `refresh_leaf`)
+    /// divides each leaf it recomputes by it too, so a refreshed average's
+    /// leaves keep their `1/k` share: the leaf becomes the `f32` nearest
+    /// `calc_weight * (eta / num_parallel_tree) / leaf_divisor`, the
+    /// refreshed weight divided exactly as `average` divides a member's.
+    /// Predictions, SHAP, and exports never read it: the stored leaves
+    /// already carry the division.
+    #[inline]
+    pub fn leaf_divisor(&self) -> u64 {
+        self.leaf_divisor
     }
 
     /// Create a vector-leaf tree with `n_outputs > 1` weights per leaf and a
@@ -262,6 +327,7 @@ impl RegTree {
             size_leaf_vector: n_outputs,
             leaf_vectors: vec![0.0; n_outputs],
             linear: None,
+            leaf_divisor: 1,
         }
     }
 
@@ -351,6 +417,7 @@ impl RegTree {
 
     pub(crate) fn is_valid_for_features(&self, n_features: usize) -> bool {
         let locally_valid = !self.nodes.is_empty()
+            && (1..=MAX_LEAF_DIVISOR).contains(&self.leaf_divisor)
             && self.nodes.iter().all(|node| {
                 node.sum_hess.is_finite()
                     && node.leaf_value.is_finite()
@@ -528,13 +595,16 @@ impl RegTree {
         self.map_leaves(|w| w * factor, |v| v * f64::from(factor));
     }
 
-    /// Divide every leaf weight by `divisor` (a whole number below `2^24`),
-    /// each quotient the `f32` nearest the exact one: the `f64` quotient of
-    /// two 24-bit values rounded to `f32` is correctly rounded (53 ≥ 2·24 +
-    /// 2). Leaf linear models' `f64` intercepts and slopes are divided in
-    /// `f64`.
-    pub(crate) fn divide_leaves(&mut self, divisor: f64) {
-        self.map_leaves(|w| (f64::from(w) / divisor) as f32, |v| v / divisor);
+    /// Divide every leaf weight by `count` (a whole number below `2^24`),
+    /// each quotient [`divide_weight`]'s, the `f32` nearest the exact one,
+    /// and multiply [`leaf_divisor`](Self::leaf_divisor) by `count`, which
+    /// the caller keeps within [`MAX_LEAF_DIVISOR`]. Leaf linear models'
+    /// `f64` intercepts and slopes are divided in `f64`.
+    pub(crate) fn divide_leaves(&mut self, count: u64) {
+        // Exact: `count` is below `2^24`.
+        let divisor = count as f64;
+        self.map_leaves(|w| divide_weight(w, divisor), |v| v / divisor);
+        self.leaf_divisor *= count;
     }
 
     /// Apply `weight` to every leaf weight (vector leaves included) and

@@ -378,7 +378,12 @@ impl<'a> Trainer<'a> {
     /// recomputes the statistics, and with `refresh_leaf` the leaf values, of
     /// iteration `i`'s trees from the gradients of the already refreshed
     /// iterations. The result holds exactly the `num_boost_round` refreshed
-    /// iterations (at most the model's count), as in XGBoost. Update mode
+    /// iterations (at most the model's count), as in XGBoost. A refreshed
+    /// leaf is `calc_weight * eta / num_parallel_tree`, divided by its
+    /// tree's [`leaf_divisor`](crate::tree::RegTree::leaf_divisor): a
+    /// [`BoostedModel::average`] of `k` members refreshes with the members'
+    /// `eta` into an average again (each refreshed leaf the `1/k` share),
+    /// while every other model's divisor is 1. Update mode
     /// needs a gbtree model without DART weights or linear leaves, no
     /// monotone constraints, and no feature weights on `dtrain`; settings
     /// refresh does not read (row and column sampling, symmetric growth,

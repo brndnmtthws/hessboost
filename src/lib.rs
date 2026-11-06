@@ -157,7 +157,10 @@
 //!   ([`predict_contribs`](model::BoostedModel::predict_contribs) /
 //!   [`predict_interactions`](model::BoostedModel::predict_interactions)),
 //!   one model predicting several models' mean margin (bagging,
-//!   [`BoostedModel::average`](model::BoostedModel::average)).
+//!   [`BoostedModel::average`](model::BoostedModel::average)), which stays
+//!   an average when refreshed on new rows (`process_type=update` divides
+//!   the refreshed leaves by each tree's
+//!   [`leaf_divisor`](tree::RegTree::leaf_divisor)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON, XGBoost JSON and
 //!   UBJSON import/export ([XGBoost interchange](model#xgboost-interchange)),
 //!   LightGBM 4.x text model import

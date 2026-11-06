@@ -175,7 +175,8 @@ See [`python/README.md`](python/README.md).
   margins and per-fold round counts, whole-query ranking folds, per-fold target statistics,
   continuing a model, and refitting on all rows at the chosen round count), early stopping,
   feature importance, SHAP values and interactions, model slicing and averaging (bagged
-  models as one), and iteration ranges.
+  models as one, which stays an average when its leaves are refreshed on new rows), and
+  iteration ranges.
 - **Prediction & inspection:** Batch, in-place (borrowed rows), and allocation-free single-row
   prediction, bit-identical in every batch; what-if prediction of many variants of one row in a
   single tree walk, and margin bounds over a box of feature values; read-only model metadata
@@ -202,6 +203,9 @@ See [`python/README.md`](python/README.md).
 - Approximate in-place updates are designed for incremental shifts (under ~1% of rows); larger changes benefit from a retrain.
 - Asymptotic Boulevard inference and prediction intervals require specific noise and structure assumptions; see the [`inference` docs](https://docs.rs/hessboost/latest/hessboost/inference/#validation) for conditions and empirical coverage validation.
 - Online calibration accepts delayed feedback in issue order but does not claim general delayed or conditional coverage. Its state and forecast receipts are not serialized. `exceedance-brier` scores a finite threshold grid, not full CRPS.
+- An averaged model's trees record their member count, which hessboost's saves (native and
+  XGBoost JSON/UBJSON) keep and refresh divides refreshed leaves by; XGBoost loads such files but
+  drops the count when it saves them again, after which a refresh treats the trees as a plain sum.
 ## Not implemented
 
 - Distributed and external-memory training.

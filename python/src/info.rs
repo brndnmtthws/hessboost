@@ -43,6 +43,7 @@ struct TreeArrays {
     gain: Vec<f32>,
     linear: Option<LinearArrays>,
     depth: usize,
+    leaf_divisor: u64,
 }
 
 impl TreeArrays {
@@ -63,6 +64,7 @@ impl TreeArrays {
             gain: Vec::with_capacity(nodes.len()),
             linear: None,
             depth: tree.depth(),
+            leaf_divisor: tree.leaf_divisor(),
         };
         for (nid, node) in nodes.iter().enumerate() {
             let leaf = node.is_leaf();
@@ -133,6 +135,7 @@ impl TreeArrays {
         dict.set_item("default_left", to_numpy(py, self.default_left, &[nodes])?)?;
         dict.set_item("categorical", to_numpy(py, self.categorical, &[nodes])?)?;
         dict.set_item("depth", self.depth)?;
+        dict.set_item("leaf_divisor", self.leaf_divisor)?;
         let categories = self
             .categories
             .into_iter()

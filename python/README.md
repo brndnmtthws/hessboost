@@ -450,8 +450,27 @@ online.model.predict(X_test)  # online.data: the updated training rows
 
 The report counts kept nodes, regrown subtrees, and refreshed rows
 (`UpdateReport`); `OnlineModel.from_model` resumes from a saved `Booster`
-and its training data. Updates need `hist` depth-wise trees without sampling
-or constraints and unweighted data.
+and its training data. Updates need `hist` depth-wise trees without
+constraints.
+
+Row weights (recency or importance weights) are honored: train on a
+weighted `DMatrix` and add rows with their weights, which every update sums
+into its gradient and Hessian statistics as `hessboost.train` does. Row and
+column subsampling (`subsample`, `colsample_bytree`) work in both modes:
+`Exact()` redraws the samples over the updated rows, as a retrain with the
+same seed does, while `Approximate` keeps each tree's samples (an added row
+joins each tree's with probability `subsample`):
+
+```python
+params = {"tree_method": "hist", "max_depth": 6, "subsample": 0.5, "colsample_bytree": 0.5}
+online = OnlineModel.train(params, hessboost.DMatrix(X_train, y_train, weight=w_train), 100)
+online.update(hessboost.DMatrix(X_new, y_new, weight=w_new), deletions=[0, 1])
+```
+
+`colsample_bylevel`, `colsample_bynode`, and gradient-based sampling need
+`Exact()`. After an approximate update under `subsample`, keep the
+`OnlineModel`: `from_model` replays training's draws, which no longer match
+the samples it kept, so only `Exact()` resumes such a model.
 
 ### Explainable boosting machines
 

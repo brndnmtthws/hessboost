@@ -8,7 +8,7 @@ use std::ops::ControlFlow;
 
 use hessboost::config::{
     BalancedBagging, BoosterKind, Dart, GrowPolicy, Langevin, MaxDeltaStep, ModelShrink,
-    ModelShrinkMode, QueryBagging,
+    ModelShrinkMode, QueryBagging, SamplingMethod,
 };
 use hessboost::data::FeatureType;
 use hessboost::metric::EvalMetric;
@@ -230,8 +230,24 @@ fn unsound_configurations_and_changes_are_refused() {
     };
     let online = OnlineParams::default();
     for (params, name) in [
-        (base().subsample(0.8).build().unwrap(), "subsample"),
-        (base().colsample_bytree(0.5).build().unwrap(), "subsample"),
+        // The approximate mode keeps each tree's samples, which it cannot
+        // for gradient-based or per-level/per-node draws.
+        (
+            base()
+                .subsample(0.5)
+                .sampling_method(SamplingMethod::GradientBased)
+                .build()
+                .unwrap(),
+            "sampling_method",
+        ),
+        (
+            base().colsample_bylevel(0.5).build().unwrap(),
+            "colsample_bylevel",
+        ),
+        (
+            base().colsample_bynode(0.5).build().unwrap(),
+            "colsample_bylevel",
+        ),
         (
             base()
                 .grow_policy(GrowPolicy::LossGuide)
@@ -301,9 +317,9 @@ fn unsound_configurations_and_changes_are_refused() {
         );
     }
     assert_eq!(OnlineParams::exact().mode(), OnlineMode::Exact);
-    let weighted = data(200, 9, false).with_weights(&[1.0; 200]).unwrap();
+    let margined = data(200, 9, false).with_base_margin(&[0.0; 200]).unwrap();
     assert_eq!(
-        invalid_data(OnlineModel::train(&p, &weighted, 3, online)),
+        invalid_data(OnlineModel::train(&p, &margined, 3, online)),
         ("data", None)
     );
     let categorical = data(200, 9, false)
@@ -327,6 +343,23 @@ fn unsound_configurations_and_changes_are_refused() {
         .unwrap();
     assert_eq!(
         invalid_data(model.update(Some(&narrow), &[])),
+        ("additions", None)
+    );
+    // Added rows carry weights exactly when the training data does.
+    let weighted = data(1, 10, false).with_weights(&[2.0]).unwrap();
+    assert_eq!(
+        invalid_data(model.update(Some(&weighted), &[])),
+        ("additions", None)
+    );
+    let mut weighted_model = OnlineModel::train(
+        &p,
+        &data(200, 9, false).with_weights(&[1.0; 200]).unwrap(),
+        3,
+        online,
+    )
+    .unwrap();
+    assert_eq!(
+        invalid_data(weighted_model.update(Some(&data(1, 10, false)), &[])),
         ("additions", None)
     );
 }
@@ -891,4 +924,291 @@ fn refreshed_margins_follow_the_prediction_recurrence() {
         online.model().predict(data, ..).unwrap().as_slice(),
         expected
     );
+}
+
+/// `d` with per-row weights in `[0.2, 3)`.
+fn weighted(d: DMatrix, seed: u64) -> DMatrix {
+    let mut next = lcg(seed);
+    let weights: Vec<f32> = (0..d.n_rows()).map(|_| 0.2 + 2.8 * next()).collect();
+    d.with_weights(&weights).unwrap()
+}
+
+/// `params(objective)` with row and column sampling.
+fn sampled(objective: Objective, subsample: f64, colsample_bytree: f64) -> TrainingParams {
+    let mut p = params(objective);
+    p.subsample = subsample;
+    p.colsample_bytree = colsample_bytree;
+    p.seed = 7;
+    p
+}
+
+/// The exact mode retrains, so weighted data and every row and column
+/// sampling option (gradient-based and per-level/per-node draws included)
+/// give `train` on the updated data bit for bit: the sampling replays
+/// training's draws over the updated rows. The updated data keeps the kept
+/// rows' weights, then the added ones'.
+#[test]
+fn exact_updates_of_weighted_and_sampled_models_equal_retraining() {
+    let squared = || Objective::SquaredError(RegLoss::default());
+    let mut per_node = sampled(logistic(), 0.6, 0.75);
+    per_node.colsample_bylevel = 0.7;
+    per_node.colsample_bynode = 0.8;
+    let mut gradient_based = sampled(squared(), 0.5, 1.0);
+    gradient_based.sampling_method = SamplingMethod::GradientBased;
+    for (p, weights) in [
+        (params(squared()), true),
+        (params(logistic()), true),
+        (sampled(squared(), 0.5, 1.0), false),
+        (sampled(logistic(), 1.0, 0.5), false),
+        (sampled(squared(), 0.5, 0.5), true),
+        (per_node, true),
+        (gradient_based, true),
+    ] {
+        let binary = matches!(p.objective, Objective::BinaryLogistic(_));
+        let with = |d: DMatrix, seed| if weights { weighted(d, seed) } else { d };
+        let train_data = with(data(400, 1, binary), 31);
+        let added = with(data(30, 2, binary), 32);
+        let mut online = OnlineModel::train(&p, &train_data, 12, OnlineParams::exact()).unwrap();
+        let mut expected_weights = train_data.weights().map(<[f32]>::to_vec);
+        for (additions, deletions) in [
+            (Some(&added), vec![0, 7, 399]),
+            (None, vec![3, 4, 5]),
+            (Some(&added), Vec::new()),
+        ] {
+            online.update(additions, &deletions).unwrap();
+            let retrained = train(&p, online.data(), 12).unwrap();
+            assert_eq!(
+                online.model().encode(ModelFormat::Json).unwrap(),
+                retrained.encode(ModelFormat::Json).unwrap(),
+                "{p:?}"
+            );
+            if let Some(w) = &mut expected_weights {
+                let mut kept: Vec<f32> = (0..w.len())
+                    .filter(|r| !deletions.contains(r))
+                    .map(|r| w[r])
+                    .collect();
+                if let Some(a) = additions {
+                    kept.extend_from_slice(a.weights().unwrap());
+                }
+                *w = kept;
+            }
+            assert_eq!(
+                online.data().weights().map(<[f32]>::to_vec),
+                expected_weights
+            );
+        }
+    }
+}
+
+/// The approximate mode sums weighted gradients and Hessians, as training
+/// does with weights: its update of weighted data stays close to weighted
+/// retraining, and a row of weight 2 updates the model as two copies of it
+/// do (the sums agree up to `f64` rounding).
+#[test]
+fn approximate_updates_of_weighted_data_follow_the_weights() {
+    let p = params(Objective::SquaredError(RegLoss::default()));
+    let train_data = weighted(data(2000, 3, false), 41);
+    let test = data(1000, 4, false);
+    let added = weighted(data(40, 5, false), 42);
+    let deletions: Vec<usize> = (0..40).map(|i| i * 13).collect();
+    let mut online = OnlineModel::train(&p, &train_data, 30, OnlineParams::default()).unwrap();
+    online.update(Some(&added), &deletions).unwrap();
+    let retrained = train(&p, online.data(), 30).unwrap();
+    let (updated, reference) = (rmse(online.model(), &test), rmse(&retrained, &test));
+    assert!(
+        (updated - reference).abs() < 0.05 * reference,
+        "updated {updated} vs retrained {reference}"
+    );
+
+    let base = data(600, 43, false);
+    let unit = base.clone().with_weights(&[1.0; 600]).unwrap();
+    let row = data(1, 44, false);
+    let x: Vec<f32> = (0..COLS).map(|c| row.get(0, c).unwrap()).collect();
+    let label = row.labels().unwrap()[0];
+    let doubled = rows(&x, COLS, &[label]).with_weights(&[2.0]).unwrap();
+    let twice = rows(&[x.clone(), x].concat(), COLS, &[label, label])
+        .with_weights(&[1.0, 1.0])
+        .unwrap();
+    let tolerant = OnlineParams::approximate(1.0).unwrap();
+    let mut a = OnlineModel::train(&p, &unit, 10, tolerant).unwrap();
+    let mut b = a.clone();
+    a.update(Some(&doubled), &[0, 1]).unwrap();
+    b.update(Some(&twice), &[0, 1]).unwrap();
+    let (pa, pb) = (
+        a.model().predict(&test, ..).unwrap(),
+        b.model().predict(&test, ..).unwrap(),
+    );
+    for (u, v) in pa.as_slice().iter().zip(pb.as_slice()) {
+        assert!((u - v).abs() <= 1e-5 * (1.0 + v.abs()), "{u} vs {v}");
+    }
+    // ... and the update did change the model.
+    let before = OnlineModel::train(&p, &unit, 10, tolerant).unwrap();
+    assert_ne!(
+        before.model().predict(&test, ..).unwrap().as_slice(),
+        pa.as_slice()
+    );
+}
+
+/// The approximate mode replays a weighted model with the data's weights:
+/// the same rows without them give other Newton steps, which it refuses.
+#[test]
+fn approximate_from_model_reads_the_weights() {
+    let p = params(Objective::SquaredError(RegLoss::default()));
+    let d = data(300, 45, false);
+    let model = train(&p, &weighted(d.clone(), 46), 5).unwrap();
+    let approximate = OnlineParams::default();
+    assert!(
+        OnlineModel::from_model(model.clone(), &p, &weighted(d.clone(), 46), approximate).is_ok()
+    );
+    assert_eq!(
+        incompatible_model(OnlineModel::from_model(model, &p, &d, approximate)),
+        "model"
+    );
+}
+
+/// The approximate mode keeps every tree's row and column samples (kept
+/// rows stay in or out, added rows join with probability `subsample`,
+/// kept splits are ranked and subtrees regrown within the tree's column
+/// pool) and stays close to retraining, which draws new samples; updates
+/// ignore the thread count and an abandoned one leaves the state as it was.
+#[test]
+fn approximate_updates_of_sampled_models_stay_close_to_retraining() {
+    let squared = || Objective::SquaredError(RegLoss::default());
+    let test = data(1000, 4, false);
+    for p in [
+        sampled(squared(), 0.5, 1.0),
+        sampled(squared(), 1.0, 0.5),
+        sampled(squared(), 0.5, 0.5),
+    ] {
+        let train_data = data(2000, 3, false);
+        let added = data(40, 5, false);
+        let deletions: Vec<usize> = (0..40).map(|i| i * 13).collect();
+        let mut online = OnlineModel::train(&p, &train_data, 30, OnlineParams::default()).unwrap();
+        let original = online.model().clone();
+        let report = online.update(Some(&added), &deletions).unwrap();
+        assert!(report.nodes_kept > 0, "{p:?}");
+        let retrained = train(&p, online.data(), 30).unwrap();
+        let (updated, reference) = (rmse(online.model(), &test), rmse(&retrained, &test));
+        assert!(
+            (updated - reference).abs() < 0.05 * reference,
+            "{p:?}: updated {updated} vs retrained {reference}"
+        );
+        assert!(rmse(online.model(), &added) <= rmse(&original, &added) * 1.01);
+
+        let run = |threads| {
+            with_threads(threads, || {
+                let mut online = OnlineModel::train(
+                    &p,
+                    &weighted(data(600, 6, false), 47),
+                    10,
+                    OnlineParams::approximate(0.05).unwrap(),
+                )
+                .unwrap();
+                online
+                    .update(Some(&weighted(data(20, 7, false), 48)), &[1, 2, 3, 50])
+                    .unwrap();
+                online
+                    .update(Some(&weighted(data(20, 8, false), 49)), &[0, 9])
+                    .unwrap();
+                online.model().encode(ModelFormat::Json).unwrap()
+            })
+        };
+        assert_eq!(run(1), run(8), "{p:?}");
+
+        // An abandoned update draws nothing: later updates equal those of
+        // a copy that never tried it, added rows' samples included.
+        let mut control = online.clone();
+        let refused = online.update_with_commit(
+            Some(&added),
+            &[1, 2],
+            |_| ControlFlow::Continue(()),
+            || ControlFlow::Break(()),
+        );
+        assert_eq!(invalid_param(refused), "on_round");
+        for (additions, deletions) in [(Some(&added), vec![3, 7]), (None, vec![0, 1, 40])] {
+            assert_eq!(
+                online.update(additions, &deletions).unwrap(),
+                control.update(additions, &deletions).unwrap()
+            );
+            assert_eq!(
+                online.model().encode(ModelFormat::Json).unwrap(),
+                control.model().encode(ModelFormat::Json).unwrap(),
+                "{p:?}"
+            );
+        }
+    }
+}
+
+/// Under sampling the approximate mode replays training's draws, so
+/// `from_model` refuses a model another seed trained. Column pools depend
+/// only on the seed and iteration, so a model an approximate update
+/// produced under `colsample_bytree` alone resumes on its data (every split
+/// still inside its tree's pool); row samples also depend on the rows, so
+/// one produced under `subsample` is refused (no replay reproduces the
+/// samples it kept), as the exact mode, which retrains, accepts it.
+#[test]
+fn approximate_from_model_replays_the_samples() {
+    let squared = || Objective::SquaredError(RegLoss::default());
+    let d = data(500, 51, false);
+    let approximate = OnlineParams::default();
+    for (p, resumable) in [
+        (sampled(squared(), 1.0, 0.5), true),
+        (sampled(squared(), 0.5, 1.0), false),
+        (sampled(squared(), 0.5, 0.5), false),
+    ] {
+        let mut other_seed = p.clone();
+        other_seed.seed = 8;
+        let foreign = train(&other_seed, &d, 15).unwrap();
+        assert_eq!(
+            incompatible_model(OnlineModel::from_model(
+                foreign.clone(),
+                &p,
+                &d,
+                approximate
+            )),
+            "model",
+            "{p:?}"
+        );
+        assert!(OnlineModel::from_model(foreign, &p, &d, OnlineParams::exact()).is_ok());
+        let model = train(&p, &d, 15).unwrap();
+        let mut online = OnlineModel::from_model(model, &p, &d, approximate).unwrap();
+        online
+            .update(Some(&data(30, 52, false)), &[0, 5, 9, 200])
+            .unwrap();
+        let resumed =
+            OnlineModel::from_model(online.model().clone(), &p, online.data(), approximate);
+        if resumable {
+            assert!(resumed.is_ok(), "{p:?}");
+        } else {
+            assert_eq!(incompatible_model(resumed), "model", "{p:?}");
+        }
+        let exact = OnlineModel::from_model(
+            online.model().clone(),
+            &p,
+            online.data(),
+            OnlineParams::exact(),
+        );
+        assert!(exact.is_ok());
+    }
+}
+
+/// Weighted, sampled updates reach a tree whose sample no longer holds any
+/// row of a node (a tiny sample after deletions) without failing, and the
+/// exact and approximate modes accept the same sampled configurations.
+#[test]
+fn sampled_updates_survive_emptied_samples() {
+    let p = sampled(Objective::SquaredError(RegLoss::default()), 0.3, 0.5);
+    let d = weighted(data(40, 53, false), 54);
+    for mode in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
+        let mut online = OnlineModel::train(&p, &d, 6, mode).unwrap();
+        let deletions: Vec<usize> = (0..36).collect();
+        online.update(None, &deletions).unwrap();
+        online
+            .update(Some(&weighted(data(10, 55, false), 56)), &[0, 1])
+            .unwrap();
+        assert_eq!(online.data().n_rows(), 12);
+    }
 }

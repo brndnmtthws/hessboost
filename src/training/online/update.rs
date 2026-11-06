@@ -14,12 +14,16 @@ use crate::data::{DMatrix, LabelBounds, Labels, MetaInfo};
 use crate::error::Result;
 use crate::model::BoostedModel;
 use crate::objective::{GRADIENT_BLOCK_ROWS, GradPair, Loss};
+use crate::rng::{keyed_unit, stream_key};
 use crate::training::api::RoundEval;
 use crate::tree::builder::HistTreeBuilder;
 use crate::tree::builder::online::rank_split;
 use crate::tree::gain::{GradStats, RegParams, calc_weight};
 use crate::tree::sampler::ColumnSampler;
 use crate::tree::{ChildLeaf, RegTree, SplitRule};
+
+/// The salt of the keyed streams that draw an added row's row samples.
+const ADDED_ROW_SALT: u64 = 0x0A11_ADD5;
 
 /// One approximate update.
 pub(super) struct Incremental<'a> {
@@ -84,6 +88,11 @@ impl Incremental<'_> {
         for (m, old_tree) in self.model.trees().iter().enumerate() {
             let tc = &mut cache.trees[m];
             let old_grads = std::mem::take(&mut tc.grads);
+            let old_sample = tc.sample.take();
+            let sample = old_sample.as_deref().map(|old_sample| {
+                row_sample(self.params, m, old_sample, &new_to_old, cache.next_row)
+            });
+            let sampled = |i: usize| sample.as_ref().is_none_or(|s| s[i]);
             fresh_gradients(
                 objective.as_ref(),
                 &info,
@@ -91,8 +100,10 @@ impl Incremental<'_> {
                 &fresh,
                 &mut fresh_grads,
             );
+            // A row outside the tree's sample contributes nothing.
             let cur: Vec<GradPair> = (0..new.n_rows())
                 .map(|i| match new_to_old[i] {
+                    _ if !sampled(i) => GradPair::default(),
                     Some(r) if !fresh[i] => old_grads[r],
                     _ => fresh_grads[i],
                 })
@@ -101,15 +112,17 @@ impl Incremental<'_> {
             let mut deltas: Vec<Delta> = Vec::new();
             if let Some(gone) = &gone {
                 for (k, &r) in deleted_rows.iter().enumerate() {
-                    deltas.push(Delta {
-                        deleted: true,
-                        row: k,
-                        g: negate(stats_of(old_grads[r])),
-                        bins: row_bins(cuts, gone, k),
-                    });
+                    if old_sample.as_ref().is_none_or(|s| s[r]) {
+                        deltas.push(Delta {
+                            deleted: true,
+                            row: k,
+                            g: negate(stats_of(old_grads[r])),
+                            bins: row_bins(cuts, gone, k),
+                        });
+                    }
                 }
             }
-            for i in (0..new.n_rows()).filter(|&i| fresh[i]) {
+            for i in (0..new.n_rows()).filter(|&i| fresh[i] && sampled(i)) {
                 let g = match new_to_old[i] {
                     // Kept rows sit on the same path in the kept structure:
                     // their change is the difference.
@@ -132,12 +145,15 @@ impl Incremental<'_> {
                 gone: gone.as_ref(),
                 cur: &cur,
                 cuts,
+                sample: sample.as_deref(),
+                columns: tc.columns.as_ref(),
             };
             let old_nodes = std::mem::take(&mut tc.nodes);
             let (tree, nodes, regrown_rows) =
                 ctx.update(old_nodes, deltas, &mut ghist, &mut report);
             tc.nodes = nodes;
             tc.grads = cur;
+            tc.sample = sample;
             for (i, v) in margins.iter_mut().enumerate() {
                 if fresh[i] {
                     *v += tree.predict_row(new, i);
@@ -158,8 +174,37 @@ impl Incremental<'_> {
             }
         }
         report.rows_refreshed = fresh.iter().filter(|&&f| f).count();
+        cache.next_row += n_added as u64;
         Ok((trees, report))
     }
+}
+
+/// Tree `m`'s row sample over the new data: kept rows keep theirs (from
+/// `old_sample`, indexed by `new_to_old`); the `k`-th added row joins it
+/// with probability `subsample`, by the variate at position `next_row + k`
+/// of a stream keyed by the seed and the tree, so its draw depends on
+/// neither the other rows nor the thread count.
+fn row_sample(
+    params: &TrainingParams,
+    m: usize,
+    old_sample: &[bool],
+    new_to_old: &[Option<usize>],
+    next_row: u64,
+) -> Vec<bool> {
+    let key = stream_key(&[params.seed, ADDED_ROW_SALT, m as u64]);
+    let mut position = next_row;
+    new_to_old
+        .iter()
+        .map(|&old| {
+            old.map_or_else(
+                || {
+                    position += 1;
+                    keyed_unit(key, position - 1) < params.subsample
+                },
+                |r| old_sample[r],
+            )
+        })
+        .collect()
 }
 
 /// Write the gradient pair of every `fresh` row of `info` at `margins` to
@@ -246,6 +291,10 @@ struct TreeUpdate<'a> {
     /// The gradient every row of the new data contributes now.
     cur: &'a [GradPair],
     cuts: &'a HistCuts,
+    /// Under row sampling, the tree's sample over the new data.
+    sample: Option<&'a [bool]>,
+    /// Under `colsample_bytree`, the tree's column sampler.
+    columns: Option<&'a ColumnSampler>,
 }
 
 impl TreeUpdate<'_> {
@@ -313,6 +362,7 @@ impl TreeUpdate<'_> {
                     cache.stats,
                     self.dense,
                     (old.split_feature, old.split_cond, old.default_left),
+                    self.columns.map(ColumnSampler::tree_features).as_deref(),
                 );
                 let allowed = ((self.run.tolerance * rank.candidates as f64) as usize).max(1);
                 let keep = rank.better.is_some_and(|b| b < allowed)
@@ -346,16 +396,29 @@ impl TreeUpdate<'_> {
                 report.nodes_kept += 1;
                 continue;
             }
-            // Regrow: every row of the new data now reaching this node, with
-            // the builder on the new data's index.
+            // Regrow: every row of the new data now reaching this node (in
+            // the tree's row sample, the rows the builder grows on), with the
+            // builder on the new data's index and the tree's column sample.
             let index = match ghist {
                 Some(index) => &*index,
                 None => ghist.insert(GHistIndex::from_dmatrix(new, self.cuts.clone())),
             };
-            let rows: Vec<u32> = (0..new.n_rows())
+            let reaching: Vec<u32> = (0..new.n_rows())
                 .filter(|&i| tree.leaf_id_with(|f| new.get(i, f as usize)) == new_id)
                 .map(|i| i as u32)
                 .collect();
+            let sampled: Vec<u32>;
+            let rows = match self.sample {
+                Some(sample) => {
+                    sampled = reaching
+                        .iter()
+                        .copied()
+                        .filter(|&i| sample[i as usize])
+                        .collect();
+                    &sampled
+                }
+                None => &reaching,
+            };
             // A split node lies above `max_depth` (`check_supported` requires
             // one, `from_model` refuses deeper trees), so its subtree keeps at
             // least one level.
@@ -365,8 +428,10 @@ impl TreeUpdate<'_> {
                     .and_then(|limit| NonZeroUsize::new(limit.get().saturating_sub(depth))),
                 ..params.clone()
             };
-            let mut sampler = ColumnSampler::new(new.n_cols(), None, 1.0, 1.0, 1.0, params.seed);
-            let sub = HistTreeBuilder::new(&sub_params).build(index, self.cur, &rows, &mut sampler);
+            let mut sampler = self.columns.cloned().unwrap_or_else(|| {
+                ColumnSampler::new(new.n_cols(), None, 1.0, 1.0, 1.0, params.seed)
+            });
+            let sub = HistTreeBuilder::new(&sub_params).build(index, self.cur, rows, &mut sampler);
             graft(&mut tree, new_id, &sub, 0, self.eta);
             nodes.resize(tree.num_nodes(), NodeCache::default());
             clear_subtree(&tree, new_id, &mut nodes);
@@ -378,7 +443,9 @@ impl TreeUpdate<'_> {
                 rows.iter().map(|&i| (i as usize, self.cur[i as usize])),
                 &mut nodes,
             );
-            regrown_rows.extend(rows.iter().map(|&i| i as usize));
+            // Every row reaching the subtree, sampled or not, now has a new
+            // margin.
+            regrown_rows.extend(reaching.iter().map(|&i| i as usize));
             report.subtrees_regrown += 1;
         }
         (tree, nodes, regrown_rows)
@@ -457,5 +524,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Kept rows keep their sample membership; added rows join with
+    /// probability `subsample` by their stream position alone, so the same
+    /// position draws the same membership whatever rows are kept or deleted
+    /// around it, and positions differ across trees.
+    #[test]
+    fn added_rows_join_by_their_stream_position() {
+        let params = TrainingParams {
+            subsample: 0.3,
+            seed: 11,
+            ..TrainingParams::default()
+        };
+        let old_sample = [true, false, true, false];
+        let added = 20_000;
+        let new_to_old: Vec<Option<usize>> = [Some(3), Some(0), Some(2)]
+            .into_iter()
+            .chain(std::iter::repeat_n(None, added))
+            .collect();
+        let sample = row_sample(&params, 2, &old_sample, &new_to_old, 4);
+        assert_eq!(sample[..3], [false, true, true]);
+        let joined = sample[3..].iter().filter(|&&s| s).count();
+        assert!((5_700..6_300).contains(&joined), "{joined} of {added}");
+        // Other kept rows, the same positions: the same draws.
+        let fewer: Vec<Option<usize>> = std::iter::once(Some(1))
+            .chain(std::iter::repeat_n(None, added))
+            .collect();
+        let again = row_sample(&params, 2, &old_sample, &fewer, 4);
+        assert_eq!((again[0], &again[1..]), (false, &sample[3..]));
+        // Another tree draws otherwise.
+        assert_ne!(row_sample(&params, 3, &old_sample, &fewer, 4), again);
     }
 }

@@ -23,16 +23,25 @@ deleted rows only partially. ``Exact()`` makes every update equal
 :func:`hessboost.train` on :attr:`~OnlineModel.data` bit for bit, at about
 the cost of retraining (the answer when unlearning must be complete).
 
-Updates need a configuration whose retraining depends on the data alone:
-``gbtree`` with ``tree_method="hist"`` (or ``"auto"``), depth-wise growth
-with ``max_depth > 0``, one output, no row or column sampling, no
-constraints, no ``extra_trees``, ``path_smooth``, ``linear_tree``, quantized
-gradients or reuse penalties, CPU, and an
-objective with per-row gradients and Newton-step leaves (not ranking,
-``survival:cox``, ``reg:absoluteerror`` or ``reg:quantileerror``); the data
-has one label per row and no weights, base margins, groups, label bounds or
-feature weights, and the approximate mode needs numerical features. Anything
-else raises :class:`~hessboost.HessboostError`.
+Updates need a configuration whose retraining depends on the data and seed
+alone: ``gbtree`` with ``tree_method="hist"`` (or ``"auto"``), depth-wise
+growth with ``max_depth > 0``, one output, no constraints, no
+``extra_trees``, ``path_smooth``, ``linear_tree``, quantized gradients or
+reuse penalties, CPU, and an objective with per-row gradients and
+Newton-step leaves (not ranking, ``survival:cox``, ``reg:absoluteerror`` or
+``reg:quantileerror``); the data has one label per row and no base margins,
+groups, label bounds or feature weights, and the approximate mode needs
+numerical features. Anything else raises :class:`~hessboost.HessboostError`.
+
+Row weights are honored as :func:`hessboost.train` honors them: added rows
+carry weights exactly when the training data does. Row and column
+subsampling work in both modes: ``Exact()`` redraws the samples over the
+updated rows, as a retrain with the same seed does; ``Approximate`` keeps
+each tree's samples (kept rows stay in or out, an added row joins each
+tree's sample with probability ``subsample``) and refuses
+``colsample_bylevel``, ``colsample_bynode`` and gradient-based sampling.
+:meth:`OnlineModel.from_model` replays training's draws, so after an
+approximate update under ``subsample`` only ``Exact()`` resumes the model.
 """
 
 from __future__ import annotations
@@ -212,13 +221,16 @@ class OnlineModel:
             HessboostError: The refusals of :meth:`train`, or ``booster`` is
                 not a model ``params`` could have trained on ``dtrain``
                 (another objective or ``max_delta_step``, several outputs,
-                weighted trees, categorical trees in the :class:`Approximate` mode,
+                DART-weighted trees, categorical trees in the :class:`Approximate` mode,
                 linear leaves such as an imported LightGBM ``linear_tree``
                 model's, another feature count or other features), it was
                 early-stopped (slice it to its best iterations first), or (in
-                the :class:`Approximate` mode) its first tree's leaves are not
-                ``params``' Newton steps on ``dtrain`` (another ``eta`` or
-                ``lambda``, other data, or an imported LightGBM model).
+                the :class:`Approximate` mode) its first tree's (under
+                ``subsample``, any tree's) leaves are not ``params``' Newton
+                steps on ``dtrain`` (another ``eta`` or ``lambda``, other data
+                or weights, another seed or an approximate update's samples
+                under ``subsample``, or an imported LightGBM model) or a split
+                lies outside its tree's ``colsample_bytree`` pool.
         """
         if not isinstance(booster, Booster):
             raise TypeError(f"booster must be a Booster, got {type(booster).__name__}")
@@ -265,7 +277,8 @@ class OnlineModel:
 
         Args:
             additions: Rows to add, with labels, the training data's
-                features, and no other metadata.
+                features, weights exactly when the training data has them,
+                and no other metadata.
             deletions: Distinct row indices of :attr:`data` to delete.
             callback: Called after every updated iteration (see
                 :data:`UpdateCallback`); returning ``True`` abandons the
@@ -285,7 +298,8 @@ class OnlineModel:
         Raises:
             HessboostError: The model is being updated, or the change is
                 refused: out-of-range or repeated deletions, deleting every
-                row, additions without labels or with metadata or other
+                row, additions without labels, with weights the training data
+                lacks or without those it has, with other metadata or other
                 features, (in the :class:`Approximate` mode) added values beyond the
                 training data's bins, or updated data retraining refuses
                 (such as labels outside the objective's domain).

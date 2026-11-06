@@ -6,7 +6,8 @@
 //! deletes 200 old ones with the approximate mode (split robustness
 //! tolerance 0.1), comparing time and test error with retraining; then
 //! checks that the exact mode (`OnlineMode::Exact`) reproduces retraining
-//! bit for bit.
+//! bit for bit, also on recency-weighted rows with row and column
+//! subsampling.
 //!
 //! Run with: `cargo run --release --example online_update`
 
@@ -85,6 +86,32 @@ fn main() -> Result<()> {
     let reference = train(&params, exact.data(), rounds)?;
     println!(
         "exact mode after deleting 200 rows equals retraining bit for bit: {}",
+        exact.model().encode(ModelFormat::Json)? == reference.encode(ModelFormat::Json)?
+    );
+
+    // Recency-weighted rows and a subsampled ensemble: the approximate mode
+    // keeps each tree's row and column samples; the exact mode redraws them
+    // over the updated rows, as a retrain with the same seed does.
+    let recency: Vec<f32> = (0..data.n_rows())
+        .map(|i| 0.5 + i as f32 / data.n_rows() as f32)
+        .collect();
+    let weighted = data.clone().with_weights(&recency)?;
+    let new_weighted = new_rows.clone().with_weights(&[1.5; 200])?;
+    let mut sampled = params.clone();
+    sampled.subsample = 0.5;
+    sampled.colsample_bytree = 0.5;
+    let mut approximate = OnlineModel::train(&sampled, &weighted, rounds, OnlineParams::default())?;
+    approximate.update(Some(&new_weighted), &deletions)?;
+    let reference = train(&sampled, approximate.data(), rounds)?;
+    println!(
+        "weighted, subsampled: test RMSE updated {:.4}, retrained {:.4}",
+        rmse(approximate.model(), &test)?,
+        rmse(&reference, &test)?,
+    );
+    let mut exact = OnlineModel::train(&sampled, &weighted, rounds, OnlineParams::exact())?;
+    exact.update(Some(&new_weighted), &deletions)?;
+    println!(
+        "weighted, subsampled exact mode equals retraining bit for bit: {}",
         exact.model().encode(ModelFormat::Json)? == reference.encode(ModelFormat::Json)?
     );
     Ok(())

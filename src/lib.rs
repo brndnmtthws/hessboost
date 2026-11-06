@@ -244,7 +244,8 @@
 //!   - PerpetualBooster-style budget training: one `budget` instead of
 //!     `eta`/depth/rounds ([`training::budget`]);
 //!   - in-place row addition and deletion (incremental learning and machine
-//!     unlearning) for trained hist models, exact or approximate
+//!     unlearning) for trained hist models, exact or approximate, on
+//!     row-weighted data and under row and column subsampling
 //!     ([`training::online`]);
 //!   - distributional boosting (NGBoost / XGBoostLSS style): `dist:normal`,
 //!     `dist:lognormal`, `dist:gamma`, `dist:poisson`, `dist:negbinomial`,
@@ -310,6 +311,9 @@
 //! - Distributed and external-memory training.
 //! - Serialization of online calibration state/receipts, out-of-order
 //!   calibration feedback, or general delayed/conditional coverage guarantees.
+//! - Serialization of an [`OnlineModel`](training::online::OnlineModel)'s
+//!   update state: `from_model` rebuilds it by replay, which under
+//!   `subsample` cannot recover the row samples an approximate update kept.
 //! - XGBoost options available at one setting only (so they are not
 //!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
 //!   setting): gblinear uses `updater = coord_descent`

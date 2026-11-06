@@ -68,6 +68,48 @@ def test_approximate_updates_report_and_stay_close_to_retraining() -> None:
     assert errors[0] == pytest.approx(errors[1], rel=0.05)
 
 
+SAMPLED = {**PARAMS, "subsample": 0.5, "colsample_bytree": 0.5, "seed": 3}
+
+
+def weighted(rows: int, seed: int) -> tuple[DMatrix, NDArray[np.float64]]:
+    x, y = regression(rows=rows, seed=seed)
+    w = np.random.default_rng(seed + 100).uniform(0.2, 3.0, rows)
+    return DMatrix(x, y, weight=w), w
+
+
+@pytest.mark.parametrize("params", [PARAMS, SAMPLED, {**SAMPLED, "colsample_bynode": 0.7}])
+def test_exact_updates_of_weighted_sampled_data_equal_training(params: dict[str, object]) -> None:
+    """The exact mode retrains, so weights and row/column sampling (training's
+    draws, replayed on the updated rows) give ``hessboost.train`` bit for bit."""
+    (dtrain, w), (added, w_added) = weighted(300, 1), weighted(20, 2)
+    online = OnlineModel.train(params, dtrain, ROUNDS, mode=Exact())
+    online.update(added, deletions=[0, 7, 299])
+    retrained = hessboost.train(params, online.data, ROUNDS)
+    assert online.model.save_raw() == retrained.save_raw()
+    kept = np.delete(w, [0, 7, 299])
+    expected = np.concatenate([kept, w_added]).astype(np.float32)
+    np.testing.assert_array_equal(online.data.get_weight(), expected)
+
+
+def test_approximate_updates_of_weighted_sampled_data_stay_close_to_retraining() -> None:
+    """The approximate mode sums weighted gradients and keeps every tree's
+    row and column samples; it stays close to retraining."""
+    (dtrain, _), (added, _) = weighted(2000, 3), weighted(40, 4)
+    x_test, y_test = regression(rows=400, seed=5)
+    online = OnlineModel.train(SAMPLED, dtrain, ROUNDS)
+    report = online.update(added, deletions=list(range(0, 400, 10)))
+    assert report.nodes_kept > 0
+    retrained = hessboost.train(SAMPLED, online.data, ROUNDS)
+    errors = [rmse(m.predict(x_test), y_test) for m in (online.model, retrained)]
+    assert errors[0] == pytest.approx(errors[1], rel=0.05)
+    # Its kept row samples are no replay of training's draws on the updated
+    # rows, so the approximate mode does not resume the updated model; the
+    # exact mode does.
+    with pytest.raises(HessboostError, match="model"):
+        OnlineModel.from_model(online.model, SAMPLED, online.data)
+    OnlineModel.from_model(online.model, SAMPLED, online.data, Exact())
+
+
 def test_the_model_is_a_snapshot() -> None:
     online = OnlineModel.train(PARAMS, binary(200, 2), ROUNDS)
     before = online.model
@@ -339,7 +381,10 @@ def test_unsupported_configurations_and_changes_are_refused() -> None:
     x, y = regression(rows=200)
     dtrain = DMatrix(x, y, feature_names=[f"f{i}" for i in range(5)])
     refused: list[dict[str, object]] = [
-        {"subsample": 0.8},
+        # The approximate mode keeps each tree's samples, which it cannot for
+        # gradient-based or per-level/per-node draws.
+        {"subsample": 0.5, "sampling_method": "gradient_based"},
+        {"colsample_bynode": 0.5},
         {"booster": "dart"},
         {"objective": "reg:absoluteerror"},
     ]
@@ -349,8 +394,11 @@ def test_unsupported_configurations_and_changes_are_refused() -> None:
     for tolerance in (0.0, -0.1, 1.5, float("nan")):
         with pytest.raises(HessboostError, match="tolerance"):
             OnlineModel.train(PARAMS, dtrain, 3, Approximate(tolerance))
+    with pytest.raises(HessboostError, match="base margins"):
+        OnlineModel.train(PARAMS, DMatrix(x, y, base_margin=np.zeros(200)), 3)
+    weighted = OnlineModel.train(PARAMS, DMatrix(x, y, weight=np.ones(200)), 3)
     with pytest.raises(HessboostError, match="weights"):
-        OnlineModel.train(PARAMS, DMatrix(x, y, weight=np.ones(200)), 3)
+        weighted.update(DMatrix(x[:2], y[:2]))
     online = OnlineModel.train(PARAMS, dtrain, 3)
     before = state(online)
     for deletions in ([200], [4, 4], list(range(200)), [-1]):

@@ -47,31 +47,79 @@
 //! fraction of rows changed and with `σ`, in exchange for touching only the
 //! changed rows and the regrown subtrees.
 //!
+//! # Weights and sampling
+//!
+//! Row weights ([`DMatrix::with_weights`], e.g. recency or importance
+//! weights) are honored as training honors them: the objective scales each
+//! row's gradient and Hessian by its weight, so every node statistic and
+//! histogram an update adds, subtracts or regrows from is a weighted sum.
+//! When the training data has weights, added rows must carry them too (and
+//! must not otherwise); [`OnlineModel::data`] keeps the kept rows' weights
+//! followed by the added rows'.
+//!
+//! Row sampling (`subsample`) and column sampling (`colsample_*`) draw from
+//! the seed sequentially: the row sample is one draw per row in row order,
+//! so adding or deleting a row shifts every later draw, and under
+//! `subsample` the tree's column pool comes after the row draws.
+//!
+//! - The exact mode retrains, which redraws every sample over the updated
+//!   rows from the same seed: the result is [`train`](super::train) on
+//!   [`OnlineModel::data`] bit for bit, with any sampling option
+//!   (`sampling_method = gradient_based` and `colsample_bylevel`/`bynode`
+//!   included). Kept rows' samples therefore generally change, as they
+//!   would in a retrain.
+//! - The approximate mode never resamples: it keeps each tree's samples and
+//!   only refreshes its statistics. Kept rows stay in or out of each tree's
+//!   row sample, deleted rows leave it, and each added row joins each
+//!   tree's sample with probability `subsample` (a draw keyed by the seed,
+//!   the tree, and the row's position in the update history, so it depends
+//!   on neither the other rows nor the thread count); rows outside a tree's
+//!   sample still get its leaf values in their margins. A kept split is
+//!   ranked among the candidates of its tree's `colsample_bytree` pool
+//!   only, and a regrown subtree is grown on the sampled rows reaching it
+//!   within that pool. [`OnlineModel::from_model`] rebuilds the samples by
+//!   replaying training's draws over `data`, so it resumes a model
+//!   trained with these parameters (and seed) on `data`: column pools
+//!   depend only on the seed and the iteration, so a model the approximate
+//!   mode updated under `colsample_bytree` alone resumes on its data, but
+//!   one updated under `subsample` does not: its kept samples are no
+//!   replay's, so resuming it in this mode is unsupported. Keep its
+//!   [`OnlineModel`], or resume it in the exact mode. The model records no
+//!   provenance; the replay checks every tree's leaves against the replayed
+//!   samples' Newton steps, which refuses such a model (or another seed's)
+//!   whenever the samples' statistics differ, but cannot tell samples apart
+//!   whose leaves agree (constant labels, leaves within the check's `1e-3`
+//!   relative tolerance). Gradient-based sampling (whose sample depends on the
+//!   gradients an update changes) and `colsample_bylevel`/`colsample_bynode`
+//!   (drawn level by level and node by node in growth order, which a
+//!   regrown subtree does not repeat) are refused in this mode.
+//!
 //! # Supported configurations
 //!
 //! Updating is sound only where retraining the same parameters on the
-//! updated data is deterministic in the data alone and every node's
+//! updated data is deterministic in the data and seed and every node's
 //! subtree depends on the node's rows only: `gbtree` with `tree_method =
 //! hist` (or `auto`), depth-wise growth with a positive `max_depth` and no
-//! `max_leaves`, one output, `num_parallel_tree = 1`, no row or column
-//! sampling (a retrain draws its samples sequentially over the rows, so
-//! they would change with any added or deleted row), no monotone or
-//! interaction constraints, none of the opt-in split options
-//! (`extra_trees`, `path_smooth`, `linear_tree`, quantized gradients, reuse
-//! penalties), CPU, and a built-in objective whose gradients are per row
-//! and whose leaves are plain Newton steps (not ranking, `survival:cox`,
-//! `reg:absoluteerror`, `reg:quantileerror`, or a custom loss). The data
-//! may not carry weights, base margins, groups, label bounds, or feature
-//! weights, and the approximate mode needs numerical features. Everything
-//! else is refused.
+//! `max_leaves`, one output, `num_parallel_tree = 1`, row and column
+//! sampling as [above](self#weights-and-sampling) (not class-balanced or
+//! query bagging), no monotone or interaction constraints, none of the
+//! opt-in split options (`extra_trees`, `path_smooth`, `linear_tree`,
+//! quantized gradients, reuse penalties), CPU, and a built-in objective
+//! whose gradients are per row and whose leaves are plain Newton steps (not
+//! ranking, `survival:cox`, `reg:absoluteerror`, `reg:quantileerror`, or a
+//! custom loss). The data may carry weights but not base margins, groups,
+//! label bounds, or feature weights, and the approximate mode needs
+//! numerical features. Everything else is refused.
 //!
 //! # Memory
 //!
-//! The approximate mode caches, per tree, one gradient pair per row and one
-//! histogram (`total_bins` pairs of `f64`) per internal node: `trees × (8 ·
-//! rows + 16 · total_bins · internal nodes)` bytes. An update works on a
-//! copy of it, swapped in on success, so an abandoned update restores the
-//! exact state it started from; the copy briefly doubles that memory.
+//! The approximate mode caches, per tree, one gradient pair per row (and,
+//! under `subsample`, one sample flag per row) and one histogram
+//! (`total_bins` pairs of `f64`) per internal node: `trees × (8 · rows + 16
+//! · total_bins · internal nodes)` bytes, plus `trees × rows` under
+//! `subsample`. An update works on a copy of it, swapped in on success, so
+//! an abandoned update restores the exact state it started from (added
+//! rows' sample draws included); the copy briefly doubles that memory.
 //!
 //! # Accuracy and speed
 //!
@@ -297,23 +345,30 @@ impl OnlineModel {
 
     /// Resume from a `model` trained with `params` on `data` (for example one
     /// loaded from a file), rebuilding the update state by replaying its
-    /// trees over `data`.
+    /// trees over `data` (and, under sampling, training's draws: see
+    /// [Weights and sampling](self#weights-and-sampling)).
     ///
     /// # Errors
     ///
     /// The refusals of [`Self::train`],
     /// [`HessboostError::IncompatibleModel`] (`model`) for a model that
     /// `params` could not have trained (another objective or
-    /// `max_delta_step`, several outputs, weighted trees, categorical trees
-    /// in the approximate mode, linear leaves, a `gblinear`, `boulevard`, or
-    /// `ebm` booster, for example from an imported LightGBM `linear_tree`
-    /// model, model shrinkage, a different feature count, or, in the
-    /// approximate mode, a first tree whose leaves are not these parameters'
-    /// Newton steps on `data`: another `eta` or `lambda`, other data, or an
-    /// imported LightGBM model, whose first tree carries the label average)
-    /// and for an early-stopped model (`best_iteration` set: slice it to its
-    /// best iterations first), and [`HessboostError::InvalidParameter`] for
-    /// `eval_metric`s training would refuse.
+    /// `max_delta_step`, several outputs, DART-weighted trees, categorical
+    /// trees in the approximate mode, linear leaves, a `gblinear`,
+    /// `boulevard`, or `ebm` booster, for example from an imported LightGBM
+    /// `linear_tree` model, model shrinkage, a different feature count, or,
+    /// in the approximate mode, a first tree (under `subsample`, any tree)
+    /// whose leaves are not these parameters' Newton steps on `data`: another
+    /// `eta` or `lambda`, other data or row weights, an imported LightGBM
+    /// model, whose first tree carries the label average, or under
+    /// `subsample` another seed or a model the approximate mode updated,
+    /// as far as their leaves differ: see [Weights and
+    /// sampling](self#weights-and-sampling); a split outside its tree's
+    /// `colsample_bytree` pool, as another seed
+    /// gives) and for an early-stopped model (`best_iteration` set: slice it
+    /// to its best iterations first), and
+    /// [`HessboostError::InvalidParameter`] for `eval_metric`s training would
+    /// refuse.
     pub fn from_model(
         model: BoostedModel,
         params: &TrainingParams,
@@ -353,8 +408,8 @@ impl OnlineModel {
         {
             return Err(HessboostError::incompatible_model(
                 "model",
-                "not a single-output, unweighted, unshrunk, numeric gbtree model (not \
-                 Boulevard or EBM) with constant leaves of these parameters and data",
+                "not a single-output, unshrunk, numeric gbtree model (not Boulevard or EBM) \
+                 with unit tree weights and constant leaves of these parameters and data",
             ));
         }
         if let Some(best) = model.best_iteration() {
@@ -386,22 +441,24 @@ impl OnlineModel {
         })
     }
 
-    /// Add the rows of `additions` (features and labels, like the training
-    /// data) and delete the training rows `deletions` (indices into
-    /// [`Self::data`]), then update the model. The new data is the kept rows
-    /// in their order followed by the added ones.
+    /// Add the rows of `additions` (features and labels, and weights when the
+    /// training data has them) and delete the training rows `deletions`
+    /// (indices into [`Self::data`]), then update the model. The new data is
+    /// the kept rows in their order followed by the added ones.
     ///
     /// # Errors
     ///
     /// [`HessboostError::InvalidParameter`] (`deletions`) for out-of-range
     /// or repeated deletions or deleting every row;
     /// [`HessboostError::InvalidData`] (`additions`) for additions without
-    /// labels or with metadata, or of another shape, and (approximate mode)
-    /// added values beyond the training data's bins; whatever training refuses on the
-    /// updated data (such as labels outside the objective's domain), checked
-    /// before anything changes; [`HessboostError::ModelFormat`] for an
-    /// update whose arithmetic overflows `f32`, as training refuses such a
-    /// model; the errors of training.
+    /// labels, with weights when the training data has none or without them
+    /// when it has, with other metadata, or of another shape, and
+    /// (approximate mode) added values beyond the training data's bins;
+    /// whatever training refuses on the updated data (such as labels outside
+    /// the objective's domain or negative weights), checked before anything
+    /// changes; [`HessboostError::ModelFormat`] for an update whose
+    /// arithmetic overflows `f32`, as training refuses such a model; the
+    /// errors of training.
     pub fn update(
         &mut self,
         additions: Option<&DMatrix>,
@@ -570,6 +627,12 @@ impl OnlineModel {
                     "added rows need the training data's columns and feature types",
                 ));
             }
+            if a.weights().is_some() != self.data.weights().is_some() {
+                return Err(HessboostError::invalid_data(
+                    "additions",
+                    "added rows need weights exactly when the training data has them",
+                ));
+            }
             if let Some(cache) = &self.cache {
                 check_within_cuts(&cache.cuts, a)?;
             }
@@ -657,16 +720,26 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
              depend on its rows only)",
         );
     }
-    if params.subsample != 1.0
-        || params.sampling_method != SamplingMethod::Uniform
-        || params.colsample_bytree != 1.0
-        || params.colsample_bylevel != 1.0
-        || params.colsample_bynode != 1.0
-    {
-        return refuse(
-            "subsample",
-            "no row or column sampling (a retrain would draw different samples)",
-        );
+    // The exact mode retrains, which replays training's draws on the
+    // updated rows; the approximate mode keeps each tree's samples, which
+    // it can only for samples drawn once per tree, independently of the
+    // gradients.
+    if online.is_approximate() {
+        if params.sampling_method != SamplingMethod::Uniform {
+            return refuse(
+                "sampling_method",
+                "uniform row sampling in the approximate mode (gradient-based samples depend on \
+                 the gradients an update changes; the exact mode accepts them)",
+            );
+        }
+        if params.colsample_bylevel != 1.0 || params.colsample_bynode != 1.0 {
+            return refuse(
+                "colsample_bylevel",
+                "no colsample_bylevel or colsample_bynode in the approximate mode (they draw per \
+                 level and node in growth order, which a regrown subtree does not repeat; the \
+                 exact mode accepts them, and colsample_bytree in either mode)",
+            );
+        }
     }
     if params.num_parallel_tree != 1 {
         return refuse("num_parallel_tree", "num_parallel_tree = 1");
@@ -715,6 +788,11 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         tree_method: params.tree_method,
         max_bin: params.max_bin,
         multi_strategy: params.multi_strategy,
+        subsample: params.subsample,
+        sampling_method: params.sampling_method,
+        colsample_bytree: params.colsample_bytree,
+        colsample_bylevel: params.colsample_bylevel,
+        colsample_bynode: params.colsample_bynode,
         ..TrainingParams::default()
     };
     params.refuse_changes_from(
@@ -771,7 +849,8 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
     validate_training_data(params, data)
 }
 
-/// Labels and none of the metadata updates cannot honor.
+/// Labels and none of the metadata updates cannot honor (weights are
+/// honored).
 fn check_data(data: &DMatrix, name: &'static str) -> Result<()> {
     if data.labels().is_none() || data.n_targets() != 1 {
         return Err(HessboostError::invalid_data(
@@ -779,23 +858,23 @@ fn check_data(data: &DMatrix, name: &'static str) -> Result<()> {
             "in-place updates need one label per row",
         ));
     }
-    if data.weights().is_some()
-        || data.base_margin().is_some()
+    if data.base_margin().is_some()
         || data.group().is_some()
         || data.label_lower_bound().is_some()
         || data.feature_weights().is_some()
     {
         return Err(HessboostError::invalid_data(
             name,
-            "in-place updates do not support weights, base margins, groups, label bounds, or \
-             feature weights",
+            "in-place updates do not support base margins, groups, label bounds, or feature \
+             weights",
         ));
     }
     Ok(())
 }
 
 /// The rows of `data` not in `deleted`, then those of `additions`: dense
-/// (missing as NaN) when `data` is dense, else compressed sparse rows.
+/// (missing as NaN) when `data` is dense, else compressed sparse rows, with
+/// their labels and, when `data` has them (and so `additions`), weights.
 fn compose(data: &DMatrix, deleted: &[bool], additions: Option<&DMatrix>) -> Result<DMatrix> {
     let p = data.n_cols();
     let rows = deleted
@@ -808,16 +887,24 @@ fn compose(data: &DMatrix, deleted: &[bool], additions: Option<&DMatrix>) -> Res
                 .into_iter()
                 .flat_map(|a| (0..a.n_rows()).map(move |r| (a, r))),
         );
-    let mut labels = Vec::new();
+    let weighted = data.weights().is_some();
+    let (mut labels, mut weights) = (Vec::new(), Vec::new());
+    let mut row_meta = |m: &DMatrix, row: usize| {
+        labels.push(m.labels().map_or(0.0, |l| l[row]));
+        if weighted {
+            weights.push(m.weights().map_or(1.0, |w| w[row]));
+        }
+    };
     let mut out = if data.dense_rows().is_some() {
         let mut values = Vec::new();
+        let mut n = 0;
         for (m, row) in rows {
             let start = values.len();
             values.resize(start + p, f32::NAN);
             m.for_row_entry(row, |c, v| values[start + c as usize] = v);
-            labels.push(m.labels().map_or(0.0, |l| l[row]));
+            row_meta(m, row);
+            n += 1;
         }
-        let n = labels.len();
         DMatrix::from_dense_vec(values, n, p)?
     } else {
         let mut indptr = vec![0usize];
@@ -828,14 +915,18 @@ fn compose(data: &DMatrix, deleted: &[bool], additions: Option<&DMatrix>) -> Res
                 values.push(v);
             });
             indptr.push(values.len());
-            labels.push(m.labels().map_or(0.0, |l| l[row]));
+            row_meta(m, row);
         }
         DMatrix::from_csr(indptr, indices, values, p)?
     };
     if data.feature_types().contains(&FeatureType::Categorical) {
         out = out.with_feature_types(data.feature_types())?;
     }
-    out.with_labels(&labels)
+    out = out.with_labels(&labels)?;
+    if weighted {
+        out = out.with_weights(&weights)?;
+    }
+    Ok(out)
 }
 
 /// Whether `tree` splits a node at depth `max_depth` or deeper (`None`: no

@@ -26,7 +26,9 @@ pub(crate) struct SplitRank {
 /// numeric candidate of `hist` (the node's per-bin sums over `cuts`, total
 /// `total`), scored with the builder's [`SplitScorer`] (no monotone bounds).
 /// `dense` is the index's density, which decides whether missing-value
-/// directions are enumerated.
+/// directions are enumerated. `features`, when set, is the tree's column
+/// sample (ascending): only its features are candidates, as only they were
+/// when the tree was grown.
 pub(crate) fn rank_split(
     reg: &RegParams,
     cuts: &HistCuts,
@@ -34,6 +36,7 @@ pub(crate) fn rank_split(
     total: GradStats,
     dense: bool,
     (feature, split_cond, default_left): (u32, f32, bool),
+    features: Option<&[u32]>,
 ) -> SplitRank {
     let bounds = Bounds::default();
     let scorer = SplitScorer {
@@ -47,6 +50,9 @@ pub(crate) fn rank_split(
     for f in 0..cuts.n_features() {
         let (fs, fe) = cuts.feature_bins(f);
         if cuts.is_categorical(f) || fe <= fs + 1 {
+            continue;
+        }
+        if features.is_some_and(|pool| pool.binary_search(&(f as u32)).is_err()) {
             continue;
         }
         for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {

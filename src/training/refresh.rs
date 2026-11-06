@@ -10,7 +10,14 @@
 //! * `split_gain` = `gain(left) + gain(right) - gain(node)` for internal nodes,
 //! * with `refresh_leaf`, a leaf value `calc_weight(stats) * learning_rate`
 //!   (the node's base weight, shrunk by the per-tree learning rate
-//!   `eta / num_parallel_tree`); without it the leaf values stay as they are.
+//!   `eta / num_parallel_tree`), then divided by the tree's
+//!   [`leaf_divisor`](RegTree::leaf_divisor) when it is an average's tree
+//!   (the `f32` nearest the `f64` quotient, as `BoostedModel::average`
+//!   divides a member's leaves; once, by the product, for an average of
+//!   averages, whose stored leaves were rounded after each division, so
+//!   they can differ in the last bit; a divisor of `1`, every other tree's,
+//!   keeps the shrunk weight as is); without it the leaf values stay as
+//!   they are.
 //!
 //! No rows are subsampled. Unlike split finding, XGBoost's refresh applies
 //! no `min_child_weight` floor: a node with any positive Hessian gets its
@@ -19,8 +26,8 @@
 use crate::config::{Refresh, TrainingParams};
 use crate::data::DMatrix;
 use crate::objective::GradPair;
-use crate::tree::RegTree;
 use crate::tree::gain::{GradStats, RegParams, calc_gain, calc_weight};
+use crate::tree::{RegTree, divide_weight};
 use rayon::prelude::*;
 
 /// Rows per statistics block. Blocks are reduced in index order, so the sums
@@ -34,8 +41,8 @@ const REFRESH_BATCH_PER_THREAD: usize = 4;
 
 /// Refresh `tree` in place from the per-row gradients `gpair` (one pair per
 /// row of `data`) with `params`' regularization and `refresh_leaf`, shrinking
-/// refreshed leaves by `learning_rate`. See the module docs for the
-/// recomputed quantities.
+/// refreshed leaves by `learning_rate` and dividing them by the tree's leaf
+/// divisor. See the module docs for the recomputed quantities.
 pub(super) fn refresh_tree(
     tree: &mut RegTree,
     data: &DMatrix,
@@ -49,13 +56,23 @@ pub(super) fn refresh_tree(
         ..RegParams::from_params(params)
     };
     let stats = node_stats(tree, data, gpair);
+    // Exact: a divisor is at most `2^53`.
+    let divisor = tree.leaf_divisor() as f64;
     for nid in 0..tree.num_nodes() {
         let node = *tree.node(nid);
         tree.set_sum_hess(nid, stats[nid].hess as f32);
         if node.is_leaf() {
             if refresh.refresh_leaf() {
                 let base_weight = calc_weight(stats[nid], reg) as f32;
-                tree.set_leaf_value(nid, base_weight * learning_rate);
+                let weight = base_weight * learning_rate;
+                tree.set_leaf_value(
+                    nid,
+                    if tree.leaf_divisor() == 1 {
+                        weight
+                    } else {
+                        divide_weight(weight, divisor)
+                    },
+                );
             }
         } else {
             let gain = calc_gain(stats[node.left as usize], reg)
@@ -183,6 +200,71 @@ mod tests {
         assert_eq!(kept.node(2).leaf_value, -7.0);
         assert_eq!(kept.node(0).sum_hess, 4.5);
         assert_eq!(kept.node(0).split_gain, gain as f32);
+    }
+
+    /// An average's tree (leaf divisor 3) refreshes to the plain tree's
+    /// refreshed leaves divided as `BoostedModel::average` divides them,
+    /// with the same statistics, and keeps its divisor.
+    #[test]
+    fn an_averaged_tree_divides_its_refreshed_leaves() {
+        let data = DMatrix::from_dense(&[0.1, 0.2, 0.9, f32::NAN, 0.7], 5, 1).unwrap();
+        let gpair = [
+            GradPair::new(1.0, 1.0),
+            GradPair::new(2.0, 1.0),
+            GradPair::new(-3.0, 2.0),
+            GradPair::new(0.5, 0.5),
+            GradPair::new(-0.7, 1.3),
+        ];
+        let params = TrainingParams::default();
+        let mut plain = stump();
+        refresh_tree(&mut plain, &data, &gpair, &params, Refresh::default(), 0.3);
+        let mut averaged = stump();
+        averaged.divide_leaves(3);
+        refresh_tree(
+            &mut averaged,
+            &data,
+            &gpair,
+            &params,
+            Refresh::default(),
+            0.3,
+        );
+        assert_eq!(averaged.leaf_divisor(), 3);
+        let mut expected = plain.clone();
+        expected.divide_leaves(3);
+        assert_eq!(averaged, expected);
+        assert!(
+            plain
+                .nodes()
+                .iter()
+                .zip(averaged.nodes())
+                .any(|(p, a)| p.is_leaf() && p.leaf_value != a.leaf_value)
+        );
+    }
+
+    /// A tree of an average of averages (divided by 3, then by 3 again:
+    /// divisor 9) refreshes with one division by the product, the `f32`
+    /// nearest the refreshed weight over 9, not the stored leaves' two
+    /// rounded divisions: those can differ in the last bit.
+    #[test]
+    fn a_nested_average_divides_its_refreshed_leaves_once() {
+        let data = DMatrix::from_dense(&[0.1, 0.9], 2, 1).unwrap();
+        let gpair = [GradPair::new(-10.0, 1.0), GradPair::new(4.0, 1.0)];
+        let params = TrainingParams::builder().lambda(1.0).build().unwrap();
+        let mut plain = stump();
+        refresh_tree(&mut plain, &data, &gpair, &params, Refresh::default(), 1.0);
+        // calc_weight = -G / (H + lambda): 10 / 2 = 5 on the left.
+        assert_eq!(plain.node(1).leaf_value, 5.0);
+        let mut nested = stump();
+        nested.divide_leaves(3);
+        nested.divide_leaves(3);
+        assert_eq!(nested.leaf_divisor(), 9);
+        refresh_tree(&mut nested, &data, &gpair, &params, Refresh::default(), 1.0);
+        let once = divide_weight(5.0, 9.0);
+        assert_eq!(nested.node(1).leaf_value.to_bits(), once.to_bits());
+        assert_ne!(
+            divide_weight(divide_weight(5.0, 3.0), 3.0).to_bits(),
+            once.to_bits()
+        );
     }
 
     #[test]

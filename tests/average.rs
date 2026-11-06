@@ -1,17 +1,21 @@
 //! `BoostedModel::average`: the bagged model's trees, leaves and intercepts
 //! follow its documented arithmetic, its margins are the members' mean, and
-//! members that do not share a margin layout are refused.
+//! members that do not share a margin layout are refused. Its trees record
+//! the member count as their leaf divisor, which every format keeps and
+//! which refresh (`process_type=update`) divides refreshed leaves by.
 
 mod common;
 
 use common::{four_features, incompatible_model, invalid_param, labeled_dense};
 use hessboost::config::{
     BoosterKind, Boulevard, Dart, Ebm, LinearTree, MaxDeltaStep, ModelShrink, ModelShrinkMode,
-    MultiStrategy, TrainingParamsBuilder,
+    MultiStrategy, ProcessType, Refresh, TrainingParamsBuilder,
 };
 use hessboost::data::FeatureType;
 use hessboost::objective::{Multiclass, Objective, Quantiles};
 use hessboost::prelude::*;
+use hessboost::tree::RegTree;
+use serde_json::Value;
 use std::num::NonZeroUsize;
 
 const ROWS: usize = 300;
@@ -290,4 +294,234 @@ fn members_differing_in_layout_are_refused() {
     let average = BoostedModel::average([&empty, &vector]).unwrap();
     assert!(average.has_vector_leaves());
     average.predict_margin(&data, Iterations::Best).unwrap();
+}
+
+/// Rows to refresh on: other rows of [`four_features`] with labels `label`
+/// of their first three features (more than one refresh statistics block).
+fn refresh_rows(label: fn([f32; 4]) -> f32) -> DMatrix {
+    let n = 9_000;
+    let row = |i: usize| four_features(i * 3 + 1);
+    let x: Vec<f32> = (0..n).flat_map(row).collect();
+    let y: Vec<f32> = (0..n).map(|i| label(row(i))).collect();
+    labeled_dense(&x, 4, &y)
+}
+
+/// `model` refreshed (`process_type=update` with `refresh_leaf`) on `rows`
+/// for `rounds` iterations with `params`.
+fn refreshed(
+    model: &BoostedModel,
+    params: TrainingParamsBuilder,
+    rows: &DMatrix,
+    rounds: usize,
+) -> BoostedModel {
+    let params = params
+        .process_type(ProcessType::Update(Refresh::default()))
+        .build()
+        .unwrap();
+    Trainer::new(&params, rows, rounds)
+        .init_model(model)
+        .train()
+        .unwrap()
+        .model
+}
+
+fn divisors(model: &BoostedModel) -> Vec<u64> {
+    model.trees().iter().map(RegTree::leaf_divisor).collect()
+}
+
+/// The acceptance property of refreshing an average: for members fit on
+/// the same data (differing in seed), refreshing their average on rows `R`
+/// gives, bit for bit, each member tree refreshed with the same `eta`
+/// against the average's own gradients on `R` (those of the already
+/// refreshed iterations, as refresh computes them) with its leaves divided
+/// by the member count as `average` divides them. Covers, gains and the
+/// divisor are kept, at any thread count; a one-member average (divisor 1)
+/// refreshes exactly as its member does.
+#[test]
+fn refreshing_an_average_refreshes_each_members_share() {
+    type Case = (Objective, usize, fn([f32; 4]) -> f32);
+    let cases: [Case; 2] = [
+        (
+            Objective::SquaredError(RegLoss::default()),
+            1,
+            |[a, b, c, _]| 2.0 * a - b * c + 1.5,
+        ),
+        (
+            Objective::BinaryLogistic(RegLoss::default()),
+            2,
+            |[a, b, _, _]| f32::from(u8::from(a + b > 1.0)),
+        ),
+    ];
+    for (objective, parallel, label) in cases {
+        let params = || {
+            TrainingParams::builder()
+                .objective(objective.clone())
+                .max_depth(3)
+                .eta(0.3)
+                .num_parallel_tree(parallel)
+        };
+        let rows = refresh_rows(label);
+        let fit = refresh_rows(|[a, b, c, _]| f32::from(u8::from(a * b + c > 0.6)));
+        let members: Vec<BoostedModel> = (0..3u64)
+            .map(|seed| {
+                let sampled = params().subsample(0.7).colsample_bynode(0.75).seed(seed);
+                train(&sampled.build().unwrap(), &fit, 4).unwrap()
+            })
+            .collect();
+        let average = BoostedModel::average(&members).unwrap();
+        assert_eq!(divisors(&average), vec![3; 12 * parallel]);
+        let got = refreshed(&average, params().nthread(1), &rows, 12);
+        let threaded = refreshed(&average, params().nthread(8), &rows, 12);
+        assert_eq!(
+            got.encode(ModelFormat::Binary).unwrap(),
+            threaded.encode(ModelFormat::Binary).unwrap()
+        );
+        assert_eq!(divisors(&got), divisors(&average));
+
+        let n = rows.n_rows();
+        for iteration in 0..12 {
+            // The average's own margins on `R` before this iteration.
+            let margins = if iteration == 0 {
+                vec![got.base_score(); n]
+            } else {
+                got.slice(..iteration, 1)
+                    .unwrap()
+                    .predict_margin(&rows, Iterations::Best)
+                    .unwrap()
+                    .into_vec()
+            };
+            let (member, own) = (iteration / 4, iteration % 4);
+            let trees = refreshed(
+                &members[member].slice(own..=own, 1).unwrap(),
+                params(),
+                &rows.clone().with_base_margin(&margins).unwrap(),
+                1,
+            );
+            let first = iteration * parallel;
+            for (slot, expected) in trees.trees().iter().enumerate() {
+                let tree = &got.trees()[first + slot];
+                assert_eq!(expected.leaf_divisor(), 1);
+                assert_eq!(tree.num_nodes(), expected.num_nodes());
+                for (node, (got, expected)) in tree.nodes().iter().zip(expected.nodes()).enumerate()
+                {
+                    let leaf = if expected.is_leaf() {
+                        (f64::from(expected.leaf_value) / 3.0) as f32
+                    } else {
+                        expected.leaf_value
+                    };
+                    let what =
+                        format!("{objective:?}: iteration {iteration}, slot {slot}, node {node}");
+                    assert_eq!(got.leaf_value.to_bits(), leaf.to_bits(), "{what}");
+                    assert_eq!(
+                        got.sum_hess.to_bits(),
+                        expected.sum_hess.to_bits(),
+                        "{what}"
+                    );
+                    assert_eq!(
+                        got.split_gain.to_bits(),
+                        expected.split_gain.to_bits(),
+                        "{what}"
+                    );
+                }
+            }
+        }
+
+        // Refreshing statistics only keeps the averaged leaves and divisors.
+        let stats_only = params()
+            .process_type(ProcessType::Update(Refresh::stats_only()))
+            .build()
+            .unwrap();
+        let kept = Trainer::new(&stats_only, &rows, 12)
+            .init_model(&average)
+            .train()
+            .unwrap()
+            .model;
+        assert_eq!(divisors(&kept), divisors(&average));
+        for (kept, average) in kept.trees().iter().zip(average.trees()) {
+            for (k, a) in kept.nodes().iter().zip(average.nodes()) {
+                assert_eq!(k.leaf_value.to_bits(), a.leaf_value.to_bits());
+            }
+        }
+
+        let alone = BoostedModel::average([&members[0]]).unwrap();
+        assert_eq!(divisors(&alone), vec![1; 4 * parallel]);
+        assert_eq!(
+            refreshed(&alone, params(), &rows, 4)
+                .encode(ModelFormat::Binary)
+                .unwrap(),
+            refreshed(&members[0], params(), &rows, 4)
+                .encode(ModelFormat::Binary)
+                .unwrap()
+        );
+    }
+}
+
+/// Every format that stores trees keeps the divisors (an average of an
+/// average records the product), so a loaded average refreshes as the
+/// average does; models that are not averages store none, and divisors
+/// outside `1..=2^53` are refused, by loaders and by `average`.
+#[test]
+fn leaf_divisors_survive_every_format() {
+    let members = bag(|_| base());
+    let average = BoostedModel::average(&members).unwrap();
+    let nested = BoostedModel::average([&average, &members[0]]).unwrap();
+    assert_eq!(divisors(&nested), [vec![6; 24], vec![2; 8]].concat());
+    let rows = refresh_rows(|[a, b, c, _]| a - b + c);
+    let update = || TrainingParams::builder().max_depth(3);
+    let expected = refreshed(&nested, update(), &rows, 32)
+        .predict_margin(&rows, Iterations::Best)
+        .unwrap();
+    let formats = [
+        ModelFormat::Binary,
+        ModelFormat::Json,
+        ModelFormat::XgboostJson,
+        ModelFormat::XgboostUbjson,
+    ];
+    for format in formats {
+        let loaded = BoostedModel::decode(nested.encode(format).unwrap(), format).unwrap();
+        assert_eq!(divisors(&loaded), divisors(&nested), "{format:?}");
+        let margins = refreshed(&loaded, update(), &rows, 32)
+            .predict_margin(&rows, Iterations::Best)
+            .unwrap();
+        assert_eq!(margins, expected, "{format:?}");
+        let plain = BoostedModel::decode(members[0].encode(format).unwrap(), format).unwrap();
+        assert_eq!(divisors(&plain), vec![1; 8], "{format:?}");
+    }
+    let container = |model: &BoostedModel| {
+        zstd::stream::decode_all(model.encode(ModelFormat::Binary).unwrap().as_slice()).unwrap()
+    };
+    let mentions = |bytes: &[u8], key: &str| bytes.windows(key.len()).any(|w| w == key.as_bytes());
+    assert!(mentions(&container(&nested), "tree.leaf_divisor"));
+    assert!(!mentions(&container(&members[0]), "tree.leaf_divisor"));
+    for (format, key) in [
+        (ModelFormat::Json, "leaf_divisor"),
+        (ModelFormat::XgboostJson, "hessboost_leaf_divisor"),
+    ] {
+        assert!(mentions(&nested.encode(format).unwrap(), key));
+        assert!(!mentions(&members[0].encode(format).unwrap(), key));
+    }
+
+    let doc = |format: ModelFormat| -> Value {
+        serde_json::from_slice(&nested.encode(format).unwrap()).unwrap()
+    };
+    for bad in [0u64, (1 << 53) + 1] {
+        let mut native = doc(ModelFormat::Json);
+        native["trees"][0]["leaf_divisor"] = bad.into();
+        assert!(BoostedModel::decode(native.to_string(), ModelFormat::Json).is_err());
+        let mut xgboost = doc(ModelFormat::XgboostJson);
+        xgboost["learner"]["gradient_booster"]["model"]["trees"][0]["hessboost_leaf_divisor"] =
+            bad.into();
+        assert!(matches!(
+            BoostedModel::decode(xgboost.to_string(), ModelFormat::XgboostJson),
+            Err(HessboostError::ModelFormat { .. })
+        ));
+    }
+    let mut largest = doc(ModelFormat::Json);
+    largest["trees"][0]["leaf_divisor"] = (1u64 << 53).into();
+    let largest = BoostedModel::decode(largest.to_string(), ModelFormat::Json).unwrap();
+    assert_eq!(largest.trees()[0].leaf_divisor(), 1 << 53);
+    assert_eq!(
+        incompatible_model(BoostedModel::average([&largest, &largest])),
+        "average"
+    );
 }

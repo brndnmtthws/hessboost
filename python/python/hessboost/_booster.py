@@ -209,6 +209,10 @@ class TreeInfo:
     single leaf)."""
     linear: LinearLeavesInfo | None
     """The leaves' linear models of a ``linear_tree`` tree, else ``None``."""
+    leaf_divisor: int
+    """The member count :meth:`Booster.average` divided the leaves by (the
+    product over nested averages), ``1`` for every other tree. Refreshing
+    (``process_type="update"``) divides each refreshed leaf by it too."""
 
     @classmethod
     def _from_core(cls, tree: dict[str, Any]) -> TreeInfo:
@@ -987,6 +991,16 @@ class Booster(_SchemaState):
         members' feature names, types and categories and has no
         :attr:`best_iteration`.
 
+        Every tree records ``k`` in :attr:`TreeInfo.leaf_divisor` (multiplied
+        into a member tree's own divisor, so an average of averages records
+        the product), and every :meth:`save_model` format keeps it.
+        Refreshing the average (``process_type="update"``, with the members'
+        ``eta``) divides each refreshed leaf by it the same way, so the
+        refreshed booster is, bit for bit, the average of the member trees
+        refreshed against the average's gradients when no member is itself
+        an average. A tree averaged twice is refreshed with one division by
+        the product, which can differ in the last bit from dividing twice.
+
         Args:
             models: The members, at least one.
 
@@ -1000,7 +1014,7 @@ class Booster(_SchemaState):
                 or categories; or a member is a ``gblinear``, model-shrinkage,
                 Boulevard or EBM model, has tree weights other than 1 (DART),
                 or is early-stopped (slice it, e.g. ``booster[: best + 1]``,
-                first).
+                first); or a tree's leaf divisor times ``k`` exceeds ``2**53``.
         """
         members = list(models)
         for member in members:

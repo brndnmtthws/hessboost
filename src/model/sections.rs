@@ -11,7 +11,8 @@
 //! ```
 //!
 //! A payload is a UTF-8 string, one `u64` or `f64`, or a little-endian array
-//! of `u8`, `u32`, `i32`, `f32` or `f64`; the section's name fixes which.
+//! of `u8`, `u32`, `i32`, `u64`, `f32` or `f64`; the section's name fixes
+//! which.
 //! Readers look sections up by name, so writers may add sections freely:
 //! a reader skips sections it does not know unless they carry the
 //! [`REQUIRED`] flag, and refuses the data then instead of misreading it.

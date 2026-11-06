@@ -260,6 +260,46 @@ def test_averaging_refuses_incompatible_members(trained: tuple[Booster, np.ndarr
         Booster.average([booster, absolute])
 
 
+def test_refreshing_an_average_keeps_the_member_share(tmp_path: Path) -> None:
+    """An average's trees record the member count, every save format keeps
+    it, and refreshing with the members' ``eta`` divides each refreshed leaf
+    by it: what refreshing at ``eta / k`` without the count gives, up to
+    float32 rounding."""
+    x, y = regression()
+    dtrain = DMatrix(x, y)
+    params = {"max_depth": 3, "eta": 0.3}
+    members = [
+        hessboost.train(params | {"subsample": 0.7, "seed": seed}, dtrain, 4) for seed in range(3)
+    ]
+    average = Booster.average(members)
+    assert [tree.leaf_divisor for tree in average.model_info().trees] == [3] * 12
+    assert {tree.leaf_divisor for tree in members[0].model_info().trees} == {1}
+    dnew = DMatrix(x[::2], y[::2] + 1.0)
+    update = params | {"process_type": "update"}
+    expected = hessboost.train(update, dnew, 12, xgb_model=average).predict(
+        dnew, output_margin=True
+    )
+    for name in ("model.bin", "model.json", "model.ubj"):
+        path = tmp_path / name
+        average.save_model(path)
+        loaded = Booster(path)
+        assert [tree.leaf_divisor for tree in loaded.model_info().trees] == [3] * 12
+        refreshed = hessboost.train(update, dnew, 12, xgb_model=loaded)
+        np.testing.assert_array_equal(refreshed.predict(dnew, output_margin=True), expected)
+
+    doc = json.loads(average.save_raw("json"))
+    for tree in doc["trees"]:
+        del tree["leaf_divisor"]
+    plain = Booster(json.dumps(doc).encode())
+    assert {tree.leaf_divisor for tree in plain.model_info().trees} == {1}
+    unscaled = hessboost.train(update, dnew, 12, xgb_model=plain)
+    workaround = hessboost.train(update | {"eta": 0.1}, dnew, 12, xgb_model=plain)
+    np.testing.assert_allclose(
+        workaround.predict(dnew, output_margin=True), expected, rtol=1e-5, atol=1e-5
+    )
+    assert not np.allclose(unscaled.predict(dnew, output_margin=True), expected, atol=1e-3)
+
+
 def test_shap_contributions_sum_to_the_margin(trained: tuple[Booster, np.ndarray]) -> None:
     booster, x = trained
     contribs = booster.predict(x, pred_contribs=True)

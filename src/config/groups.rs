@@ -451,7 +451,11 @@ impl Refresh {
         }
     }
 
-    /// Whether leaf values are rewritten too. XGBoost `refresh_leaf`.
+    /// Whether leaf values are rewritten too. XGBoost `refresh_leaf`. A
+    /// rewritten leaf is divided by its tree's
+    /// [`leaf_divisor`](crate::tree::RegTree::leaf_divisor) (the member
+    /// count of a [`BoostedModel::average`](crate::model::BoostedModel::average),
+    /// 1 for every other tree).
     pub fn refresh_leaf(&self) -> bool {
         self.refresh_leaf
     }

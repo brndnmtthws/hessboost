@@ -471,9 +471,12 @@ request, not the docs.
     sections: not an EBM; the `REQUIRED` `leaf_linear.lower`/`upper`,
     written only when a tree's linear leaves clamp (`tree.has_linear` 2):
     no clamping; the `REQUIRED` `objective.exceedance_threshold`, written
-    only for `reg:exceedance` models: no thresholds). Readers refuse
+    only for `reg:exceedance` models: no thresholds; the optional `u64`
+    `tree.leaf_divisor`, written only when an average's tree has a divisor
+    other than 1: every divisor 1). Readers refuse
     anything undefined inside known sections (unknown `node.flags` bits,
-    `tree.has_linear` not 0/1/2, trailing bytes), which is what makes new flag
+    `tree.has_linear` not 0/1/2, a leaf divisor outside `1..=2^53`, trailing
+    bytes), which is what makes new flag
     bits safe. Changing a section's meaning or the container layout bumps
     `CONTAINER_VERSION` and needs a reader for the previous version (only
     the current one is accepted). A save whose frame would exceed the
@@ -501,11 +504,16 @@ request, not the docs.
     Everything predictions depend on is required, nullable ones via
     `deserialize_with = "Option::deserialize"` (a plain `Option` would
     default when absent); exceptions: a tree may omit `size_leaf_vector`
-    (0) except in multi-output models, and `leaf_vectors`; an absent
+    (0) except in multi-output models, `leaf_vectors`, and `leaf_divisor`
+    (1); an absent
     `best_iteration` means none, an absent `shrinkage` means no model
     shrinkage, and a `linear` without `ranges` does not clamp. Writers emit
     every field, except `exceedance_threshold`, written only for
-    `reg:exceedance` so other models' saves stay byte-identical.
+    `reg:exceedance`, and a tree's `leaf_divisor`, written only when it is
+    not 1, so other models' saves stay byte-identical.
+  - XGBoost JSON/UBJSON export adds an average's divisor as the tree key
+    `hessboost_leaf_divisor` (only when not 1), which import reads back and
+    XGBoost ignores (and drops on its own re-save).
   - Compact (`HBTD`, `model/compact/`): section-table metadata; a bit
     stream change bumps its version byte (1).
   - Diffusion (`HBDM`, `diffusion/format.rs`): the shared container framing
@@ -526,7 +534,14 @@ request, not the docs.
   `slice(..k, 1)`, virtual ensembles) repeat training's shrink-then-add
   recurrence (`shrink_margins`), so they are the training margins and the
   `k`-round model bit for bit; later starts are refused, and early
-  stopping truncates it to the best iteration.
+  stopping truncates it to the best iteration. A tree's `leaf_divisor` is
+  the member count `BoostedModel::average` divided its stored leaves by
+  (product over nested averages; 1 for every other tree): predictions,
+  SHAP and exports never read it, and refresh (`training/refresh.rs`)
+  divides each refreshed leaf by it as `average` divides (`divide_weight`;
+  once by the product for nested averages, which `average` rounded per
+  division, so those may differ in the last bit), skipping the division at
+  1 so other models refresh bit for bit as XGBoost.
 - **Prediction iterations:** every `BoostedModel` prediction method takes
   `iterations: impl Into<model::Iterations>`: `Iterations::Best` (through
   `best_iteration`, else all) or any Rust range of iterations (`..` is

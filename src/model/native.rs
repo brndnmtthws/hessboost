@@ -30,6 +30,11 @@
 //! A Boulevard fit adds the `boulevard.*` sections of its
 //! [`BoulevardInfo`] (not `REQUIRED`: predictions do not read them), an
 //! EBM the `ebm.*` sections of its [`EbmInfo`] (likewise optional).
+//! `tree.leaf_divisor` (`u64`, one per tree: [`RegTree::leaf_divisor`]) is
+//! written only when some tree is an average's (a divisor other than 1),
+//! and is not `REQUIRED` either: predictions do not read it, and a reader
+//! that predates it refreshes the trees as it always did. Its absence means
+//! every divisor is 1; `0` and divisors above `2^53` are refused.
 //!
 //! The reader is strict about everything it knows: `node.flags` bits it
 //! does not define, `tree.has_linear` bytes other than 0, 1 and 2, and bytes
@@ -67,7 +72,7 @@ use crate::objective::AftDistribution;
 use crate::objective::distributional::DistFamily;
 use crate::objective::distributional::{DistGradient, DistSplitDirection};
 use crate::tree::linear::LinearLeaves;
-use crate::tree::{Node, RegTree};
+use crate::tree::{MAX_LEAF_DIVISOR, Node, RegTree};
 
 const MAGIC: &[u8; 4] = b"HBM\0";
 /// The magic of the pre-0.2.0 native format (hessboost 0.1.x), which this
@@ -110,6 +115,8 @@ const LINEAR: u8 = 1;
 const CLAMPED_LINEAR: u8 = 2;
 /// The sections of the clamped trees' term ranges.
 const RANGE_SECTIONS: [&str; 2] = ["leaf_linear.lower", "leaf_linear.upper"];
+/// The per-tree [`RegTree::leaf_divisor`]s, written when one is not 1.
+const LEAF_DIVISOR: &str = "tree.leaf_divisor";
 
 /// Every section this version reads.
 const KNOWN: &[&str] = &[
@@ -143,6 +150,7 @@ const KNOWN: &[&str] = &[
     "tree.size_leaf_vector",
     "tree.leaf_vectors",
     "tree.has_linear",
+    LEAF_DIVISOR,
     "leaf_linear.offsets",
     "leaf_linear.intercepts",
     "leaf_linear.features",
@@ -536,6 +544,15 @@ fn write_tree_sections(w: &mut Writer, trees: &[RegTree]) {
         }),
         |b: u8| [b],
     );
+    // Only averages carry divisors, so every other model's file keeps its
+    // bytes; optional, as predictions do not read it.
+    if trees.iter().any(|t| t.leaf_divisor() != 1) {
+        let payload: Vec<u8> = trees
+            .iter()
+            .flat_map(|t| t.leaf_divisor().to_le_bytes())
+            .collect();
+        w.raw(LEAF_DIVISOR, 0, &payload);
+    }
     w.array(
         "leaf_linear.offsets",
         linear().flat_map(|p| p.offsets.iter().copied()),
@@ -634,6 +651,20 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
     let category_count = u32s("tree.category_count", n_trees)?;
     let size_leaf_vector = u32s("tree.size_leaf_vector", n_trees)?;
     let has_linear = s.bytes_exact("tree.has_linear", Some(n_trees))?;
+    let leaf_divisor = if s.has(LEAF_DIVISOR) {
+        let divisors = s.array_exact(LEAF_DIVISOR, n_trees, u64::from_le_bytes)?;
+        if let Some(bad) = divisors
+            .iter()
+            .find(|d| !(1..=MAX_LEAF_DIVISOR).contains(d))
+        {
+            return Err(format_error(format!(
+                "`{LEAF_DIVISOR}` holds {bad}, not a whole number from 1 to 2^53"
+            )));
+        }
+        divisors
+    } else {
+        vec![1; n_trees]
+    };
     if let Some(&bad) = flags.iter().find(|&&f| f & !NODE_FLAGS != 0) {
         return Err(format_error(format!(
             "`node.flags` holds undefined bits {:#04x}",
@@ -704,13 +735,16 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
                 offsets, intercepts, features, coeffs, ranges,
             ))
         };
-        trees.push(RegTree::from_parts(
-            nodes,
-            categories.take(category_count[t] as usize, "tree.categories")?,
-            width,
-            leaf_vectors.take(n_weights, "tree.leaf_vectors")?,
-            linear,
-        ));
+        trees.push(
+            RegTree::from_parts(
+                nodes,
+                categories.take(category_count[t] as usize, "tree.categories")?,
+                width,
+                leaf_vectors.take(n_weights, "tree.leaf_vectors")?,
+                linear,
+            )
+            .with_leaf_divisor(leaf_divisor[t]),
+        );
     }
     for (rest, name) in [
         (categories.rest(), "tree.categories"),

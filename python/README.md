@@ -105,7 +105,7 @@ to walk the trees and recompute the margins without parsing a model file: a
 `ModelInfo` with the layout, base margins, per-tree weights and outputs, and
 the `gblinear` and model-shrinkage records, and per tree a `TreeInfo` of node
 arrays (children, split features, thresholds, categories, leaf values, covers,
-gains, linear leaves).
+gains, linear leaves) and its leaf divisor (an average's member count).
 
 ### Input data
 
@@ -217,6 +217,19 @@ geometric mean of the members' predictions:
 ```python
 bag = [hessboost.train(params | {"seed": seed}, dtrain, 300) for seed in range(5)]
 averaged = hessboost.Booster.average(bag)
+```
+
+Every tree of the average records the member count it was divided by
+(`TreeInfo.leaf_divisor`), so refreshing the average on new rows
+(`process_type="update"`, with the members' `eta`) keeps it an average:
+each refreshed leaf is divided by that count again. Every format
+`save_model` writes keeps the count; a file XGBoost itself loads and saves
+again does not, and refreshes as a plain ensemble.
+
+```python
+refreshed = hessboost.train(
+    params | {"process_type": "update"}, dtrain, averaged.num_boosted_rounds(), xgb_model=averaged
+)
 ```
 
 `hessboost.train_with_budget(params, dtrain, budget)` trains with one

@@ -48,8 +48,32 @@ fi
 # The argument lists and the globs are unquoted on purpose: the lists split
 # into their arguments, and each glob expands to its matching wheel (a glob
 # without a match stays literal and uv reports the missing file).
-# shellcheck disable=SC2086
-uv sync --locked --only-group test --python "$request" $sync_args
+#
+# uv resolves the whole locked test group (numpy, scipy, scikit-learn, polars,
+# ...) for every interpreter on every platform. The release workflow runs that
+# across a wide, uncached wheel matrix, so a transient files.pythonhosted.org
+# connection error can fail one wheel job; because crates.io, PyPI and the
+# GitHub release all depend on the entire wheel matrix, one such blip skips the
+# whole release. uv retries a failed request a few times on its own, but a CDN
+# blip can outlast that budget. Retry the whole sync a few times with a short
+# backoff: uv's cache makes each retry cheap (only the wheel that failed to
+# download is fetched again).
+sync_with_retry() {
+  attempt=1
+  while [ "$attempt" -lt 3 ]; do
+    # shellcheck disable=SC2086
+    if uv sync --locked --only-group test --python "$request" $sync_args; then
+      return 0
+    fi
+    echo "uv sync failed (attempt $attempt/3); retrying in 10s" >&2
+    sleep 10
+    attempt=$((attempt + 1))
+  done
+  # Final attempt: a failure propagates through set -eu and fails the job.
+  # shellcheck disable=SC2086
+  uv sync --locked --only-group test --python "$request" $sync_args
+}
+sync_with_retry
 # shellcheck disable=SC2086
 uv pip install $wheel_glob
 uv run --no-sync python -c "import hessboost; assert 'site-packages' in hessboost.__file__, hessboost.__file__"

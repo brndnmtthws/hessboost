@@ -1,14 +1,14 @@
 [tools]
 rust = { version = "1.99.1", profile = "minimal", components = "clippy,rustfmt", mr_boxington = true }
-mr-boxington = { version = "1.28.0", workflow = "release.yml@refs/heads/main" }
-uv = "0.13.6"
+mr-boxington = { version = "1.29.2", workflow = "release.yml@refs/heads/main" }
+uv = "0.13.7"
 # mise installs `cargo:` tools with cargo-binstall (prebuilt binaries) when
 # it is present, instead of compiling them.
-cargo-binstall = "1.26.1"
-"cargo:cargo-nextest" = "0.9.150"
+cargo-binstall = "1.26.2"
+"cargo:cargo-nextest" = "0.9.151"
 "cargo:cargo-semver-checks" = "0.51.0"
 shellcheck = "0.11.0"
-ruff = "0.17.3"
+ruff = "0.17.4"
 
 # Install anything missing whenever a mise-activated shell enters the repo.
 [hooks]

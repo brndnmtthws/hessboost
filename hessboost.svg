@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 284" width="960" height="284" role="img" aria-labelledby="title description">
+  <title id="title">hessboost — Fast gradient boosting in Rust</title>
+  <desc id="description">A copper path through a decision tree leads from a leaf to the minimum of its quadratic loss approximation: w* = −G / (H + λ).</desc>
+  <style>
+    svg {
+      --ink: #18222c;
+      --subtle: #4e5964;
+      --line: #7d8994;
+      --highlight: #b44420;
+      font-family: system-ui, sans-serif;
+      fill: var(--ink);
+    }
+    @media (prefers-color-scheme: dark) {
+      svg {
+        --ink: #f0f4f8;
+        --subtle: #b8c3cf;
+        --line: #8492a0;
+        --highlight: #ff9e75;
+      }
+    }
+    .subtitle { fill: var(--subtle); }
+    .tree { stroke: var(--line); }
+    .focus { stroke: var(--highlight); }
+    .accent-fill { fill: var(--highlight); }
+    .math { font-family: Georgia, serif; }
+  </style>
+
+  <defs>
+    <linearGradient id="curve-fade" gradientUnits="userSpaceOnUse" x1="796" x2="916" y1="0" y2="0">
+      <stop offset=".2" stop-color="var(--highlight)"/>
+      <stop offset="1" stop-color="var(--highlight)" stop-opacity=".5"/>
+    </linearGradient>
+  </defs>
+
+  <text x="36" y="142" font-size="80" font-weight="750" letter-spacing="-4">hessboost</text>
+  <text class="subtitle" x="40" y="185" font-size="28">Fast gradient boosting in Rust</text>
+
+  <!-- Circles are splits; squares are leaves. The selected leaf starts the parabola. -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <g class="tree" stroke-width="1.8">
+      <path d="M560 45L505 82 M493 94L466 130 M503 94L524 130 M629 94L609 130"/>
+      <circle cx="498" cy="87" r="8"/>
+      <rect x="452" y="129" width="16" height="16" rx="2"/>
+      <rect x="522" y="129" width="16" height="16" rx="2"/>
+      <rect x="595" y="129" width="16" height="16" rx="2"/>
+    </g>
+    <g class="focus" stroke-width="3">
+      <path d="M575 45L626 82 M639 94L676 137"/>
+      <circle cx="568" cy="40" r="8"/>
+      <circle cx="633" cy="87" r="8"/>
+    </g>
+    <path d="M676 137Q796 273 916 137" stroke="url(#curve-fade)" stroke-width="3"/>
+  </g>
+  <rect class="accent-fill" x="668" y="129" width="16" height="16" rx="2"/>
+  <circle class="accent-fill" cx="796" cy="205" r="5"/>
+
+  <text class="math" x="796" y="248" font-size="29" text-anchor="middle"><tspan font-style="italic">w</tspan><tspan baseline-shift="super" font-size="18">*</tspan> = −<tspan font-style="italic">G</tspan> / (<tspan font-style="italic">H</tspan> + λ)</text>
+</svg>

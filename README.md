@@ -5,7 +5,7 @@
 [![CI](https://github.com/brndnmtthws/hessboost/actions/workflows/ci.yml/badge.svg)](https://github.com/brndnmtthws/hessboost/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-![hessboost](hessboost.png)
+![hessboost, with a decision tree illustrating the Newton leaf weight](hessboost.svg)
 
 **Fast, deterministic gradient boosting in Rust (with Python bindings).**
 hessboost provides multi-core tree building with runtime-detected NEON and AVX2

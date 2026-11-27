@@ -19,6 +19,7 @@ include = [
     "/examples/**",
     "/benches/**",
     "/README.md",
+    "/hessboost.svg",
     "/LICENSE",
 ]
 
